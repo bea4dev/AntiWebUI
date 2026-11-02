@@ -1,0 +1,13 @@
+[package]
+name = "anti-webui-wgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anti-webui-core.workspace = true
+wgpu.workspace = true
+swash.workspace = true
+bytemuck.workspace = true
+raw-window-handle.workspace = true
+pollster.workspace = true

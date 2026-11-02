@@ -1,0 +1,13 @@
+[package]
+name = "anti-webui-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anti-webui-core.workspace = true
+anti-webui-wgpu.workspace = true
+png.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+anti-webui-wayland.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "anti-webui-dylib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["dylib"]
+
+[dependencies]
+anti-webui-internal.workspace = true

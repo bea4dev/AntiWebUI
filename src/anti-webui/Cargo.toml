@@ -1,0 +1,15 @@
+[package]
+name = "anti-webui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A lightweight native UI framework rendered with wgpu"
+
+[features]
+default = []
+## Link AntiWebUI dynamically for faster incremental builds (development only).
+dynamic_linking = ["dep:anti-webui-dylib"]
+
+[dependencies]
+anti-webui-internal.workspace = true
+anti-webui-dylib = { workspace = true, optional = true }

@@ -1,0 +1,50 @@
+# !tyml @cargo/Cargo
+[workspace]
+resolver = "2"
+members = [
+    "src/anti-webui",
+    "src/anti-webui-internal",
+    "src/anti-webui-dylib",
+    "src/anti-webui-core",
+    "src/anti-webui-style",
+    "src/anti-webui-widgets",
+    "src/anti-webui-app",
+    "src/anti-webui-wgpu",
+    "src/anti-webui-wayland",
+    "src/anti-webui-x11",
+    "src/anti-webui-windows",
+    "src/anti-webui-macos",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bea4dev/AntiWebUI"
+
+[workspace.dependencies]
+anti-webui = { path = "src/anti-webui", version = "0.1.0" }
+anti-webui-internal = { path = "src/anti-webui-internal", version = "0.1.0" }
+anti-webui-dylib = { path = "src/anti-webui-dylib", version = "0.1.0" }
+anti-webui-core = { path = "src/anti-webui-core", version = "0.1.0" }
+anti-webui-style = { path = "src/anti-webui-style", version = "0.1.0" }
+anti-webui-widgets = { path = "src/anti-webui-widgets", version = "0.1.0" }
+anti-webui-app = { path = "src/anti-webui-app", version = "0.1.0" }
+anti-webui-wgpu = { path = "src/anti-webui-wgpu", version = "0.1.0" }
+anti-webui-wayland = { path = "src/anti-webui-wayland", version = "0.1.0" }
+
+wgpu = "30"
+parley = { version = "0.12", features = ["complex-scripts"] }
+swash = "0.2.10"
+wayland-client = "0.31.15"
+wayland-backend = { version = "0.3.17", features = ["client_system"] }
+wayland-protocols = { version = "0.32.13", features = ["client", "staging", "unstable"] }
+xkbcommon = { version = "0.9", features = ["wayland"] }
+raw-window-handle = "0.6.2"
+slotmap = "1.1"
+unicode-segmentation = "1.13"
+rustix = { version = "1.1", features = ["event", "pipe", "time"] }
+pollster = "1"
+png = "0.18"
+bytemuck = { version = "1.25", features = ["derive"] }
+log = "0.4"

@@ -1,0 +1,7 @@
+[package]
+name = "anti-webui-x11"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

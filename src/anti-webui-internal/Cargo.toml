@@ -1,0 +1,12 @@
+[package]
+name = "anti-webui-internal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anti-webui-core.workspace = true
+anti-webui-style.workspace = true
+anti-webui-widgets.workspace = true
+anti-webui-app.workspace = true
+anti-webui-wgpu.workspace = true

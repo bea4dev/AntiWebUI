@@ -1,0 +1,11 @@
+[package]
+name = "anti-webui-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anti-webui-style.workspace = true
+parley.workspace = true
+slotmap.workspace = true
+unicode-segmentation.workspace = true
