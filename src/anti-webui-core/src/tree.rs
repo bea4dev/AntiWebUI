@@ -2,7 +2,7 @@
 
 use crate::event::{KeyboardEvent, PointerEvent, ScrollEvent};
 use crate::geometry::{PointI, RectI, Scale, SizeI};
-use crate::layout::{MeasureCache, MeasureKey, Resolved};
+use crate::layout::{MeasureCache, MeasureKey, Resolved, child_clip};
 use crate::platform::PlatformRequest;
 use crate::scene::Scene;
 use crate::text::TextLayout;
@@ -11,7 +11,7 @@ use crate::text::selection::DocSelection;
 use anti_webui_style::{ComputedStyle, Style};
 use slotmap::{SlotMap, new_key_type};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -78,9 +78,11 @@ pub struct Node {
     pub rect: RectI,
     /// Extent of the children relative to the padding box origin, for scrolling.
     pub content_size: SizeI,
-    /// Border box in window coordinates, after scrolling.
+    /// Border box after scrolling, in window coordinates, or in content coordinates for the
+    /// descendants of a scroll root (see [`Document::window_rect`]).
     pub abs: RectI,
-    /// Clip that applies to this node, in window coordinates.
+    /// Clip that applies to this node, in the same coordinates as `abs`. For the descendants of a
+    /// scroll root it leaves out the root's own clip.
     pub clip: RectI,
     /// Corner radii of `clip` (non-zero when an ancestor with rounded corners clips).
     pub clip_radii: [f32; 4],
@@ -88,6 +90,21 @@ pub struct Node {
     pub doc_order: u32,
     /// False inside `display: none` subtrees.
     pub visible: bool,
+    /// The outermost scroller that overflows: its descendants don't move when it scrolls.
+    pub scroll_root: bool,
+    /// The scroll root whose content this node is part of.
+    pub space: Option<NodeId>,
+    /// Contains everything the subtree paints, in the same coordinates as `abs`. It may be too
+    /// big, never too small.
+    pub subtree_bounds: RectI,
+    /// The `subtree_bounds` of each child, so that culling doesn't need to touch the children.
+    pub child_bounds: Vec<RectI>,
+    /// Nodes in the subtree that are not `display: none`, itself included.
+    pub(crate) subtree_nodes: u32,
+    /// The children may have moved since the node was last positioned.
+    pub(crate) position_dirty: bool,
+    /// The node's style inputs changed since it was last resolved.
+    pub(crate) style_dirty: bool,
     /// The node or a descendant changed since it was last laid out.
     pub(crate) layout_dirty: bool,
     /// Inputs and result of the last layout pass, reused while the subtree is clean.
@@ -115,6 +132,13 @@ impl Node {
             scroll: PointI::default(),
             doc_order: 0,
             visible: false,
+            scroll_root: false,
+            space: None,
+            subtree_bounds: RectI::default(),
+            child_bounds: Vec::new(),
+            subtree_nodes: 0,
+            position_dirty: true,
+            style_dirty: false,
             layout_dirty: true,
             last_perform: None,
             measure_cache: MeasureCache::default(),
@@ -143,7 +167,7 @@ impl Node {
         }
     }
 
-    /// The content box in window coordinates.
+    /// The content box, in the same coordinates as `abs`.
     pub fn content_abs(&self) -> RectI {
         let r = &self.resolved;
         self.abs.inset(
@@ -162,7 +186,7 @@ impl Node {
         }
     }
 
-    /// The padding box in window coordinates.
+    /// The padding box, in the same coordinates as `abs`.
     pub fn padding_abs(&self) -> RectI {
         let b = &self.resolved.border;
         self.abs.inset(b.top, b.right, b.bottom, b.left)
@@ -178,6 +202,8 @@ pub struct Dirty {
     pub paint: bool,
     /// What scroll layers hold is stale. Scrolling a layer alone doesn't set this.
     pub content: bool,
+    /// An edit's caret moved and may need scrolling into view.
+    pub carets: bool,
 }
 
 /// Per-window interaction state.
@@ -202,8 +228,17 @@ pub struct Document {
     pub requests: Vec<PlatformRequest>,
     /// Programmatic focus change requested through a `NodeRef`.
     pub pending_focus: Option<Option<NodeId>>,
-    /// What each scroll layer painted last, reused while its content is unchanged.
-    pub layer_contents: HashMap<NodeId, Arc<Scene>>,
+    /// What each scroll layer painted last and the rectangle it covers, reused while the content
+    /// is unchanged and the view stays inside the rectangle.
+    pub layer_contents: HashMap<NodeId, (Arc<Scene>, RectI)>,
+    /// Nodes whose style must be resolved again; see `style_all`.
+    pub style_dirty: Vec<NodeId>,
+    /// Every node's style must be resolved again.
+    pub style_all: bool,
+    /// Nodes whose descendants must be positioned again, short of a whole `dirty.position`.
+    pub reposition: Vec<NodeId>,
+    /// All edit nodes, which are few, to look through for pending caret scrolling.
+    pub edits: Vec<NodeId>,
 }
 
 thread_local! {
@@ -217,6 +252,10 @@ thread_local! {
         requests: Vec::new(),
         pending_focus: None,
         layer_contents: HashMap::new(),
+        style_dirty: Vec::new(),
+        style_all: false,
+        reposition: Vec::new(),
+        edits: Vec::new(),
     });
 }
 
@@ -227,7 +266,40 @@ pub fn with_doc<R>(f: impl FnOnce(&mut Document) -> R) -> R {
 
 impl Document {
     pub fn create(&mut self, node: Node) -> NodeId {
-        self.nodes.insert(node)
+        let edit = node.is_edit();
+        let id = self.nodes.insert(node);
+        if edit {
+            self.edits.push(id);
+        }
+        id
+    }
+
+    /// What to add to a node's coordinates to get window coordinates.
+    pub fn space_offset(&self, node: &Node) -> PointI {
+        node.space
+            .and_then(|r| self.nodes.get(r))
+            .map_or(PointI::default(), |r| {
+                PointI::new(r.abs.x - r.scroll.x, r.abs.y - r.scroll.y)
+            })
+    }
+
+    /// The node's border box in window coordinates.
+    pub fn window_rect(&self, id: NodeId) -> Option<RectI> {
+        let n = self.nodes.get(id)?;
+        let o = self.space_offset(n);
+        Some(n.abs.translate(o.x, o.y))
+    }
+
+    /// The part of the node that is not clipped away, in window coordinates.
+    pub fn visible_window_rect(&self, id: NodeId) -> Option<RectI> {
+        let n = self.nodes.get(id)?;
+        let o = self.space_offset(n);
+        let clip = n.clip_shape().translated(o.x, o.y).rect;
+        let rect = n.abs.translate(o.x, o.y).intersect(&clip);
+        Some(match n.space.and_then(|r| self.nodes.get(r)) {
+            Some(root) => rect.intersect(&child_clip(root, self.scale, root.clip_shape()).rect),
+            None => rect,
+        })
     }
 
     pub fn get(&self, id: NodeId) -> Option<&Node> {
@@ -239,7 +311,23 @@ impl Document {
     }
 
     /// Styles need recomputing. Layout runs only if a layout-affecting property changed.
-    pub fn mark_style(&mut self) {
+    /// The style inputs of `id` changed.
+    pub fn mark_style_of(&mut self, id: NodeId) {
+        let Some(n) = self.nodes.get_mut(id) else {
+            return;
+        };
+        if !n.style_dirty {
+            n.style_dirty = true;
+            self.style_dirty.push(id);
+        }
+        self.dirty.style = true;
+        self.dirty.paint = true;
+        self.dirty.content = true;
+    }
+
+    /// Something every style depends on changed.
+    pub fn mark_style_all(&mut self) {
+        self.style_all = true;
         self.dirty.style = true;
         self.dirty.paint = true;
         self.dirty.content = true;
@@ -253,6 +341,8 @@ impl Document {
                 break;
             };
             n.layout_dirty = true;
+            n.position_dirty = true;
+            n.measure_cache.clear();
             cur = n.parent;
         }
         self.mark_layout();
@@ -262,6 +352,7 @@ impl Document {
     pub fn invalidate_all_layout(&mut self) {
         for (_, n) in self.nodes.iter_mut() {
             n.layout_dirty = true;
+            n.measure_cache.clear();
         }
         self.mark_layout();
     }
@@ -285,7 +376,7 @@ impl Document {
         if let Some(p) = self.nodes.get_mut(parent) {
             p.children.push(child);
         }
-        self.mark_style();
+        self.mark_style_of(child);
         self.invalidate_layout(parent);
     }
 
@@ -294,23 +385,27 @@ impl Document {
             Some(p) => std::mem::take(&mut p.children),
             None => return,
         };
-        for c in old {
-            if let Some(n) = self.nodes.get_mut(c)
+        for c in &old {
+            if let Some(n) = self.nodes.get_mut(*c)
                 && n.parent == Some(parent)
             {
                 n.parent = None;
             }
         }
+        let old: HashSet<NodeId> = old.into_iter().collect();
         for &c in &children {
             self.detach(c);
             if let Some(n) = self.nodes.get_mut(c) {
                 n.parent = Some(parent);
             }
+            // Children that stay inherit the same things as before.
+            if !old.contains(&c) {
+                self.mark_style_of(c);
+            }
         }
         if let Some(p) = self.nodes.get_mut(parent) {
             p.children = children;
         }
-        self.mark_style();
         self.invalidate_layout(parent);
     }
 
@@ -324,7 +419,6 @@ impl Document {
         if let Some(n) = self.nodes.get_mut(id) {
             n.parent = None;
         }
-        self.mark_style();
         self.invalidate_layout(parent);
     }
 
@@ -357,7 +451,9 @@ impl Document {
         if self.root == Some(id) {
             self.root = None;
         }
-        self.mark_style();
+        self.edits.retain(|e| *e != id);
+        self.layer_contents.remove(&id);
+        self.mark_paint();
     }
 
     pub fn is_ancestor(&self, ancestor: NodeId, mut node: NodeId) -> bool {

@@ -28,33 +28,23 @@ pub fn paint_document(doc: &mut Document, now: Instant) -> Scene {
     };
     let old_layers = std::mem::take(&mut doc.layer_contents);
     let doc_ref = &*doc;
+    let screen = RectI::new(0, 0, scene.width as i32, scene.height as i32);
     let mut painter = Painter {
         doc: doc_ref,
         scene: &mut scene,
         now,
-        offset: PointI::default(),
-        in_layer: false,
+        screen,
         old_layers,
         new_layers: HashMap::new(),
         reuse_layers: !doc_ref.dirty.content,
+        cull: true,
     };
     if let Some(root) = doc_ref.root {
-        painter.node(root, 1.0, Clip::NONE);
+        painter.node(root, 1.0, screen);
     }
     let new_layers = painter.new_layers;
     doc.layer_contents = new_layers;
     scene
-}
-
-/// Whether the node's content is painted into a scroll layer: it scrolls and overflows.
-fn scrolls_content(node: &Node) -> bool {
-    if node.is_edit() {
-        return false;
-    }
-    let c = &node.computed;
-    let pad = node.padding_abs();
-    (c.overflow_y == Overflow::Scroll && node.content_size.height > pad.height)
-        || (c.overflow_x == Overflow::Scroll && node.content_size.width > pad.width)
 }
 
 fn fade(c: Color, opacity: f32) -> Color {
@@ -65,7 +55,33 @@ fn fade(c: Color, opacity: f32) -> Color {
     }
 }
 
-/// Where an edit node's text origin is, in window coordinates.
+/// Paints without culling or reusing anything, as a reference for tests.
+#[doc(hidden)]
+pub fn paint_everything(doc: &Document, now: Instant) -> Scene {
+    let mut scene = Scene {
+        width: doc.viewport.width.max(0) as u32,
+        height: doc.viewport.height.max(0) as u32,
+        clear: Color::WHITE,
+        primitives: Vec::new(),
+        chunks: Vec::new(),
+    };
+    let mut painter = Painter {
+        doc,
+        scene: &mut scene,
+        now,
+        screen: RectI::new(0, 0, doc.viewport.width, doc.viewport.height),
+        old_layers: HashMap::new(),
+        new_layers: HashMap::new(),
+        reuse_layers: false,
+        cull: false,
+    };
+    if let Some(root) = doc.root {
+        painter.node(root, 1.0, RectI::INFINITE);
+    }
+    scene
+}
+
+/// Where an edit node's text origin is, in the same coordinates as the node.
 pub fn edit_text_origin(doc: &Document, id: NodeId) -> PointI {
     let node = &doc.nodes[id];
     let content = node.content_abs();
@@ -103,13 +119,12 @@ struct Painter<'a> {
     doc: &'a Document,
     scene: &'a mut Scene,
     now: Instant,
-    /// Added to window coordinates to get the scene's: non-zero while painting a layer's content.
-    offset: PointI,
-    in_layer: bool,
-    /// Layer contents of the last frame, and whether they are still right.
-    old_layers: HashMap<NodeId, Arc<Scene>>,
-    new_layers: HashMap<NodeId, Arc<Scene>>,
+    screen: RectI,
+    /// Layer contents of the last frame with what they cover, and whether they are still right.
+    old_layers: HashMap<NodeId, (Arc<Scene>, RectI)>,
+    new_layers: HashMap<NodeId, (Arc<Scene>, RectI)>,
     reuse_layers: bool,
+    cull: bool,
 }
 
 impl Painter<'_> {
@@ -120,41 +135,34 @@ impl Painter<'_> {
         });
     }
 
-    fn to_scene(&self, rect: RectI) -> RectI {
-        rect.translate(self.offset.x, self.offset.y)
-    }
-
-    fn clip_to_scene(&self, clip: Clip) -> Clip {
-        clip.translated(self.offset.x, self.offset.y)
-    }
-
-    /// Fills a rectangle given in window coordinates.
-    fn fill(&mut self, rect: RectI, color: Color, clip: Clip) {
-        let (rect, clip) = (self.to_scene(rect), self.clip_to_scene(clip));
-        self.scene.fill(rect, color, clip);
-    }
-
-    /// Paints the node's children as a layer; `clip` is where they show.
-    fn layer(&mut self, id: NodeId, opacity: f32, clip: Clip) {
+    /// Paints the scroll root's children as a layer.
+    fn layer(&mut self, id: NodeId, opacity: f32) {
         let doc = self.doc;
         let node = &doc.nodes[id];
+        let clip = child_clip(node, doc.scale, node.clip_shape());
         let origin = PointI::new(node.abs.x - node.scroll.x, node.abs.y - node.scroll.y);
+        let view = clip
+            .rect
+            .intersect(&self.screen)
+            .translate(-origin.x, -origin.y);
         let reused = self
-            .reuse_layers
-            .then(|| self.old_layers.remove(&id))
-            .flatten();
-        let content = reused.unwrap_or_else(|| {
+            .old_layers
+            .remove(&id)
+            .filter(|(_, covers)| self.reuse_layers && covers.intersect(&view) == view);
+        let (content, covers) = reused.unwrap_or_else(|| {
+            // A screenful around the view, so that scrolling doesn't paint on every frame.
+            let (w, h) = (self.screen.width, self.screen.height);
+            let covers = RectI::new(
+                view.x - w,
+                view.y - h,
+                view.width + 2 * w,
+                view.height + 2 * h,
+            );
             let outer = std::mem::take(self.scene);
-            self.offset = PointI::new(-origin.x, -origin.y);
-            self.in_layer = true;
-            for &child in &node.children {
-                self.node(child, opacity, Clip::NONE);
-            }
-            self.in_layer = false;
-            self.offset = PointI::default();
-            Arc::new(std::mem::replace(self.scene, outer))
+            self.children(node, opacity, covers);
+            (Arc::new(std::mem::replace(self.scene, outer)), covers)
         });
-        self.new_layers.insert(id, content.clone());
+        self.new_layers.insert(id, (content.clone(), covers));
         self.chunk(id, part::LAYER);
         self.scene.primitives.push(Primitive::Layer(ScrollLayer {
             key: id.data().as_ffi(),
@@ -164,8 +172,17 @@ impl Painter<'_> {
         }));
     }
 
-    /// `clip` is what the parent clips the node to, in window coordinates.
-    fn node(&mut self, id: NodeId, opacity: f32, clip: Clip) {
+    /// Paints the children whose bounds touch `cull`.
+    fn children(&mut self, node: &Node, opacity: f32, cull: RectI) {
+        for (i, &child) in node.children.iter().enumerate() {
+            if !self.cull || node.child_bounds.get(i).is_none_or(|b| b.intersects(&cull)) {
+                self.node(child, opacity, cull);
+            }
+        }
+    }
+
+    /// `cull` is the rectangle worth painting, in the same coordinates as the node.
+    fn node(&mut self, id: NodeId, opacity: f32, cull: RectI) {
         let doc = self.doc;
         let Some(node) = doc.nodes.get(id) else {
             return;
@@ -180,10 +197,7 @@ impl Painter<'_> {
         }
         match &node.kind {
             NodeKind::Fragment => {
-                let inner = child_clip(node, doc.scale, clip);
-                for &child in &node.children {
-                    self.node(child, opacity, inner);
-                }
+                self.children(node, opacity, cull);
                 return;
             }
             NodeKind::Text(t) => {
@@ -193,7 +207,7 @@ impl Painter<'_> {
                     self.chunk(id, part::SELECTION);
                     let color = fade(c.selection_color, opacity);
                     for r in t.layout.range_rects(a, b, node.abs.x, node.abs.y) {
-                        self.fill(r, color, clip);
+                        self.scene.fill(r, color, node.clip_shape());
                     }
                 }
                 self.chunk(id, part::CONTENT);
@@ -201,7 +215,7 @@ impl Painter<'_> {
                     &t.layout,
                     node.abs.origin(),
                     fade(c.color, opacity),
-                    clip,
+                    node.clip_shape(),
                     c.underline,
                     c.strikethrough,
                 );
@@ -211,29 +225,27 @@ impl Painter<'_> {
         }
 
         self.chunk(id, part::BOX);
-        self.box_decorations(id, opacity, clip);
+        self.box_decorations(id, opacity);
 
         if let NodeKind::Edit(_) = &node.kind {
-            self.edit(id, opacity, clip);
+            self.edit(id, opacity);
         }
 
-        let inner = child_clip(node, doc.scale, clip);
-        if !self.in_layer && scrolls_content(node) {
-            self.layer(id, opacity, inner);
+        if node.scroll_root {
+            self.layer(id, opacity);
         } else {
-            for &child in &node.children {
-                self.node(child, opacity, inner);
-            }
+            let inner = child_clip(node, doc.scale, node.clip_shape());
+            self.children(node, opacity, cull.intersect(&inner.rect));
         }
 
         self.chunk(id, part::AFTER);
-        self.scrollbars(id, opacity, clip);
-        self.outline(id, opacity, clip);
+        self.scrollbars(id, opacity);
+        self.outline(id, opacity);
     }
 
-    fn box_decorations(&mut self, id: NodeId, opacity: f32, clip: Clip) {
-        let clip = self.clip_to_scene(clip);
+    fn box_decorations(&mut self, id: NodeId, opacity: f32) {
         let node = &self.doc.nodes[id];
+        let clip = node.clip_shape();
         let c = &node.computed;
         let scale = self.doc.scale;
         let radii = c.radii().map(|r| scale.pxf(r));
@@ -249,7 +261,6 @@ impl Painter<'_> {
                 .abs
                 .translate(scale.px(s.offset_x), scale.px(s.offset_y))
                 .outset(spread);
-            let rect = self.to_scene(rect);
             self.scene.primitives.push(Primitive::Shadow(Shadow {
                 rect,
                 radii: radii.map(|r| if r > 0.0 { r + spread as f32 } else { r }),
@@ -265,7 +276,7 @@ impl Painter<'_> {
             return;
         }
         self.scene.primitives.push(Primitive::Quad(Quad {
-            rect: self.to_scene(node.abs),
+            rect: node.abs,
             background: fade(c.background, opacity),
             border_widths: if has_border {
                 [b.top, b.right, b.bottom, b.left]
@@ -278,9 +289,9 @@ impl Painter<'_> {
         }));
     }
 
-    fn outline(&mut self, id: NodeId, opacity: f32, clip: Clip) {
-        let clip = self.clip_to_scene(clip);
+    fn outline(&mut self, id: NodeId, opacity: f32) {
         let node = &self.doc.nodes[id];
+        let clip = node.clip_shape();
         let c = &node.computed;
         if c.outline_width <= 0.0 || c.outline_color.is_transparent() {
             return;
@@ -288,7 +299,7 @@ impl Painter<'_> {
         let scale = self.doc.scale;
         let w = scale.px_min1(c.outline_width);
         let offset = scale.px(c.outline_offset);
-        let rect = self.to_scene(node.abs.outset(offset + w));
+        let rect = node.abs.outset(offset + w);
         let grow = (offset + w) as f32;
         let radii = c
             .radii()
@@ -308,9 +319,9 @@ impl Painter<'_> {
         }));
     }
 
-    fn scrollbars(&mut self, id: NodeId, opacity: f32, clip: Clip) {
-        let clip = self.clip_to_scene(clip);
+    fn scrollbars(&mut self, id: NodeId, opacity: f32) {
         let node = &self.doc.nodes[id];
+        let clip = node.clip_shape();
         let c = &node.computed;
         let scale = self.doc.scale;
         let pad = node.padding_abs();
@@ -329,12 +340,7 @@ impl Painter<'_> {
             let y = pad.y
                 + inset
                 + ((track - thumb) as i64 * node.scroll.y as i64 / max_scroll.max(1) as i64) as i32;
-            let rect = self.to_scene(RectI::new(
-                pad.right() - thickness - inset,
-                y,
-                thickness,
-                thumb,
-            ));
+            let rect = RectI::new(pad.right() - thickness - inset, y, thickness, thumb);
             self.scene.primitives.push(Primitive::Quad(Quad {
                 rect,
                 background: color,
@@ -353,12 +359,7 @@ impl Painter<'_> {
             let x = pad.x
                 + inset
                 + ((track - thumb) as i64 * node.scroll.x as i64 / max_scroll.max(1) as i64) as i32;
-            let rect = self.to_scene(RectI::new(
-                x,
-                pad.bottom() - thickness - inset,
-                thumb,
-                thickness,
-            ));
+            let rect = RectI::new(x, pad.bottom() - thickness - inset, thumb, thickness);
             self.scene.primitives.push(Primitive::Quad(Quad {
                 rect,
                 background: color,
@@ -370,12 +371,12 @@ impl Painter<'_> {
         }
     }
 
-    fn edit(&mut self, id: NodeId, opacity: f32, clip: Clip) {
+    fn edit(&mut self, id: NodeId, opacity: f32) {
         let doc = self.doc;
         let node = &doc.nodes[id];
         let c = &node.computed;
         let edit = node.edit().unwrap();
-        let clip = child_clip(node, doc.scale, clip);
+        let clip = child_clip(node, doc.scale, node.clip_shape());
         let origin = edit_text_origin(doc, id);
         let focused = doc.state.focused == Some(id);
 
@@ -388,7 +389,7 @@ impl Painter<'_> {
                 c.selection_color.with_alpha(c.selection_color.a * 0.5)
             };
             for r in edit.layout.range_rects(a, b, origin.x, origin.y) {
-                self.fill(r, fade(color, opacity), clip);
+                self.scene.fill(r, fade(color, opacity), clip);
             }
         }
 
@@ -421,7 +422,7 @@ impl Painter<'_> {
             let thin = self.doc.scale.px_min1(1.0);
             for r in edit.layout.range_rects(start, end, origin.x, origin.y) {
                 let line = RectI::new(r.x, r.bottom() - thin * 2, r.width, thin);
-                self.fill(line, fade(c.color, opacity), clip);
+                self.scene.fill(line, fade(c.color, opacity), clip);
             }
             if let Some((a, b)) = pre.cursor
                 && a != b
@@ -431,7 +432,7 @@ impl Painter<'_> {
                     .range_rects(start + a, start + b, origin.x, origin.y)
                 {
                     let line = RectI::new(r.x, r.bottom() - thin * 3, r.width, thin * 2);
-                    self.fill(line, fade(c.color, opacity), clip);
+                    self.scene.fill(line, fade(c.color, opacity), clip);
                 }
             }
         }
@@ -444,7 +445,7 @@ impl Painter<'_> {
                 let caret = edit
                     .caret_rect(caret_width(doc))
                     .translate(origin.x, origin.y);
-                self.fill(caret, fade(c.caret_color, opacity), clip);
+                self.scene.fill(caret, fade(c.caret_color, opacity), clip);
             }
         }
     }
@@ -458,12 +459,7 @@ impl Painter<'_> {
         underline: bool,
         strikethrough: bool,
     ) {
-        // Computed in scene coordinates so that glyph positions don't depend on the scroll offset.
-        let clip = self.clip_to_scene(clip);
-        let (ox, oy) = (
-            (origin.x + self.offset.x) as f32,
-            (origin.y + self.offset.y) as f32,
-        );
+        let (ox, oy) = (origin.x as f32, origin.y as f32);
         for line in layout.layout.lines() {
             for item in line.items() {
                 let PositionedLayoutItem::GlyphRun(glyph_run) = item else {

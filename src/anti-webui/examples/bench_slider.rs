@@ -37,7 +37,7 @@ fn main() {
         };
         d.get(row).unwrap().children[0]
     });
-    let rect = with_doc(|d| d.get(slider).unwrap().abs);
+    let rect = with_doc(|d| d.window_rect(slider).unwrap());
     let y = rect.y as f32 + rect.height as f32 / 2.0;
     let m = Modifiers::default();
     ui.handle_event(WindowEvent::PointerButton {

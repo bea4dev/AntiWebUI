@@ -56,7 +56,7 @@ impl NodeRef {
     /// The border box in window physical pixels, as of the last layout.
     pub fn rect(&self) -> Option<RectI> {
         let id = self.0.get_untracked()?;
-        with_doc(|d| d.get(id).map(|n| n.abs))
+        with_doc(|d| d.window_rect(id))
     }
 
     pub fn focus(&self) {
@@ -87,7 +87,7 @@ fn bind_dynamic_styles(id: NodeId, layers: Vec<StyleFn>) {
                     && n.style.dynamic[slot] != style
                 {
                     n.style.dynamic[slot] = style;
-                    d.mark_style();
+                    d.mark_style_of(id);
                 }
             });
         });
@@ -125,7 +125,7 @@ impl ElementConfig {
                     if let Some(n) = d.get_mut(id) {
                         n.disabled = v;
                     }
-                    d.mark_style();
+                    d.mark_style_of(id);
                 });
             });
         }

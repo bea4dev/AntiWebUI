@@ -1,6 +1,7 @@
 //! The document-wide text selection (see `docs/design/04-text.md`).
 
-use crate::geometry::{PointF, RectI};
+use crate::geometry::{PointF, PointI, RectI};
+use crate::layout::child_clip;
 use crate::tree::{Document, NodeId, NodeKind};
 use anti_webui_style::UserSelect;
 use std::cmp::Ordering;
@@ -96,27 +97,77 @@ pub fn node_range(doc: &Document, sel: &DocSelection, node: NodeId) -> Option<(u
 /// Finds the text position nearest to `p`, the way browsers do while dragging a selection:
 /// the point may be outside of any text, between lines, or far away from the anchor.
 pub fn hit_text_point(doc: &Document, p: PointF) -> Option<TextPoint> {
-    let mut best: Option<((f32, f32), NodeId, RectI)> = None;
-    for id in selectable_text_nodes(doc) {
-        let n = &doc.nodes[id];
-        let vis = n.abs.intersect(&n.clip);
-        if vis.is_empty() {
-            continue;
-        }
-        let (dx, dy) = vis.axis_distance(p);
-        let key = (dy, dx);
-        if best.as_ref().is_none_or(|(k, _, _)| key < *k) {
-            best = Some((key, id, vis));
-        }
-    }
-    let (_, id, vis) = best?;
+    let mut best = None;
+    nearest_text(
+        doc,
+        doc.root?,
+        PointI::default(),
+        RectI::INFINITE,
+        p,
+        &mut best,
+    );
+    let (_, id, vis): ((f32, f32), NodeId, RectI) = best?;
     let n = &doc.nodes[id];
     let NodeKind::Text(t) = &n.kind else {
         return None;
     };
     let q = vis.clamp_point(p);
-    let (offset, _) = t.layout.hit(q.x - n.abs.x as f32, q.y - n.abs.y as f32);
+    let o = doc.space_offset(n);
+    let (offset, _) = t
+        .layout
+        .hit(q.x - (n.abs.x + o.x) as f32, q.y - (n.abs.y + o.y) as f32);
     Some(TextPoint { node: id, offset })
+}
+
+/// Looks through the selectable text that isn't clipped away, in document order. `offset` takes
+/// the node's coordinates to window coordinates, and `view` is the window rectangle left by the
+/// scroll root it is in.
+fn nearest_text(
+    doc: &Document,
+    id: NodeId,
+    offset: PointI,
+    view: RectI,
+    p: PointF,
+    best: &mut Option<((f32, f32), NodeId, RectI)>,
+) {
+    let Some(n) = doc.nodes.get(id) else {
+        return;
+    };
+    if !n.visible {
+        return;
+    }
+    if n.is_text() && n.computed.user_select == UserSelect::Text {
+        let clip = n.clip_shape().translated(offset.x, offset.y).rect;
+        let vis = n
+            .abs
+            .translate(offset.x, offset.y)
+            .intersect(&clip)
+            .intersect(&view);
+        if !vis.is_empty() {
+            let (dx, dy) = vis.axis_distance(p);
+            let key = (dy, dx);
+            if best.as_ref().is_none_or(|(k, _, _)| key < *k) {
+                *best = Some((key, id, vis));
+            }
+        }
+    }
+    let (offset, view) = if n.scroll_root {
+        (
+            PointI::new(n.abs.x - n.scroll.x, n.abs.y - n.scroll.y),
+            view.intersect(&child_clip(n, doc.scale, n.clip_shape()).rect),
+        )
+    } else {
+        (offset, view)
+    };
+    for (i, &c) in n.children.iter().enumerate() {
+        let touches = n
+            .child_bounds
+            .get(i)
+            .is_none_or(|b| b.translate(offset.x, offset.y).intersects(&view));
+        if touches {
+            nearest_text(doc, c, offset, view, p, best);
+        }
+    }
 }
 
 fn unit_at(
@@ -129,8 +180,10 @@ fn unit_at(
     let NodeKind::Text(t) = &n.kind else {
         return (p, p);
     };
-    let q = n.abs.intersect(&n.clip).clamp_point(at);
-    let (x, y) = (q.x - n.abs.x as f32, q.y - n.abs.y as f32);
+    let vis = doc.visible_window_rect(p.node).unwrap_or_default();
+    let q = vis.clamp_point(at);
+    let o = doc.space_offset(n);
+    let (x, y) = (q.x - (n.abs.x + o.x) as f32, q.y - (n.abs.y + o.y) as f32);
     let (a, b) = match granularity {
         Granularity::Char => (p.offset, p.offset),
         Granularity::Word => t.layout.word_at(x, y),
@@ -220,11 +273,12 @@ pub fn selected_text(doc: &Document, sel: &DocSelection) -> String {
         };
         let n = &doc.nodes[id];
         let NodeKind::Text(t) = &n.kind else { continue };
+        let rect = doc.window_rect(id).unwrap_or_default();
         if let Some(p) = prev {
-            out.push(if n.abs.y >= p.bottom() - 1 { '\n' } else { ' ' });
+            out.push(if rect.y >= p.bottom() - 1 { '\n' } else { ' ' });
         }
         out.push_str(&t.text[a..b]);
-        prev = Some(n.abs);
+        prev = Some(rect);
     }
     out
 }

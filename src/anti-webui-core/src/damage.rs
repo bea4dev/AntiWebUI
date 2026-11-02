@@ -178,19 +178,19 @@ pub fn diff_content(old: &Scene, new: &Scene) -> Damage {
                 used[i] = true;
                 let old_prims = &old.primitives[old.chunk_range(i)];
                 if last_matched.is_some_and(|l| i < l) {
-                    damage.add(run_bounds(old_prims));
-                    damage.add(run_bounds(new_prims));
+                    add_run(old_prims, &mut damage);
+                    add_run(new_prims, &mut damage);
                 } else {
                     last_matched = Some(i);
                     diff_runs(old_prims, new_prims, &mut damage);
                 }
             }
-            _ => damage.add(run_bounds(new_prims)),
+            _ => add_run(new_prims, &mut damage),
         }
     }
     for (i, used) in used.iter().enumerate() {
         if !used {
-            damage.add(run_bounds(&old.primitives[old.chunk_range(i)]));
+            add_run(&old.primitives[old.chunk_range(i)], &mut damage);
         }
     }
     damage
@@ -207,8 +207,8 @@ fn diff_runs(old: &[Primitive], new: &[Primitive], damage: &mut Damage) {
             }
         }
     } else {
-        damage.add(run_bounds(old));
-        damage.add(run_bounds(new));
+        add_run(old, damage);
+        add_run(new, damage);
     }
 }
 
@@ -226,10 +226,12 @@ fn diff_layers(old: &ScrollLayer, new: &ScrollLayer, damage: &mut Damage) {
     }
 }
 
-fn run_bounds(prims: &[Primitive]) -> RectI {
-    prims
-        .iter()
-        .fold(RectI::default(), |acc, p| acc.union(&primitive_bounds(p)))
+/// Adds each primitive on its own: the box around a whole run can be much bigger than the run
+/// (scrollbars on two sides, say).
+fn add_run(prims: &[Primitive], damage: &mut Damage) {
+    for p in prims {
+        damage.add(primitive_bounds(p));
+    }
 }
 
 /// A rectangle containing every pixel the primitive can touch.

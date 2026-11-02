@@ -1,8 +1,11 @@
 //! The per-window UI state machine: input handling, selection, editing, focus and frames.
 
 use crate::event::*;
+use crate::geometry::PointI;
 use crate::geometry::{PointF, RectI, Scale, SizeI};
-use crate::layout::{layout_document, position_document, resolve_styles};
+use crate::layout::{
+    child_clip, layout_document, position_document, reposition_children, resolve_styles,
+};
 use crate::paint::{CARET_BLINK, caret_width, edit_text_origin, paint_document};
 use crate::platform::{CursorIcon, ImeState, PlatformRequest};
 use crate::reactive::{Owner, batch, create_root};
@@ -107,7 +110,26 @@ impl Ui {
     /// Recomputes styles, layout and positions as needed.
     pub fn update(&mut self) {
         self.apply_pending_focus();
-        let changed = with_doc(|doc| {
+        // Content moving under a stationary pointer can change what is hovered, which can change
+        // styles and even layout again.
+        for _ in 0..4 {
+            let changed = self.update_once();
+            if changed
+                && self.press.is_none()
+                && let Some(p) = self.pointer
+            {
+                self.update_hover(p);
+            }
+            if !with_doc(|d| Self::needs_update(d)) {
+                break;
+            }
+        }
+        self.sync_ime();
+    }
+
+    /// Brings styles, layout and positions up to date. Returns whether anything moved.
+    fn update_once(&mut self) -> bool {
+        with_doc(|doc| {
             with_text(|ts| {
                 let mut changed = false;
                 if doc.dirty.style {
@@ -123,24 +145,36 @@ impl Ui {
                 if doc.dirty.position {
                     position_document(doc);
                     doc.dirty.position = false;
-                    scroll_carets_into_view(doc);
+                    doc.reposition.clear();
+                    doc.dirty.carets = true;
+                    doc.dirty.paint = true;
+                    changed = true;
+                } else if !doc.reposition.is_empty() {
+                    for id in std::mem::take(&mut doc.reposition) {
+                        reposition_children(doc, id);
+                    }
                     doc.dirty.paint = true;
                     changed = true;
                 }
+                if doc.dirty.carets {
+                    doc.dirty.carets = false;
+                    scroll_carets_into_view(doc);
+                }
                 changed
             })
-        });
-        if changed && self.press.is_none() {
-            // Content may have moved under a stationary pointer.
-            if let Some(p) = self.pointer {
-                self.update_hover(p);
-            }
-        }
-        self.sync_ime();
+        })
+    }
+
+    fn needs_update(d: &Document) -> bool {
+        d.dirty.style
+            || d.dirty.layout
+            || d.dirty.position
+            || d.dirty.carets
+            || !d.reposition.is_empty()
     }
 
     pub fn needs_redraw(&self) -> bool {
-        with_doc(|d| d.dirty.paint || d.dirty.layout || d.dirty.style || d.dirty.position)
+        with_doc(|d| d.dirty.paint || Self::needs_update(d))
     }
 
     /// Produces the frame. Call [`Ui::update`] first.
@@ -258,7 +292,7 @@ impl Ui {
             if d.viewport != size || d.scale != scale {
                 if d.scale != scale {
                     // Every resolved style and text measurement depends on the scale.
-                    d.mark_style();
+                    d.mark_style_all();
                     d.invalidate_all_layout();
                 }
                 d.viewport = size;
@@ -269,7 +303,7 @@ impl Ui {
     }
 
     fn ensure_layout(&mut self) {
-        if with_doc(|d| d.dirty.style || d.dirty.layout || d.dirty.position) {
+        if with_doc(|d| Self::needs_update(d)) {
             self.update();
         }
     }
@@ -297,11 +331,15 @@ impl Ui {
                 return (Vec::new(), Vec::new());
             }
             let old = std::mem::replace(&mut d.state.hovered, chain.clone());
-            let changed = |id: &NodeId| d.get(*id).is_some_and(|n| n.style.hover.is_some());
-            if old.iter().filter(|i| !chain.contains(i)).any(changed)
-                || chain.iter().filter(|i| !old.contains(i)).any(changed)
-            {
-                d.mark_style();
+            for &id in old.iter().filter(|i| !chain.contains(i)) {
+                if d.get(id).is_some_and(|n| n.style.hover.is_some()) {
+                    d.mark_style_of(id);
+                }
+            }
+            for &id in chain.iter().filter(|i| !old.contains(i)) {
+                if d.get(id).is_some_and(|n| n.style.hover.is_some()) {
+                    d.mark_style_of(id);
+                }
             }
             let collect = |ids: &mut dyn Iterator<Item = NodeId>| -> Vec<Rc<dyn Fn(bool)>> {
                 ids.filter_map(|id| d.get(id).and_then(|n| n.listeners.hover.clone()))
@@ -346,7 +384,7 @@ impl Ui {
                     PointerKind::Move => l.pointer_move.clone(),
                     PointerKind::Click => l.click.clone(),
                 }?;
-                Some((h, n.abs))
+                Some((h, d.window_rect(id).unwrap_or_default()))
             });
             let Some((handler, rect)) = found else {
                 continue;
@@ -379,7 +417,7 @@ impl Ui {
                 }
             }),
             Drag::Edit(id) => with_doc(|d| {
-                let origin = edit_text_origin(d, id);
+                let origin = edit_window_origin(d, id);
                 if let Some(e) = d.get_mut(id).and_then(Node::edit_mut) {
                     e.pointer_drag(p.x - origin.x as f32, p.y - origin.y as f32);
                     d.mark_paint();
@@ -432,16 +470,7 @@ impl Ui {
         if button == PointerButton::Primary {
             if let Some(t) = target {
                 let chain = with_doc(|d| d.ancestors(t));
-                let active_changed = with_doc(|d| {
-                    let any = chain
-                        .iter()
-                        .any(|id| d.get(*id).is_some_and(|n| n.style.active.is_some()));
-                    d.state.active = chain.clone();
-                    any
-                });
-                if active_changed {
-                    with_doc(Document::mark_style);
-                }
+                with_doc(|d| d.set_active(chain));
             }
             if let Some((id, vertical, grab)) =
                 with_doc(|d| target.and_then(|t| scrollbar_hit(d, t, p)))
@@ -452,7 +481,7 @@ impl Ui {
             {
                 let extend = self.modifiers.shift;
                 with_doc(|d| {
-                    let origin = edit_text_origin(d, edit);
+                    let origin = edit_window_origin(d, edit);
                     if let Some(e) = d.get_mut(edit).and_then(Node::edit_mut) {
                         e.pointer_down(
                             p.x - origin.x as f32,
@@ -494,7 +523,7 @@ impl Ui {
                 target.filter(|t| with_doc(|d| d.get(*t).is_some_and(Node::is_edit)))
         {
             with_doc(|d| {
-                let origin = edit_text_origin(d, edit);
+                let origin = edit_window_origin(d, edit);
                 if let Some(e) = d.get_mut(edit).and_then(Node::edit_mut) {
                     e.pointer_down(p.x - origin.x as f32, p.y - origin.y as f32, 1, false);
                     e.drag = None;
@@ -566,18 +595,7 @@ impl Ui {
             }),
             _ => {}
         }
-        let had_active = with_doc(|d| {
-            let any = d
-                .state
-                .active
-                .iter()
-                .any(|id| d.get(*id).is_some_and(|n| n.style.active.is_some()));
-            d.state.active.clear();
-            any
-        });
-        if had_active {
-            with_doc(Document::mark_style);
-        }
+        with_doc(|d| d.set_active(Vec::new()));
         self.update_hover(p);
     }
 
@@ -597,15 +615,7 @@ impl Ui {
             {
                 e.drag = None;
             }
-            let had_active = d
-                .state
-                .active
-                .iter()
-                .any(|id| d.get(*id).is_some_and(|n| n.style.active.is_some()));
-            d.state.active.clear();
-            if had_active {
-                d.mark_style();
-            }
+            d.set_active(Vec::new());
         });
     }
 
@@ -685,7 +695,10 @@ impl Ui {
             if let Some(e) = prev.and_then(|id| d.get_mut(id)).and_then(Node::edit_mut) {
                 e.preedit = None;
             }
-            d.mark_style();
+            d.dirty.carets = true;
+            for id in [prev, next].into_iter().flatten() {
+                d.mark_style_of(id);
+            }
             (prev, handlers)
         });
         if prev == next {
@@ -793,7 +806,7 @@ impl Ui {
             }),
             Key::Named(NamedKey::Enter | NamedKey::Space) if focused.is_some() && !key.repeat => {
                 let t = focused.unwrap();
-                let rect = with_doc(|d| d.get(t).map(|n| n.abs).unwrap_or_default());
+                let rect = with_doc(|d| d.window_rect(t).unwrap_or_default());
                 let center = PointF::new(
                     rect.x as f32 + rect.width as f32 / 2.0,
                     rect.y as f32 + rect.height as f32 / 2.0,
@@ -962,7 +975,7 @@ impl Ui {
             if out.changed {
                 d.invalidate_layout(id);
             } else if out.moved {
-                d.mark_position_only();
+                d.mark_caret_moved();
             }
             out
         });
@@ -1076,7 +1089,7 @@ impl Ui {
             if e.read_only {
                 return Some(None);
             }
-            let origin = edit_text_origin(d, id);
+            let origin = edit_window_origin(d, id);
             let caret = e.caret_rect(caret_width(d)).translate(origin.x, origin.y);
             Some(Some(e.ime_state(caret)))
         });
@@ -1110,36 +1123,76 @@ impl Drop for Ui {
 }
 
 impl Document {
-    /// Caret or selection moved without changing text: repaint and re-scroll only.
-    fn mark_position_only(&mut self) {
-        self.dirty.position = true;
-        self.dirty.paint = true;
-        self.dirty.content = true;
+    /// Sets the pressed nodes, invalidating those whose style depends on it.
+    fn set_active(&mut self, chain: Vec<NodeId>) {
+        let old = std::mem::replace(&mut self.state.active, chain);
+        let new = self.state.active.clone();
+        for id in old.iter().filter(|i| !new.contains(i)) {
+            if self.get(*id).is_some_and(|n| n.style.active.is_some()) {
+                self.mark_style_of(*id);
+            }
+        }
+        for id in new.iter().filter(|i| !old.contains(i)) {
+            if self.get(*id).is_some_and(|n| n.style.active.is_some()) {
+                self.mark_style_of(*id);
+            }
+        }
     }
 
-    /// `id` scrolled. The outermost scroller is a layer, whose content stays the same; a nested
-    /// one is part of the content of the layer around it.
+    /// Caret or selection moved without changing text: repaint and re-scroll only.
+    fn mark_caret_moved(&mut self) {
+        self.dirty.carets = true;
+        self.mark_paint();
+    }
+
+    /// `id` scrolled. Nothing moves in a scroll root's content; a scroller inside of one is part
+    /// of that content.
     fn mark_scrolled(&mut self, id: NodeId) {
-        self.dirty.position = true;
         self.dirty.paint = true;
-        let nested = self.ancestors(id).iter().skip(1).any(|a| {
-            self.get(*a).is_some_and(|n| {
-                n.computed.overflow_x == Overflow::Scroll
-                    || n.computed.overflow_y == Overflow::Scroll
-            })
-        });
-        self.dirty.content |= nested;
+        if !self.get(id).is_some_and(|n| n.scroll_root) {
+            self.reposition.push(id);
+            self.dirty.content = true;
+        }
     }
 }
 
+/// Where an edit node's text origin is, in window coordinates.
+fn edit_window_origin(doc: &Document, id: NodeId) -> PointI {
+    let origin = edit_text_origin(doc, id);
+    let offset = doc
+        .nodes
+        .get(id)
+        .map_or(PointI::default(), |n| doc.space_offset(n));
+    PointI::new(origin.x + offset.x, origin.y + offset.y)
+}
+
+/// `p` is in the same coordinates as the node.
 fn hit(doc: &Document, id: NodeId, p: PointF) -> Option<NodeId> {
     let node = doc.get(id)?;
     if !node.visible || !node.clip.contains(p) {
         return None;
     }
-    for &c in node.children.iter().rev() {
-        if let Some(h) = hit(doc, c, p) {
-            return Some(h);
+    // A scroll root's children are in content coordinates and clipped by the root only here.
+    let child_p = if node.scroll_root {
+        child_clip(node, doc.scale, node.clip_shape())
+            .rect
+            .contains(p)
+            .then(|| {
+                PointF::new(
+                    p.x - (node.abs.x - node.scroll.x) as f32,
+                    p.y - (node.abs.y - node.scroll.y) as f32,
+                )
+            })
+    } else {
+        Some(p)
+    };
+    if let Some(cp) = child_p {
+        for (i, &c) in node.children.iter().enumerate().rev() {
+            if node.child_bounds.get(i).is_none_or(|b| b.contains(cp))
+                && let Some(h) = hit(doc, c, cp)
+            {
+                return Some(h);
+            }
         }
     }
     if matches!(node.kind, NodeKind::Fragment) || !node.computed.pointer_events {
@@ -1190,7 +1243,7 @@ fn scroll_node(doc: &mut Document, id: NodeId, dx: f32, dy: f32) -> bool {
         let next = (e.scroll.y + dy.round() as i32).clamp(0, max_y);
         if e.multiline && next != e.scroll.y {
             e.scroll.y = next;
-            doc.mark_position_only();
+            doc.mark_paint();
             return true;
         }
     }
@@ -1202,7 +1255,8 @@ fn scrollbar_hit(doc: &Document, target: NodeId, p: PointF) -> Option<(NodeId, b
     let grab_width = doc.scale.pxf(12.0);
     for id in doc.ancestors(target) {
         let n = doc.get(id)?;
-        let pad = n.padding_abs();
+        let offset = doc.space_offset(n);
+        let pad = n.padding_abs().translate(offset.x, offset.y);
         if n.computed.overflow_y == Overflow::Scroll
             && n.content_size.height > pad.height
             && p.x >= pad.right() as f32 - grab_width
@@ -1226,8 +1280,11 @@ fn scrollbar_hit(doc: &Document, target: NodeId, p: PointF) -> Option<(NodeId, b
 }
 
 fn scrollbar_drag(doc: &mut Document, id: NodeId, vertical: bool, grab: f32, p: PointF) {
+    let Some(offset) = doc.get(id).map(|n| doc.space_offset(n)) else {
+        return;
+    };
     let Some(n) = doc.get_mut(id) else { return };
-    let pad = n.padding_abs();
+    let pad = n.padding_abs().translate(offset.x, offset.y);
     if vertical {
         let ratio = n.content_size.height as f32 / pad.height.max(1) as f32;
         let max = (n.content_size.height - pad.height).max(0);
@@ -1243,10 +1300,15 @@ fn scrollbar_drag(doc: &mut Document, id: NodeId, vertical: bool, grab: f32, p: 
 /// Adjusts the internal scroll of edits so their caret stays visible.
 fn scroll_carets_into_view(doc: &mut Document) {
     let ids: Vec<NodeId> = doc
-        .nodes
+        .edits
         .iter()
-        .filter(|(_, n)| n.edit().is_some_and(|e| e.scroll_to_caret))
-        .map(|(id, _)| id)
+        .copied()
+        .filter(|id| {
+            doc.nodes
+                .get(*id)
+                .and_then(Node::edit)
+                .is_some_and(|e| e.scroll_to_caret)
+        })
         .collect();
     let cw = caret_width(doc);
     let mut moved = false;

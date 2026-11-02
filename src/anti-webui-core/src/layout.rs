@@ -178,7 +178,7 @@ impl MeasureCache {
         self.entries.push((key, size));
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.entries.clear();
     }
 }
@@ -205,66 +205,197 @@ fn same_layout(a: &ComputedStyle, b: &ComputedStyle) -> bool {
         && a.white_space == b.white_space
 }
 
-/// Recomputes the computed and resolved style of every node, invalidating the layout of the
-/// nodes whose layout-affecting properties changed.
+/// Resolves the styles that may have changed, invalidating the layout of the nodes whose
+/// layout-affecting properties did. A node's result depends only on its own style and its parent's
+/// result, so the work stops wherever a result comes out the same.
 pub fn resolve_styles(doc: &mut Document) {
-    let Some(root) = doc.root else { return };
-    let mut changed = Vec::new();
-    let scale = doc.scale;
-    let mut stack = vec![(root, ComputedStyle::default())];
-    while let Some((id, parent)) = stack.pop() {
-        let Some(node) = doc.nodes.get(id) else {
-            continue;
-        };
-        let mut computed = ComputedStyle::inherit_from(&parent);
-        node.style.base.apply_to(&mut computed);
-        for layer in &node.style.dynamic {
-            layer.apply_to(&mut computed);
+    let dirty = std::mem::take(&mut doc.style_dirty);
+    let mut out = Resolution::default();
+    if doc.style_all || dirty.len() * 8 > doc.nodes.len() {
+        doc.style_all = false;
+        for &id in &dirty {
+            if let Some(n) = doc.nodes.get_mut(id) {
+                n.style_dirty = false;
+            }
         }
-        if let Some(s) = &node.style.hover
-            && doc.state.hovered.contains(&id)
-        {
-            s.apply_to(&mut computed);
+        if let Some(root) = doc.root {
+            resolve_node(doc, root, &ComputedStyle::default(), true, &mut out);
         }
-        if let Some(s) = &node.style.focus
-            && doc.state.focused == Some(id)
-        {
-            s.apply_to(&mut computed);
+    } else {
+        for id in dirty {
+            // Reached from a parent that changed in the meantime?
+            let Some(n) = doc.nodes.get(id).filter(|n| n.style_dirty) else {
+                continue;
+            };
+            let parent = n
+                .parent
+                .and_then(|p| doc.nodes.get(p))
+                .map_or_else(ComputedStyle::default, |p| p.computed.clone());
+            resolve_node(doc, id, &parent, false, &mut out);
         }
-        if let Some(s) = &node.style.active
-            && doc.state.active.contains(&id)
-        {
-            s.apply_to(&mut computed);
-        }
-        if matches!(node.kind, NodeKind::Text(_)) {
-            // Text nodes are inline content: box properties never apply to them.
-            computed.display = Display::Block;
-        }
-        let resolved = Resolved::from_computed(&computed, scale);
-        if node.resolved != resolved || !same_layout(&node.computed, &computed) {
-            changed.push(id);
-        }
-        let children = node.children.clone();
-        let node = doc.nodes.get_mut(id).unwrap();
-        node.resolved = resolved;
-        for c in children.into_iter().rev() {
-            stack.push((c, computed.clone()));
-        }
-        node.computed = computed;
     }
-    for id in changed {
+    for id in out.layout {
         doc.invalidate_layout(id);
     }
+    for id in out.visual {
+        grow_bounds(doc, id);
+    }
+    doc.reposition.extend(out.clips);
+}
+
+#[derive(Default)]
+struct Resolution {
+    /// Layout-affecting properties changed.
+    layout: Vec<NodeId>,
+    /// Painted extent changed without necessarily affecting layout.
+    visual: Vec<NodeId>,
+    /// The clip for the descendants changed without affecting layout.
+    clips: Vec<NodeId>,
+}
+
+fn resolve_node(
+    doc: &mut Document,
+    id: NodeId,
+    parent: &ComputedStyle,
+    all: bool,
+    out: &mut Resolution,
+) {
+    let Some(node) = doc.nodes.get(id) else {
+        return;
+    };
+    let mut computed = ComputedStyle::inherit_from(parent);
+    node.style.base.apply_to(&mut computed);
+    for layer in &node.style.dynamic {
+        layer.apply_to(&mut computed);
+    }
+    if let Some(s) = &node.style.hover
+        && doc.state.hovered.contains(&id)
+    {
+        s.apply_to(&mut computed);
+    }
+    if let Some(s) = &node.style.focus
+        && doc.state.focused == Some(id)
+    {
+        s.apply_to(&mut computed);
+    }
+    if let Some(s) = &node.style.active
+        && doc.state.active.contains(&id)
+    {
+        s.apply_to(&mut computed);
+    }
+    if matches!(node.kind, NodeKind::Text(_)) {
+        // Text nodes are inline content: box properties never apply to them.
+        computed.display = Display::Block;
+    }
+    let resolved = Resolved::from_computed(&computed, doc.scale);
+    if node.resolved != resolved || !same_layout(&node.computed, &computed) {
+        out.layout.push(id);
+    }
+    let old = &node.computed;
+    if old.shadows != computed.shadows
+        || old.outline_width != computed.outline_width
+        || old.outline_offset != computed.outline_offset
+    {
+        out.visual.push(id);
+    }
+    if old.radii() != computed.radii() {
+        out.clips.push(id);
+    }
+    let changed = *old != computed;
+    let children = (all || changed).then(|| node.children.clone());
+    let node = doc.nodes.get_mut(id).unwrap();
+    node.style_dirty = false;
+    node.resolved = resolved;
+    node.computed = computed;
+    if let Some(children) = children {
+        let computed = doc.nodes[id].computed.clone();
+        for c in children {
+            resolve_node(doc, c, &computed, all, out);
+        }
+    }
+}
+
+/// Makes sure the bounds of `id` and its ancestors contain what `id` paints now. They only grow:
+/// too big is harmless, and the next positioning pass tightens them.
+fn grow_bounds(doc: &mut Document, id: NodeId) {
+    let Some(n) = doc.nodes.get_mut(id) else {
+        return;
+    };
+    let own = own_bounds(n, doc.scale);
+    n.subtree_bounds = n.subtree_bounds.union(&own);
+    let mut bounds = n.subtree_bounds;
+    let mut child = id;
+    let mut parent = n.parent;
+    while let Some(p) = parent {
+        let scale = doc.scale;
+        let Some(n) = doc.nodes.get_mut(p) else {
+            return;
+        };
+        if let Some(i) = n.children.iter().position(|c| *c == child)
+            && let Some(b) = n.child_bounds.get_mut(i)
+        {
+            *b = bounds;
+        }
+        if n.scroll_root {
+            return;
+        }
+        let clip = child_clip(n, scale, n.clip_shape());
+        let grown = n.subtree_bounds.union(&bounds.intersect(&clip.rect));
+        if grown == n.subtree_bounds {
+            return;
+        }
+        n.subtree_bounds = grown;
+        bounds = grown;
+        child = p;
+        parent = n.parent;
+    }
+}
+
+/// What the node itself paints, in the same coordinates as `abs`.
+fn own_bounds(node: &Node, scale: Scale) -> RectI {
+    if matches!(node.kind, NodeKind::Fragment) {
+        return RectI::default();
+    }
+    if let NodeKind::Text(t) = &node.kind {
+        // Glyphs can stick out of the line box, by less than a font size in practice.
+        let size = t.layout.size();
+        let text = RectI::new(node.abs.x, node.abs.y, size.width, size.height);
+        return node
+            .abs
+            .union(&text)
+            .outset(scale.px(node.computed.font_size).max(1));
+    }
+    let c = &node.computed;
+    let mut bounds = node.abs;
+    for s in &c.shadows {
+        let grow = scale.px(s.spread) + (scale.pxf(s.blur) * 1.5 + 1.0).ceil() as i32;
+        let rect = node
+            .abs
+            .translate(scale.px(s.offset_x), scale.px(s.offset_y))
+            .outset(grow.max(0));
+        bounds = bounds.union(&rect);
+    }
+    if c.outline_width > 0.0 {
+        let w = scale.px_min1(c.outline_width) + scale.px(c.outline_offset);
+        bounds = bounds.union(&node.abs.outset(w.max(0)));
+    }
+    bounds
+}
+
+/// Whether the node's content scrolls: it is a scroller and something overflows.
+fn overflows(node: &Node) -> bool {
+    if node.is_edit() {
+        return false;
+    }
+    let c = &node.computed;
+    let pad = node.padding_abs();
+    (c.overflow_y == Overflow::Scroll && node.content_size.height > pad.height)
+        || (c.overflow_x == Overflow::Scroll && node.content_size.width > pad.width)
 }
 
 /// Lays out the whole document against the viewport.
 pub fn layout_document(doc: &mut Document, ts: &mut TextSystem) {
     let Some(root) = doc.root else { return };
-    for (_, n) in doc.nodes.iter_mut() {
-        if n.layout_dirty {
-            n.measure_cache.clear();
-        }
-    }
     let viewport = doc.viewport;
     let scale = doc.scale;
     let mut engine = Engine { doc, ts, scale };
@@ -304,44 +435,121 @@ pub fn child_clip(node: &Node, scale: Scale, parent: Clip) -> Clip {
     Clip { rect, radii }
 }
 
-/// Computes window coordinates, clips and document order, and clamps scroll offsets.
+/// Computes coordinates, clips, bounds and document order, and clamps scroll offsets.
+///
+/// The descendants of a scroll root get coordinates that don't depend on its scroll offset, so
+/// scrolling it doesn't come here at all. Subtrees that layout didn't touch and that stay where
+/// they were are skipped.
 pub fn position_document(doc: &mut Document) {
     let Some(root) = doc.root else { return };
-    let scale = doc.scale;
     let mut order = 0u32;
-    let mut stack = vec![(root, PointI::default(), Clip::NONE)];
-    while let Some((id, origin, clip)) = stack.pop() {
-        let Some(node) = doc.nodes.get_mut(id) else {
-            continue;
-        };
-        if node.computed.display == Display::None {
-            hide_subtree(doc, id);
-            continue;
-        }
-        node.visible = true;
-        node.abs = node.rect.translate(origin.x, origin.y);
-        node.clip = clip.rect;
-        node.clip_radii = clip.radii;
-        node.doc_order = order;
-        order += 1;
-        let max_x = (node.content_size.width - node.padding_abs().width).max(0);
-        let max_y = (node.content_size.height - node.padding_abs().height).max(0);
-        node.scroll.x = if node.computed.overflow_x == Overflow::Scroll {
-            node.scroll.x.clamp(0, max_x)
-        } else {
-            0
-        };
-        node.scroll.y = if node.computed.overflow_y == Overflow::Scroll {
-            node.scroll.y.clamp(0, max_y)
-        } else {
-            0
-        };
-        let child_clip = child_clip(node, scale, clip);
-        let child_origin = PointI::new(node.abs.x - node.scroll.x, node.abs.y - node.scroll.y);
-        for &c in node.children.iter().rev() {
-            stack.push((c, child_origin, child_clip));
-        }
+    position_node(doc, root, PointI::default(), Clip::NONE, None, &mut order);
+}
+
+fn position_node(
+    doc: &mut Document,
+    id: NodeId,
+    origin: PointI,
+    clip: Clip,
+    space: Option<NodeId>,
+    order: &mut u32,
+) {
+    let Some(node) = doc.nodes.get_mut(id) else {
+        return;
+    };
+    if node.computed.display == Display::None {
+        hide_subtree(doc, id);
+        return;
     }
+    let abs = node.rect.translate(origin.x, origin.y);
+    // Layout places a fragment's children from its parent, without visiting the fragment.
+    let fragment =
+        matches!(node.kind, NodeKind::Fragment) || node.computed.display == Display::Contents;
+    if !fragment
+        && !node.position_dirty
+        && node.visible
+        && node.abs == abs
+        && node.clip == clip.rect
+        && node.clip_radii == clip.radii
+        && node.space == space
+        && node.doc_order == *order
+    {
+        *order += node.subtree_nodes;
+        return;
+    }
+    let first = *order;
+    *order += 1;
+    node.position_dirty = false;
+    node.visible = true;
+    node.abs = abs;
+    node.clip = clip.rect;
+    node.clip_radii = clip.radii;
+    node.space = space;
+    node.doc_order = first;
+    let max_x = (node.content_size.width - node.padding_abs().width).max(0);
+    let max_y = (node.content_size.height - node.padding_abs().height).max(0);
+    node.scroll.x = if node.computed.overflow_x == Overflow::Scroll {
+        node.scroll.x.clamp(0, max_x)
+    } else {
+        0
+    };
+    node.scroll.y = if node.computed.overflow_y == Overflow::Scroll {
+        node.scroll.y.clamp(0, max_y)
+    } else {
+        0
+    };
+    node.scroll_root = space.is_none() && overflows(node);
+    position_children(doc, id, order);
+    let node = &mut doc.nodes[id];
+    node.subtree_nodes = *order - first;
+}
+
+/// Positions the children of a node that is itself in place, and updates its bounds.
+fn position_children(doc: &mut Document, id: NodeId, order: &mut u32) {
+    let scale = doc.scale;
+    let node = &mut doc.nodes[id];
+    let inner = child_clip(node, scale, node.clip_shape());
+    let (origin, clip, space) = if node.scroll_root {
+        (PointI::default(), Clip::NONE, Some(id))
+    } else {
+        (
+            PointI::new(node.abs.x - node.scroll.x, node.abs.y - node.scroll.y),
+            inner,
+            node.space,
+        )
+    };
+    let children = std::mem::take(&mut node.children);
+    let mut bounds = std::mem::take(&mut node.child_bounds);
+    bounds.clear();
+    let mut union = RectI::default();
+    for &c in &children {
+        position_node(doc, c, origin, clip, space, order);
+        let b = doc
+            .nodes
+            .get(c)
+            .map_or(RectI::default(), |n| n.subtree_bounds);
+        bounds.push(b);
+        union = union.union(&b);
+    }
+    let node = &mut doc.nodes[id];
+    node.children = children;
+    node.child_bounds = bounds;
+    let own = own_bounds(node, scale);
+    // A scroll root's descendants are in other coordinates, and within its box anyway.
+    node.subtree_bounds = if node.scroll_root {
+        own
+    } else {
+        own.union(&union.intersect(&inner.rect))
+    };
+}
+
+/// Positions the descendants of `id` again after it scrolled (it is not a scroll root).
+pub fn reposition_children(doc: &mut Document, id: NodeId) {
+    let Some(n) = doc.nodes.get(id) else {
+        return;
+    };
+    let mut order = n.doc_order + 1;
+    position_children(doc, id, &mut order);
 }
 
 fn hide_subtree(doc: &mut Document, id: NodeId) {
@@ -349,6 +557,8 @@ fn hide_subtree(doc: &mut Document, id: NodeId) {
     while let Some(id) = stack.pop() {
         if let Some(n) = doc.nodes.get_mut(id) {
             n.visible = false;
+            n.subtree_bounds = RectI::default();
+            n.scroll_root = false;
             stack.extend(n.children.iter().copied());
         }
     }
@@ -466,6 +676,7 @@ impl Engine<'_> {
         if perform {
             node.last_perform = Some((key, size));
             node.layout_dirty = false;
+            node.position_dirty = true;
         } else {
             node.measure_cache.put(key, size);
         }
