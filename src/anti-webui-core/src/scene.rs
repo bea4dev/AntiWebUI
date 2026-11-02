@@ -1,8 +1,9 @@
 //! The renderer-independent display list produced each frame. Coordinates are physical pixels.
 
-use crate::geometry::RectI;
+use crate::geometry::{PointI, RectI};
 use anti_webui_style::Color;
 pub use parley::FontData;
+use std::sync::Arc;
 
 /// A clip region: a rectangle, optionally with rounded corners.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -20,6 +21,19 @@ impl Clip {
 
     pub fn is_rounded(&self) -> bool {
         self.radii.iter().any(|r| *r > 0.0)
+    }
+
+    /// The clip moved by `(dx, dy)`. "No clip" stays exactly that, so it compares equal at any
+    /// translation.
+    pub fn translated(&self, dx: i32, dy: i32) -> Clip {
+        if self.rect == RectI::INFINITE {
+            *self
+        } else {
+            Clip {
+                rect: self.rect.translate(dx, dy),
+                radii: self.radii,
+            }
+        }
     }
 }
 
@@ -74,11 +88,38 @@ pub struct GlyphRun {
     pub clip: Clip,
 }
 
+/// Scrolled content, which the renderer keeps in a texture so that scrolling only draws what
+/// it exposes (see `docs/design/05-rendering.md`).
+#[derive(Clone, Debug)]
+pub struct ScrollLayer {
+    /// Identifies the layer across frames.
+    pub key: u64,
+    /// Where the layer shows, in window coordinates.
+    pub clip: Clip,
+    /// The window position of the content's origin. Scrolling only changes this.
+    pub origin: PointI,
+    /// What to draw, in content coordinates and without this layer's clip. Layers don't nest.
+    /// Sharing the allocation means the content is unchanged.
+    pub content: Arc<Scene>,
+}
+
+impl PartialEq for ScrollLayer {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.clip == other.clip
+            && self.origin == other.origin
+            && (Arc::ptr_eq(&self.content, &other.content)
+                || (self.content.primitives == other.content.primitives
+                    && self.content.chunks == other.content.chunks))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Primitive {
     Shadow(Shadow),
     Quad(Quad),
     Glyphs(GlyphRun),
+    Layer(ScrollLayer),
 }
 
 /// Identifies a run of primitives across frames: one part of what a node paints.

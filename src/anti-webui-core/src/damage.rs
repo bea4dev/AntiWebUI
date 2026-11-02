@@ -1,10 +1,11 @@
 //! Damage tracking: which pixels differ between two frames (see `docs/design/05-rendering.md`).
 
 use crate::geometry::RectI;
-use crate::scene::{ChunkKey, GlyphRun, Primitive, Scene};
+use crate::scene::{ChunkKey, GlyphRun, Primitive, Scene, ScrollLayer};
 use parley::FontData;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 /// More rectangles than this are merged; each one costs a scissored pass on the GPU.
 pub const MAX_RECTS: usize = 8;
@@ -142,6 +143,14 @@ pub fn diff(old: &Scene, new: &Scene) -> Damage {
     if old.width != new.width || old.height != new.height || old.clear != new.clear {
         return Damage::full(new.width, new.height);
     }
+    let mut damage = diff_content(old, new);
+    damage.clip(RectI::new(0, 0, new.width as i32, new.height as i32));
+    damage
+}
+
+/// Like [`diff`], for the content of a layer: compares only the primitives, in their own
+/// coordinates and without limiting the result to a window.
+pub fn diff_content(old: &Scene, new: &Scene) -> Damage {
     let mut damage = Damage::new();
 
     let old_pre = old.chunks.first().map_or(old.primitives.len(), |c| c.start);
@@ -184,14 +193,15 @@ pub fn diff(old: &Scene, new: &Scene) -> Damage {
             damage.add(run_bounds(&old.primitives[old.chunk_range(i)]));
         }
     }
-    damage.clip(RectI::new(0, 0, new.width as i32, new.height as i32));
     damage
 }
 
 fn diff_runs(old: &[Primitive], new: &[Primitive], damage: &mut Damage) {
     if old.len() == new.len() {
         for (a, b) in old.iter().zip(new) {
-            if a != b {
+            if let (Primitive::Layer(a), Primitive::Layer(b)) = (a, b) {
+                diff_layers(a, b, damage);
+            } else if a != b {
                 damage.add(primitive_bounds(a));
                 damage.add(primitive_bounds(b));
             }
@@ -199,6 +209,20 @@ fn diff_runs(old: &[Primitive], new: &[Primitive], damage: &mut Damage) {
     } else {
         damage.add(run_bounds(old));
         damage.add(run_bounds(new));
+    }
+}
+
+fn diff_layers(old: &ScrollLayer, new: &ScrollLayer, damage: &mut Damage) {
+    if old.clip != new.clip || old.origin != new.origin {
+        // Everything in it moved on screen.
+        damage.add(old.clip.rect);
+        damage.add(new.clip.rect);
+    } else if !Arc::ptr_eq(&old.content, &new.content) {
+        let changed = diff_content(&old.content, &new.content);
+        for r in changed.rects() {
+            let r = r.translate(new.origin.x, new.origin.y);
+            damage.add(r.intersect(&new.clip.rect));
+        }
     }
 }
 
@@ -218,6 +242,7 @@ pub fn primitive_bounds(p: &Primitive) -> RectI {
             s.rect.outset(grow).intersect(&s.clip.rect)
         }
         Primitive::Glyphs(run) => glyph_run_bounds(run).intersect(&run.clip.rect),
+        Primitive::Layer(l) => l.clip.rect,
     }
 }
 

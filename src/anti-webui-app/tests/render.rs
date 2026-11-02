@@ -230,6 +230,7 @@ fn damaged_repaint_matches_full_repaint() {
         );
         gpu.queue.submit([encoder.finish()]);
         let partial = target.read_rgba(&gpu);
+        full_renderer.clear_layer_caches();
         let full = gpu.render_to_rgba(&mut full_renderer, &scene);
         let differing = partial
             .chunks_exact(4)
@@ -246,4 +247,260 @@ fn damaged_repaint_matches_full_repaint() {
         );
         prev = scene;
     }
+}
+
+/// A scene that scrolls both ways like a map: tall and wide, with text, rounded corners, shadows
+/// and a nested scroller, all in a rounded viewport.
+fn map_like(view: NodeRef, inner: NodeRef, cell: NodeRef) -> Div {
+    div().bg(Color::WHITE).h(pct(100.0)).p(10.0).child(
+        div()
+            .h(240.0)
+            .w(320.0)
+            .rounded(14.0)
+            .bg(rgb(0xf8f8f0))
+            .overflow_scroll()
+            .node_ref(view)
+            .child(
+                div()
+                    .w(1500.0)
+                    .flex()
+                    .flex_col()
+                    .gap(4.0)
+                    .child(
+                        div()
+                            .w(160.0)
+                            .h(70.0)
+                            .overflow_y_scroll()
+                            .bg(rgb(0xddeeff))
+                            .node_ref(inner)
+                            .children(
+                                (0..10).map(|i| div().h(22.0).child(text(format!("in {i}")))),
+                            ),
+                    )
+                    .children((0..40).map(move |row| {
+                        div().flex().gap(4.0).children((0..14).map(move |col| {
+                            let d = div()
+                                .w(100.0)
+                                .h(34.0)
+                                .rounded(6.0)
+                                .shadow_sm()
+                                .bg(if (row + col) % 2 == 0 {
+                                    rgb(0xffe0e0)
+                                } else {
+                                    rgb(0xe0ffe0)
+                                })
+                                .child(text(format!("{row}:{col} 地図")));
+                            if row == 3 && col == 1 {
+                                d.hover(|s| s.bg(rgb(0x3366ff))).node_ref(cell)
+                            } else {
+                                d
+                            }
+                        }))
+                    })),
+            ),
+    )
+}
+
+/// Panning in any direction through the cached texture must give exactly the pixels of drawing
+/// the content from scratch, including where it wraps around the texture.
+#[test]
+fn scroll_layers_match_a_fresh_render() {
+    use anti_webui_core::Ui;
+    use anti_webui_core::damage;
+    use anti_webui_core::event::{Modifiers, WindowEvent};
+    use anti_webui_core::geometry::{PointF, Scale, SizeI};
+    use anti_webui_wgpu::{Gpu, Offscreen, Renderer, wgpu};
+    use std::time::Instant;
+
+    let gpu = match Gpu::headless() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
+    let (w, h) = (500u32, 400u32);
+    let (view, inner, cell) = (node_ref(), node_ref(), node_ref());
+    let mut ui = Ui::new(move || map_like(view, inner, cell));
+    ui.handle_event(WindowEvent::Resized {
+        size: SizeI::new(w as i32, h as i32),
+        scale: Scale::from_f64(1.25),
+    });
+    ui.handle_event(WindowEvent::Focused(true));
+    ui.update();
+
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut cached = Renderer::new(&gpu.device, format);
+    let mut fresh = Renderer::new(&gpu.device, format);
+    let target = Offscreen::new(&gpu, format, w, h);
+    let now = Instant::now();
+    let mut prev = ui.paint(now);
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    cached.render(&gpu.device, &gpu.queue, &mut encoder, &target.view, &prev);
+    gpu.queue.submit([encoder.finish()]);
+
+    let r = view.rect().unwrap();
+    let center = PointF::new(
+        r.x as f32 + r.width as f32 * 0.75,
+        r.y as f32 + r.height as f32 * 0.75,
+    );
+    // Small steps both ways, diagonals, reversals, jumps of more than a viewport, and past the
+    // texture's size so that everything wraps.
+    let mut pans: Vec<(f32, f32)> = vec![
+        (0.0, 7.0),
+        (9.0, 0.0),
+        (13.0, 17.0),
+        (-5.0, 3.0),
+        (-30.0, -20.0),
+        (600.0, 450.0),
+        (-200.0, 90.0),
+        (333.0, -41.0),
+        (-11.0, -11.0),
+    ];
+    pans.extend((0..40).map(|i| (37.0, if i % 2 == 0 { 53.0 } else { -3.0 })));
+    pans.extend((0..30).map(|_| (-41.0, -29.0)));
+    for (i, (dx, dy)) in pans.iter().enumerate() {
+        ui.handle_event(WindowEvent::Scroll {
+            position: center,
+            delta_x: *dx,
+            delta_y: *dy,
+            modifiers: Modifiers::default(),
+        });
+        // Now and then the content changes too: hover follows whatever is under the pointer.
+        if i % 7 == 3 {
+            ui.handle_event(WindowEvent::PointerMoved {
+                position: PointF::new(center.x - i as f32, center.y),
+                modifiers: Modifiers::default(),
+            });
+        }
+        ui.update();
+        let scene = ui.paint(now);
+        let d = damage::diff(&prev, &scene);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        cached.render_damaged(
+            &gpu.device,
+            &gpu.queue,
+            &mut encoder,
+            &target.view,
+            &scene,
+            &d,
+        );
+        gpu.queue.submit([encoder.finish()]);
+        let pixels = target.read_rgba(&gpu);
+        fresh.clear_layer_caches();
+        let expected = gpu.render_to_rgba(&mut fresh, &scene);
+        let differing = pixels
+            .chunks_exact(4)
+            .zip(expected.chunks_exact(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            differing, 0,
+            "pan {i} ({dx}, {dy}): {differing} pixels differ"
+        );
+        prev = scene;
+    }
+
+    // A nested scroller redraws only itself in the outer layer.
+    ui.handle_event(WindowEvent::Scroll {
+        position: center,
+        delta_x: -5000.0,
+        delta_y: -5000.0,
+        modifiers: Modifiers::default(),
+    });
+    ui.update();
+    let at_start = ui.paint(now);
+    let d = damage::diff(&prev, &at_start);
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    cached.render_damaged(
+        &gpu.device,
+        &gpu.queue,
+        &mut encoder,
+        &target.view,
+        &at_start,
+        &d,
+    );
+    gpu.queue.submit([encoder.finish()]);
+    let i = inner.rect().unwrap();
+    ui.handle_event(WindowEvent::Scroll {
+        position: PointF::new(i.x as f32 + 5.0, i.y as f32 + 5.0),
+        delta_x: 0.0,
+        delta_y: 15.0,
+        modifiers: Modifiers::default(),
+    });
+    ui.update();
+    let scene = ui.paint(now);
+    let d = damage::diff(&at_start, &scene);
+    assert!(d.area() <= i.area(), "{d:?} vs {i:?}");
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    cached.render_damaged(
+        &gpu.device,
+        &gpu.queue,
+        &mut encoder,
+        &target.view,
+        &scene,
+        &d,
+    );
+    gpu.queue.submit([encoder.finish()]);
+    let pixels = target.read_rgba(&gpu);
+    fresh.clear_layer_caches();
+    assert!(
+        pixels == gpu.render_to_rgba(&mut fresh, &scene),
+        "nested scroll differs"
+    );
+}
+
+/// Drawing through a layer looks the same as drawing directly, within 8-bit rounding.
+#[test]
+fn layers_look_like_direct_drawing() {
+    let content = || {
+        (0..4).map(|i| {
+            div()
+                .h(40.0)
+                .m(4.0)
+                .rounded(8.0)
+                .shadow_md()
+                .bg(rgba(0x3366ff80))
+                .child(text(format!("半透明の行 {i}")))
+        })
+    };
+    let (w, h) = (300u32, 200u32);
+    let frame = |inner: Div| {
+        div()
+            .bg(rgb(0xffeecc))
+            .h(pct(100.0))
+            .p(10.0)
+            .child(inner.w(260.0).h(160.0).rounded(12.0).bg(rgb(0xccffee)))
+    };
+    let Some(layered) = render(w, h, 1.25, || {
+        frame(
+            div()
+                .overflow_y_scroll()
+                .children(content())
+                .child(div().h(400.0)),
+        )
+    }) else {
+        return;
+    };
+    let Some(direct) = render(w, h, 1.25, || {
+        frame(
+            div()
+                .overflow_clip()
+                .children(content())
+                .child(div().h(400.0)),
+        )
+    }) else {
+        return;
+    };
+    let mut worst = 0;
+    for y in 0..h {
+        // The scrollbar is only in the scrolling version.
+        for x in 0..w - 40 {
+            let (a, b) = (px(&layered, w, x, y), px(&direct, w, x, y));
+            for c in 0..4 {
+                worst = worst.max(a[c].abs_diff(b[c]));
+            }
+        }
+    }
+    assert!(worst <= 2, "layered and direct drawing differ by {worst}");
 }

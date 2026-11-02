@@ -14,13 +14,13 @@
 - [x] 基本ウィジェット: Button, Checkbox, Switch, Slider, ScrollView, TextField, Card
 - [x] オフスクリーン描画（`headless`）と、合成イベントによる統合テスト
 - [x] ダメージトラッキング（変更矩形の計算・部分描画・Wayland の dmabuf presenter と `damage_buffer`）
+- [x] スクロールレイヤー（上下左右のスクロールで、動いた分だけ描く）
 
 ### M1 の既知の制限
 
 - 実機での確認が必要: IME（fcitx5 等）・クリップボード・primary selection の Wayland 往復
 - 選択ドラッグがウィンドウ端に達したときの自動スクロールは未実装
 - パスワード入力のマスク表示は未実装（`ImePurpose::Password` は IME へのヒントのみ）
-- スクロールは動いた内容全体を描き直す（スクロールレイヤーのキャッシュは未実装）
 - スタイル解決とペイントは毎回全ノードを走査する（レイアウトは差分化済み。[03](03-layout.md) 参照）
 - `opacity` は子孫の色に乗算する近似（グループ不透明度ではない）
 - サーバ側装飾が無いコンポジタではタイトルバーが出ない（CSD は M2）

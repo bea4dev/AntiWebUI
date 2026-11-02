@@ -146,8 +146,10 @@ impl Ui {
     /// Produces the frame. Call [`Ui::update`] first.
     pub fn paint(&mut self, now: Instant) -> Scene {
         with_doc(|d| {
+            let scene = paint_document(d, now);
             d.dirty.paint = false;
-            paint_document(d, now)
+            d.dirty.content = false;
+            scene
         })
     }
 
@@ -1112,6 +1114,21 @@ impl Document {
     fn mark_position_only(&mut self) {
         self.dirty.position = true;
         self.dirty.paint = true;
+        self.dirty.content = true;
+    }
+
+    /// `id` scrolled. The outermost scroller is a layer, whose content stays the same; a nested
+    /// one is part of the content of the layer around it.
+    fn mark_scrolled(&mut self, id: NodeId) {
+        self.dirty.position = true;
+        self.dirty.paint = true;
+        let nested = self.ancestors(id).iter().skip(1).any(|a| {
+            self.get(*a).is_some_and(|n| {
+                n.computed.overflow_x == Overflow::Scroll
+                    || n.computed.overflow_y == Overflow::Scroll
+            })
+        });
+        self.dirty.content |= nested;
     }
 }
 
@@ -1162,20 +1179,22 @@ fn scroll_node(doc: &mut Document, id: NodeId, dx: f32, dy: f32) -> bool {
         changed |= next != n.scroll.x;
         n.scroll.x = next;
     }
-    if !changed && let Some(e) = n.edit_mut() {
+    if changed {
+        doc.mark_scrolled(id);
+        return true;
+    }
+    if let Some(e) = n.edit_mut() {
         // Edits scroll their own text.
         let view = pad;
         let max_y = (e.content_size.height - view.height).max(0);
         let next = (e.scroll.y + dy.round() as i32).clamp(0, max_y);
         if e.multiline && next != e.scroll.y {
             e.scroll.y = next;
-            changed = true;
+            doc.mark_position_only();
+            return true;
         }
     }
-    if changed {
-        doc.mark_position_only();
-    }
-    changed
+    false
 }
 
 /// Hit-tests the scrollbar thumbs of `target`'s scroll containers.
@@ -1218,7 +1237,7 @@ fn scrollbar_drag(doc: &mut Document, id: NodeId, vertical: bool, grab: f32, p: 
         let max = (n.content_size.width - pad.width).max(0);
         n.scroll.x = (((p.x - pad.x as f32) * ratio - grab).round() as i32).clamp(0, max);
     }
-    doc.mark_position_only();
+    doc.mark_scrolled(id);
 }
 
 /// Adjusts the internal scroll of edits so their caret stays visible.
@@ -1260,6 +1279,6 @@ fn scroll_carets_into_view(doc: &mut Document) {
         }
     }
     if moved {
-        doc.dirty.paint = true;
+        doc.mark_paint();
     }
 }

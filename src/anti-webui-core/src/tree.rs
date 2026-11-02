@@ -4,13 +4,16 @@ use crate::event::{KeyboardEvent, PointerEvent, ScrollEvent};
 use crate::geometry::{PointI, RectI, Scale, SizeI};
 use crate::layout::{MeasureCache, MeasureKey, Resolved};
 use crate::platform::PlatformRequest;
+use crate::scene::Scene;
 use crate::text::TextLayout;
 use crate::text::edit::EditData;
 use crate::text::selection::DocSelection;
 use anti_webui_style::{ComputedStyle, Style};
 use slotmap::{SlotMap, new_key_type};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 new_key_type! {
     /// Identifies a node in the UI tree.
@@ -173,6 +176,8 @@ pub struct Dirty {
     pub layout: bool,
     pub position: bool,
     pub paint: bool,
+    /// What scroll layers hold is stale. Scrolling a layer alone doesn't set this.
+    pub content: bool,
 }
 
 /// Per-window interaction state.
@@ -197,6 +202,8 @@ pub struct Document {
     pub requests: Vec<PlatformRequest>,
     /// Programmatic focus change requested through a `NodeRef`.
     pub pending_focus: Option<Option<NodeId>>,
+    /// What each scroll layer painted last, reused while its content is unchanged.
+    pub layer_contents: HashMap<NodeId, Arc<Scene>>,
 }
 
 thread_local! {
@@ -209,6 +216,7 @@ thread_local! {
         viewport: SizeI::default(),
         requests: Vec::new(),
         pending_focus: None,
+        layer_contents: HashMap::new(),
     });
 }
 
@@ -234,6 +242,7 @@ impl Document {
     pub fn mark_style(&mut self) {
         self.dirty.style = true;
         self.dirty.paint = true;
+        self.dirty.content = true;
     }
 
     /// Marks `id` and its ancestors for re-layout; clean subtrees keep their cached layout.
@@ -260,10 +269,12 @@ impl Document {
     pub fn mark_layout(&mut self) {
         self.dirty.layout = true;
         self.dirty.paint = true;
+        self.dirty.content = true;
     }
 
     pub fn mark_paint(&mut self) {
         self.dirty.paint = true;
+        self.dirty.content = true;
     }
 
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
