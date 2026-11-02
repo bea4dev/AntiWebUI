@@ -1,6 +1,7 @@
 //! The Wayland backend (see `docs/design/06-platform-wayland.md`).
 
 mod keyboard;
+mod popup;
 mod present;
 mod state;
 
@@ -10,18 +11,19 @@ pub use present::{
 
 use anti_webui_core::event::{ClipboardKind, WindowEvent};
 use anti_webui_core::geometry::{RectI, Scale, SizeI};
-use anti_webui_core::platform::{CursorIcon, ImeState};
+use anti_webui_core::platform::{CursorIcon, ImeState, PopupId, PopupParams};
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
 };
 use rustix::event::{PollFd, PollFlags};
 use state::State;
+pub use state::SurfaceId;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::ptr::NonNull;
 use std::sync::mpsc;
 use std::time::Instant;
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_compositor, wl_seat};
+use wayland_client::protocol::{wl_compositor, wl_seat, wl_subcompositor};
 use wayland_client::{Connection, Proxy};
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1;
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1;
@@ -62,8 +64,8 @@ pub struct WindowOptions {
 /// Callbacks from the event loop.
 pub trait WaylandHandler {
     fn event(&mut self, ctx: &mut Ctx<'_>, event: WindowEvent);
-    /// The compositor is ready for a frame. Returns whether a buffer was presented.
-    fn frame(&mut self, ctx: &mut Ctx<'_>) -> bool;
+    /// The compositor is ready for a frame on every surface.
+    fn frame(&mut self, ctx: &mut Ctx<'_>);
     /// The next time [`WaylandHandler::timer`] should run.
     fn deadline(&mut self, now: Instant) -> Option<Instant>;
     fn timer(&mut self, ctx: &mut Ctx<'_>, now: Instant);
@@ -75,7 +77,7 @@ impl<H: WaylandHandler> WaylandHandler for &mut H {
     fn event(&mut self, ctx: &mut Ctx<'_>, event: WindowEvent) {
         (**self).event(ctx, event)
     }
-    fn frame(&mut self, ctx: &mut Ctx<'_>) -> bool {
+    fn frame(&mut self, ctx: &mut Ctx<'_>) {
         (**self).frame(ctx)
     }
     fn deadline(&mut self, now: Instant) -> Option<Instant> {
@@ -181,26 +183,63 @@ impl Ctx<'_> {
         self.state.destroy_timeline(id);
     }
 
+    pub fn show_popup(&mut self, params: PopupParams) {
+        self.state.show_popup(params);
+    }
+
+    pub fn update_popup(&mut self, params: PopupParams) {
+        self.state.update_popup(params);
+    }
+
+    /// Closes a popup and what is attached to it. GPU surfaces on them must go first.
+    pub fn close_popup(&mut self, id: PopupId) {
+        self.state.close_popup(id);
+    }
+
+    /// What closes along with a popup.
+    pub fn popups_attached_to(&self, id: PopupId) -> Vec<PopupId> {
+        self.state.popups_attached_to(id)
+    }
+
     /// Turns explicit sync off again (before presenting through a GPU surface).
     pub fn disable_explicit_sync(&mut self) {
         self.state.disable_explicit_sync();
     }
 
     /// Attaches the buffer, damages `damage` (buffer pixels) and commits.
-    pub fn present_buffer(&mut self, id: BufferId, damage: &[RectI], sync: Option<SyncPoints>) {
-        self.state.present_buffer(id, damage, sync);
+    pub fn present_buffer(
+        &mut self,
+        surface: SurfaceId,
+        id: BufferId,
+        damage: &[RectI],
+        sync: Option<SyncPoints>,
+    ) {
+        self.state.present_buffer(surface, id, damage, sync);
+    }
+
+    /// To call before something else commits to the surface, like a GPU surface.
+    pub fn prepare_commit(&mut self, surface: SurfaceId) {
+        self.state.prepare_commit(surface);
+    }
+
+    /// To call after something else committed to the surface.
+    pub fn committed(&mut self, surface: SurfaceId) {
+        self.state.committed(surface);
     }
 
     /// Marks the whole surface opaque or not, so the compositor can skip what is behind it.
-    pub fn set_opaque(&mut self, opaque: bool) {
-        self.state.present.opaque = opaque;
+    pub fn set_opaque(&mut self, surface: SurfaceId, opaque: bool) {
+        if let Some(f) = self.state.frame_state(surface) {
+            f.opaque = opaque;
+        }
     }
 
-    /// Raw handles for creating a GPU surface. Valid until the event loop returns.
-    pub fn raw_handles(&self) -> (RawDisplayHandle, RawWindowHandle) {
+    /// Raw handles for creating a GPU surface. Valid until the surface closes.
+    pub fn raw_handles(&self, surface: SurfaceId) -> (RawDisplayHandle, RawWindowHandle) {
         let display =
             NonNull::new(self.conn.backend().display_ptr() as *mut _).expect("wl_display");
-        let surface = NonNull::new(self.state.surface.id().as_ptr() as *mut _).expect("wl_surface");
+        let surface = self.state.wl_surface(surface).expect("an open surface");
+        let surface = NonNull::new(surface.id().as_ptr() as *mut _).expect("wl_surface");
         (
             RawDisplayHandle::Wayland(WaylandDisplayHandle::new(display)),
             RawWindowHandle::Wayland(WaylandWindowHandle::new(surface)),
@@ -216,8 +255,8 @@ pub fn run<H: WaylandHandler>(options: WindowOptions, mut handler: H) -> Result<
 
     let compositor: wl_compositor::WlCompositor = globals.bind(&qh, 4..=6, ()).map_err(err)?;
     let wm_base: xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).map_err(err)?;
-    let surface = compositor.create_surface(&qh, ());
-    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let surface = compositor.create_surface(&qh, SurfaceId::Window);
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, SurfaceId::Window);
     let toplevel = xdg_surface.get_toplevel(&qh, ());
     toplevel.set_title(options.title.clone());
     toplevel.set_app_id(options.app_id.clone());
@@ -230,6 +269,7 @@ pub fn run<H: WaylandHandler>(options: WindowOptions, mut handler: H) -> Result<
     let mut state = State::new(
         qh.clone(),
         compositor,
+        wm_base,
         surface.clone(),
         xdg_surface,
         toplevel.clone(),
@@ -240,7 +280,11 @@ pub fn run<H: WaylandHandler>(options: WindowOptions, mut handler: H) -> Result<
 
     if let Ok(vp) = globals.bind::<wp_viewporter::WpViewporter, _, _>(&qh, 1..=1, ()) {
         state.viewport = Some(vp.get_viewport(&surface, &qh, ()));
+        state.viewporter = Some(vp);
     }
+    state.subcompositor = globals
+        .bind::<wl_subcompositor::WlSubcompositor, _, _>(&qh, 1..=1, ())
+        .ok();
     if state.viewport.is_some()
         && let Ok(mgr) = globals
             .bind::<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, _, _>(
@@ -322,7 +366,6 @@ impl Loop<'_> {
             wake_read,
         } = self;
         let (conn, paste_rx, wl_fd, wake_read) = (*conn, *paste_rx, *wl_fd, *wake_read);
-        let qh = queue.handle();
         let mut exit = false;
         let mut timer_deadline: Option<Instant> = None;
         loop {
@@ -338,6 +381,12 @@ impl Loop<'_> {
                 state.events.push(WindowEvent::Paste { kind, text });
             }
 
+            if state.keyboard_focused != state.focus_announced {
+                state.focus_announced = state.keyboard_focused;
+                state
+                    .events
+                    .insert(0, WindowEvent::Focused(state.keyboard_focused));
+            }
             let mut events = std::mem::take(&mut state.events);
             // Only the last of consecutive pointer moves matters; high-rate mice send many per
             // frame.
@@ -375,24 +424,17 @@ impl Loop<'_> {
                 state.redraw_at = None;
                 state.redraw_requested = true;
             }
-            if state.configured && state.redraw_requested && !state.frame_pending {
+            if state.configured
+                && state.redraw_requested
+                && state.frame_wait(Instant::now()).is_ok()
+            {
                 state.redraw_requested = false;
-                // A frame callback requested for a frame that committed nothing stays in the
-                // surface's pending state and goes out with the next commit.
-                if !state.frame_callback_queued {
-                    state.surface.frame(&qh, ());
-                    state.frame_callback_queued = true;
-                }
-                state.apply_opaque_region();
                 let mut ctx = Ctx {
                     state,
                     conn,
                     exit: &mut exit,
                 };
-                if handler.frame(&mut ctx) {
-                    state.frame_callback_queued = false;
-                    state.frame_pending = true;
-                }
+                handler.frame(&mut ctx);
             }
 
             conn.flush().map_err(err)?;
@@ -410,6 +452,11 @@ impl Loop<'_> {
                 deadline = Some(deadline.map_or(r.next, |d| d.min(r.next)));
             }
             if let Some(t) = state.redraw_at {
+                deadline = Some(deadline.map_or(t, |d| d.min(t)));
+            }
+            if state.redraw_requested
+                && let Err(Some(t)) = state.frame_wait(now)
+            {
                 deadline = Some(deadline.map_or(t, |d| d.min(t)));
             }
             let timeout = deadline.map(|d| {

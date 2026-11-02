@@ -116,9 +116,9 @@ mod wayland {
     use crate::present::{Presented, Presenter};
     use anti_webui_core::Ui;
     use anti_webui_core::event::WindowEvent;
-    use anti_webui_core::platform::PlatformRequest;
+    use anti_webui_core::platform::{PlatformRequest, PopupId};
     use anti_webui_core::view::IntoView;
-    use anti_webui_wayland::{Ctx, WaylandHandler, WindowOptions};
+    use anti_webui_wayland::{Ctx, SurfaceId, WaylandHandler, WindowOptions};
     use std::time::Instant;
 
     struct Runner {
@@ -146,7 +146,57 @@ mod wayland {
                     PlatformRequest::Paste(kind) => ctx.request_paste(kind),
                     PlatformRequest::SetTitle(t) => ctx.set_title(&t),
                     PlatformRequest::Close => ctx.exit(),
+                    PlatformRequest::ShowPopup(params) => ctx.show_popup(params),
+                    PlatformRequest::UpdatePopup(params) => ctx.update_popup(params),
+                    PlatformRequest::ClosePopup(id) => {
+                        self.forget_popup(ctx, id);
+                        ctx.close_popup(id);
+                    }
                 }
+            }
+        }
+
+        /// What is on a popup and what closes with it has to go before their surfaces.
+        fn forget_popup(&mut self, ctx: &mut Ctx<'_>, id: PopupId) {
+            for child in ctx.popups_attached_to(id) {
+                self.forget_popup(ctx, child);
+            }
+            if let Some(p) = &mut self.presenter {
+                p.forget(ctx, SurfaceId::Popup(id));
+            }
+        }
+
+        fn dump(&mut self, surface: SurfaceId, suffix: &str) {
+            let Some(presenter) = &self.presenter else {
+                return;
+            };
+            let Some(scene) = presenter.last_scene(surface) else {
+                return;
+            };
+            if self.dump.is_none()
+                && let Ok(path) = std::env::var("ANTIWEBUI_DUMP_FRAME")
+            {
+                let r = anti_webui_wgpu::Renderer::new(
+                    &presenter.gpu().device,
+                    anti_webui_wgpu::wgpu::TextureFormat::Rgba8Unorm,
+                );
+                self.dump = Some((path, r));
+            }
+            if let Some((path, renderer)) = &mut self.dump {
+                renderer.set_target(match surface {
+                    SurfaceId::Window => 0,
+                    SurfaceId::Popup(id) => id.0,
+                });
+                let pixels = presenter.gpu().render_to_rgba(renderer, scene);
+                let path = format!("{path}{suffix}");
+                let _ =
+                    crate::headless::write_png(path.as_str(), scene.width, scene.height, &pixels);
+                eprintln!(
+                    "[anti-webui] frame {}x{} scale {:.3} -> {path}",
+                    scene.width,
+                    scene.height,
+                    self.ui.scale().as_f64()
+                );
             }
         }
     }
@@ -157,14 +207,14 @@ mod wayland {
             self.process(ctx);
         }
 
-        fn frame(&mut self, ctx: &mut Ctx<'_>) -> bool {
+        fn frame(&mut self, ctx: &mut Ctx<'_>) {
             if self.presenter.is_none() {
                 match Presenter::new(ctx) {
                     Ok(p) => self.presenter = Some(p),
                     Err(e) => {
                         self.error = Some(Box::new(e));
                         ctx.exit();
-                        return false;
+                        return;
                     }
                 }
             }
@@ -173,46 +223,34 @@ mod wayland {
             self.ui.update();
             // Not `process`: the frame painted below is the redraw it would ask for.
             self.handle_requests(ctx);
-            let scene = self.ui.paint(now);
+            let frame = self.ui.paint_frame(now);
             let presenter = self.presenter.as_mut().unwrap();
-            let presented = presenter.present(ctx, scene);
-            if presented == Presented::Yes
-                && let Some(scene) = presenter.last_scene()
-            {
-                if self.dump.is_none()
-                    && let Ok(path) = std::env::var("ANTIWEBUI_DUMP_FRAME")
-                {
-                    let r = anti_webui_wgpu::Renderer::new(
-                        &presenter.gpu().device,
-                        anti_webui_wgpu::wgpu::TextureFormat::Rgba8Unorm,
-                    );
-                    self.dump = Some((path, r));
-                }
-                if let Some((path, renderer)) = &mut self.dump {
-                    let pixels = presenter.gpu().render_to_rgba(renderer, scene);
-                    let _ = crate::headless::write_png(
-                        path.as_str(),
-                        scene.width,
-                        scene.height,
-                        &pixels,
-                    );
-                    eprintln!(
-                        "[anti-webui] frame {}x{} scale {:.3} -> {path}",
-                        scene.width,
-                        scene.height,
-                        self.ui.scale().as_f64()
-                    );
+            let window = presenter.present(ctx, SurfaceId::Window, frame.window);
+            let mut results = vec![(SurfaceId::Window, window)];
+            for (id, scene) in frame.popups {
+                let surface = SurfaceId::Popup(id);
+                results.push((surface, presenter.present(ctx, surface, scene)));
+            }
+            let mut committed = false;
+            let mut retry = false;
+            for (i, (surface, presented)) in results.into_iter().enumerate() {
+                committed |= presented == Presented::Yes;
+                retry |= presented == Presented::Retry;
+                if presented == Presented::Yes {
+                    let suffix = if i == 0 {
+                        String::new()
+                    } else {
+                        format!(".popup{i}.png")
+                    };
+                    self.dump(surface, &suffix);
                 }
             }
             // Nothing was committed, so no frame callback will pace the next try.
-            if presented == Presented::Retry
-                || (presented == Presented::Unchanged && self.ui.animating())
-            {
+            if retry || (!committed && self.ui.animating()) {
                 ctx.request_redraw_after(std::time::Duration::from_millis(4));
             } else if self.ui.animating() {
                 ctx.request_redraw();
             }
-            presented == Presented::Yes
         }
 
         fn deadline(&mut self, now: Instant) -> Option<Instant> {

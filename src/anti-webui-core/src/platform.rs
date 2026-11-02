@@ -1,7 +1,7 @@
 //! Requests from the UI to the platform layer.
 
 use crate::event::ClipboardKind;
-use crate::geometry::RectI;
+use crate::geometry::{PointI, RectI, SizeI};
 pub use anti_webui_style::CursorIcon;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -28,6 +28,61 @@ pub struct ImeState {
     pub purpose: ImePurpose,
 }
 
+/// Identifies a popup between the core and the platform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PopupId(pub u64);
+
+/// What a popup is for, which decides how it behaves (see
+/// `docs/design/09-shadows-stacking-popups.md`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PopupKind {
+    /// Takes the input: pressing anywhere else closes it. Pull-down lists and menus.
+    #[default]
+    Menu,
+    /// Only shows something: input goes through it to what is below.
+    Tooltip,
+    /// Takes input where it is, stays until it is removed, and appears at once. The platform
+    /// doesn't keep it on the screen; the core keeps it in the window.
+    Bubble,
+}
+
+/// Where a popup goes relative to its anchor. "Start" and "end" are the anchor's left and right, or
+/// top and bottom for the sides. The platform may flip it to keep it on the screen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Placement {
+    #[default]
+    BelowStart,
+    BelowEnd,
+    AboveStart,
+    AboveEnd,
+    RightStart,
+    LeftStart,
+}
+
+/// Everything the platform needs to show a popup. Physical pixels unless it says logical.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PopupParams {
+    pub id: PopupId,
+    /// The popup it is attached to, or the window.
+    pub parent: Option<PopupId>,
+    pub kind: PopupKind,
+    pub placement: Placement,
+    /// In window coordinates, inside of the parent.
+    pub anchor: RectI,
+    /// Logical pixels between the anchor and the popup.
+    pub gap: i32,
+    /// The box it would like to have, in logical pixels. The platform may grant less.
+    pub wanted: SizeI,
+    /// The size of its buffers, the rounded product of `logical` and the scale.
+    pub buffer: SizeI,
+    /// The size of its surface, in logical pixels.
+    pub logical: SizeI,
+    /// Its box in the surface, in logical pixels; the rest is shadow.
+    pub geometry: RectI,
+    /// Where a [`PopupKind::Bubble`] goes: the surface's origin in logical window coordinates.
+    pub position: Option<PointI>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlatformRequest {
     SetCursor(CursorIcon),
@@ -41,4 +96,9 @@ pub enum PlatformRequest {
     Paste(ClipboardKind),
     SetTitle(String),
     Close,
+    /// Answered with `WindowEvent::PopupConfigured`.
+    ShowPopup(PopupParams),
+    UpdatePopup(PopupParams),
+    /// Closes it and what is attached to it.
+    ClosePopup(PopupId),
 }

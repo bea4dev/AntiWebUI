@@ -238,11 +238,7 @@ fn add_run(prims: &[Primitive], damage: &mut Damage) {
 pub fn primitive_bounds(p: &Primitive) -> RectI {
     match p {
         Primitive::Quad(q) => q.rect.intersect(&q.clip.rect),
-        Primitive::Shadow(s) => {
-            // The shader extends shadows by `blur * 1.5 + 1`.
-            let grow = (s.blur * 1.5 + 1.0).ceil() as i32;
-            s.rect.outset(grow).intersect(&s.clip.rect)
-        }
+        Primitive::Shadow(s) => s.bounds().intersect(&s.clip.rect),
         Primitive::Glyphs(run) => glyph_run_bounds(run).intersect(&run.clip.rect),
         Primitive::Layer(l) => l.clip.rect,
     }

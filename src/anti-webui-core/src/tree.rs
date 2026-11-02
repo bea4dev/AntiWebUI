@@ -1,15 +1,16 @@
 //! The retained node tree (a small DOM) and the per-window document state.
 
 use crate::event::{KeyboardEvent, PointerEvent, ScrollEvent};
-use crate::geometry::{PointI, RectI, Scale, SizeI};
+use crate::geometry::{PointF, PointI, RectI, Scale, SizeI};
 use crate::layout::{MeasureCache, MeasureKey, Resolved, child_clip};
-use crate::platform::PlatformRequest;
+use crate::platform::{Placement, PlatformRequest, PopupId, PopupKind, PopupParams};
 use crate::scene::Scene;
 use crate::text::TextLayout;
 use crate::text::edit::EditData;
 use crate::text::selection::DocSelection;
-use anti_webui_style::{ComputedStyle, Style};
-use slotmap::{SlotMap, new_key_type};
+use crate::view::NodeRef;
+use anti_webui_style::{ComputedStyle, Display, Style};
+use slotmap::{Key, KeyData, SlotMap, new_key_type};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -51,6 +52,57 @@ pub struct TextData {
     pub layout: TextLayout,
 }
 
+/// What a popup's surface needs to hold its box and what sticks out of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PopupSurface {
+    pub buffer: SizeI,
+    pub logical: SizeI,
+    /// The box, in logical pixels.
+    pub geometry: RectI,
+}
+
+#[derive(Default)]
+pub struct PopupData {
+    pub kind: PopupKind,
+    pub placement: Placement,
+    /// Logical pixels between the anchor and the popup.
+    pub gap: i32,
+    /// What it hangs from; by default the closest ancestor with a box.
+    pub anchor: Option<NodeRef>,
+    /// Takes precedence over `anchor`, in window coordinates.
+    pub anchor_rect: Option<RectI>,
+    /// At least as wide as the anchor.
+    pub match_anchor_width: bool,
+    pub on_dismiss: Option<Rc<dyn Fn()>>,
+
+    /// The size it would like to have, in physical pixels.
+    pub natural: SizeI,
+    pub surface: PopupSurface,
+    /// The last request to the platform.
+    pub sent: Option<PopupParams>,
+    /// The origin of its surface in window coordinates, once the platform placed it.
+    pub origin: PointI,
+    /// The logical size the platform granted to its box.
+    pub granted: Option<SizeI>,
+    /// Closed for good: only building it again brings it back.
+    pub dismissed: bool,
+}
+
+impl PopupData {
+    /// Whether it is on the screen: it has a surface in a known place.
+    pub fn shown(&self) -> bool {
+        self.sent.is_some() && self.granted.is_some() && !self.dismissed
+    }
+}
+
+pub fn popup_id(id: NodeId) -> PopupId {
+    PopupId(id.data().as_ffi())
+}
+
+pub fn popup_node(id: PopupId) -> NodeId {
+    KeyData::from_ffi(id.0).into()
+}
+
 #[allow(
     clippy::large_enum_variant,
     reason = "text nodes are the common case; boxing them would add an indirection per paint"
@@ -61,6 +113,9 @@ pub enum NodeKind {
     Edit(Box<EditData>),
     /// Generates no box; children take part in the parent's layout.
     Fragment,
+    /// The root of what is shown in a surface of its own. It stays in the tree for its lifetime,
+    /// inherited styles and events, and is out of the way for layout and painting.
+    Popup(Box<PopupData>),
 }
 
 pub struct Node {
@@ -92,8 +147,12 @@ pub struct Node {
     pub visible: bool,
     /// The outermost scroller that overflows: its descendants don't move when it scrolls.
     pub scroll_root: bool,
-    /// The scroll root whose content this node is part of.
+    /// The scroll root whose content this node is part of, or the popup whose surface it is on.
     pub space: Option<NodeId>,
+    /// Painted from its stacking context's list instead of in tree order.
+    pub stacked: bool,
+    /// Its stacked descendants are ordered among themselves, and stay above its background.
+    pub stacking_context: bool,
     /// Contains everything the subtree paints, in the same coordinates as `abs`. It may be too
     /// big, never too small.
     pub subtree_bounds: RectI,
@@ -134,6 +193,8 @@ impl Node {
             visible: false,
             scroll_root: false,
             space: None,
+            stacked: false,
+            stacking_context: false,
             subtree_bounds: RectI::default(),
             child_bounds: Vec::new(),
             subtree_nodes: 0,
@@ -151,6 +212,24 @@ impl Node {
 
     pub fn is_edit(&self) -> bool {
         matches!(self.kind, NodeKind::Edit(_))
+    }
+
+    pub fn is_popup(&self) -> bool {
+        matches!(self.kind, NodeKind::Popup(_))
+    }
+
+    pub fn popup(&self) -> Option<&PopupData> {
+        match &self.kind {
+            NodeKind::Popup(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn popup_mut(&mut self) -> Option<&mut PopupData> {
+        match &mut self.kind {
+            NodeKind::Popup(p) => Some(p),
+            _ => None,
+        }
     }
 
     pub fn edit(&self) -> Option<&EditData> {
@@ -239,6 +318,25 @@ pub struct Document {
     pub reposition: Vec<NodeId>,
     /// All edit nodes, which are few, to look through for pending caret scrolling.
     pub edits: Vec<NodeId>,
+    /// All nodes with `stacked` set.
+    pub stacked: HashSet<NodeId>,
+    /// The stacked descendants of each stacking context that has any, in paint order. See
+    /// `layout::build_stacking`.
+    pub stacking: HashMap<NodeId, StackingList>,
+    /// `stacking` must be built again.
+    pub stacking_dirty: bool,
+    /// All popups, parents before what is attached to them once `stacking` is built.
+    pub popups: Vec<NodeId>,
+    /// Nodes to bring into view after the next layout.
+    pub pending_scroll: Vec<NodeId>,
+}
+
+/// What a stacking context paints above its own background, besides its children in tree order.
+#[derive(Default)]
+pub struct StackingList {
+    pub nodes: Vec<NodeId>,
+    /// `nodes[..negative]` go below the children.
+    pub negative: usize,
 }
 
 thread_local! {
@@ -256,6 +354,11 @@ thread_local! {
         style_all: false,
         reposition: Vec::new(),
         edits: Vec::new(),
+        stacked: HashSet::new(),
+        stacking: HashMap::new(),
+        stacking_dirty: false,
+        popups: Vec::new(),
+        pending_scroll: Vec::new(),
     });
 }
 
@@ -265,22 +368,94 @@ pub fn with_doc<R>(f: impl FnOnce(&mut Document) -> R) -> R {
 }
 
 impl Document {
+    /// The stacked descendants of `id` that paint below and above its children.
+    pub fn stacked_around(&self, id: NodeId) -> (&[NodeId], &[NodeId]) {
+        match self.nodes.get(id).filter(|n| n.stacking_context) {
+            Some(_) => self
+                .stacking
+                .get(&id)
+                .map_or((&[][..], &[][..]), |l| l.nodes.split_at(l.negative)),
+            None => (&[][..], &[][..]),
+        }
+    }
+
     pub fn create(&mut self, node: Node) -> NodeId {
         let edit = node.is_edit();
+        let popup = node.is_popup();
         let id = self.nodes.insert(node);
         if edit {
             self.edits.push(id);
         }
+        if popup {
+            self.popups.push(id);
+        }
         id
+    }
+
+    /// Whether `id` hangs from the root.
+    pub fn attached(&self, id: NodeId) -> bool {
+        let mut cur = id;
+        while let Some(n) = self.nodes.get(cur) {
+            match n.parent {
+                Some(p) => cur = p,
+                None => return self.root == Some(cur),
+            }
+        }
+        false
+    }
+
+    /// What a popup hangs from when nothing else is said: the closest ancestor with a box.
+    pub fn anchor_of(&self, id: NodeId) -> Option<NodeId> {
+        let mut cur = self.nodes.get(id)?.parent;
+        while let Some(n) = cur.and_then(|c| self.nodes.get(c)) {
+            if !matches!(n.kind, NodeKind::Fragment) && n.computed.display != Display::Contents {
+                return cur;
+            }
+            cur = n.parent;
+        }
+        None
+    }
+
+    /// The popup whose surface `id` is on.
+    pub fn popup_of(&self, id: NodeId) -> Option<NodeId> {
+        let mut cur = Some(id);
+        while let Some(n) = cur.and_then(|c| self.nodes.get(c)) {
+            if n.is_popup() {
+                return cur;
+            }
+            cur = n.parent;
+        }
+        None
+    }
+
+    /// The popup that holds `p`, a point in window coordinates, and `p` in its surface's
+    /// coordinates. Input goes through tooltips.
+    pub fn popup_at(&self, p: PointF) -> Option<(NodeId, PointF)> {
+        self.popups.iter().rev().find_map(|&id| {
+            let n = self.nodes.get(id)?;
+            let data = n
+                .popup()
+                .filter(|d| d.shown() && d.kind != PopupKind::Tooltip)?;
+            let local = PointF::new(p.x - data.origin.x as f32, p.y - data.origin.y as f32);
+            n.abs.contains(local).then_some((id, local))
+        })
     }
 
     /// What to add to a node's coordinates to get window coordinates.
     pub fn space_offset(&self, node: &Node) -> PointI {
-        node.space
-            .and_then(|r| self.nodes.get(r))
-            .map_or(PointI::default(), |r| {
-                PointI::new(r.abs.x - r.scroll.x, r.abs.y - r.scroll.y)
-            })
+        let mut offset = PointI::default();
+        let mut space = node.space.and_then(|r| self.nodes.get(r));
+        while let Some(r) = space {
+            if let Some(popup) = r.popup() {
+                offset.x += popup.origin.x;
+                offset.y += popup.origin.y;
+                break;
+            }
+            offset.x += r.abs.x - r.scroll.x;
+            offset.y += r.abs.y - r.scroll.y;
+            space = r.space.and_then(|s| self.nodes.get(s));
+        }
+        offset
     }
 
     /// The node's border box in window coordinates.
@@ -297,8 +472,12 @@ impl Document {
         let clip = n.clip_shape().translated(o.x, o.y).rect;
         let rect = n.abs.translate(o.x, o.y).intersect(&clip);
         Some(match n.space.and_then(|r| self.nodes.get(r)) {
-            Some(root) => rect.intersect(&child_clip(root, self.scale, root.clip_shape()).rect),
-            None => rect,
+            Some(root) if !root.is_popup() => {
+                let o = self.space_offset(root);
+                let clip = child_clip(root, self.scale, root.clip_shape());
+                rect.intersect(&clip.rect.translate(o.x, o.y))
+            }
+            _ => rect,
         })
     }
 
@@ -343,7 +522,8 @@ impl Document {
             n.layout_dirty = true;
             n.position_dirty = true;
             n.measure_cache.clear();
-            cur = n.parent;
+            // Nothing outside of a popup depends on its size.
+            cur = if n.is_popup() { None } else { n.parent };
         }
         self.mark_layout();
     }
@@ -370,6 +550,7 @@ impl Document {
 
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
         self.detach(child);
+        self.stacking_dirty = true;
         if let Some(c) = self.nodes.get_mut(child) {
             c.parent = Some(parent);
         }
@@ -381,6 +562,7 @@ impl Document {
     }
 
     pub fn set_children(&mut self, parent: NodeId, children: Vec<NodeId>) {
+        self.stacking_dirty = true;
         let old = match self.nodes.get_mut(parent) {
             Some(p) => std::mem::take(&mut p.children),
             None => return,
@@ -413,6 +595,7 @@ impl Document {
         let Some(parent) = self.nodes.get(id).and_then(|n| n.parent) else {
             return;
         };
+        self.stacking_dirty = true;
         if let Some(p) = self.nodes.get_mut(parent) {
             p.children.retain(|c| *c != id);
         }
@@ -430,6 +613,13 @@ impl Document {
         }
         self.detach(id);
         if let Some(node) = self.nodes.remove(id) {
+            if let Some(popup) = node.popup() {
+                self.popups.retain(|p| *p != id);
+                if popup.sent.is_some() {
+                    self.requests
+                        .push(PlatformRequest::ClosePopup(popup_id(id)));
+                }
+            }
             for c in node.children {
                 if let Some(n) = self.nodes.get_mut(c) {
                     n.parent = None;
@@ -452,6 +642,8 @@ impl Document {
             self.root = None;
         }
         self.edits.retain(|e| *e != id);
+        self.stacked.remove(&id);
+        self.stacking_dirty = true;
         self.layer_contents.remove(&id);
         self.mark_paint();
     }

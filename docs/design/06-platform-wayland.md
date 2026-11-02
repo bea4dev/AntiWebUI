@@ -6,7 +6,8 @@
 
 | プロトコル | 用途 | 必須 |
 |---|---|---|
-| `wl_compositor`, `xdg_wm_base` | ウィンドウ | ○ |
+| `wl_compositor`, `xdg_wm_base` | ウィンドウ、`xdg_popup` | ○ |
+| `wl_subcompositor` | バブル（[09](09-shadows-stacking-popups.md)） | 任意（無ければ grab なしの `xdg_popup`） |
 | `wp_fractional_scale_v1` + `wp_viewporter` | 小数スケール | 推奨（無ければ `preferred_buffer_scale` の整数スケール） |
 | `zxdg_decoration_manager_v1` | サーバ側装飾 | 推奨（無い場合は装飾なし。CSD は将来） |
 | `wl_seat`（pointer / keyboard） | 入力 | ○ |
@@ -38,7 +39,7 @@ loop {
 
 - タイマー: キーリピート、キャレット点滅。発火の判定は、眠る前に求めた締め切りと比べる（`deadline()` は常に「次の」時刻を返すため、起きてから聞き直すと永遠に発火しない）。
 - wake pipe: クリップボード読み込みスレッドなど、他スレッドからの通知用。
-- フレームコールバック: 描画のたびに `wl_surface.frame` を要求するが、何も提示しなかったフレーム（変更矩形が空など）では commit せず、要求は次の commit まで保留する。何も変わらない commit にはコンポジタがコールバックを返さないことがあり、待つと描画が止まるため。
+- フレームコールバック: commit するサーフェスごとに `wl_surface.frame` を要求する。何も提示しないフレーム（変更矩形が空など）では要求も commit もしない。何も変わらない commit にはコンポジタがコールバックを返さないことがあり、待つと描画が止まるため。どのサーフェスにも待ちがないときに次のフレームを描く（ポップアップの待ちは 100 ms で打ち切る）。
 - 提示できなかったフレーム（空きバッファが無い）は、数ミリ秒後に再試行する。
 
 ## スクロール
@@ -58,10 +59,15 @@ loop {
 - 片方の軸だけの `axis_stop` と、もう片方の軸の移動が同じフレームに来たら、指はまだ動いている。
 - `zwp_pointer_gesture_hold_v1` の `begin` は `Held` にする。
 
+## ポップアップ
+
+[09](09-shadows-stacking-popups.md) を参照。ポインタの座標はサーフェスの原点を足してウィンドウ座標にしてから core に渡す。
+
 ## キーボード
 
 - `wl_keyboard.keymap` の fd を mmap して xkb keymap を作る。
 - `repeat_info` に従いキーリピートを自前で行う。
+- `enter` / `leave` は自分のサーフェスの間の移動（grab でポップアップに移る場合など）では core に知らせない。
 - core へは `KeyEvent { key: Key（論理キー）, code（物理）, text: Option<String>, modifiers, repeat }` を渡す。
 
 ## クリップボード

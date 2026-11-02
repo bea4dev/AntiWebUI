@@ -9,7 +9,7 @@ use anti_webui_core::paint::paint_everything;
 use anti_webui_core::prelude::*;
 use anti_webui_core::scene::{Primitive, Scene};
 use anti_webui_core::text::selection;
-use anti_webui_core::tree::{NodeId, NodeKind, with_doc};
+use anti_webui_core::tree::{Document, NodeId, NodeKind, with_doc};
 use std::time::Instant;
 
 /// What every later stage depends on, for every node.
@@ -94,11 +94,67 @@ fn assert_same_in_view(all: &Scene, culled: &Scene, what: &str) {
     }
 }
 
+/// The paint order worked out from the styles alone, without the lists the painter uses.
+fn paint_order(d: &Document) -> Vec<NodeId> {
+    fn stacked(d: &Document, id: NodeId) -> bool {
+        let n = d.get(id).unwrap();
+        !matches!(n.kind, NodeKind::Fragment)
+            && (n.computed.z_index.is_some() || n.computed.position == Position::Absolute)
+    }
+    fn context(d: &Document, id: NodeId) -> bool {
+        let n = d.get(id).unwrap();
+        !matches!(n.kind, NodeKind::Fragment)
+            && (d.root == Some(id)
+                || n.computed.z_index.is_some()
+                || n.computed.opacity < 1.0
+                || n.computed.overflow_x == Overflow::Scroll
+                || n.computed.overflow_y == Overflow::Scroll)
+    }
+    fn gather(d: &Document, id: NodeId, out: &mut Vec<NodeId>) {
+        for &c in &d.get(id).unwrap().children {
+            if stacked(d, c) {
+                out.push(c);
+            }
+            if !context(d, c) {
+                gather(d, c, out);
+            }
+        }
+    }
+    fn flow(d: &Document, id: NodeId, out: &mut Vec<NodeId>) {
+        for &c in &d.get(id).unwrap().children {
+            if !stacked(d, c) {
+                paint(d, c, out);
+            }
+        }
+    }
+    fn paint(d: &Document, id: NodeId, out: &mut Vec<NodeId>) {
+        out.push(id);
+        if !context(d, id) {
+            flow(d, id, out);
+            return;
+        }
+        let mut lifted = Vec::new();
+        gather(d, id, &mut lifted);
+        lifted.sort_by_key(|n| d.get(*n).unwrap().computed.z_index.unwrap_or(0));
+        let z = |n: &NodeId| d.get(*n).unwrap().computed.z_index.unwrap_or(0);
+        for n in lifted.iter().filter(|n| z(n) < 0) {
+            paint(d, *n, out);
+        }
+        flow(d, id, out);
+        for n in lifted.iter().filter(|n| z(n) >= 0) {
+            paint(d, *n, out);
+        }
+    }
+    let mut out = Vec::new();
+    paint(d, d.root.unwrap(), &mut out);
+    out
+}
+
 /// What hit testing should find, by looking at every node: the last one in paint order that
 /// isn't clipped away at `p`.
 fn hit_by_brute_force(p: PointF) -> Option<NodeId> {
     with_doc(|d| {
-        d.preorder().into_iter().rev().find(|id| {
+        paint_order(d).into_iter().rev().find(|id| {
             let n = d.get(*id).unwrap();
             n.visible
                 && n.computed.pointer_events
@@ -150,6 +206,7 @@ fn check(ui: &mut Ui, now: Instant, what: &str) {
     with_doc(|d| {
         d.mark_style_all();
         d.invalidate_all_layout();
+        d.stacking_dirty = true;
     });
     ui.update();
     let full = snapshot();
@@ -217,6 +274,11 @@ struct Doc {
     corner: Signal<f32>,
     fills: Signal<bool>,
     box_corner: Signal<f32>,
+    /// `z_index` of some rows; 0 for none.
+    row_z: Signal<i32>,
+    /// Overlapping stacked boxes, in the scroller and over everything.
+    overlays: Signal<bool>,
+    faded: Signal<bool>,
     outer: NodeRef,
     inner: NodeRef,
     field: NodeRef,
@@ -227,6 +289,7 @@ fn view(s: &Doc) -> impl IntoView + use<> {
     let (shown, hidden, glow, corner, fills) = (s.shown, s.hidden, s.glow, s.corner, s.fills);
     let (outer, inner, field) = (s.outer, s.inner, s.field);
     let box_corner = s.box_corner;
+    let (row_z, overlays, faded) = (s.row_z, s.overlays, s.faded);
     // Clips without scrolling; its child's clip follows the corners without any layout.
     let rounded_box = move || {
         div()
@@ -311,15 +374,70 @@ fn view(s: &Doc) -> impl IntoView + use<> {
                                             st
                                         }
                                     })
+                                    .dyn_style(move |st| {
+                                        if row_z.get() != 0 && i % 2 == 0 {
+                                            st.z_index(row_z.get() * (i as i32 % 5 - 2))
+                                        } else {
+                                            st
+                                        }
+                                    })
+                                    .dyn_style(move |st| {
+                                        if faded.get() && i % 4 == 1 {
+                                            st.opacity(0.5)
+                                        } else {
+                                            st
+                                        }
+                                    })
                                     .child(text(format!("row {i}")))
                             },
                         ))
                         .child(rounded_box())
+                        .child(show(
+                            move || overlays.get(),
+                            || {
+                                div()
+                                    .absolute()
+                                    .top(40.0)
+                                    .left(30.0)
+                                    .w(150.0)
+                                    .h(120.0)
+                                    .bg(rgb(0xccddee))
+                                    .child(text("in the content"))
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .top(10.0)
+                                            .left(100.0)
+                                            .w(120.0)
+                                            .h(40.0)
+                                            .z_index(1)
+                                            .bg(rgb(0xeeddcc))
+                                            .shadow_md(),
+                                    )
+                            },
+                        ))
                         .child(
                             div().dyn_style(move |st| st.h(if fills.get() { 3000.0 } else { 1.0 })),
                         ),
                 ),
         )
+        .child(show(
+            move || overlays.get(),
+            || {
+                div()
+                    .absolute()
+                    .top(10.0)
+                    .right(10.0)
+                    .w(160.0)
+                    .h(90.0)
+                    .z_index(2)
+                    .rounded(8.0)
+                    .bg(rgb(0xffffff))
+                    .shadow_md()
+                    .hover(|st| st.bg(rgb(0xeeeeff)))
+                    .child(text("over everything"))
+            },
+        ))
         // Stays where it is when the list above changes, but comes later in document order.
         .child(div().h(20.0).child(text("footer")))
 }
@@ -348,6 +466,9 @@ fn random_changes(seed: u64) {
         corner: signal(0.0),
         fills: signal(true),
         box_corner: signal(0.0),
+        row_z: signal(0),
+        overlays: signal(false),
+        faded: signal(false),
         outer: node_ref(),
         inner: node_ref(),
         field: node_ref(),
@@ -371,7 +492,7 @@ fn random_changes(seed: u64) {
             rng.next(size.width as u32) as f32,
             rng.next(size.height as u32) as f32,
         );
-        let what = rng.next(21);
+        let what = rng.next(24);
         // Like a real pointer, it gets to a place before doing anything there.
         ui.handle_event(WindowEvent::PointerMoved {
             position: p,
@@ -467,6 +588,9 @@ fn random_changes(seed: u64) {
             16 => s.corner.set(rng.next(20) as f32),
             17 => s.fills.update(|v| *v = !*v),
             18 => s.box_corner.set(rng.next(16) as f32),
+            21 => s.row_z.set(rng.next(4) as i32 - 1),
+            22 => s.overlays.update(|v| *v = !*v),
+            23 => s.faded.update(|v| *v = !*v),
             _ => {
                 size = SizeI::new(300 + rng.next(400) as i32, 200 + rng.next(400) as i32);
                 let scale = Scale(120 + rng.next(120));
@@ -597,6 +721,7 @@ fn culling_at_the_window_edge() {
                         blur: 40.0,
                         spread: 0.0,
                         color: Color::BLACK,
+                        inset: false,
                     }),
             )
             // Past the right edge, with an outline reaching back.

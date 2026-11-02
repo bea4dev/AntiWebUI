@@ -562,3 +562,354 @@ fn layers_look_like_direct_drawing() {
     }
     assert!(worst <= 2, "layered and direct drawing differ by {worst}");
 }
+
+/// Coverage of a rounded rectangle blurred by a Gaussian, by adding up the real thing.
+fn true_blur(x: f32, y: f32, rect: (f32, f32, f32, f32), r: f32, sigma: f32) -> f32 {
+    let inside = |px: f32, py: f32| {
+        let (dx, dy) = (
+            (px - (rect.0 + rect.2 / 2.0)).abs() - (rect.2 / 2.0 - r),
+            (py - (rect.1 + rect.3 / 2.0)).abs() - (rect.3 / 2.0 - r),
+        );
+        dx.max(0.0).hypot(dy.max(0.0)) <= r && dx.max(dy) <= r
+    };
+    let reach = (sigma * 4.0) as i32;
+    let (mut sum, mut total) = (0.0, 0.0);
+    for j in -reach * 2..=reach * 2 {
+        for i in -reach * 2..=reach * 2 {
+            let (u, v) = (i as f32 / 2.0, j as f32 / 2.0);
+            let g = (-(u * u + v * v) / (2.0 * sigma * sigma)).exp();
+            total += g;
+            if inside(x + u, y + v) {
+                sum += g;
+            }
+        }
+    }
+    sum / total
+}
+
+#[test]
+fn shadows_are_a_real_gaussian_blur_outside_of_the_box() {
+    // CSS asks for each pixel to be within 5% of the exact result.
+    let (w, h) = (240u32, 200u32);
+    for (bw, bh, r, blur) in [
+        (100.0, 60.0, 0.0, 20.0),
+        (100.0, 60.0, 16.0, 20.0),
+        (20.0, 20.0, 4.0, 30.0),
+        (100.0, 60.0, 30.0, 8.0),
+    ] {
+        let Some(p) = render(w, h, 1.0, move || {
+            div()
+                .bg(Color::WHITE)
+                .h(pct(100.0))
+                .pl(70.0)
+                .pt(70.0)
+                .child(div().w(bw).h(bh).rounded(r).shadow(BoxShadow {
+                    blur,
+                    color: Color::BLACK,
+                    ..Default::default()
+                }))
+        }) else {
+            return;
+        };
+        let rect = (70.0, 70.0, bw, bh);
+        let mut worst: f32 = 0.0;
+        for y in (0..h).step_by(3) {
+            for x in (0..w).step_by(3) {
+                let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
+                // The box itself is left out; only what's clearly outside of it counts here.
+                if cx >= rect.0 - 1.0
+                    && cx <= rect.0 + bw + 1.0
+                    && cy >= rect.1 - 1.0
+                    && cy <= rect.1 + bh + 1.0
+                {
+                    continue;
+                }
+                let got = 1.0 - px(&p, w, x, y)[0] as f32 / 255.0;
+                let want = true_blur(cx, cy, rect, r, blur / 2.0);
+                worst = worst.max((got - want).abs());
+            }
+        }
+        assert!(worst < 0.05, "{bw}x{bh} r{r} blur{blur}: off by {worst}");
+    }
+}
+
+#[test]
+fn shadows_stay_out_of_the_box_and_are_ordered_like_css() {
+    let (w, h) = (200, 120);
+    let Some(p) = render(w, h, 1.0, || {
+        div().bg(Color::WHITE).h(pct(100.0)).p(30.0).child(
+            div()
+                .w(100.0)
+                .h(50.0)
+                .rounded(8.0)
+                .bg(rgba(0x00ff0040))
+                .shadows(vec![
+                    // The first goes on top.
+                    BoxShadow {
+                        offset_x: 10.0,
+                        color: rgb(0xff0000),
+                        ..Default::default()
+                    },
+                    BoxShadow {
+                        offset_x: 20.0,
+                        color: rgb(0x0000ff),
+                        ..Default::default()
+                    },
+                ]),
+        )
+    }) else {
+        return;
+    };
+    // Under the translucent box there is only the page and the box.
+    let inside = px(&p, w, 80, 55);
+    assert!(
+        inside[0] == inside[2] && inside[1] > inside[0],
+        "a shadow shows through the box: {inside:?}"
+    );
+    assert_eq!(px(&p, w, 135, 55), [255, 0, 0, 255]);
+    assert_eq!(px(&p, w, 145, 55), [0, 0, 255, 255]);
+    assert_eq!(px(&p, w, 155, 55), [255, 255, 255, 255]);
+}
+
+#[test]
+fn an_opaque_box_has_no_light_seam_around_its_corners() {
+    let (w, h) = (120, 120);
+    let Some(p) = render(w, h, 1.0, || {
+        div().bg(Color::WHITE).h(pct(100.0)).p(30.0).child(
+            div()
+                .w(60.0)
+                .h(60.0)
+                .rounded(20.0)
+                .bg(Color::BLACK)
+                .shadow(BoxShadow {
+                    color: Color::BLACK,
+                    spread: 4.0,
+                    ..Default::default()
+                }),
+        )
+    }) else {
+        return;
+    };
+    // Black on black: a leak of the white page would show along the edge of the box.
+    for i in 0..24u32 {
+        let t = i as f32 / 23.0 * std::f32::consts::FRAC_PI_2;
+        let x = 50.0 - 20.0 * t.cos();
+        let y = 50.0 - 20.0 * t.sin();
+        let c = px(&p, w, x as u32, y as u32);
+        assert!(c[0] < 3, "seam at {x},{y}: {c:?}");
+    }
+}
+
+#[test]
+fn inset_shadows_darken_the_inside_edge_only() {
+    let (w, h) = (160, 120);
+    let Some(p) = render(w, h, 1.0, || {
+        div().bg(Color::WHITE).h(pct(100.0)).p(20.0).child(
+            div()
+                .w(120.0)
+                .h(80.0)
+                .bg(Color::WHITE)
+                .border(2.0)
+                .border_color(rgb(0x00ff00))
+                .child(div().w(10.0).h(10.0).ml(50.0).mt(30.0).bg(rgb(0xff0000)))
+                .shadow(BoxShadow {
+                    blur: 10.0,
+                    color: Color::BLACK,
+                    inset: true,
+                    ..Default::default()
+                }),
+        )
+    }) else {
+        return;
+    };
+    assert_eq!(
+        px(&p, w, 10, 60),
+        [255, 255, 255, 255],
+        "outside stays clean"
+    );
+    assert_eq!(
+        px(&p, w, 20, 60),
+        [0, 255, 0, 255],
+        "the border stays clean"
+    );
+    let edge = px(&p, w, 22, 60)[0];
+    assert!(
+        (110..=145).contains(&edge),
+        "half covered at the edge: {edge}"
+    );
+    assert_eq!(
+        px(&p, w, 110, 60),
+        [255, 255, 255, 255],
+        "the middle is clean"
+    );
+    assert_eq!(
+        px(&p, w, 75, 55),
+        [255, 0, 0, 255],
+        "the children are above"
+    );
+}
+
+#[test]
+fn the_area_a_shadow_skips_is_transparent_anyway() {
+    use anti_webui_core::geometry::RectI;
+    use anti_webui_core::scene::{Clip, Primitive, Scene, Shadow};
+    use anti_webui_wgpu::{Gpu, Renderer, wgpu};
+    let Ok(gpu) = Gpu::headless() else {
+        return;
+    };
+    let mut renderer = Renderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+    let (w, h) = (320u32, 240u32);
+    let mut draw = |s: Shadow| {
+        let scene = Scene {
+            width: w,
+            height: h,
+            clear: Color::TRANSPARENT,
+            primitives: vec![Primitive::Shadow(s)],
+            chunks: Vec::new(),
+        };
+        gpu.render_to_rgba(&mut renderer, &scene)
+    };
+    let rect = RectI::new(60, 50, 200, 140);
+    for (blur, radii) in [
+        (0.0, [0.0; 4]),
+        (12.0, [0.0; 4]),
+        (12.0, [30.0; 4]),
+        (40.0, [10.0, 30.0, 0.0, 50.0]),
+        (6.0, [70.0; 4]),
+    ] {
+        let shadow = Shadow {
+            rect,
+            radii,
+            blur,
+            color: Color::BLACK,
+            clip: Clip::NONE,
+            cut: RectI::default(),
+            cut_radii: [0.0; 4],
+            inset: false,
+        };
+        // With nothing to cut, it draws everywhere: the reference.
+        let all = draw(shadow.clone());
+        let outer = draw(Shadow {
+            cut: rect,
+            cut_radii: radii,
+            ..shadow.clone()
+        });
+        let window = RectI::new(0, 0, w as i32, h as i32);
+        let inset = draw(Shadow {
+            cut: window,
+            inset: true,
+            ..shadow.clone()
+        });
+        for y in 0..h {
+            for x in 0..w {
+                let (a, o, i) = (
+                    px(&all, w, x, y)[3] as i32,
+                    px(&outer, w, x, y)[3] as i32,
+                    px(&inset, w, x, y)[3] as i32,
+                );
+                // Inside of the rectangle an outer shadow fades out over the antialiased edge.
+                let beyond = !rect
+                    .outset(1)
+                    .contains(anti_webui_core::geometry::PointF::new(x as f32, y as f32));
+                if beyond {
+                    assert!(
+                        (a - o).abs() <= 1,
+                        "outer at {x},{y} blur {blur}: {o} vs {a}"
+                    );
+                }
+                assert!(o <= a + 1, "outer at {x},{y} blur {blur}: {o} vs {a}");
+                assert!(
+                    (i - (255 - a)).abs() <= 2,
+                    "inset at {x},{y} blur {blur} radii {radii:?}: {i} vs {}",
+                    255 - a
+                );
+            }
+        }
+        // And deep in the box nothing is drawn at all.
+        let hole = Shadow {
+            cut: rect,
+            cut_radii: radii,
+            ..shadow.clone()
+        }
+        .hole();
+        assert!(!hole.is_empty());
+        let (cx, cy) = (hole.x as u32 + 1, hole.y as u32 + 1);
+        assert_eq!(px(&outer, w, cx, cy)[3], 0);
+        // Nor in the box outside of the hole, which only the shader keeps clean.
+        let edge = px(
+            &outer,
+            w,
+            rect.x as u32 + 3,
+            (rect.y + rect.height / 2) as u32,
+        );
+        assert_eq!(edge[3], 0, "blur {blur} radii {radii:?}");
+    }
+}
+
+#[test]
+fn a_popup_has_its_own_transparent_scene() {
+    use anti_webui_core::Ui;
+    use anti_webui_core::event::WindowEvent;
+    use anti_webui_core::geometry::{PointI, Scale, SizeI};
+    use anti_webui_core::platform::PlatformRequest;
+    use anti_webui_wgpu::{Gpu, Renderer, wgpu};
+    let Ok(gpu) = Gpu::headless() else {
+        return;
+    };
+    let mut ui = Ui::new(|| {
+        div().size_full().bg(rgb(0x0000ff)).child(
+            popup().child(
+                div()
+                    .w(60.0)
+                    .h(40.0)
+                    .rounded(10.0)
+                    .bg(rgb(0xff0000))
+                    .shadow(BoxShadow {
+                        blur: 10.0,
+                        color: Color::BLACK,
+                        ..Default::default()
+                    }),
+            ),
+        )
+    });
+    ui.handle_event(WindowEvent::Resized {
+        size: SizeI::new(200, 200),
+        scale: Scale::ONE,
+    });
+    ui.update();
+    let params = ui
+        .take_requests()
+        .into_iter()
+        .find_map(|r| match r {
+            PlatformRequest::ShowPopup(p) => Some(p),
+            _ => None,
+        })
+        .unwrap();
+    ui.handle_event(WindowEvent::PopupConfigured {
+        id: params.id,
+        origin: PointI::new(50, 50),
+        size: params.wanted,
+    });
+    ui.update();
+    let frame = ui.paint_frame(std::time::Instant::now());
+    let mut renderer = Renderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+    let scene = &frame.popups[0].1;
+    let p = gpu.render_to_rgba(&mut renderer, scene);
+    let g = params.geometry;
+    let (cx, cy) = ((g.x + 30) as u32, (g.y + 20) as u32);
+    assert_eq!(px(&p, scene.width, cx, cy), [255, 0, 0, 255]);
+    assert_eq!(
+        px(&p, scene.width, 0, 0),
+        [0, 0, 0, 0],
+        "transparent around it"
+    );
+    let below = px(&p, scene.width, cx, (g.bottom() + 2) as u32);
+    assert!(
+        below[3] > 40 && below[3] < 200,
+        "the shadow fades: {below:?}"
+    );
+    assert_eq!(below[0], 0, "and is premultiplied black");
+    // The window below is untouched by it.
+    let window = gpu.render_to_rgba(&mut renderer, &frame.window);
+    assert_eq!(px(&window, 200, 100, 100), [0, 0, 255, 255]);
+}

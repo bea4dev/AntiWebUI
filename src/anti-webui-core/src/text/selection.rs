@@ -98,14 +98,11 @@ pub fn node_range(doc: &Document, sel: &DocSelection, node: NodeId) -> Option<(u
 /// the point may be outside of any text, between lines, or far away from the anchor.
 pub fn hit_text_point(doc: &Document, p: PointF) -> Option<TextPoint> {
     let mut best = None;
-    nearest_text(
-        doc,
-        doc.root?,
-        PointI::default(),
-        RectI::INFINITE,
-        p,
-        &mut best,
-    );
+    let (root, offset) = match doc.popup_at(p) {
+        Some((popup, _)) => (popup, doc.nodes[popup].popup()?.origin),
+        None => (doc.root?, PointI::default()),
+    };
+    nearest_text(doc, root, offset, RectI::INFINITE, p, &mut best);
     let (_, id, vis): ((f32, f32), NodeId, RectI) = best?;
     let n = &doc.nodes[id];
     let NodeKind::Text(t) = &n.kind else {
@@ -152,9 +149,13 @@ fn nearest_text(
         }
     }
     let (offset, view) = if n.scroll_root {
+        let clip = child_clip(n, doc.scale, n.clip_shape());
         (
-            PointI::new(n.abs.x - n.scroll.x, n.abs.y - n.scroll.y),
-            view.intersect(&child_clip(n, doc.scale, n.clip_shape()).rect),
+            PointI::new(
+                offset.x + n.abs.x - n.scroll.x,
+                offset.y + n.abs.y - n.scroll.y,
+            ),
+            view.intersect(&clip.rect.translate(offset.x, offset.y)),
         )
     } else {
         (offset, view)

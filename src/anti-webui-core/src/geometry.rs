@@ -38,6 +38,17 @@ impl Scale {
         (logical as f64 * self.0 as f64 / 120.0) as f32
     }
 
+    /// The whole logical pixels needed to cover `physical` pixels.
+    pub fn logical_ceil(self, physical: i32) -> i32 {
+        (physical as i64 * 120).div_euclid(self.0 as i64) as i32
+            + ((physical as i64 * 120).rem_euclid(self.0 as i64) != 0) as i32
+    }
+
+    /// The whole logical pixels up to `physical` pixels.
+    pub fn logical_floor(self, physical: i32) -> i32 {
+        (physical as i64 * 120).div_euclid(self.0 as i64) as i32
+    }
+
     /// Physical → logical, for coordinates handed back to the OS (R7).
     pub fn to_logical(self, physical: f32) -> f32 {
         (physical as f64 * 120.0 / self.0 as f64) as f32

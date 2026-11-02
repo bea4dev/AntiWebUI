@@ -11,6 +11,7 @@ taffy の丸め（`round_layout`）は辺をスナップする B 方式であり
 | サイズ | `width/height/min/max`（`Px` / `Percent` / `Auto`） |
 | 余白 | `margin`, `padding`, `border` |
 | position | `Relative`, `Absolute`（`inset`、親のパディングボックス基準） |
+| z_index | 重なり順。レイアウトには影響しない（[09](09-shadows-stacking-popups.md)） |
 | overflow | `Visible`, `Hidden`, `Scroll`（スクロールオフセットは物理 px 整数） |
 
 未対応（後回し）: `flex-wrap`, Grid, `aspect-ratio`, `order`。

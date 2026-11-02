@@ -19,6 +19,7 @@ struct Globals {
     _pad: [f32; 2],
 }
 
+/// A box or part of a shadow; see the shader for what the fields mean for each.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct QuadInstance {
@@ -28,8 +29,9 @@ struct QuadInstance {
     border: [f32; 4],
     radii: [f32; 4],
     clip: [f32; 4],
-    params: [f32; 4],
     clip_radii: [f32; 4],
+    cut_radii: [f32; 4],
+    params: [f32; 2],
 }
 
 #[repr(C)]
@@ -54,6 +56,8 @@ enum Batch {
 /// `(x mod width, y mod height)`, so what is already drawn stays put as the layer scrolls in any
 /// direction (see `docs/design/05-rendering.md`).
 struct LayerCache {
+    /// The target it is shown on, which decides when it is no longer in use.
+    owner: u64,
     view: wgpu::TextureView,
     /// Binds the texture like the glyph atlas, for compositing.
     bind: wgpu::BindGroup,
@@ -105,6 +109,36 @@ fn torus_parts(r: RectI, size: (i32, i32), mut f: impl FnMut(RectI, (i32, i32)))
             x += w;
         }
         y += h;
+    }
+}
+
+/// The parts of `outer` outside of `hole`, which may stick out of it: at most four rectangles.
+fn around_hole(outer: RectI, hole: RectI, mut f: impl FnMut(RectI)) {
+    let hole = hole.intersect(&outer);
+    if hole.is_empty() {
+        f(outer);
+        return;
+    }
+    let parts = [
+        RectI::new(outer.x, outer.y, outer.width, hole.y - outer.y),
+        RectI::new(
+            outer.x,
+            hole.bottom(),
+            outer.width,
+            outer.bottom() - hole.bottom(),
+        ),
+        RectI::new(outer.x, hole.y, hole.x - outer.x, hole.height),
+        RectI::new(
+            hole.right(),
+            hole.y,
+            outer.right() - hole.right(),
+            hole.height,
+        ),
+    ];
+    for part in parts {
+        if !part.is_empty() {
+            f(part);
+        }
     }
 }
 
@@ -194,6 +228,8 @@ pub struct Renderer {
     glyph_buffer: InstanceBuffer,
     max_texture: u32,
     layers: HashMap<u64, LayerCache>,
+    /// The target being rendered to, when one renderer serves several.
+    target: u64,
 }
 
 fn create_atlas(
@@ -323,7 +359,7 @@ impl Renderer {
         });
         let quad_attrs = wgpu::vertex_attr_array![
             0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4,
-            4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4
+            4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4, 8 => Float32x2
         ];
         let quad_buffers = [Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<QuadInstance>() as u64,
@@ -420,7 +456,19 @@ impl Renderer {
             glyph_buffer: InstanceBuffer::new(device, "glyphs"),
             max_texture: device.limits().max_texture_dimension_2d,
             layers: HashMap::new(),
+            target: 0,
         }
+    }
+
+    /// Selects what the next frames are for. The layer textures of other targets stay as they
+    /// are, however many frames go by.
+    pub fn set_target(&mut self, target: u64) {
+        self.target = target;
+    }
+
+    /// Frees what was kept for a target that is gone.
+    pub fn forget_target(&mut self, target: u64) {
+        self.layers.retain(|_, c| c.owner != target);
     }
 
     pub fn format(&self) -> wgpu::TextureFormat {
@@ -484,6 +532,7 @@ impl Renderer {
             }],
         });
         LayerCache {
+            owner: self.target,
             view,
             bind,
             globals_bind,
@@ -509,7 +558,8 @@ impl Renderer {
         damage: Option<&[RectI]>,
     ) -> Vec<LayerPlan> {
         let screen = RectI::new(0, 0, scene.width as i32, scene.height as i32);
-        for cache in self.layers.values_mut() {
+        let target = self.target;
+        for cache in self.layers.values_mut().filter(|c| c.owner == target) {
             cache.used = false;
         }
         let mut plans = Vec::new();
@@ -570,7 +620,7 @@ impl Renderer {
                 });
             }
         }
-        self.layers.retain(|_, c| c.used);
+        self.layers.retain(|_, c| c.used || c.owner != target);
         plans
     }
 
@@ -713,24 +763,36 @@ impl Renderer {
                     border: [b[0] as f32, b[1] as f32, b[2] as f32, b[3] as f32],
                     radii: q.radii,
                     clip,
-                    params: [0.0; 4],
                     clip_radii,
+                    cut_radii: [0.0; 4],
+                    params: [0.0; 2],
                 });
                 push_batch(batches, true, quads.len() as u32 - 1, quads.len() as u32);
             }
             Primitive::Shadow(s) => {
                 let (clip, clip_radii) = gpu_clip(&s.clip.translated(dx, dy), target);
-                quads.push(QuadInstance {
-                    rect: rect4(s.rect.translate(dx, dy)),
-                    background: s.color.premultiplied(),
-                    border_color: [0.0; 4],
-                    border: [0.0; 4],
-                    radii: s.radii,
-                    clip,
-                    params: [1.0, s.blur, 0.0, 0.0],
-                    clip_radii,
+                let start = quads.len() as u32;
+                let visible = s
+                    .bounds()
+                    .translate(dx, dy)
+                    .intersect(&s.clip.translated(dx, dy).rect)
+                    .intersect(&target);
+                around_hole(visible, s.hole().translate(dx, dy), |area| {
+                    quads.push(QuadInstance {
+                        rect: rect4(area),
+                        background: s.color.premultiplied(),
+                        border_color: rect4(s.rect.translate(dx, dy)),
+                        border: rect4(s.cut.translate(dx, dy)),
+                        radii: s.radii,
+                        clip,
+                        clip_radii,
+                        cut_radii: s.cut_radii,
+                        params: [if s.inset { 2.0 } else { 1.0 }, s.blur * 0.5],
+                    });
                 });
-                push_batch(batches, true, quads.len() as u32 - 1, quads.len() as u32);
+                if quads.len() as u32 > start {
+                    push_batch(batches, true, start, quads.len() as u32);
+                }
             }
             Primitive::Glyphs(run) => {
                 placed.clear();
@@ -960,8 +1022,9 @@ fn clear_instance(r: RectI, color: [f32; 4]) -> QuadInstance {
         border: [0.0; 4],
         radii: [0.0; 4],
         clip: rect4(r),
-        params: [0.0; 4],
         clip_radii: [0.0; 4],
+        cut_radii: [0.0; 4],
+        params: [0.0; 2],
     }
 }
 
@@ -1006,5 +1069,41 @@ fn push_batch(batches: &mut Vec<Batch>, quad: bool, start: u32, end: u32) {
         } else {
             Batch::Glyphs(start..end)
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pieces(outer: RectI, hole: RectI) -> Vec<RectI> {
+        let mut out = Vec::new();
+        around_hole(outer, hole, |r| out.push(r));
+        out
+    }
+
+    #[test]
+    fn the_area_around_a_hole_covers_the_rest_once() {
+        let outer = RectI::new(10, 10, 100, 80);
+        for hole in [
+            RectI::new(30, 30, 40, 20),
+            RectI::new(0, 0, 40, 40),
+            RectI::new(90, 70, 100, 100),
+            RectI::new(10, 10, 100, 80),
+            RectI::new(0, 40, 500, 10),
+            RectI::new(300, 300, 10, 10),
+            RectI::new(30, 30, 0, 20),
+        ] {
+            let parts = pieces(outer, hole);
+            assert!(parts.len() <= 4);
+            for y in 0..120 {
+                for x in 0..130 {
+                    let p = anti_webui_core::geometry::PointF::new(x as f32, y as f32);
+                    let n = parts.iter().filter(|r| r.contains(p)).count();
+                    let want = outer.contains(p) && !hole.contains(p);
+                    assert_eq!(n, want as usize, "{hole:?} at {x},{y}");
+                }
+            }
+        }
     }
 }

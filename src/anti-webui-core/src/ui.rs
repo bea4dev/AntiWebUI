@@ -4,10 +4,13 @@ use crate::event::*;
 use crate::geometry::PointI;
 use crate::geometry::{PointF, RectI, Scale, SizeI};
 use crate::layout::{
-    child_clip, layout_document, position_document, reposition_children, resolve_styles,
+    build_stacking, child_clip, layout_document, position_document, reposition_children,
+    resolve_styles,
 };
-use crate::paint::{CARET_BLINK, caret_width, edit_text_origin, paint_document};
-use crate::platform::{CursorIcon, ImeState, PlatformRequest};
+use crate::paint::{CARET_BLINK, Frame, caret_width, edit_text_origin, paint_document};
+use crate::platform::{
+    CursorIcon, ImeState, Placement, PlatformRequest, PopupId, PopupKind, PopupParams,
+};
 use crate::reactive::{Owner, batch, create_root};
 use crate::scene::Scene;
 use crate::scroll::{Booster, FLING_SPEED_RATIO, Fling, VelocityTracker};
@@ -15,7 +18,7 @@ use crate::settings::with_settings;
 use crate::text::edit::{EditOutcome, Motion};
 use crate::text::selection::{self, Granularity};
 use crate::text::with_text;
-use crate::tree::{Document, Handler, Node, NodeId, NodeKind, with_doc};
+use crate::tree::{Document, Handler, Node, NodeId, NodeKind, popup_id, popup_node, with_doc};
 use crate::view::IntoView;
 use anti_webui_style::{AlignItems, Display, FlexDirection, Overflow, Style, UserSelect};
 use std::cell::Cell;
@@ -165,6 +168,7 @@ impl Ui {
             }
         }
         self.sync_ime();
+        self.sync_popups();
     }
 
     /// Brings styles, layout and positions up to date. Returns whether anything moved.
@@ -196,9 +200,18 @@ impl Ui {
                     doc.dirty.paint = true;
                     changed = true;
                 }
+                if doc.stacking_dirty {
+                    build_stacking(doc);
+                    doc.dirty.paint = true;
+                    doc.dirty.content = true;
+                    changed = true;
+                }
                 if doc.dirty.carets {
                     doc.dirty.carets = false;
                     scroll_carets_into_view(doc);
+                }
+                for id in std::mem::take(&mut doc.pending_scroll) {
+                    scroll_into_view(doc, id);
                 }
                 changed
             })
@@ -210,6 +223,8 @@ impl Ui {
             || d.dirty.layout
             || d.dirty.position
             || d.dirty.carets
+            || d.stacking_dirty
+            || !d.pending_scroll.is_empty()
             || !d.reposition.is_empty()
     }
 
@@ -237,14 +252,108 @@ impl Ui {
         }
     }
 
-    /// Produces the frame. Call [`Ui::update`] first.
+    /// Produces the window's part of the frame. Call [`Ui::update`] first.
     pub fn paint(&mut self, now: Instant) -> Scene {
+        self.paint_frame(now).window
+    }
+
+    /// Produces the frame. Call [`Ui::update`] first.
+    pub fn paint_frame(&mut self, now: Instant) -> Frame {
         with_doc(|d| {
-            let scene = paint_document(d, now);
+            let frame = paint_document(d, now);
             d.dirty.paint = false;
             d.dirty.content = false;
-            scene
+            frame
         })
+    }
+
+    /// Tells the platform what changed about the popups.
+    fn sync_popups(&mut self) {
+        for id in with_doc(|d| d.popups.clone()) {
+            let Some(params) = with_doc(|d| popup_params(d, id)) else {
+                let sent = with_doc(|d| {
+                    d.nodes.get_mut(id)?.popup_mut()?.granted = None;
+                    d.nodes.get_mut(id)?.popup_mut()?.sent.take()
+                });
+                if sent.is_some() {
+                    with_doc(|d| d.request(PlatformRequest::ClosePopup(popup_id(id))));
+                }
+                continue;
+            };
+            let sent = with_doc(|d| d.nodes[id].popup().and_then(|p| p.sent.clone()));
+            if sent.as_ref() == Some(&params) {
+                continue;
+            }
+            // A grab goes on the topmost grabbing popup, so other menus have to go first.
+            if sent.is_none() && params.kind == PopupKind::Menu {
+                let others = with_doc(|d| open_menus_outside(d, Some(id)));
+                self.dismiss_popups(&others);
+            }
+            with_doc(|d| {
+                let req = if sent.is_some() {
+                    PlatformRequest::UpdatePopup(params.clone())
+                } else {
+                    PlatformRequest::ShowPopup(params.clone())
+                };
+                d.request(req);
+                d.nodes[id].popup_mut().unwrap().sent = Some(params);
+            });
+        }
+    }
+
+    /// Closes these popups and what is attached to them, and tells whoever wants to know.
+    fn dismiss_popups(&mut self, ids: &[NodeId]) {
+        let handlers = with_doc(|d| {
+            let mut handlers = Vec::new();
+            let all: Vec<NodeId> = d
+                .popups
+                .iter()
+                .copied()
+                .filter(|&p| ids.iter().any(|&id| d.is_ancestor(id, p)))
+                .collect();
+            for id in all {
+                let Some(data) = d.nodes[id].popup_mut() else {
+                    continue;
+                };
+                if data.dismissed {
+                    continue;
+                }
+                data.dismissed = true;
+                data.granted = None;
+                let sent = data.sent.take().is_some();
+                handlers.extend(data.on_dismiss.clone());
+                if sent {
+                    d.request(PlatformRequest::ClosePopup(popup_id(id)));
+                }
+            }
+            d.dirty.position = true;
+            d.mark_paint();
+            handlers
+        });
+        batch(|| {
+            for h in handlers {
+                h();
+            }
+        });
+    }
+
+    fn popup_configured(&mut self, id: PopupId, origin: PointI, size: SizeI) {
+        with_doc(|d| {
+            let node = popup_node(id);
+            let Some(data) = d.get_mut(node).and_then(Node::popup_mut) else {
+                return;
+            };
+            if data.dismissed {
+                return;
+            }
+            let resized = data.granted != Some(size);
+            data.origin = origin;
+            data.granted = Some(size);
+            if resized {
+                d.invalidate_layout(node);
+            }
+            d.mark_paint();
+        });
     }
 
     pub fn take_requests(&mut self) -> Vec<PlatformRequest> {
@@ -357,6 +466,10 @@ impl Ui {
                 }
             }
             WindowEvent::CloseRequested => with_doc(|d| d.request(PlatformRequest::Close)),
+            WindowEvent::PopupConfigured { id, origin, size } => {
+                self.popup_configured(id, origin, size)
+            }
+            WindowEvent::PopupDismissed(id) => self.dismiss_popups(&[popup_node(id)]),
         }
         self.sync_ime();
     }
@@ -383,7 +496,10 @@ impl Ui {
     }
 
     fn hit_test(&self, p: PointF) -> Option<NodeId> {
-        with_doc(|d| d.root.and_then(|r| hit(d, r, p)))
+        with_doc(|d| match d.popup_at(p) {
+            Some((popup, local)) => hit(d, popup, local),
+            None => d.root.and_then(|r| hit(d, r, p)),
+        })
     }
 
     fn update_hover(&mut self, p: PointF) {
@@ -528,15 +644,28 @@ impl Ui {
         };
         self.last_click = Some((time, p, button, clicks));
 
-        // Focus follows the nearest focusable ancestor; clicking elsewhere blurs.
+        // Pressing outside of the open menus closes them, and does nothing else if it was in the
+        // window. The platform leaves this to us: during a grab our surfaces get input as usual.
+        let popup = with_doc(|d| target.and_then(|t| d.popup_of(t)));
+        let outside = with_doc(|d| open_menus_outside(d, popup));
+        if !outside.is_empty() {
+            self.dismiss_popups(&outside);
+            if popup.is_none() {
+                return;
+            }
+        }
+
+        // Focus follows the nearest focusable ancestor; clicking elsewhere blurs. What opened a
+        // popup keeps the focus when pressing in it, unless there's something else to focus.
         let focus_target = target.and_then(|t| {
             with_doc(|d| {
                 d.ancestors(t)
                     .into_iter()
+                    .take_while(|id| Some(*id) != popup.and_then(|p| d.get(p)?.parent))
                     .find(|id| d.get(*id).is_some_and(|n| n.focusable && !n.disabled))
             })
         });
-        if button != PointerButton::Secondary {
+        if button != PointerButton::Secondary && (focus_target.is_some() || popup.is_none()) {
             self.set_focus(focus_target);
         }
 
@@ -746,9 +875,23 @@ impl Ui {
 
     fn begin_scroll_gesture(&mut self, p: PointF, source: ScrollSource) {
         self.ensure_layout();
-        self.gesture = self.hit_test(p).map(|target| ScrollGesture {
+        let target = self.hit_test(p).filter(|&t| {
+            // Open menus take the input.
+            with_doc(|d| {
+                let popup = d.popup_of(t);
+                popup.is_some() || open_menus_outside(d, popup).is_empty()
+            })
+        });
+        self.gesture = target.map(|target| ScrollGesture {
             position: p,
-            chain: with_doc(|d| d.ancestors(target)),
+            // Scrolling doesn't go from a popup to what is behind it.
+            chain: with_doc(|d| {
+                let mut chain = d.ancestors(target);
+                if let Some(i) = chain.iter().position(|&id| d.nodes[id].is_popup()) {
+                    chain.truncate(i + 1);
+                }
+                chain
+            }),
             scroller: None,
             source,
             shift: self.modifiers.shift,
@@ -1026,11 +1169,18 @@ impl Ui {
         let m = key.modifiers;
         match &key.key {
             Key::Named(NamedKey::Tab) if !m.ctrl && !m.alt => self.focus_next(m.shift),
-            Key::Named(NamedKey::Escape) => with_doc(|d| {
-                if d.state.selection.take().is_some() {
-                    d.mark_paint();
+            Key::Named(NamedKey::Escape) => {
+                let top = with_doc(|d| open_menus_outside(d, None).pop());
+                if let Some(top) = top {
+                    self.dismiss_popups(&[top]);
+                    return;
                 }
-            }),
+                with_doc(|d| {
+                    if d.state.selection.take().is_some() {
+                        d.mark_paint();
+                    }
+                })
+            }
             Key::Named(NamedKey::Enter | NamedKey::Space) if focused.is_some() && !key.repeat => {
                 let t = focused.unwrap();
                 let rect = with_doc(|d| d.window_rect(t).unwrap_or_default());
@@ -1414,18 +1564,36 @@ fn hit(doc: &Document, id: NodeId, p: PointF) -> Option<NodeId> {
         Some(p)
     };
     if let Some(cp) = child_p {
+        let (below, above) = doc.stacked_around(id);
+        if let Some(h) = hit_stacked(doc, above, cp) {
+            return Some(h);
+        }
         for (i, &c) in node.children.iter().enumerate().rev() {
             if node.child_bounds.get(i).is_none_or(|b| b.contains(cp))
-                && let Some(h) = hit(doc, c, cp)
+                && let Some(h) = doc
+                    .get(c)
+                    .filter(|c| !c.stacked)
+                    .and_then(|_| hit(doc, c, cp))
             {
                 return Some(h);
             }
+        }
+        if let Some(h) = hit_stacked(doc, below, cp) {
+            return Some(h);
         }
     }
     if matches!(node.kind, NodeKind::Fragment) || !node.computed.pointer_events {
         return None;
     }
     node.abs.contains(p).then_some(id)
+}
+
+fn hit_stacked(doc: &Document, nodes: &[NodeId], p: PointF) -> Option<NodeId> {
+    nodes.iter().rev().find_map(|&id| {
+        doc.get(id)
+            .filter(|n| n.subtree_bounds.contains(p))
+            .and_then(|_| hit(doc, id, p))
+    })
 }
 
 fn cursor_for(doc: &Document, target: Option<NodeId>) -> CursorIcon {
@@ -1509,6 +1677,9 @@ fn scrollbar_hit(doc: &Document, target: NodeId, p: PointF) -> Option<(NodeId, b
     let grab_width = doc.scale.pxf(12.0);
     for id in doc.ancestors(target) {
         let n = doc.get(id)?;
+        if n.is_popup() {
+            return None;
+        }
         let offset = doc.space_offset(n);
         let pad = n.padding_abs().translate(offset.x, offset.y);
         if n.computed.overflow_y == Overflow::Scroll
@@ -1549,6 +1720,182 @@ fn scrollbar_drag(doc: &mut Document, id: NodeId, vertical: bool, grab: f32, p: 
         n.scroll.x = (((p.x - pad.x as f32) * ratio - grab).round() as i32).clamp(0, max);
     }
     doc.mark_scrolled(id);
+}
+
+/// Scrolls the ancestors of `id` until it is in view, as far as they can.
+fn scroll_into_view(doc: &mut Document, id: NodeId) {
+    let Some(mut rect) = doc.window_rect(id) else {
+        return;
+    };
+    let ancestors = doc.ancestors(id);
+    for &a in &ancestors[1..] {
+        let Some(n) = doc.nodes.get(a) else {
+            return;
+        };
+        if n.is_popup() {
+            return;
+        }
+        let offset = doc.space_offset(n);
+        let pad = n.padding_abs().translate(offset.x, offset.y);
+        let (c, content) = (&n.computed, n.content_size);
+        let wanted = |lo: i32, hi: i32, view_lo: i32, view_hi: i32| {
+            if lo < view_lo {
+                lo - view_lo
+            } else if hi > view_hi {
+                (hi - view_hi).min(lo - view_lo)
+            } else {
+                0
+            }
+        };
+        let mut scroll = n.scroll;
+        if c.overflow_y == Overflow::Scroll {
+            let d = wanted(rect.y, rect.bottom(), pad.y, pad.bottom());
+            scroll.y = (scroll.y + d).clamp(0, (content.height - pad.height).max(0));
+        }
+        if c.overflow_x == Overflow::Scroll {
+            let d = wanted(rect.x, rect.right(), pad.x, pad.right());
+            scroll.x = (scroll.x + d).clamp(0, (content.width - pad.width).max(0));
+        }
+        if scroll != n.scroll {
+            rect = rect.translate(n.scroll.x - scroll.x, n.scroll.y - scroll.y);
+            doc.nodes[a].scroll = scroll;
+            doc.mark_scrolled(a);
+        }
+    }
+}
+
+/// The menus on the screen or about to be, except `inside` and those it is attached to. What
+/// is attached to others comes after them.
+fn open_menus_outside(doc: &Document, inside: Option<NodeId>) -> Vec<NodeId> {
+    doc.popups
+        .iter()
+        .copied()
+        .filter(|&id| {
+            doc.nodes[id]
+                .popup()
+                .is_some_and(|p| p.kind == PopupKind::Menu && p.sent.is_some() && !p.dismissed)
+                && inside.is_none_or(|i| !doc.is_ancestor(id, i))
+        })
+        .collect()
+}
+
+/// What the platform should know about a popup, if it should be there. A popup waits for the
+/// one it is attached to.
+fn popup_params(doc: &Document, id: NodeId) -> Option<PopupParams> {
+    let node = doc.nodes.get(id)?;
+    let data = node.popup()?;
+    if !node.visible || data.dismissed || node.abs.is_empty() {
+        return None;
+    }
+    // A grab has to go on the topmost grabbing popup, or on the window.
+    let mut parent = node.parent.and_then(|p| doc.popup_of(p));
+    while let Some(p) = parent.filter(|_| data.kind == PopupKind::Menu) {
+        if doc.nodes[p].popup()?.kind == PopupKind::Menu {
+            break;
+        }
+        parent = doc.nodes[p].parent.and_then(|q| doc.popup_of(q));
+    }
+    if let Some(p) = parent
+        && !doc.nodes[p].popup()?.shown()
+    {
+        return None;
+    }
+    let scale = doc.scale;
+    let window = RectI::new(0, 0, doc.viewport.width, doc.viewport.height);
+    let anchor = data.anchor_rect.or_else(|| {
+        let a = data
+            .anchor
+            .and_then(|a| a.id_untracked())
+            .or_else(|| doc.anchor_of(id))?;
+        let on_popup = doc.popup_of(a).is_some();
+        let visible = doc.visible_window_rect(a)?;
+        Some(if on_popup {
+            visible
+        } else {
+            visible.intersect(&window)
+        })
+    })?;
+    let anchor = RectI::new(
+        anchor.x,
+        anchor.y,
+        anchor.width.max(1),
+        anchor.height.max(1),
+    );
+    let surface = data.surface;
+    let wanted = SizeI::new(
+        scale.logical_ceil(data.natural.width).max(1),
+        scale.logical_ceil(data.natural.height).max(1),
+    );
+    let position = (data.kind == PopupKind::Bubble).then(|| {
+        let at = place_in_window(
+            anchor,
+            data.placement,
+            scale.px(data.gap as f32),
+            node.abs.size(),
+            window,
+        );
+        PointI::new(
+            scale.logical_floor(at.x) - surface.geometry.x,
+            scale.logical_floor(at.y) - surface.geometry.y,
+        )
+    });
+    Some(PopupParams {
+        id: popup_id(id),
+        parent: parent.map(popup_id),
+        kind: data.kind,
+        placement: data.placement,
+        anchor,
+        gap: data.gap,
+        wanted,
+        buffer: surface.buffer,
+        logical: surface.logical,
+        geometry: surface.geometry,
+        position,
+    })
+}
+
+/// Where a box goes next to `anchor`: on the other side if it doesn't fit, then moved along the
+/// edges as far as it takes to stay in `window`.
+fn place_in_window(
+    anchor: RectI,
+    placement: Placement,
+    gap: i32,
+    size: SizeI,
+    window: RectI,
+) -> PointI {
+    let below = anchor.bottom() + gap;
+    let above = anchor.y - gap - size.height;
+    let right = anchor.right() + gap;
+    let left = anchor.x - gap - size.width;
+    let start_x = anchor.x;
+    let end_x = anchor.right() - size.width;
+    let (x, y) = match placement {
+        Placement::BelowStart => (start_x, below),
+        Placement::BelowEnd => (end_x, below),
+        Placement::AboveStart => (start_x, above),
+        Placement::AboveEnd => (end_x, above),
+        Placement::RightStart => (right, anchor.y),
+        Placement::LeftStart => (left, anchor.y),
+    };
+    let (x, y) = match placement {
+        Placement::BelowStart | Placement::BelowEnd
+            if y + size.height > window.bottom() && above >= window.y =>
+        {
+            (x, above)
+        }
+        Placement::AboveStart | Placement::AboveEnd
+            if y < window.y && below + size.height <= window.bottom() =>
+        {
+            (x, below)
+        }
+        Placement::RightStart if x + size.width > window.right() && left >= window.x => (left, y),
+        Placement::LeftStart if x < window.x && right + size.width <= window.right() => (right, y),
+        _ => (x, y),
+    };
+    PointI::new(
+        x.min(window.right() - size.width).max(window.x),
+        y.min(window.bottom() - size.height).max(window.y),
+    )
 }
 
 /// Adjusts the internal scroll of edits so their caret stays visible.

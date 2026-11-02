@@ -186,6 +186,30 @@ pub trait Styled: Sized {
         })
     }
 
+    /// A large elevation shadow, for what floats above the page.
+    fn shadow_lg(self) -> Self {
+        self.shadows(vec![
+            BoxShadow {
+                offset_y: 8.0,
+                blur: 24.0,
+                color: Color::from_rgba(0x00000033),
+                ..Default::default()
+            },
+            BoxShadow {
+                offset_y: 2.0,
+                blur: 6.0,
+                color: Color::from_rgba(0x0000001f),
+                ..Default::default()
+            },
+        ])
+    }
+
+    /// Paints above or below what comes in tree order, and makes the node a stacking context.
+    fn z_index(mut self, z: i32) -> Self {
+        self.style_mut().z_index = Some(Some(z));
+        self
+    }
+
     fn overflow_scroll(mut self) -> Self {
         let style = self.style_mut();
         style.overflow_x = Some(Overflow::Scroll);

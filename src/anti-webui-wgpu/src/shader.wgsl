@@ -46,27 +46,25 @@ fn sd_rounded_box(p: vec2<f32>, half: vec2<f32>, radii: vec4<f32>) -> f32 {
     return min(max(q.x, q.y), 0.0) + length(max(q, vec2<f32>(0.0))) - r;
 }
 
-// Abramowitz–Stegun approximation of erf.
-fn erf(x: f32) -> f32 {
-    let s = sign(x);
-    let a = abs(x);
-    let t = 1.0 / (1.0 + 0.3275911 * a);
-    let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-a * a);
-    return s * y;
+// Coverage of a pixel by a rounded rectangle, anti-aliased.
+fn rrect_coverage(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>) -> f32 {
+    let half = rect.zw * 0.5;
+    return clamp(0.5 - sd_rounded_box(p - (rect.xy + half), half, radii), 0.0, 1.0);
 }
 
 // ---------------------------------------------------------------------------------------------
-// Quads and shadows
+// Quads and shadows. They share a pipeline so that a page of boxes with shadows is one draw call.
 
 struct QuadInstance {
-    @location(0) rect: vec4<f32>,
-    @location(1) background: vec4<f32>,
-    @location(2) border_color: vec4<f32>,
-    @location(3) border: vec4<f32>,   // top, right, bottom, left
-    @location(4) radii: vec4<f32>,    // tl, tr, br, bl
+    @location(0) rect: vec4<f32>,         // what this instance draws
+    @location(1) background: vec4<f32>,   // shadows: the color
+    @location(2) border_color: vec4<f32>, // shadows: the shape that is blurred
+    @location(3) border: vec4<f32>,       // top, right, bottom, left; shadows: the cut
+    @location(4) radii: vec4<f32>,        // tl, tr, br, bl; shadows: of the shape
     @location(5) clip: vec4<f32>,
-    @location(6) params: vec4<f32>,   // x: kind (0 quad, 1 shadow), y: blur
-    @location(7) clip_radii: vec4<f32>,
+    @location(6) clip_radii: vec4<f32>,
+    @location(7) cut_radii: vec4<f32>,    // shadows only
+    @location(8) params: vec2<f32>,       // x: 0 quad, 1 outer shadow, 2 inset shadow; y: sigma
 }
 
 struct QuadOut {
@@ -78,20 +76,15 @@ struct QuadOut {
     @location(4) @interpolate(flat) border: vec4<f32>,
     @location(5) @interpolate(flat) radii: vec4<f32>,
     @location(6) @interpolate(flat) clip: vec4<f32>,
-    @location(7) @interpolate(flat) params: vec4<f32>,
-    @location(8) @interpolate(flat) clip_radii: vec4<f32>,
+    @location(7) @interpolate(flat) clip_radii: vec4<f32>,
+    @location(8) @interpolate(flat) cut_radii: vec4<f32>,
+    @location(9) @interpolate(flat) params: vec2<f32>,
 }
 
 @vertex
 fn vs_quad(@builtin(vertex_index) vi: u32, inst: QuadInstance) -> QuadOut {
     var out: QuadOut;
-    var rect = inst.rect;
-    if (inst.params.x > 0.5) {
-        // Shadows extend beyond the box by three standard deviations.
-        let grow = inst.params.y * 1.5 + 1.0;
-        rect = vec4<f32>(rect.xy - vec2<f32>(grow), rect.zw + vec2<f32>(grow * 2.0));
-    }
-    let p = rect.xy + corner(vi) * rect.zw;
+    let p = inst.rect.xy + corner(vi) * inst.rect.zw;
     out.position = to_clip(p);
     out.local = p;
     out.rect = inst.rect;
@@ -100,8 +93,9 @@ fn vs_quad(@builtin(vertex_index) vi: u32, inst: QuadInstance) -> QuadOut {
     out.border = inst.border;
     out.radii = inst.radii;
     out.clip = inst.clip;
-    out.params = inst.params;
     out.clip_radii = inst.clip_radii;
+    out.cut_radii = inst.cut_radii;
+    out.params = inst.params;
     return out;
 }
 
@@ -111,16 +105,21 @@ fn fs_quad(in: QuadOut) -> @location(0) vec4<f32> {
     if (clip_cov <= 0.0) {
         discard;
     }
+    if (in.params.x > 0.5) {
+        let cut = rrect_coverage(in.local, in.border, in.cut_radii);
+        let shape = blurred_coverage(in.local, in.border_color, in.radii, in.params.y);
+        var a: f32;
+        if (in.params.x > 1.5) {
+            a = (1.0 - shape) * cut;
+        } else {
+            a = shape * (1.0 - cut);
+        }
+        return in.background * (a * clip_cov);
+    }
+
     let half = in.rect.zw * 0.5;
     let center = in.rect.xy + half;
     let p = in.local - center;
-
-    if (in.params.x > 0.5) {
-        let sigma = max(in.params.y * 0.5, 0.0001);
-        let d = sd_rounded_box(p, half, in.radii);
-        let a = 0.5 * (1.0 - erf(d / (sigma * 1.41421356)));
-        return in.background * (a * clip_cov);
-    }
 
     let outer = sd_rounded_box(p, half, in.radii);
     let outer_cov = clamp(0.5 - outer, 0.0, 1.0);
@@ -141,6 +140,61 @@ fn fs_quad(in: QuadOut) -> @location(0) vec4<f32> {
         color = in.border_color * ring + color * (1.0 - in.border_color.a * ring);
     }
     return color * clip_cov;
+}
+
+// ---------------------------------------------------------------------------------------------
+// A rounded rectangle blurred by a Gaussian, after Evan Wallace's "Fast Rounded Rectangle
+// Shadows": exact along x, four samples along y. A shadow's instances draw the area around what
+// its cut hides (see docs/design/09-shadows-stacking-popups.md).
+
+fn erf2(v: vec2<f32>) -> vec2<f32> {
+    let s = sign(v);
+    let a = abs(v);
+    var x = 1.0 + (0.278393 + (0.230389 + 0.078108 * (a * a)) * a) * a;
+    x = x * x;
+    return s - s / (x * x);
+}
+
+fn gaussian(x: f32, sigma: f32) -> f32 {
+    return exp(-(x * x) / (2.0 * sigma * sigma)) / (2.5066282746 * sigma);
+}
+
+// How much of the row `y` the shape covers at `x` after blurring along x.
+fn blurred_row(x: f32, y: f32, sigma: f32, r: f32, half: vec2<f32>) -> f32 {
+    let delta = min(half.y - r - abs(y), 0.0);
+    let curved = half.x - r + sqrt(max(0.0, r * r - delta * delta));
+    let integral = 0.5 + 0.5 * erf2((vec2<f32>(x) + vec2<f32>(-curved, curved)) * (0.70710678 / sigma));
+    return integral.y - integral.x;
+}
+
+fn blurred_coverage(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>, sigma: f32) -> f32 {
+    if (rect.z <= 0.0 || rect.w <= 0.0) {
+        return 0.0;
+    }
+    if (sigma < 0.05) {
+        return rrect_coverage(p, rect, radii);
+    }
+    let half = rect.zw * 0.5;
+    let q = p - rect.xy - half;
+    var r: f32;
+    if (q.x < 0.0) {
+        r = select(radii.w, radii.x, q.y < 0.0);
+    } else {
+        r = select(radii.z, radii.y, q.y < 0.0);
+    }
+    r = min(r, min(half.x, half.y));
+    let low = q.y - half.y;
+    let high = q.y + half.y;
+    let start = clamp(-3.0 * sigma, low, high);
+    let end = clamp(3.0 * sigma, low, high);
+    let step = (end - start) / 4.0;
+    var y = start + step * 0.5;
+    var value = 0.0;
+    for (var i = 0; i < 4; i++) {
+        value += blurred_row(q.x, q.y - y, sigma, r, half) * gaussian(y, sigma) * step;
+        y += step;
+    }
+    return clamp(value, 0.0, 1.0);
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -4,6 +4,8 @@
 //! extended further with the usual methods.
 
 use anti_webui_core::prelude::*;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// Colors shared by the default widget styles.
 pub mod theme {
@@ -236,6 +238,146 @@ pub fn text_field(value: Signal<String>) -> TextInput {
 /// A multi-line text field bound to `value`.
 pub fn text_area_field(value: Signal<String>) -> TextInput {
     field_style(text_area().value(value))
+}
+
+/// A pull-down list bound to `value`. Opens where it is pressed, like a browser's `<select>`.
+pub fn select<T: Clone + PartialEq + 'static>(value: Signal<T>, options: Vec<(T, String)>) -> Div {
+    let options = Rc::new(options);
+    let open = signal(false);
+    let highlighted = signal(0usize);
+    let rows = Rc::new(RefCell::new(Vec::<NodeRef>::new()));
+    let current = {
+        let options = options.clone();
+        move || {
+            let v = value.get_untracked();
+            options.iter().position(|(o, _)| *o == v).unwrap_or(0)
+        }
+    };
+    let show_list = {
+        let current = current.clone();
+        move || {
+            highlighted.set(current());
+            open.set(true);
+        }
+    };
+    let keys = {
+        let (options, rows) = (options.clone(), rows.clone());
+        let show_list = show_list.clone();
+        move |e: &KeyboardEvent| {
+            let last = options.len().saturating_sub(1);
+            let is_open = open.get_untracked();
+            let moved = match &e.key {
+                Key::Named(NamedKey::Enter | NamedKey::Space) => {
+                    e.prevent_default();
+                    if is_open {
+                        if let Some((v, _)) = options.get(highlighted.get_untracked()) {
+                            value.set(v.clone());
+                        }
+                        open.set(false);
+                    } else {
+                        show_list();
+                    }
+                    return;
+                }
+                Key::Named(NamedKey::Tab) => {
+                    open.set(false);
+                    return;
+                }
+                Key::Named(NamedKey::ArrowDown) if !is_open => {
+                    e.prevent_default();
+                    show_list();
+                    return;
+                }
+                Key::Named(NamedKey::ArrowDown) => (highlighted.get_untracked() + 1).min(last),
+                Key::Named(NamedKey::ArrowUp) => highlighted.get_untracked().saturating_sub(1),
+                Key::Named(NamedKey::Home) => 0,
+                Key::Named(NamedKey::End) => last,
+                _ => return,
+            };
+            e.prevent_default();
+            if is_open {
+                highlighted.set(moved);
+                if let Some(row) = rows.borrow().get(moved) {
+                    row.scroll_into_view();
+                }
+            }
+        }
+    };
+    let label = {
+        let options = options.clone();
+        move || {
+            let v = value.get();
+            options
+                .iter()
+                .find(|(o, _)| *o == v)
+                .map_or(String::new(), |(_, label)| label.clone())
+        }
+    };
+    let list = move || {
+        let refs: Vec<NodeRef> = options.iter().map(|_| node_ref()).collect();
+        *rows.borrow_mut() = refs.clone();
+        let items = options.iter().enumerate().map(|(i, (v, name))| {
+            let v = v.clone();
+            div()
+                .px(8.0)
+                .py(5.0)
+                .rounded(4.0)
+                .cursor(CursorIcon::Pointer)
+                .node_ref(refs[i])
+                .dyn_style(move |s| {
+                    if highlighted.get() == i {
+                        s.bg(theme::ACCENT).text_color(Color::WHITE)
+                    } else {
+                        s
+                    }
+                })
+                .on_hover(move |inside| {
+                    if inside {
+                        highlighted.set(i);
+                    }
+                })
+                .on_click(move |_| {
+                    value.set(v.clone());
+                    open.set(false);
+                })
+                .child(text(name.clone()))
+        });
+        let list = popup()
+            .gap(4)
+            .match_anchor_width()
+            .on_dismiss(move || open.set(false))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .p(4.0)
+                    .max_h(280.0)
+                    .rounded(8.0)
+                    .border(1.0)
+                    .border_color(theme::BORDER)
+                    .bg(theme::SURFACE)
+                    .shadow_lg()
+                    .overflow_y_scroll()
+                    .children(items.collect::<Vec<_>>()),
+            );
+        if let Some(row) = refs.get(highlighted.get_untracked()) {
+            row.scroll_into_view();
+        }
+        list
+    };
+    div()
+        .flex()
+        .flex_col()
+        .child(
+            button(label)
+                .justify_between()
+                .gap(12.0)
+                .bg(theme::SURFACE)
+                .on_pointer_down(move |_| show_list())
+                .on_key_down(keys)
+                .child(text("▾").text_color(theme::TEXT_MUTED)),
+        )
+        .child(show(move || open.get(), list))
 }
 
 /// A vertically scrolling container.

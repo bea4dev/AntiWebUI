@@ -6,7 +6,7 @@
 use crate::geometry::{PointI, RectI, Scale, SizeI};
 use crate::scene::Clip;
 use crate::text::{ShapeStyle, TextSystem};
-use crate::tree::{Document, Node, NodeId, NodeKind};
+use crate::tree::{Document, Node, NodeId, NodeKind, PopupSurface};
 use anti_webui_style::{
     AlignItems, ComputedStyle, Display, Edges, JustifyContent, Length, Overflow, Position,
 };
@@ -291,6 +291,10 @@ fn resolve_node(
     if node.resolved != resolved || !same_layout(&node.computed, &computed) {
         out.layout.push(id);
     }
+    let (stacked, context) = stacking_role(&node.kind, &computed, doc.root == Some(id));
+    let stacking_changed = stacked != node.stacked
+        || context != node.stacking_context
+        || (stacked && node.computed.z_index != computed.z_index);
     let old = &node.computed;
     if old.shadows != computed.shadows
         || old.outline_width != computed.outline_width
@@ -307,12 +311,77 @@ fn resolve_node(
     node.style_dirty = false;
     node.resolved = resolved;
     node.computed = computed;
+    if stacking_changed {
+        node.stacked = stacked;
+        node.stacking_context = context;
+        doc.stacking_dirty = true;
+        if stacked {
+            doc.stacked.insert(id);
+        } else {
+            doc.stacked.remove(&id);
+        }
+    }
     if let Some(children) = children {
         let computed = doc.nodes[id].computed.clone();
         for c in children {
             resolve_node(doc, c, &computed, all, out);
         }
     }
+}
+
+/// Whether a node is painted from a stacking context's list, and whether it is a stacking context.
+/// See `docs/design/09-shadows-stacking-popups.md`.
+fn stacking_role(kind: &NodeKind, c: &ComputedStyle, root: bool) -> (bool, bool) {
+    if matches!(kind, NodeKind::Fragment) || c.display == Display::Contents {
+        return (false, root);
+    }
+    let stacked = c.z_index.is_some() || c.position == Position::Absolute;
+    let context = root
+        || matches!(kind, NodeKind::Popup(_))
+        || c.z_index.is_some()
+        || c.opacity < 1.0
+        || c.overflow_x == Overflow::Scroll
+        || c.overflow_y == Overflow::Scroll;
+    (stacked, context)
+}
+
+/// Builds the paint order of the stacked nodes, which needs their document order.
+pub fn build_stacking(doc: &mut Document) {
+    doc.stacking_dirty = false;
+    let mut lists = std::mem::take(&mut doc.stacking);
+    lists.clear();
+    for &id in &doc.stacked {
+        // The first context above it; nodes that aren't in the document don't get there.
+        let mut cur = doc.nodes.get(id).and_then(|n| n.parent);
+        let mut context = None;
+        while let Some(c) = cur {
+            let Some(n) = doc.nodes.get(c) else {
+                break;
+            };
+            if context.is_none() && n.stacking_context {
+                context = Some(c);
+            }
+            cur = n.parent;
+            if cur.is_none() && doc.root != Some(c) {
+                context = None;
+            }
+        }
+        if let Some(context) = context {
+            lists.entry(context).or_default().nodes.push(id);
+        }
+    }
+    for list in lists.values_mut() {
+        let key = |id: &NodeId| {
+            let n = &doc.nodes[*id];
+            (n.computed.z_index.unwrap_or(0), n.doc_order)
+        };
+        list.nodes.sort_unstable_by_key(key);
+        list.negative = list.nodes.partition_point(|id| key(id).0 < 0);
+    }
+    doc.stacking = lists;
+    let mut popups = std::mem::take(&mut doc.popups);
+    popups.sort_by_cached_key(|id| doc.ancestors(*id).len());
+    doc.popups = popups;
 }
 
 /// Makes sure the bounds of `id` and its ancestors contain what `id` paints now. They only grow:
@@ -336,7 +405,7 @@ fn grow_bounds(doc: &mut Document, id: NodeId) {
         {
             *b = bounds;
         }
-        if n.scroll_root {
+        if n.scroll_root || n.is_popup() {
             return;
         }
         let clip = child_clip(n, scale, n.clip_shape());
@@ -367,7 +436,7 @@ fn own_bounds(node: &Node, scale: Scale) -> RectI {
     }
     let c = &node.computed;
     let mut bounds = node.abs;
-    for s in &c.shadows {
+    for s in c.shadows.iter().filter(|s| !s.inset) {
         let grow = scale.px(s.spread) + (scale.pxf(s.blur) * 1.5 + 1.0).ceil() as i32;
         let rect = node
             .abs
@@ -402,6 +471,9 @@ pub fn layout_document(doc: &mut Document, ts: &mut TextSystem) {
     let size = (Some(viewport.width), Some(viewport.height));
     engine.compute(root, size, Some(viewport.width), size, true);
     engine.doc.nodes[root].rect = RectI::new(0, 0, viewport.width, viewport.height);
+    for id in engine.doc.popups.clone() {
+        engine.layout_popup(id, size);
+    }
 }
 
 /// The clip `node` imposes on its children, given the clip that applies to `node` itself.
@@ -444,6 +516,79 @@ pub fn position_document(doc: &mut Document) {
     let Some(root) = doc.root else { return };
     let mut order = 0u32;
     position_node(doc, root, PointI::default(), Clip::NONE, None, &mut order);
+    for id in doc.popups.clone() {
+        position_popup(doc, id, &mut order);
+    }
+}
+
+/// What a subtree paints, for sizing a surface. Unlike `subtree_bounds`, which culling may take as
+/// a generous estimate, this has no room for glyphs sticking out of their lines: every extra pixel
+/// is one the compositor has to blend.
+fn painted_extent(doc: &Document, id: NodeId) -> RectI {
+    let Some(n) = doc.nodes.get(id).filter(|n| n.visible) else {
+        return RectI::default();
+    };
+    if let NodeKind::Text(t) = &n.kind {
+        let size = t.layout.size();
+        return n
+            .abs
+            .union(&RectI::new(n.abs.x, n.abs.y, size.width, size.height));
+    }
+    let own = own_bounds(n, doc.scale);
+    if n.computed.overflow_x != Overflow::Visible || n.computed.overflow_y != Overflow::Visible {
+        return own;
+    }
+    n.children
+        .iter()
+        .filter(|c| doc.nodes.get(**c).is_some_and(|c| !c.is_popup()))
+        .fold(own, |bounds, c| bounds.union(&painted_extent(doc, *c)))
+}
+
+/// Positions a popup in its surface, leaving room for what sticks out of its box, and works out
+/// the surface.
+fn position_popup(doc: &mut Document, id: NodeId, order: &mut u32) {
+    let parent_visible = doc.nodes[id]
+        .parent
+        .is_some_and(|p| doc.nodes.get(p).is_some_and(|n| n.visible));
+    let open =
+        parent_visible && doc.nodes[id].popup().is_some_and(|d| !d.dismissed) && doc.attached(id);
+    if !open {
+        hide_subtree(doc, id);
+        return;
+    }
+    let scale = doc.scale;
+    let start = *order;
+    position_node(doc, id, PointI::default(), Clip::NONE, Some(id), order);
+    let node = &mut doc.nodes[id];
+    let abs = node.abs;
+    let bounds = painted_extent(doc, id).union(&abs);
+    let node = &mut doc.nodes[id];
+    let geometry = RectI::new(
+        scale.logical_ceil(abs.x - bounds.x),
+        scale.logical_ceil(abs.y - bounds.y),
+        scale.logical_ceil(abs.width).max(1),
+        scale.logical_ceil(abs.height).max(1),
+    );
+    let logical = SizeI::new(
+        geometry.right() + scale.logical_ceil(bounds.right() - abs.right()),
+        geometry.bottom() + scale.logical_ceil(bounds.bottom() - abs.bottom()),
+    );
+    let surface = PopupSurface {
+        buffer: SizeI::new(
+            scale.px(logical.width as f32),
+            scale.px(logical.height as f32),
+        ),
+        logical,
+        geometry,
+    };
+    let at = PointI::new(scale.px(geometry.x as f32), scale.px(geometry.y as f32));
+    node.popup_mut().unwrap().surface = surface;
+    if abs.origin() != at {
+        node.rect.x = at.x;
+        node.rect.y = at.y;
+        *order = start;
+        position_node(doc, id, PointI::default(), Clip::NONE, Some(id), order);
+    }
 }
 
 fn position_node(
@@ -498,7 +643,10 @@ fn position_node(
     } else {
         0
     };
-    node.scroll_root = space.is_none() && overflows(node);
+    // Layers don't nest; a popup's surface is like a window to them.
+    let scroller = overflows(node);
+    let scroll_root = scroller && space.is_none_or(|s| doc.nodes[s].is_popup());
+    doc.nodes[id].scroll_root = scroll_root;
     position_children(doc, id, order);
     let node = &mut doc.nodes[id];
     node.subtree_nodes = *order - first;
@@ -523,10 +671,15 @@ fn position_children(doc: &mut Document, id: NodeId, order: &mut u32) {
     bounds.clear();
     let mut union = RectI::default();
     for &c in &children {
-        position_node(doc, c, origin, clip, space, order);
+        // A popup is on another surface, positioned on its own.
+        let popup = doc.nodes.get(c).is_some_and(Node::is_popup);
+        if !popup {
+            position_node(doc, c, origin, clip, space, order);
+        }
         let b = doc
             .nodes
             .get(c)
+            .filter(|_| !popup)
             .map_or(RectI::default(), |n| n.subtree_bounds);
         bounds.push(b);
         union = union.union(&b);
@@ -609,6 +762,9 @@ impl Engine<'_> {
             let Some(n) = self.doc.nodes.get(c) else {
                 continue;
             };
+            if n.is_popup() {
+                continue;
+            }
             if matches!(n.kind, NodeKind::Fragment) || n.computed.display == Display::Contents {
                 stack.extend(n.children.iter().rev());
                 continue;
@@ -1283,6 +1439,34 @@ impl Engine<'_> {
         self.doc.nodes[id].resolved = saved;
         self.doc.nodes[id].measure_cache.clear();
         v
+    }
+
+    /// Lays out a popup at the size it would like, as far as the platform grants it.
+    fn layout_popup(&mut self, id: NodeId, window: (Option<i32>, Option<i32>)) {
+        let natural = self.compute(id, (None, None), None, window, false);
+        let doc = &*self.doc;
+        let Some(data) = doc.nodes[id].popup() else {
+            return;
+        };
+        let anchor = data
+            .anchor
+            .and_then(|a| a.id_untracked())
+            .or_else(|| doc.anchor_of(id))
+            .and_then(|a| doc.nodes.get(a));
+        let width = match anchor {
+            Some(a) if data.match_anchor_width => natural.width.max(a.rect.width),
+            _ => natural.width,
+        };
+        let natural = SizeI::new(width, natural.height);
+        let granted = data.granted.map_or(natural, |g| {
+            SizeI::new(
+                natural.width.min(self.scale.px(g.width as f32)),
+                natural.height.min(self.scale.px(g.height as f32)),
+            )
+        });
+        self.doc.nodes[id].popup_mut().unwrap().natural = natural;
+        let known = (Some(granted.width), Some(granted.height));
+        self.compute(id, known, Some(granted.width), window, true);
     }
 
     fn layout_absolute(&mut self, id: NodeId, size: SizeI) {

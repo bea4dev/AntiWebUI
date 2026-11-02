@@ -145,6 +145,29 @@ impl Gpu {
         Ok((gpu, window))
     }
 
+    /// Creates a surface for another window, like a popup, with a renderer of its own.
+    ///
+    /// # Safety
+    /// The display and window handles must stay valid until the returned object is dropped.
+    pub unsafe fn add_window(
+        &self,
+        display: RawDisplayHandle,
+        window: RawWindowHandle,
+        width: u32,
+        height: u32,
+    ) -> Result<WindowRenderer, GpuError> {
+        // SAFETY: forwarded to the caller.
+        let surface = unsafe {
+            self.instance
+                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                    raw_display_handle: Some(display),
+                    raw_window_handle: window,
+                })
+        }
+        .map_err(GpuError::Surface)?;
+        Ok(self.configure_window(surface, width, height))
+    }
+
     /// Creates a GPU context without a window, for offscreen rendering.
     pub fn headless() -> Result<Gpu, GpuError> {
         let instance =
@@ -187,11 +210,14 @@ impl Gpu {
         } else {
             wgpu::PresentMode::Fifo
         };
-        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
-            wgpu::CompositeAlphaMode::Opaque
-        } else {
-            caps.alpha_modes[0]
-        };
+        // Popups have transparent corners and shadows; the window says it is opaque by other means.
+        let alpha_mode = [
+            wgpu::CompositeAlphaMode::PreMultiplied,
+            wgpu::CompositeAlphaMode::Opaque,
+        ]
+        .into_iter()
+        .find(|m| caps.alpha_modes.contains(m))
+        .unwrap_or(caps.alpha_modes[0]);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,

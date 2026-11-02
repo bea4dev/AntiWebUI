@@ -2,10 +2,11 @@
 
 use crate::geometry::{PointI, RectI};
 use crate::layout::child_clip;
+use crate::platform::PopupId;
 use crate::scene::{ChunkKey, Clip, Glyph, GlyphRun, Primitive, Quad, Scene, ScrollLayer, Shadow};
 use crate::text::selection::node_range;
 use crate::text::{Brush, TextLayout};
-use crate::tree::{Document, Node, NodeId, NodeKind};
+use crate::tree::{Document, Node, NodeId, NodeKind, popup_id};
 use anti_webui_style::{Color, Overflow};
 use parley::PositionedLayoutItem;
 use slotmap::Key;
@@ -18,32 +19,88 @@ pub const CARET_BLINK: Duration = Duration::from_millis(530);
 /// Width of scrollbar thumbs in logical pixels.
 const SCROLLBAR_WIDTH: f32 = 6.0;
 
-pub fn paint_document(doc: &mut Document, now: Instant) -> Scene {
+/// A frame: what to show in the window and in each popup on the screen.
+#[derive(Debug, Default)]
+pub struct Frame {
+    pub window: Scene,
+    pub popups: Vec<(PopupId, Scene)>,
+}
+
+pub fn paint_document(doc: &mut Document, now: Instant) -> Frame {
+    let mut old_layers = std::mem::take(&mut doc.layer_contents);
+    let mut new_layers = HashMap::new();
+    let doc_ref = &*doc;
+    let window = doc_ref.root.map(|root| {
+        let size = (doc_ref.viewport.width, doc_ref.viewport.height);
+        paint_root(
+            doc_ref,
+            root,
+            size,
+            Color::WHITE,
+            now,
+            &mut old_layers,
+            &mut new_layers,
+        )
+    });
+    let popups = doc_ref
+        .popups
+        .iter()
+        .filter_map(|&id| {
+            let data = doc_ref.nodes[id].popup().filter(|d| d.shown())?;
+            let size = (data.surface.buffer.width, data.surface.buffer.height);
+            let scene = paint_root(
+                doc_ref,
+                id,
+                size,
+                Color::TRANSPARENT,
+                now,
+                &mut old_layers,
+                &mut new_layers,
+            );
+            Some((popup_id(id), scene))
+        })
+        .collect();
+    doc.layer_contents = new_layers;
+    Frame {
+        window: window.unwrap_or_default(),
+        popups,
+    }
+}
+
+fn paint_root(
+    doc: &Document,
+    root: NodeId,
+    size: (i32, i32),
+    clear: Color,
+    now: Instant,
+    old_layers: &mut HashMap<NodeId, (Arc<Scene>, RectI)>,
+    new_layers: &mut HashMap<NodeId, (Arc<Scene>, RectI)>,
+) -> Scene {
     let mut scene = Scene {
-        width: doc.viewport.width.max(0) as u32,
-        height: doc.viewport.height.max(0) as u32,
-        clear: Color::WHITE,
+        width: size.0.max(0) as u32,
+        height: size.1.max(0) as u32,
+        clear,
         primitives: Vec::new(),
         chunks: Vec::new(),
     };
-    let old_layers = std::mem::take(&mut doc.layer_contents);
-    let doc_ref = &*doc;
     let screen = RectI::new(0, 0, scene.width as i32, scene.height as i32);
     let mut painter = Painter {
-        doc: doc_ref,
+        doc,
         scene: &mut scene,
         now,
         screen,
-        old_layers,
-        new_layers: HashMap::new(),
-        reuse_layers: !doc_ref.dirty.content,
+        old_layers: std::mem::take(old_layers),
+        new_layers: std::mem::take(new_layers),
+        reuse_layers: !doc.dirty.content,
         cull: true,
     };
-    if let Some(root) = doc_ref.root {
+    if doc.nodes[root].is_popup() {
+        painter.contents(root, 1.0, screen);
+    } else {
         painter.node(root, 1.0, screen);
     }
-    let new_layers = painter.new_layers;
-    doc.layer_contents = new_layers;
+    *old_layers = painter.old_layers;
+    *new_layers = painter.new_layers;
     scene
 }
 
@@ -159,7 +216,7 @@ impl Painter<'_> {
                 view.height + 2 * h,
             );
             let outer = std::mem::take(self.scene);
-            self.children(node, opacity, covers);
+            self.contents(id, opacity, covers);
             (Arc::new(std::mem::replace(self.scene, outer)), covers)
         });
         self.new_layers.insert(id, (content.clone(), covers));
@@ -181,8 +238,39 @@ impl Painter<'_> {
         }
     }
 
+    /// Paints what is above the node's background: its children and, for a stacking context, the
+    /// stacked descendants around them.
+    fn contents(&mut self, id: NodeId, opacity: f32, cull: RectI) {
+        let doc = self.doc;
+        let (below, above) = doc.stacked_around(id);
+        self.stacked(below, opacity, cull);
+        self.children(&doc.nodes[id], opacity, cull);
+        self.stacked(above, opacity, cull);
+    }
+
+    /// A stacked node has only 1 for opacity between it and its stacking context, which is where
+    /// `opacity` comes from.
+    fn stacked(&mut self, nodes: &[NodeId], opacity: f32, cull: RectI) {
+        let doc = self.doc;
+        for &id in nodes {
+            let Some(n) = doc.nodes.get(id) else {
+                continue;
+            };
+            let cull = cull.intersect(&n.clip);
+            if !self.cull || n.subtree_bounds.intersects(&cull) {
+                self.node_contents(id, opacity, cull);
+            }
+        }
+    }
+
     /// `cull` is the rectangle worth painting, in the same coordinates as the node.
     fn node(&mut self, id: NodeId, opacity: f32, cull: RectI) {
+        if self.doc.nodes.get(id).is_some_and(|n| !n.stacked) {
+            self.node_contents(id, opacity, cull);
+        }
+    }
+
+    fn node_contents(&mut self, id: NodeId, opacity: f32, cull: RectI) {
         let doc = self.doc;
         let Some(node) = doc.nodes.get(id) else {
             return;
@@ -200,6 +288,7 @@ impl Painter<'_> {
                 self.children(node, opacity, cull);
                 return;
             }
+            NodeKind::Popup(_) => return,
             NodeKind::Text(t) => {
                 if let Some(sel) = &doc.state.selection
                     && let Some((a, b)) = node_range(doc, sel, id)
@@ -235,7 +324,7 @@ impl Painter<'_> {
             self.layer(id, opacity);
         } else {
             let inner = child_clip(node, doc.scale, node.clip_shape());
-            self.children(node, opacity, cull.intersect(&inner.rect));
+            self.contents(id, opacity, cull.intersect(&inner.rect));
         }
 
         self.chunk(id, part::AFTER);
@@ -255,38 +344,92 @@ impl Painter<'_> {
             radii.bottom_right,
             radii.bottom_left,
         ];
-        for s in &c.shadows {
+        let b = &node.resolved.border;
+        let has_border =
+            (b.top | b.right | b.bottom | b.left) != 0 && !c.border_color.is_transparent();
+        let background = fade(c.background, opacity);
+        // A rounded edge where shadow and box each cover part of a pixel would let what is behind
+        // show through. An opaque background hides a shadow that goes a little under it.
+        let rounded = radii.iter().any(|r| *r > 0.0);
+        let under = if rounded && background.a >= 1.0 {
+            scale.px_min1(1.0)
+        } else {
+            0
+        };
+        let cut = node.abs.inset(under, under, under, under);
+        let cut_radii = radii.map(|r| (r - under as f32).max(0.0));
+        // The first shadow is on top.
+        for s in c.shadows.iter().rev().filter(|s| !s.inset) {
             let spread = scale.px(s.spread);
             let rect = node
                 .abs
                 .translate(scale.px(s.offset_x), scale.px(s.offset_y))
                 .outset(spread);
+            if rect.is_empty() {
+                continue;
+            }
             self.scene.primitives.push(Primitive::Shadow(Shadow {
                 rect,
-                radii: radii.map(|r| if r > 0.0 { r + spread as f32 } else { r }),
+                radii: radii.map(|r| {
+                    if r > 0.0 {
+                        (r + spread as f32).max(0.0)
+                    } else {
+                        0.0
+                    }
+                }),
                 blur: scale.pxf(s.blur),
                 color: fade(s.color, opacity),
                 clip,
+                cut,
+                cut_radii,
+                inset: false,
             }));
         }
-        let b = &node.resolved.border;
-        let has_border =
-            (b.top | b.right | b.bottom | b.left) != 0 && !c.border_color.is_transparent();
-        if c.background.is_transparent() && !has_border {
-            return;
+        if !c.background.is_transparent() || has_border {
+            self.scene.primitives.push(Primitive::Quad(Quad {
+                rect: node.abs,
+                background,
+                border_widths: if has_border {
+                    [b.top, b.right, b.bottom, b.left]
+                } else {
+                    [0; 4]
+                },
+                border_color: fade(c.border_color, opacity),
+                radii,
+                clip,
+            }));
         }
-        self.scene.primitives.push(Primitive::Quad(Quad {
-            rect: node.abs,
-            background: fade(c.background, opacity),
-            border_widths: if has_border {
-                [b.top, b.right, b.bottom, b.left]
-            } else {
-                [0; 4]
-            },
-            border_color: fade(c.border_color, opacity),
-            radii,
-            clip,
-        }));
+        if c.shadows.iter().any(|s| s.inset) {
+            let pad = node.padding_abs();
+            let inner = [
+                (radii[0] - b.left.max(b.top) as f32).max(0.0),
+                (radii[1] - b.right.max(b.top) as f32).max(0.0),
+                (radii[2] - b.right.max(b.bottom) as f32).max(0.0),
+                (radii[3] - b.left.max(b.bottom) as f32).max(0.0),
+            ];
+            for s in c.shadows.iter().rev().filter(|s| s.inset) {
+                let spread = scale.px(s.spread);
+                let shape = pad
+                    .translate(scale.px(s.offset_x), scale.px(s.offset_y))
+                    .outset(-spread);
+                self.scene.primitives.push(Primitive::Shadow(Shadow {
+                    rect: RectI::new(shape.x, shape.y, shape.width.max(0), shape.height.max(0)),
+                    radii: inner.map(|r| {
+                        if r > 0.0 {
+                            (r - spread as f32).max(0.0)
+                        } else {
+                            0.0
+                        }
+                    }),
+                    blur: scale.pxf(s.blur),
+                    color: fade(s.color, opacity),
+                    clip,
+                    cut: pad,
+                    cut_radii: inner,
+                    inset: true,
+                }));
+            }
+        }
     }
 
     fn outline(&mut self, id: NodeId, opacity: f32) {

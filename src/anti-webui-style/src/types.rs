@@ -275,4 +275,6 @@ pub struct BoxShadow {
     pub blur: f32,
     pub spread: f32,
     pub color: Color,
+    /// Drawn inside the padding box, above the background and below the children.
+    pub inset: bool,
 }

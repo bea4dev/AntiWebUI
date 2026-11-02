@@ -1,7 +1,7 @@
 //! Presenting our own buffers: linux-dmabuf feedback and buffers, explicit sync timelines, and
 //! damage (see `docs/design/06-platform-wayland.md`).
 
-use crate::state::State;
+use crate::state::{State, SurfaceId};
 use std::collections::HashMap;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::fs::FileExt;
@@ -101,12 +101,8 @@ pub(crate) struct PresentState {
     pub buffer_events: Vec<BufferEvent>,
     pub next_id: u64,
     pub syncobj_manager: Option<wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1>,
-    pub syncobj_surface: Option<wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1>,
     pub timelines:
         HashMap<TimelineId, wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1>,
-    /// Whether the surface is opaque, and the logical size the opaque region was set for.
-    pub opaque: bool,
-    pub opaque_applied: Option<(i32, i32)>,
 }
 
 impl State {
@@ -153,9 +149,6 @@ impl State {
 
     pub(crate) fn import_timeline(&mut self, fd: BorrowedFd<'_>) -> Option<TimelineId> {
         let manager = self.present.syncobj_manager.as_ref()?;
-        if self.present.syncobj_surface.is_none() {
-            self.present.syncobj_surface = Some(manager.get_surface(&self.surface, &self.qh, ()));
-        }
         self.present.next_id += 1;
         let id = TimelineId(self.present.next_id);
         let timeline = manager.import_timeline(fd, &self.qh, ());
@@ -169,27 +162,41 @@ impl State {
         }
     }
 
-    /// Stops explicit sync on the surface (needed before presenting through WSI).
+    /// Stops explicit sync on the surfaces (needed before presenting through WSI).
     pub(crate) fn disable_explicit_sync(&mut self) {
-        if let Some(s) = self.present.syncobj_surface.take() {
-            s.destroy();
+        let popups = self.popups.values_mut().map(|p| &mut p.frame);
+        for f in std::iter::once(&mut self.window_frame).chain(popups) {
+            if let Some(s) = f.syncobj.take() {
+                s.destroy();
+            }
         }
     }
 
     pub(crate) fn present_buffer(
         &mut self,
+        surface: SurfaceId,
         id: BufferId,
         damage: &[anti_webui_core::geometry::RectI],
         sync: Option<SyncPoints>,
     ) {
+        self.prepare_commit(surface);
+        let Some(wl) = self.wl_surface(surface).cloned() else {
+            return;
+        };
         let Some(buffer) = self.present.buffers.get(&id) else {
             return;
         };
-        self.surface.attach(Some(buffer), 0, 0);
+        wl.attach(Some(buffer), 0, 0);
         for r in damage {
-            self.surface.damage_buffer(r.x, r.y, r.width, r.height);
+            wl.damage_buffer(r.x, r.y, r.width, r.height);
         }
-        if let (Some(sync), Some(surface)) = (sync, &self.present.syncobj_surface) {
+        if let (Some(sync), Some(manager)) = (sync, self.present.syncobj_manager.clone()) {
+            let qh = self.qh.clone();
+            let frame = self.frame_state(surface).expect("the surface exists");
+            let object = frame
+                .syncobj
+                .get_or_insert_with(|| manager.get_surface(&wl, &qh, ()))
+                .clone();
             let point = |(timeline, value): (TimelineId, u64)| {
                 self.present
                     .timelines
@@ -197,29 +204,37 @@ impl State {
                     .map(|t| (t, (value >> 32) as u32, value as u32))
             };
             if let (Some(a), Some(r)) = (point(sync.acquire), point(sync.release)) {
-                surface.set_acquire_point(a.0, a.1, a.2);
-                surface.set_release_point(r.0, r.1, r.2);
+                object.set_acquire_point(a.0, a.1, a.2);
+                object.set_release_point(r.0, r.1, r.2);
             }
         }
-        self.apply_opaque_region();
-        self.surface.commit();
+        wl.commit();
+        self.committed(surface);
     }
 
-    pub(crate) fn apply_opaque_region(&mut self) {
+    pub(crate) fn apply_opaque_region(&mut self, surface: SurfaceId) {
         let size = self.logical_size;
-        let wanted = self.present.opaque.then_some(size);
-        if self.present.opaque_applied == wanted {
+        let qh = self.qh.clone();
+        let compositor = self.compositor.clone();
+        let Some(wl) = self.wl_surface(surface).cloned() else {
+            return;
+        };
+        let Some(f) = self.frame_state(surface) else {
+            return;
+        };
+        let wanted = f.opaque.then_some(size);
+        if f.opaque_applied == wanted {
             return;
         }
-        self.present.opaque_applied = wanted;
+        f.opaque_applied = wanted;
         match wanted {
             Some((w, h)) => {
-                let region = self.compositor.create_region(&self.qh, ());
+                let region = compositor.create_region(&qh, ());
                 region.add(0, 0, w, h);
-                self.surface.set_opaque_region(Some(&region));
+                wl.set_opaque_region(Some(&region));
                 region.destroy();
             }
-            None => self.surface.set_opaque_region(None),
+            None => wl.set_opaque_region(None),
         }
     }
 }

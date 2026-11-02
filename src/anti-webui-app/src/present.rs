@@ -3,33 +3,51 @@
 
 use anti_webui_core::damage::{self, Damage, DamageHistory};
 use anti_webui_core::scene::Scene;
-use anti_webui_wayland::{BufferEvent, BufferId, Ctx, DmabufPlaneDesc, SyncPoints, TimelineId};
+use anti_webui_wayland::{
+    BufferEvent, BufferId, Ctx, DmabufPlaneDesc, SurfaceId, SyncPoints, TimelineId,
+};
 use anti_webui_wgpu::dmabuf::{DRM_FORMAT_ARGB8888, DmabufContext, DmabufImage};
 use anti_webui_wgpu::linux_sync::{self, DrmDevice};
 use anti_webui_wgpu::{FrameResult, Gpu, GpuError, Renderer, WindowRenderer, wgpu};
+use std::collections::HashMap;
 use std::os::fd::AsFd;
 
 /// Buffers beyond this make the compositor wait for us instead.
 const MAX_BUFFERS: usize = 4;
 
+/// Presents to the window and the popups. They share the GPU, and all but the fallback also the
+/// renderer with its glyph atlas.
 pub(crate) struct Presenter {
     // Dropped before `gpu`.
-    backend: Backend,
+    targets: HashMap<SurfaceId, Target>,
+    dmabuf: Option<DmabufPresenter>,
     gpu: Gpu,
-    /// The last presented scene, to diff the next one against.
-    prev: Option<Scene>,
     debug: bool,
 }
 
-// There is one per window.
+/// What is kept per surface.
+struct Target {
+    kind: TargetKind,
+    /// The last presented scene, to diff the next one against.
+    prev: Option<Scene>,
+}
+
+// There are few of them.
 #[allow(clippy::large_enum_variant)]
-enum Backend {
+enum TargetKind {
     Surface(WindowRenderer),
-    Dmabuf(DmabufPresenter),
+    Dmabuf(DmabufTarget),
 }
 
 fn debug_enabled() -> bool {
     std::env::var_os("ANTIWEBUI_DEBUG_DAMAGE").is_some_and(|v| v != "0")
+}
+
+fn renderer_target(surface: SurfaceId) -> u64 {
+    match surface {
+        SurfaceId::Window => 0,
+        SurfaceId::Popup(id) => id.0,
+    }
 }
 
 impl Presenter {
@@ -43,9 +61,9 @@ impl Presenter {
                         eprintln!("[anti-webui] presenting dmabufs ({} sync)", d.sync.name());
                     }
                     return Ok(Self {
-                        backend: Backend::Dmabuf(d),
+                        targets: HashMap::new(),
+                        dmabuf: Some(d),
                         gpu,
-                        prev: None,
                         debug,
                     });
                 }
@@ -58,9 +76,15 @@ impl Presenter {
         }
         let (gpu, window) = surface_gpu(ctx)?;
         Ok(Self {
-            backend: Backend::Surface(window),
+            targets: HashMap::from([(
+                SurfaceId::Window,
+                Target {
+                    kind: TargetKind::Surface(window),
+                    prev: None,
+                },
+            )]),
+            dmabuf: None,
             gpu,
-            prev: None,
             debug,
         })
     }
@@ -69,65 +93,164 @@ impl Presenter {
         &self.gpu
     }
 
-    /// The scene of the last presented frame.
-    pub fn last_scene(&self) -> Option<&Scene> {
-        self.prev.as_ref()
+    /// The scene of the last presented frame of a surface.
+    pub fn last_scene(&self, surface: SurfaceId) -> Option<&Scene> {
+        self.targets.get(&surface)?.prev.as_ref()
     }
 
-    /// Presents the scene if it differs from the last one. Returns whether a buffer was
-    /// committed, and whether the frame must be retried.
-    pub fn present(&mut self, ctx: &mut Ctx<'_>, scene: Scene) -> Presented {
-        let damage = match &self.prev {
+    /// Frees what is kept for a surface. To call before the surface goes.
+    pub fn forget(&mut self, ctx: &mut Ctx<'_>, surface: SurfaceId) {
+        let Some(target) = self.targets.remove(&surface) else {
+            return;
+        };
+        if let Some(d) = &mut self.dmabuf {
+            d.renderer.forget_target(renderer_target(surface));
+            if let TargetKind::Dmabuf(mut t) = target.kind {
+                d.drop_slots(&mut t, ctx);
+            }
+        }
+    }
+
+    /// Presents the scene if it differs from the last one on this surface. Returns whether a
+    /// buffer was committed, and whether the frame must be retried.
+    pub fn present(&mut self, ctx: &mut Ctx<'_>, surface: SurfaceId, scene: Scene) -> Presented {
+        if let Err(e) = self.update_buffers(ctx) {
+            return self.failed(ctx, e);
+        }
+        if !self.targets.contains_key(&surface) {
+            let kind = match &self.dmabuf {
+                Some(_) => TargetKind::Dmabuf(DmabufTarget::default()),
+                None => {
+                    let (display, window) = ctx.raw_handles(surface);
+                    let size = (scene.width.max(1), scene.height.max(1));
+                    // SAFETY: the surface outlives the target: see `forget`.
+                    let created = unsafe { self.gpu.add_window(display, window, size.0, size.1) };
+                    match created {
+                        Ok(w) => TargetKind::Surface(w),
+                        Err(e) => {
+                            eprintln!("[anti-webui] no GPU surface for a popup: {e}");
+                            return Presented::Unchanged;
+                        }
+                    }
+                }
+            };
+            self.targets.insert(surface, Target { kind, prev: None });
+        }
+        let target = self.targets.get_mut(&surface).expect("just inserted");
+        let damage = match &target.prev {
             Some(prev) => damage::diff(prev, &scene),
             None => Damage::full(scene.width, scene.height),
         };
         if damage.is_empty() {
             if self.debug {
-                eprintln!("[anti-webui] frame unchanged");
+                eprintln!("[anti-webui] {surface:?}: frame unchanged");
             }
             return Presented::Unchanged;
         }
-        ctx.set_opaque(scene.clear.a >= 1.0);
-        let result = match &mut self.backend {
-            Backend::Surface(window) => match window.present(&self.gpu, &scene) {
-                FrameResult::Presented => Ok(Some(full_stats(&scene))),
-                FrameResult::Skipped => Ok(None),
-            },
-            Backend::Dmabuf(d) => d.present(&self.gpu, ctx, &scene, &damage),
+        ctx.set_opaque(surface, scene.clear.a >= 1.0);
+        let result = match &mut target.kind {
+            TargetKind::Surface(window) => {
+                ctx.prepare_commit(surface);
+                match window.present(&self.gpu, &scene) {
+                    FrameResult::Presented => {
+                        ctx.committed(surface);
+                        Ok(Some(full_stats(&scene)))
+                    }
+                    FrameResult::Skipped => Ok(None),
+                }
+            }
+            TargetKind::Dmabuf(t) => self
+                .dmabuf
+                .as_mut()
+                .expect("dmabuf targets come with it")
+                .present(&self.gpu, ctx, surface, t, &scene, &damage),
         };
         match result {
             Ok(Some(stats)) => {
                 if self.debug {
-                    stats.log(&scene, &damage);
+                    stats.log(surface, &scene, &damage);
                 }
-                self.prev = Some(scene);
+                target.prev = Some(scene);
                 Presented::Yes
             }
             Ok(None) => {
                 if self.debug {
-                    eprintln!("[anti-webui] no free buffer; retrying");
+                    eprintln!("[anti-webui] {surface:?}: no free buffer; retrying");
                 }
                 Presented::Retry
             }
-            Err(e) => {
-                eprintln!("[anti-webui] dmabuf presentation failed ({e}); using a wgpu surface");
-                self.fall_back(ctx);
-                Presented::Retry
-            }
+            Err(e) => self.failed(ctx, e),
         }
     }
 
+    fn failed(&mut self, ctx: &mut Ctx<'_>, e: GpuError) -> Presented {
+        eprintln!("[anti-webui] dmabuf presentation failed ({e}); using a wgpu surface");
+        self.fall_back(ctx);
+        Presented::Retry
+    }
+
+    /// Takes in what happened to the buffers, on whichever surface.
+    fn update_buffers(&mut self, ctx: &mut Ctx<'_>) -> Result<(), GpuError> {
+        let Some(d) = &mut self.dmabuf else {
+            return Ok(());
+        };
+        let targets = self.targets.values_mut().filter_map(|t| match &mut t.kind {
+            TargetKind::Dmabuf(t) => Some(t),
+            TargetKind::Surface(_) => None,
+        });
+        let mut targets: Vec<&mut DmabufTarget> = targets.collect();
+        for event in ctx.take_buffer_events() {
+            match event {
+                BufferEvent::Failed(_) => {
+                    return Err(GpuError::Dmabuf("the compositor rejected a buffer".into()));
+                }
+                BufferEvent::Released(id) => {
+                    let slots = targets.iter_mut().flat_map(|t| t.slots.iter_mut());
+                    if let Some(s) = slots.into_iter().find(|s| s.buffer == id) {
+                        s.busy = false;
+                    }
+                }
+            }
+        }
+        if let Some(f) = ctx.dmabuf_feedback()
+            && f.generation != d.generation
+        {
+            d.generation = f.generation;
+            let modifiers = f.modifiers(DRM_FORMAT_ARGB8888);
+            if modifiers != d.modifiers {
+                d.modifiers = modifiers;
+                for t in &mut targets {
+                    d.drop_slots(t, ctx);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn fall_back(&mut self, ctx: &mut Ctx<'_>) {
-        if let Backend::Dmabuf(d) = &mut self.backend {
+        let mut targets = std::mem::take(&mut self.targets);
+        if let Some(d) = &mut self.dmabuf {
+            for target in targets.values_mut() {
+                if let TargetKind::Dmabuf(t) = &mut target.kind {
+                    d.drop_slots(t, ctx);
+                }
+            }
             d.release_protocol_objects(ctx);
         }
+        drop(targets);
         ctx.disable_explicit_sync();
         match surface_gpu(ctx) {
             Ok((gpu, window)) => {
-                // The old backend goes before the GPU it was created on.
-                self.backend = Backend::Surface(window);
+                // The old presenter goes before the GPU it was created on.
+                self.dmabuf = None;
+                self.targets.insert(
+                    SurfaceId::Window,
+                    Target {
+                        kind: TargetKind::Surface(window),
+                        prev: None,
+                    },
+                );
                 self.gpu = gpu;
-                self.prev = None;
             }
             Err(e) => {
                 eprintln!("[anti-webui] no GPU surface either: {e}");
@@ -147,7 +270,7 @@ pub(crate) enum Presented {
 }
 
 fn surface_gpu(ctx: &mut Ctx<'_>) -> Result<(Gpu, WindowRenderer), GpuError> {
-    let (display, window) = ctx.raw_handles();
+    let (display, window) = ctx.raw_handles(SurfaceId::Window);
     let size = ctx.buffer_size();
     // SAFETY: the Wayland connection and surface outlive the presenter.
     unsafe { Gpu::with_window(display, window, size.width as u32, size.height as u32) }
@@ -168,11 +291,11 @@ fn full_stats(scene: &Scene) -> Stats {
 }
 
 impl Stats {
-    fn log(&self, scene: &Scene, damage: &Damage) {
+    fn log(&self, surface: SurfaceId, scene: &Scene, damage: &Damage) {
         let total = (scene.width as i64 * scene.height as i64).max(1) as f64;
         let age = self.age.map_or("-".to_string(), |a| a.to_string());
         eprintln!(
-            "[anti-webui] damage {} rect(s) {:.1}% | buffer age {age} | repaint {:.1}% | buffers {}",
+            "[anti-webui] {surface:?}: damage {} rect(s) {:.1}% | buffer age {age} | repaint {:.1}% | buffers {}",
             damage.rects().len(),
             damage.area() as f64 * 100.0 / total,
             self.repaint as f64 * 100.0 / total,
@@ -221,17 +344,23 @@ impl Sync {
     }
 }
 
+/// What surfaces presenting our own buffers share.
 struct DmabufPresenter {
-    slots: Vec<Slot>,
     ctx: DmabufContext,
     renderer: Renderer,
     sync: Sync,
+    generation: u64,
+    modifiers: Vec<u64>,
+}
+
+/// The buffers of one surface.
+#[derive(Default)]
+struct DmabufTarget {
+    slots: Vec<Slot>,
     history: DamageHistory,
     /// Frames presented so far.
     frame: u64,
     size: (u32, u32),
-    generation: u64,
-    modifiers: Vec<u64>,
 }
 
 impl DmabufPresenter {
@@ -258,13 +387,9 @@ impl DmabufPresenter {
         Ok((
             gpu,
             Self {
-                slots: Vec::new(),
                 ctx: dctx,
                 renderer,
                 sync,
-                history: DamageHistory::default(),
-                frame: 0,
-                size: (0, 0),
                 generation,
                 modifiers,
             },
@@ -276,47 +401,27 @@ impl DmabufPresenter {
         &mut self,
         gpu: &Gpu,
         ctx: &mut Ctx<'_>,
+        surface: SurfaceId,
+        target: &mut DmabufTarget,
         scene: &Scene,
         damage: &Damage,
     ) -> Result<Option<Stats>, GpuError> {
-        for event in ctx.take_buffer_events() {
-            match event {
-                BufferEvent::Failed(_) => {
-                    return Err(GpuError::Dmabuf("the compositor rejected a buffer".into()));
-                }
-                BufferEvent::Released(id) => {
-                    if let Some(s) = self.slots.iter_mut().find(|s| s.buffer == id) {
-                        s.busy = false;
-                    }
-                }
-            }
-        }
-        if let Some(f) = ctx.dmabuf_feedback()
-            && f.generation != self.generation
-        {
-            self.generation = f.generation;
-            let modifiers = f.modifiers(DRM_FORMAT_ARGB8888);
-            if modifiers != self.modifiers {
-                self.modifiers = modifiers;
-                self.drop_slots(ctx);
-            }
-        }
         let size = (scene.width.max(1), scene.height.max(1));
-        if size != self.size {
-            self.size = size;
-            self.drop_slots(ctx);
-            self.history.clear();
+        if size != target.size {
+            target.size = size;
+            self.drop_slots(target, ctx);
+            target.history.clear();
         }
 
-        let Some(index) = self.free_slot(gpu, ctx)? else {
+        let Some(index) = self.free_slot(gpu, ctx, target)? else {
             return Ok(None);
         };
-        let frame = self.frame + 1;
-        let slot = &mut self.slots[index];
+        let frame = target.frame + 1;
+        let slot = &mut target.slots[index];
         let age = (slot.frame > 0).then(|| frame - slot.frame);
         let repaint = match age {
             Some(1) => Some(damage.clone()),
-            Some(age) => self.history.last(age as usize - 1).map(|mut d| {
+            Some(age) => target.history.last(age as usize - 1).map(|mut d| {
                 d.extend(damage);
                 d
             }),
@@ -334,6 +439,7 @@ impl DmabufPresenter {
         };
         self.ctx.begin_access(&mut slot.image, wait)?;
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        self.renderer.set_target(renderer_target(surface));
         self.renderer.render_damaged(
             &gpu.device,
             &gpu.queue,
@@ -371,20 +477,25 @@ impl DmabufPresenter {
                 None
             }
         };
-        ctx.present_buffer(slot.buffer, damage.rects(), sync);
+        ctx.present_buffer(surface, slot.buffer, damage.rects(), sync);
         slot.busy = true;
         slot.frame = frame;
-        self.frame = frame;
-        self.history.push(damage.clone());
+        target.frame = frame;
+        target.history.push(damage.clone());
         Ok(Some(Stats {
             age,
             repaint: repaint.area(),
-            buffers: self.slots.len(),
+            buffers: target.slots.len(),
         }))
     }
 
     /// The free buffer holding the most recent frame, allocating one if none is free.
-    fn free_slot(&mut self, gpu: &Gpu, ctx: &mut Ctx<'_>) -> Result<Option<usize>, GpuError> {
+    fn free_slot(
+        &mut self,
+        gpu: &Gpu,
+        ctx: &mut Ctx<'_>,
+        target: &mut DmabufTarget,
+    ) -> Result<Option<usize>, GpuError> {
         let free = |s: &Slot, sync: &Sync, deadline: i64| -> bool {
             match (sync, &s.release) {
                 (Sync::Explicit { drm, .. }, Some(r)) => {
@@ -393,28 +504,33 @@ impl DmabufPresenter {
                 _ => !s.busy,
             }
         };
-        let best = (0..self.slots.len())
-            .filter(|&i| free(&self.slots[i], &self.sync, 0))
-            .max_by_key(|&i| self.slots[i].frame);
+        let best = (0..target.slots.len())
+            .filter(|&i| free(&target.slots[i], &self.sync, 0))
+            .max_by_key(|&i| target.slots[i].frame);
         if best.is_some() {
             return Ok(best);
         }
-        if self.slots.len() < MAX_BUFFERS {
-            return self.allocate(gpu, ctx).map(Some);
+        if target.slots.len() < MAX_BUFFERS {
+            return self.allocate(gpu, ctx, target).map(Some);
         }
         // All buffers are with the compositor: briefly wait for the oldest (explicit sync).
-        let oldest = (0..self.slots.len()).min_by_key(|&i| self.slots[i].frame);
+        let oldest = (0..target.slots.len()).min_by_key(|&i| target.slots[i].frame);
         if let (Some(i), Sync::Explicit { .. }) = (oldest, &self.sync) {
             let deadline = linux_sync::monotonic_ns() + 50_000_000;
-            if free(&self.slots[i], &self.sync, deadline) {
+            if free(&target.slots[i], &self.sync, deadline) {
                 return Ok(Some(i));
             }
         }
         Ok(None)
     }
 
-    fn allocate(&mut self, gpu: &Gpu, ctx: &mut Ctx<'_>) -> Result<usize, GpuError> {
-        let (w, h) = self.size;
+    fn allocate(
+        &mut self,
+        gpu: &Gpu,
+        ctx: &mut Ctx<'_>,
+        target: &mut DmabufTarget,
+    ) -> Result<usize, GpuError> {
+        let (w, h) = target.size;
         let image = self.ctx.allocate(gpu, w, h, &self.modifiers)?;
         let planes: Vec<DmabufPlaneDesc<'_>> = image
             .planes
@@ -447,18 +563,18 @@ impl DmabufPresenter {
             }
             Sync::Implicit => None,
         };
-        self.slots.push(Slot {
+        target.slots.push(Slot {
             image,
             buffer,
             frame: 0,
             busy: false,
             release,
         });
-        Ok(self.slots.len() - 1)
+        Ok(target.slots.len() - 1)
     }
 
-    fn drop_slots(&mut self, ctx: &mut Ctx<'_>) {
-        for slot in self.slots.drain(..) {
+    fn drop_slots(&mut self, target: &mut DmabufTarget, ctx: &mut Ctx<'_>) {
+        for slot in target.slots.drain(..) {
             ctx.destroy_buffer(slot.buffer);
             if let Some(r) = slot.release {
                 ctx.destroy_timeline(r.id);
@@ -471,17 +587,23 @@ impl DmabufPresenter {
     }
 
     fn release_protocol_objects(&mut self, ctx: &mut Ctx<'_>) {
-        self.drop_slots(ctx);
         if let Sync::Explicit { acquire_id, .. } = &self.sync {
             ctx.destroy_timeline(*acquire_id);
         }
     }
 }
 
-impl Drop for DmabufPresenter {
+impl Drop for Presenter {
     fn drop(&mut self) {
-        for slot in self.slots.drain(..) {
-            self.ctx.retire(slot.image);
+        let targets = std::mem::take(&mut self.targets);
+        if let Some(d) = &mut self.dmabuf {
+            for target in targets.into_values() {
+                if let TargetKind::Dmabuf(mut t) = target.kind {
+                    for slot in t.slots.drain(..) {
+                        d.ctx.retire(slot.image);
+                    }
+                }
+            }
         }
     }
 }

@@ -60,11 +60,50 @@ pub struct Quad {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Shadow {
+    /// The shape that is blurred.
     pub rect: RectI,
     pub radii: [f32; 4],
     pub blur: f32,
     pub color: Color,
     pub clip: Clip,
+    /// An outer shadow shows only outside of this rounded rectangle, an inset one only inside.
+    pub cut: RectI,
+    pub cut_radii: [f32; 4],
+    pub inset: bool,
+}
+
+impl Shadow {
+    /// How far the blur reaches past [`Shadow::rect`]: three standard deviations.
+    pub fn extent(&self) -> i32 {
+        (self.blur * 1.5 + 1.0).ceil() as i32
+    }
+
+    /// A rectangle containing every pixel the shadow can touch, before clipping.
+    pub fn bounds(&self) -> RectI {
+        if self.inset {
+            self.cut
+        } else {
+            self.rect.outset(self.extent())
+        }
+    }
+
+    /// A rectangle in which the shadow is known to be fully transparent, so that drawing can
+    /// skip it. See `docs/design/09-shadows-stacking-popups.md`.
+    pub fn hole(&self) -> RectI {
+        // A corner's arc stays outside of the square cut `r * (1 - 1/sqrt 2)` in from the corner;
+        // one more pixel covers the antialiased edge.
+        let corners = |radii: &[f32; 4]| {
+            (radii.iter().copied().fold(0.0, f32::max) * (1.0 - std::f32::consts::FRAC_1_SQRT_2))
+                .ceil() as i32
+                + 1
+        };
+        let (rect, inset) = if self.inset {
+            (self.rect, corners(&self.radii) + self.extent())
+        } else {
+            (self.cut, corners(&self.cut_radii))
+        };
+        rect.inset(inset, inset, inset, inset)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

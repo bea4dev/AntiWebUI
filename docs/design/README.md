@@ -13,6 +13,7 @@ AntiWebUI は WebView に頼らず、wgpu による自前描画とネイティ�
 | 06 | [platform-wayland](06-platform-wayland.md) | Wayland バックエンド |
 | 07 | [roadmap](07-roadmap.md) | マイルストーン |
 | 08 | [scrolling-and-settings](08-scrolling-and-settings.md) | 慣性スクロールと全体設定 |
+| 09 | [shadows-stacking-popups](09-shadows-stacking-popups.md) | 影、z_index、ポップアップ（xdg_popup / wl_subsurface） |
 
 ## 用語
 

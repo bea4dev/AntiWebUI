@@ -1,12 +1,13 @@
 //! Wayland protocol state and event dispatch.
 
 use crate::keyboard::{Keyboard, Repeat};
+use crate::popup::{Popup, SurfaceFrame};
 use anti_webui_core::event::{
     AXIS_MOTION_GAIN, ClipboardKind, ImeUpdate, PointerButton, ScrollPhase, ScrollSource,
     WindowEvent,
 };
-use anti_webui_core::geometry::{PointF, Scale, SizeI};
-use anti_webui_core::platform::{CursorIcon, ImePurpose, ImeState};
+use anti_webui_core::geometry::{PointF, PointI, Scale, SizeI};
+use anti_webui_core::platform::{CursorIcon, ImePurpose, ImeState, PopupId, PopupParams};
 use std::collections::HashMap;
 use std::io::Write;
 use std::os::fd::{AsFd, OwnedFd};
@@ -15,7 +16,7 @@ use std::time::Instant;
 use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::{
     wl_callback, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
-    wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_surface,
+    wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_subcompositor, wl_surface,
 };
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop, event_created_child,
@@ -71,13 +72,26 @@ pub struct PointerFrame {
     pub time: u32,
 }
 
+/// One of the surfaces that show something.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SurfaceId {
+    Window,
+    Popup(PopupId),
+}
+
+/// How long a popup may hold up the next frame by not getting its frame callback.
+const POPUP_FRAME_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
 pub struct State {
     pub qh: QueueHandle<State>,
     pub compositor: wl_compositor::WlCompositor,
+    pub wm_base: xdg_wm_base::XdgWmBase,
     pub surface: wl_surface::WlSurface,
-    #[allow(dead_code, reason = "the xdg_surface must outlive the toplevel")]
     pub xdg_surface: xdg_surface::XdgSurface,
     pub toplevel: xdg_toplevel::XdgToplevel,
+    pub viewporter: Option<wp_viewporter::WpViewporter>,
+    pub subcompositor: Option<wl_subcompositor::WlSubcompositor>,
+    pub seat: Option<wl_seat::WlSeat>,
     pub viewport: Option<wp_viewport::WpViewport>,
     pub fractional: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
     pub _decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
@@ -98,6 +112,8 @@ pub struct State {
     pub pointer: Option<wl_pointer::WlPointer>,
     pub cursor_device: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
     pub pointer_serial: u32,
+    /// What the pointer is on, which `pointer_pos` is relative to.
+    pub pointer_surface: SurfaceId,
     pub pointer_pos: (f64, f64),
     pub cursor: CursorIcon,
     pub frame: PointerFrame,
@@ -107,7 +123,14 @@ pub struct State {
     pub hold_gesture: Option<zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1>,
     pub keyboard: Option<wl_keyboard::WlKeyboard>,
     pub kb: Keyboard,
+    /// What the keyboard is on, which the IME's cursor rectangle is relative to.
+    pub keyboard_surface: SurfaceId,
+    pub keyboard_focused: bool,
+    /// What the core was told; moving between our surfaces isn't a change.
+    pub focus_announced: bool,
     pub input_serial: u32,
+    /// The last press of a button or key, which a popup's grab refers to.
+    pub press_serial: u32,
 
     pub text_input: Option<zwp_text_input_v3::ZwpTextInputV3>,
     pub ti_entered: bool,
@@ -129,10 +152,10 @@ pub struct State {
     pub paste_tx: mpsc::Sender<(ClipboardKind, String)>,
     pub wake: OwnedFd,
 
-    /// A frame callback is outstanding for a committed frame.
-    pub frame_pending: bool,
-    /// A frame callback was requested but not committed yet.
-    pub frame_callback_queued: bool,
+    pub(crate) window_frame: SurfaceFrame,
+    pub(crate) popups: HashMap<PopupId, Popup>,
+    /// Popups whose parent has no buffer yet.
+    pub(crate) waiting_popups: Vec<PopupParams>,
     pub redraw_requested: bool,
     pub redraw_at: Option<Instant>,
     pub events: Vec<WindowEvent>,
@@ -144,6 +167,7 @@ impl State {
     pub fn new(
         qh: QueueHandle<State>,
         compositor: wl_compositor::WlCompositor,
+        wm_base: xdg_wm_base::XdgWmBase,
         surface: wl_surface::WlSurface,
         xdg_surface: xdg_surface::XdgSurface,
         toplevel: xdg_toplevel::XdgToplevel,
@@ -154,9 +178,13 @@ impl State {
         Self {
             qh,
             compositor,
+            wm_base,
             surface,
             xdg_surface,
             toplevel,
+            viewporter: None,
+            subcompositor: None,
+            seat: None,
             viewport: None,
             fractional: None,
             _decoration: None,
@@ -174,6 +202,7 @@ impl State {
             pointer: None,
             cursor_device: None,
             pointer_serial: 0,
+            pointer_surface: SurfaceId::Window,
             pointer_pos: (0.0, 0.0),
             cursor: CursorIcon::Default,
             frame: PointerFrame::default(),
@@ -182,7 +211,11 @@ impl State {
             hold_gesture: None,
             keyboard: None,
             kb: Keyboard::new(),
+            keyboard_surface: SurfaceId::Window,
+            keyboard_focused: false,
+            focus_announced: false,
             input_serial: 0,
+            press_serial: 0,
             text_input: None,
             ti_entered: false,
             ti_enabled: false,
@@ -198,8 +231,9 @@ impl State {
             primary_source: None,
             paste_tx,
             wake,
-            frame_pending: false,
-            frame_callback_queued: false,
+            window_frame: SurfaceFrame::default(),
+            popups: HashMap::new(),
+            waiting_popups: Vec::new(),
             redraw_requested: true,
             redraw_at: None,
             events: Vec::new(),
@@ -207,9 +241,81 @@ impl State {
         }
     }
 
+    /// A position on the pointer's surface in window coordinates.
     fn physical(&self, x: f64, y: f64) -> PointF {
         let s = self.scale.as_f64();
-        PointF::new((x * s) as f32, (y * s) as f32)
+        let origin = self.surface_origin(self.pointer_surface);
+        PointF::new(
+            (x * s) as f32 + origin.x as f32,
+            (y * s) as f32 + origin.y as f32,
+        )
+    }
+
+    /// Where a surface's origin is in window coordinates.
+    pub(crate) fn surface_origin(&self, surface: SurfaceId) -> PointI {
+        match surface {
+            SurfaceId::Popup(id) => self.popups.get(&id).map_or(PointI::default(), |p| p.origin),
+            SurfaceId::Window => PointI::default(),
+        }
+    }
+
+    pub(crate) fn frame_state(&mut self, surface: SurfaceId) -> Option<&mut SurfaceFrame> {
+        match surface {
+            SurfaceId::Window => Some(&mut self.window_frame),
+            SurfaceId::Popup(id) => self.popups.get_mut(&id).map(|p| &mut p.frame),
+        }
+    }
+
+    pub(crate) fn wl_surface(&self, surface: SurfaceId) -> Option<&wl_surface::WlSurface> {
+        match surface {
+            SurfaceId::Window => Some(&self.surface),
+            SurfaceId::Popup(id) => self.popups.get(&id).map(|p| &p.surface),
+        }
+    }
+
+    /// Asks for a frame callback with the next commit of the surface.
+    pub(crate) fn prepare_commit(&mut self, surface: SurfaceId) {
+        let qh = self.qh.clone();
+        let Some(wl) = self.wl_surface(surface).cloned() else {
+            return;
+        };
+        if let Some(f) = self.frame_state(surface)
+            && !f.callback_queued
+        {
+            f.callback_queued = true;
+            wl.frame(&qh, surface);
+        }
+        self.apply_opaque_region(surface);
+    }
+
+    /// A buffer was committed to the surface.
+    pub(crate) fn committed(&mut self, surface: SurfaceId) {
+        let now = Instant::now();
+        if let Some(f) = self.frame_state(surface) {
+            f.callback_queued = false;
+            f.pending = Some(now);
+            if !std::mem::replace(&mut f.mapped, true) {
+                self.create_waiting_popups();
+            }
+        }
+    }
+
+    /// Whether frame callbacks allow a frame now. If not, the time when a popup stops holding it
+    /// up, if that's all it is waiting for.
+    pub(crate) fn frame_wait(&self, now: Instant) -> Result<(), Option<Instant>> {
+        if self.window_frame.pending.is_some() {
+            return Err(None);
+        }
+        let latest = self
+            .popups
+            .values()
+            .filter_map(|p| p.frame.pending)
+            .map(|t| t + POPUP_FRAME_WAIT)
+            .max();
+        match latest {
+            Some(t) if t > now => Err(Some(t)),
+            _ => Ok(()),
+        }
     }
 
     /// Recomputes the buffer size (R3) and announces size/scale changes.
@@ -291,7 +397,8 @@ impl State {
                     hint |= ContentHint::SensitiveData | ContentHint::HiddenText;
                 }
                 ti.set_content_type(hint, purpose);
-                let r = state.cursor_rect;
+                let origin = self.surface_origin(self.keyboard_surface);
+                let r = state.cursor_rect.translate(-origin.x, -origin.y);
                 let s = self.scale;
                 let x = s.to_logical(r.x as f32).floor() as i32;
                 let y = s.to_logical(r.y as f32).floor() as i32;
@@ -450,17 +557,21 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
     }
 }
 
-impl Dispatch<xdg_surface::XdgSurface, ()> for State {
+impl Dispatch<xdg_surface::XdgSurface, SurfaceId> for State {
     fn event(
         state: &mut Self,
         surface: &xdg_surface::XdgSurface,
         event: xdg_surface::Event,
-        _: &(),
+        id: &SurfaceId,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         if let xdg_surface::Event::Configure { serial } = event {
             surface.ack_configure(serial);
+            if let SurfaceId::Popup(id) = id {
+                state.popup_placed(*id);
+                return;
+            }
             if let Some(size) = state.pending_size.take() {
                 state.logical_size = size;
             }
@@ -510,16 +621,17 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for State {
     }
 }
 
-impl Dispatch<wl_surface::WlSurface, ()> for State {
+impl Dispatch<wl_surface::WlSurface, SurfaceId> for State {
     fn event(
         state: &mut Self,
         _: &wl_surface::WlSurface,
         event: wl_surface::Event,
-        _: &(),
+        id: &SurfaceId,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         if let wl_surface::Event::PreferredBufferScale { factor } = event
+            && *id == SurfaceId::Window
             && state.fractional.is_none()
         {
             state.scale = Scale(factor.max(1) as u32 * 120);
@@ -530,17 +642,21 @@ impl Dispatch<wl_surface::WlSurface, ()> for State {
     }
 }
 
-impl Dispatch<wl_callback::WlCallback, ()> for State {
+impl Dispatch<wl_callback::WlCallback, SurfaceId> for State {
     fn event(
         state: &mut Self,
         _: &wl_callback::WlCallback,
         event: wl_callback::Event,
-        _: &(),
+        surface: &SurfaceId,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_callback::Event::Done { .. } = event {
-            state.frame_pending = false;
+        if let wl_callback::Event::Done { .. } = event
+            && let Some(f) = state.frame_state(*surface)
+        {
+            // Any commit takes a queued request along, not only those that present something.
+            f.callback_queued = false;
+            f.pending = None;
         }
     }
 }
@@ -554,6 +670,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
+        state.seat.get_or_insert_with(|| seat.clone());
         let wl_seat::Event::Capabilities {
             capabilities: WEnum::Value(caps),
         } = event
@@ -602,11 +719,12 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
         match event {
             wl_pointer::Event::Enter {
                 serial,
+                surface,
                 surface_x,
                 surface_y,
-                ..
             } => {
                 state.pointer_serial = serial;
+                state.pointer_surface = surface_id(&surface);
                 state.pointer_pos = (surface_x, surface_y);
                 state.apply_cursor();
                 let position = state.physical(surface_x, surface_y);
@@ -635,13 +753,16 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 state: btn_state,
             } => {
                 state.input_serial = serial;
+                let pressed = matches!(btn_state, WEnum::Value(wl_pointer::ButtonState::Pressed));
+                if pressed {
+                    state.press_serial = serial;
+                }
                 let button = match button {
                     0x110 => PointerButton::Primary,
                     0x111 => PointerButton::Secondary,
                     0x112 => PointerButton::Middle,
                     b => PointerButton::Other(b),
                 };
-                let pressed = matches!(btn_state, WEnum::Value(wl_pointer::ButtonState::Pressed));
                 let (x, y) = state.pointer_pos;
                 let position = state.physical(x, y);
                 state.events.push(WindowEvent::PointerButton {
@@ -704,6 +825,13 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
             _ => {}
         }
     }
+}
+
+fn surface_id(surface: &wl_surface::WlSurface) -> SurfaceId {
+    surface
+        .data::<SurfaceId>()
+        .copied()
+        .unwrap_or(SurfaceId::Window)
 }
 
 impl PointerFrame {
@@ -799,13 +927,16 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
     ) {
         match event {
             wl_keyboard::Event::Keymap { fd, size, .. } => state.kb.set_keymap(fd, size),
-            wl_keyboard::Event::Enter { serial, .. } => {
+            wl_keyboard::Event::Enter {
+                serial, surface, ..
+            } => {
                 state.input_serial = serial;
-                state.events.push(WindowEvent::Focused(true));
+                state.keyboard_surface = surface_id(&surface);
+                state.keyboard_focused = true;
             }
             wl_keyboard::Event::Leave { .. } => {
                 state.kb.repeat = None;
-                state.events.push(WindowEvent::Focused(false));
+                state.keyboard_focused = false;
             }
             wl_keyboard::Event::Modifiers {
                 mods_depressed,
@@ -831,6 +962,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 state.input_serial = serial;
                 let pressed = matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed));
                 if pressed {
+                    state.press_serial = serial;
                     if state.kb.repeat_rate > 0 && state.kb.repeats(key) {
                         state.kb.repeat = Some(Repeat {
                             keycode: key,

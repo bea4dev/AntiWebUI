@@ -5,14 +5,14 @@
 
 use crate::event::{KeyboardEvent, PointerEvent, ScrollEvent};
 use crate::geometry::RectI;
-use crate::platform::ImePurpose;
+use crate::platform::{ImePurpose, Placement, PopupKind};
 use crate::reactive::{
     Owner, Signal, create_child_owner, effect, memo, on_cleanup, signal, untrack,
 };
 use crate::text::TextLayout;
 use crate::text::edit::{EditData, TextCallback};
-use crate::tree::{Listeners, Node, NodeId, NodeKind, TextData, with_doc};
-use anti_webui_style::{Style, Styled};
+use crate::tree::{Listeners, Node, NodeId, NodeKind, PopupData, TextData, with_doc};
+use anti_webui_style::{AlignItems, Display as Layout, FlexDirection, Style, Styled, UserSelect};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -51,6 +51,20 @@ pub fn node_ref() -> NodeRef {
 impl NodeRef {
     pub fn get(&self) -> Option<NodeId> {
         self.0.get()
+    }
+
+    pub(crate) fn id_untracked(&self) -> Option<NodeId> {
+        self.0.get_untracked()
+    }
+
+    /// Scrolls what contains the node, after the next layout, until the node is in view.
+    pub fn scroll_into_view(&self) {
+        if let Some(id) = self.0.get_untracked() {
+            with_doc(|d| {
+                d.pending_scroll.push(id);
+                d.dirty.paint = true;
+            });
+        }
     }
 
     /// The border box in window physical pixels, as of the last layout.
@@ -478,6 +492,85 @@ where
         with_doc(|d| d.set_children(id, order));
     });
     View(id)
+}
+
+/// Content in a surface of its own, above the window and free to leave it. See
+/// `docs/design/09-shadows-stacking-popups.md`.
+#[derive(Default)]
+pub struct Popup {
+    data: PopupData,
+    children: Vec<View>,
+}
+
+/// Shows its children above everything for as long as it exists, usually inside of a [`show`].
+/// By default it is a [`PopupKind::Menu`] below the closest ancestor with a box.
+pub fn popup() -> Popup {
+    Popup::default()
+}
+
+impl Popup {
+    pub fn kind(mut self, kind: PopupKind) -> Self {
+        self.data.kind = kind;
+        self
+    }
+
+    pub fn placement(mut self, placement: Placement) -> Self {
+        self.data.placement = placement;
+        self
+    }
+
+    /// Logical pixels between the anchor and the popup.
+    pub fn gap(mut self, gap: i32) -> Self {
+        self.data.gap = gap;
+        self
+    }
+
+    /// Hangs it from this node.
+    pub fn anchor(mut self, anchor: NodeRef) -> Self {
+        self.data.anchor = Some(anchor);
+        self
+    }
+
+    /// Hangs it from a rectangle in window coordinates, such as where the pointer was pressed.
+    pub fn anchor_rect(mut self, rect: RectI) -> Self {
+        self.data.anchor_rect = Some(rect);
+        self
+    }
+
+    /// Makes it at least as wide as its anchor.
+    pub fn match_anchor_width(mut self) -> Self {
+        self.data.match_anchor_width = true;
+        self
+    }
+
+    /// Called when it closes because of something outside of it. It won't show again until it
+    /// is built again, so this is the place to update what decides that.
+    pub fn on_dismiss(mut self, f: impl Fn() + 'static) -> Self {
+        self.data.on_dismiss = Some(Rc::new(f));
+        self
+    }
+
+    pub fn child(mut self, child: impl IntoView) -> Self {
+        self.children.push(child.into_view());
+        self
+    }
+}
+
+impl IntoView for Popup {
+    fn into_view(self) -> View {
+        let mut node = Node::new(NodeKind::Popup(Box::new(self.data)));
+        node.style.base = Style {
+            display: Some(Layout::Flex),
+            flex_direction: Some(FlexDirection::Column),
+            align_items: Some(AlignItems::Stretch),
+            user_select: Some(UserSelect::None),
+            ..Default::default()
+        };
+        let id = create_node(node);
+        let children: Vec<NodeId> = self.children.into_iter().map(|v| v.0).collect();
+        with_doc(|d| d.set_children(id, children));
+        View(id)
+    }
 }
 
 /// A single- or multi-line text field.

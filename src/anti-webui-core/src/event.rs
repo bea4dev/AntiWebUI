@@ -1,6 +1,7 @@
 //! Platform-independent input events and the events delivered to node handlers.
 
-use crate::geometry::{PointF, RectI, Scale, SizeI};
+use crate::geometry::{PointF, PointI, RectI, Scale, SizeI};
+use crate::platform::PopupId;
 use std::cell::Cell;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -177,6 +178,15 @@ pub enum WindowEvent {
     },
     Focused(bool),
     CloseRequested,
+    /// The platform placed a popup. `origin` is its surface's origin in window coordinates, the
+    /// coordinates of all pointer events; `size` the logical size granted to its box.
+    PopupConfigured {
+        id: PopupId,
+        origin: PointI,
+        size: SizeI,
+    },
+    /// The platform closed a popup, because of something happening outside of it.
+    PopupDismissed(PopupId),
 }
 
 /// Information passed to pointer handlers.

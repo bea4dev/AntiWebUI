@@ -250,6 +250,234 @@ fn scroll_demo() -> Div {
         })))
 }
 
+fn shadow_demo() -> Div {
+    let tile = |name: &'static str| {
+        div()
+            .w(120.0)
+            .h(72.0)
+            .rounded(10.0)
+            .bg(theme::SURFACE)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(label(name))
+    };
+    div()
+        .flex()
+        .flex_row()
+        .gap(24.0)
+        .p(12.0)
+        .child(tile("shadow_sm").shadow_sm())
+        .child(tile("shadow_md").shadow_md())
+        .child(tile("shadow_lg").shadow_lg())
+        .child(tile("inset").shadow(BoxShadow {
+            offset_y: 2.0,
+            blur: 8.0,
+            color: rgba(0x00000040),
+            inset: true,
+            ..Default::default()
+        }))
+}
+
+fn overlay_demo() -> Div {
+    let fruit = signal(1u32);
+    let in_page = signal(false);
+    let tip = signal(false);
+    let bubble = signal(false);
+    let context = signal(None::<RectI>);
+    let fruits = [
+        "りんご",
+        "みかん",
+        "ぶどう",
+        "もも",
+        "なし",
+        "かき",
+        "いちご",
+        "すいか",
+        "メロン",
+        "バナナ",
+        "キウイ",
+        "パイナップル",
+        "さくらんぼ",
+        "マンゴー",
+    ];
+    div()
+        .flex()
+        .flex_col()
+        .gap(12.0)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(12.0)
+                .child(
+                    select(
+                        fruit,
+                        fruits
+                            .iter()
+                            .enumerate()
+                            .map(|(i, f)| (i as u32, f.to_string()))
+                            .collect(),
+                    )
+                    .w(180.0),
+                )
+                .child(text(move || {
+                    format!("選択: {}", fruits[fruit.get() as usize])
+                })),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(12.0)
+                .child(
+                    // Stays in the window and is clipped like anything else.
+                    div()
+                        .relative()
+                        .child(
+                            button("ウィンドウ内 (z_index)")
+                                .on_click(move |_| in_page.update(|v| *v = !*v)),
+                        )
+                        .child(show(
+                            move || in_page.get(),
+                            || {
+                                div()
+                                    .absolute()
+                                    .top(pct(100.0))
+                                    .left(0.0)
+                                    .mt(4.0)
+                                    .w(200.0)
+                                    .p(12.0)
+                                    .z_index(10)
+                                    .rounded(8.0)
+                                    .bg(theme::SURFACE)
+                                    .border(1.0)
+                                    .border_color(theme::BORDER)
+                                    .shadow_lg()
+                                    .child(text("後ろの要素より上に描かれます"))
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .child(button("ツールチップ").on_hover(move |inside| tip.set(inside)))
+                        .child(show(
+                            move || tip.get(),
+                            || {
+                                popup()
+                                    .kind(PopupKind::Tooltip)
+                                    .placement(Placement::AboveStart)
+                                    .gap(6)
+                                    .child(
+                                        div()
+                                            .px(8.0)
+                                            .py(4.0)
+                                            .rounded(4.0)
+                                            .bg(rgb(0x1f2328))
+                                            .text_color(Color::WHITE)
+                                            .text_size(12.0)
+                                            .shadow_md()
+                                            .child(text("入力はこの下に素通りします")),
+                                    )
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .child(
+                            button("バブル (subsurface)")
+                                .on_click(move |_| bubble.update(|v| *v = !*v)),
+                        )
+                        .child(show(
+                            move || bubble.get(),
+                            move || {
+                                popup()
+                                    .kind(PopupKind::Bubble)
+                                    .placement(Placement::RightStart)
+                                    .gap(8)
+                                    .child(
+                                        card()
+                                            .shadow_lg()
+                                            .w(220.0)
+                                            .child(text("閉じるまで残ります"))
+                                            .child(
+                                                button("閉じる")
+                                                    .on_click(move |_| bubble.set(false)),
+                                            ),
+                                    )
+                            },
+                        )),
+                ),
+        )
+        .child(
+            div()
+                .p(16.0)
+                .rounded(6.0)
+                .bg(theme::SURFACE_MUTED)
+                .child(text("ここを右クリックするとメニューが開きます"))
+                .on_pointer_down(move |e| {
+                    if e.button == Some(PointerButton::Secondary) {
+                        let (x, y) = (e.position.x as i32, e.position.y as i32);
+                        context.set(Some(RectI::new(x, y, 1, 1)));
+                    }
+                })
+                .child(dyn_view(move || {
+                    context.get().map(|at| {
+                        popup()
+                            .anchor_rect(at)
+                            .on_dismiss(move || context.set(None))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .p(4.0)
+                                    .w(160.0)
+                                    .rounded(8.0)
+                                    .border(1.0)
+                                    .border_color(theme::BORDER)
+                                    .bg(theme::SURFACE)
+                                    .shadow_lg()
+                                    .children(["コピー", "貼り付け", "削除"].map(|name| {
+                                        div()
+                                            .px(8.0)
+                                            .py(5.0)
+                                            .rounded(4.0)
+                                            .cursor(CursorIcon::Pointer)
+                                            .hover(|s| s.bg(theme::HOVER))
+                                            .on_click(move |_| context.set(None))
+                                            .child(text(name))
+                                    })),
+                            )
+                    })
+                })),
+        )
+        // Painted after what comes later only because of its `z_index`.
+        .child(
+            div()
+                .relative()
+                .h(70.0)
+                .child(div().flex().flex_row().children((0..4).map(|i| {
+                    div()
+                        .w(90.0)
+                        .h(60.0)
+                        .ml(if i == 0 { 0.0 } else { -24.0 })
+                        .mt(i as f32 * 3.0)
+                        .rounded(8.0)
+                        .bg([rgb(0xffd7d5), rgb(0xd8f3dc), rgb(0xcfe2ff), rgb(0xfff3bf)][i])
+                        .border(1.0)
+                        .border_color(theme::BORDER_STRONG)
+                        .shadow_sm()
+                        .z_index(4 - i as i32)
+                        .hover(|s| s.z_index(9))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(label(format!("z {}", 4 - i)))
+                }))),
+        )
+}
+
 /// The whole showcase page. Also used by the `bench_slider` example.
 pub fn root() -> Div {
     scroll_view().h_full().bg(theme::SURFACE_MUTED).child(
@@ -279,7 +507,9 @@ pub fn root() -> Div {
             .child(section("Text input & IME", input_demo()))
             .child(section("Controls", controls_demo()))
             .child(section("Keyed list", todo_demo()))
-            .child(section("Scroll view", scroll_demo())),
+            .child(section("Scroll view", scroll_demo()))
+            .child(section("Shadows", shadow_demo()))
+            .child(section("Overlays", overlay_demo())),
     )
 }
 

@@ -106,6 +106,8 @@ define_style! {
     background: Color = Color::TRANSPARENT, local;
     shadows: Vec<BoxShadow> = Vec::new(), local;
     opacity: f32 = 1.0, local;
+    /// `None` means `auto`. Anything else creates a stacking context.
+    z_index: Option<i32> = None, local;
     overflow_x: Overflow = Overflow::Visible, local;
     overflow_y: Overflow = Overflow::Visible, local;
     /// `None` means `auto`: an I-beam over selectable text, the default arrow elsewhere.
