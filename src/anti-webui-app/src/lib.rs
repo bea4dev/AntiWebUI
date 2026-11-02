@@ -1,6 +1,8 @@
 //! Wires a platform backend, the wgpu renderer and the core together.
 
 pub mod headless;
+#[cfg(target_os = "linux")]
+mod present;
 
 use anti_webui_core::view::IntoView;
 
@@ -70,17 +72,17 @@ impl App {
 #[cfg(target_os = "linux")]
 mod wayland {
     use super::App;
+    use crate::present::{Presented, Presenter};
     use anti_webui_core::Ui;
     use anti_webui_core::event::WindowEvent;
     use anti_webui_core::platform::PlatformRequest;
     use anti_webui_core::view::IntoView;
     use anti_webui_wayland::{Ctx, WaylandHandler, WindowOptions};
-    use anti_webui_wgpu::{FrameResult, Gpu, WindowRenderer};
     use std::time::Instant;
 
     struct Runner {
         ui: Ui,
-        gpu: Option<(Gpu, WindowRenderer)>,
+        presenter: Option<Presenter>,
         error: Option<Box<dyn std::error::Error>>,
         /// `ANTIWEBUI_DUMP_FRAME=path.png` writes every presented frame to a file (debugging).
         dump: Option<(String, anti_webui_wgpu::Renderer)>,
@@ -88,6 +90,13 @@ mod wayland {
 
     impl Runner {
         fn process(&mut self, ctx: &mut Ctx<'_>) {
+            self.handle_requests(ctx);
+            if self.ui.needs_redraw() {
+                ctx.request_redraw();
+            }
+        }
+
+        fn handle_requests(&mut self, ctx: &mut Ctx<'_>) {
             for req in self.ui.take_requests() {
                 match req {
                     PlatformRequest::SetCursor(c) => ctx.set_cursor(c),
@@ -97,9 +106,6 @@ mod wayland {
                     PlatformRequest::SetTitle(t) => ctx.set_title(&t),
                     PlatformRequest::Close => ctx.exit(),
                 }
-            }
-            if self.ui.needs_redraw() {
-                ctx.request_redraw();
             }
         }
     }
@@ -111,14 +117,9 @@ mod wayland {
         }
 
         fn frame(&mut self, ctx: &mut Ctx<'_>) -> bool {
-            if self.gpu.is_none() {
-                let (display, window) = ctx.raw_handles();
-                let size = ctx.buffer_size();
-                // SAFETY: the Wayland connection and surface outlive the runner.
-                match unsafe {
-                    Gpu::with_window(display, window, size.width as u32, size.height as u32)
-                } {
-                    Ok(g) => self.gpu = Some(g),
+            if self.presenter.is_none() {
+                match Presenter::new(ctx) {
+                    Ok(p) => self.presenter = Some(p),
                     Err(e) => {
                         self.error = Some(Box::new(e));
                         ctx.exit();
@@ -127,22 +128,25 @@ mod wayland {
                 }
             }
             self.ui.update();
-            self.process(ctx);
+            // Not `process`: the frame painted below is the redraw it would ask for.
+            self.handle_requests(ctx);
             let scene = self.ui.paint(Instant::now());
-            let (gpu, window) = self.gpu.as_mut().unwrap();
-            let presented = window.present(gpu, &scene) == FrameResult::Presented;
-            if presented {
+            let presenter = self.presenter.as_mut().unwrap();
+            let presented = presenter.present(ctx, scene);
+            if presented == Presented::Yes
+                && let Some(scene) = presenter.last_scene()
+            {
                 if self.dump.is_none()
                     && let Ok(path) = std::env::var("ANTIWEBUI_DUMP_FRAME")
                 {
                     let r = anti_webui_wgpu::Renderer::new(
-                        &gpu.device,
+                        &presenter.gpu().device,
                         anti_webui_wgpu::wgpu::TextureFormat::Rgba8Unorm,
                     );
                     self.dump = Some((path, r));
                 }
                 if let Some((path, renderer)) = &mut self.dump {
-                    let pixels = gpu.render_to_rgba(renderer, &scene);
+                    let pixels = presenter.gpu().render_to_rgba(renderer, scene);
                     let _ = crate::headless::write_png(
                         path.as_str(),
                         scene.width,
@@ -157,10 +161,10 @@ mod wayland {
                     );
                 }
             }
-            if !presented {
-                ctx.request_redraw();
+            if presented == Presented::Retry {
+                ctx.request_redraw_after(std::time::Duration::from_millis(4));
             }
-            presented
+            presented == Presented::Yes
         }
 
         fn deadline(&mut self, now: Instant) -> Option<Instant> {
@@ -173,9 +177,9 @@ mod wayland {
         }
 
         fn exit(&mut self) {
-            // The GPU surface must go before the Wayland surface it renders to.
+            // GPU objects must go before the Wayland surface they render to.
             self.dump = None;
-            self.gpu = None;
+            self.presenter = None;
         }
     }
 
@@ -185,7 +189,7 @@ mod wayland {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let runner = Runner {
             ui: Ui::new(root),
-            gpu: None,
+            presenter: None,
             error: None,
             dump: None,
         };

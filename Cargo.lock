@@ -47,6 +47,7 @@ version = "0.1.0"
 dependencies = [
  "anti-webui-style",
  "parley",
+ "read-fonts",
  "slotmap",
  "unicode-segmentation",
 ]
@@ -95,7 +96,9 @@ name = "anti-webui-wgpu"
 version = "0.1.0"
 dependencies = [
  "anti-webui-core",
+ "ash",
  "bytemuck",
+ "libc",
  "pollster",
  "raw-window-handle",
  "swash",

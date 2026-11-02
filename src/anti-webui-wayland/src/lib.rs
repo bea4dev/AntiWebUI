@@ -1,17 +1,22 @@
 //! The Wayland backend (see `docs/design/06-platform-wayland.md`).
 
 mod keyboard;
+mod present;
 mod state;
 
+pub use present::{
+    BufferEvent, BufferId, DmabufFeedback, DmabufPlaneDesc, DmabufTranche, SyncPoints, TimelineId,
+};
+
 use anti_webui_core::event::{ClipboardKind, WindowEvent};
-use anti_webui_core::geometry::{Scale, SizeI};
+use anti_webui_core::geometry::{RectI, Scale, SizeI};
 use anti_webui_core::platform::{CursorIcon, ImeState};
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
 };
 use rustix::event::{PollFd, PollFlags};
 use state::State;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::ptr::NonNull;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -20,6 +25,8 @@ use wayland_client::protocol::{wl_compositor, wl_seat};
 use wayland_client::{Connection, Proxy};
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1;
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1;
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1;
+use wayland_protocols::wp::linux_drm_syncobj::v1::client::wp_linux_drm_syncobj_manager_v1;
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_device_manager_v1;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3;
 use wayland_protocols::wp::viewporter::client::wp_viewporter;
@@ -93,6 +100,12 @@ impl Ctx<'_> {
         self.state.redraw_requested = true;
     }
 
+    /// Requests a redraw after `delay`, for retrying a frame that could not be presented.
+    pub fn request_redraw_after(&mut self, delay: std::time::Duration) {
+        let t = Instant::now() + delay;
+        self.state.redraw_at = Some(self.state.redraw_at.map_or(t, |r| r.min(t)));
+    }
+
     pub fn set_cursor(&mut self, icon: CursorIcon) {
         self.state.set_cursor(icon);
     }
@@ -124,6 +137,62 @@ impl Ctx<'_> {
 
     pub fn scale(&self) -> Scale {
         self.state.scale
+    }
+
+    /// What dmabufs the compositor accepts, if it supports linux-dmabuf v4.
+    pub fn dmabuf_feedback(&self) -> Option<&DmabufFeedback> {
+        self.state.present.feedback.as_ref()
+    }
+
+    /// Wraps a dmabuf in a `wl_buffer`. Failure is reported later as [`BufferEvent::Failed`].
+    pub fn create_dmabuf_buffer(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: u32,
+        modifier: u64,
+        planes: &[DmabufPlaneDesc<'_>],
+    ) -> Option<BufferId> {
+        self.state
+            .create_dmabuf_buffer(width, height, format, modifier, planes)
+    }
+
+    pub fn destroy_buffer(&mut self, id: BufferId) {
+        self.state.destroy_buffer(id);
+    }
+
+    pub fn take_buffer_events(&mut self) -> Vec<BufferEvent> {
+        std::mem::take(&mut self.state.present.buffer_events)
+    }
+
+    /// Whether the compositor supports explicit sync (`linux-drm-syncobj-v1`).
+    pub fn explicit_sync_available(&self) -> bool {
+        self.state.present.syncobj_manager.is_some()
+    }
+
+    /// Shares a DRM syncobj timeline. The first call turns on explicit sync for the surface:
+    /// from then on every buffer commit needs [`SyncPoints`].
+    pub fn import_timeline(&mut self, fd: BorrowedFd<'_>) -> Option<TimelineId> {
+        self.state.import_timeline(fd)
+    }
+
+    pub fn destroy_timeline(&mut self, id: TimelineId) {
+        self.state.destroy_timeline(id);
+    }
+
+    /// Turns explicit sync off again (before presenting through a GPU surface).
+    pub fn disable_explicit_sync(&mut self) {
+        self.state.disable_explicit_sync();
+    }
+
+    /// Attaches the buffer, damages `damage` (buffer pixels) and commits.
+    pub fn present_buffer(&mut self, id: BufferId, damage: &[RectI], sync: Option<SyncPoints>) {
+        self.state.present_buffer(id, damage, sync);
+    }
+
+    /// Marks the whole surface opaque or not, so the compositor can skip what is behind it.
+    pub fn set_opaque(&mut self, opaque: bool) {
+        self.state.present.opaque = opaque;
     }
 
     /// Raw handles for creating a GPU surface. Valid until the event loop returns.
@@ -203,6 +272,14 @@ pub fn run<H: WaylandHandler>(options: WindowOptions, mut handler: H) -> Result<
         )
         .ok();
     let _seat: wl_seat::WlSeat = globals.bind(&qh, 1..=8, ()).map_err(err)?;
+    if let Ok(dmabuf) = globals.bind::<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _, _>(&qh, 4..=5, ())
+    {
+        state.present.feedback_object = Some(dmabuf.get_surface_feedback(&surface, &qh, ()));
+        state.present.dmabuf = Some(dmabuf);
+    }
+    state.present.syncobj_manager = globals
+        .bind::<wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1, _, _>(&qh, 1..=1, ())
+        .ok();
 
     surface.commit();
     queue.roundtrip(&mut state).map_err(err)?;
@@ -243,6 +320,7 @@ impl Loop<'_> {
         let (conn, paste_rx, wl_fd, wake_read) = (*conn, *paste_rx, *wl_fd, *wake_read);
         let qh = queue.handle();
         let mut exit = false;
+        let mut timer_deadline: Option<Instant> = None;
         loop {
             queue.dispatch_pending(*state).map_err(err)?;
 
@@ -275,9 +353,9 @@ impl Loop<'_> {
                 };
                 handler.event(&mut ctx, ev);
             }
-            if let Some(d) = handler.deadline(now)
-                && d <= Instant::now()
-            {
+            // The deadline we slept until; asking again now would give the one after it.
+            if timer_deadline.is_some_and(|d| d <= Instant::now()) {
+                timer_deadline = None;
                 let mut ctx = Ctx {
                     state,
                     conn,
@@ -289,18 +367,27 @@ impl Loop<'_> {
                 break;
             }
 
+            if state.redraw_at.is_some_and(|t| t <= Instant::now()) {
+                state.redraw_at = None;
+                state.redraw_requested = true;
+            }
             if state.configured && state.redraw_requested && !state.frame_pending {
                 state.redraw_requested = false;
-                state.surface.frame(&qh, ());
-                state.frame_pending = true;
+                // A frame callback requested for a frame that committed nothing stays in the
+                // surface's pending state and goes out with the next commit.
+                if !state.frame_callback_queued {
+                    state.surface.frame(&qh, ());
+                    state.frame_callback_queued = true;
+                }
+                state.apply_opaque_region();
                 let mut ctx = Ctx {
                     state,
                     conn,
                     exit: &mut exit,
                 };
-                if !handler.frame(&mut ctx) {
-                    // Commit anyway so the frame callback fires.
-                    state.surface.commit();
+                if handler.frame(&mut ctx) {
+                    state.frame_callback_queued = false;
+                    state.frame_pending = true;
                 }
             }
 
@@ -313,9 +400,13 @@ impl Loop<'_> {
                 continue;
             };
             let now = Instant::now();
-            let mut deadline = handler.deadline(now);
+            timer_deadline = handler.deadline(now);
+            let mut deadline = timer_deadline;
             if let Some(r) = &state.kb.repeat {
                 deadline = Some(deadline.map_or(r.next, |d| d.min(r.next)));
+            }
+            if let Some(t) = state.redraw_at {
+                deadline = Some(deadline.map_or(t, |d| d.min(t)));
             }
             let timeout = deadline.map(|d| {
                 let dur = d.saturating_duration_since(now);

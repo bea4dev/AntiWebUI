@@ -1,6 +1,7 @@
 //! The platform- and GPU-independent core of AntiWebUI: reactivity, the node tree, style
 //! resolution, layout, text, selection, editing and input handling.
 
+pub mod damage;
 pub mod event;
 pub mod geometry;
 pub mod layout;

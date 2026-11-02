@@ -64,10 +64,6 @@ pub struct PointerFrame {
 
 pub struct State {
     pub qh: QueueHandle<State>,
-    #[allow(
-        dead_code,
-        reason = "keeps the global bound for the lifetime of the window"
-    )]
     pub compositor: wl_compositor::WlCompositor,
     pub surface: wl_surface::WlSurface,
     #[allow(dead_code, reason = "the xdg_surface must outlive the toplevel")]
@@ -120,9 +116,14 @@ pub struct State {
     pub paste_tx: mpsc::Sender<(ClipboardKind, String)>,
     pub wake: OwnedFd,
 
+    /// A frame callback is outstanding for a committed frame.
     pub frame_pending: bool,
+    /// A frame callback was requested but not committed yet.
+    pub frame_callback_queued: bool,
     pub redraw_requested: bool,
+    pub redraw_at: Option<Instant>,
     pub events: Vec<WindowEvent>,
+    pub(crate) present: crate::present::PresentState,
 }
 
 impl State {
@@ -182,8 +183,11 @@ impl State {
             paste_tx,
             wake,
             frame_pending: false,
+            frame_callback_queued: false,
             redraw_requested: true,
+            redraw_at: None,
             events: Vec::new(),
+            present: Default::default(),
         }
     }
 

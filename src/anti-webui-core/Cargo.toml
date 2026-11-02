@@ -9,3 +9,4 @@ anti-webui-style.workspace = true
 parley.workspace = true
 slotmap.workspace = true
 unicode-segmentation.workspace = true
+read-fonts.workspace = true

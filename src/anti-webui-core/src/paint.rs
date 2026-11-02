@@ -2,12 +2,13 @@
 
 use crate::geometry::{PointI, RectI};
 use crate::layout::child_clip;
-use crate::scene::{Clip, Glyph, GlyphRun, Primitive, Quad, Scene, Shadow};
+use crate::scene::{ChunkKey, Clip, Glyph, GlyphRun, Primitive, Quad, Scene, Shadow};
 use crate::text::selection::node_range;
 use crate::text::{Brush, TextLayout};
 use crate::tree::{Document, NodeId, NodeKind};
 use anti_webui_style::{Color, Overflow};
 use parley::PositionedLayoutItem;
+use slotmap::Key;
 use std::time::{Duration, Instant};
 
 pub const CARET_BLINK: Duration = Duration::from_millis(530);
@@ -21,6 +22,7 @@ pub fn paint_document(doc: &Document, now: Instant) -> Scene {
         height: doc.viewport.height.max(0) as u32,
         clear: Color::WHITE,
         primitives: Vec::new(),
+        chunks: Vec::new(),
     };
     if let Some(root) = doc.root {
         let mut painter = Painter {
@@ -63,6 +65,17 @@ pub fn caret_width(doc: &Document) -> i32 {
     doc.scale.px_min1(1.0)
 }
 
+/// The parts of a node's painting, chunked separately so that a change in one (a blinking caret,
+/// a moving selection) does not damage the others.
+mod part {
+    pub const BOX: u32 = 0;
+    pub const SELECTION: u32 = 1;
+    pub const CONTENT: u32 = 2;
+    pub const CARET: u32 = 3;
+    /// Painted after the children: scrollbars and the outline.
+    pub const AFTER: u32 = 4;
+}
+
 struct Painter<'a> {
     doc: &'a Document,
     scene: &'a mut Scene,
@@ -70,6 +83,13 @@ struct Painter<'a> {
 }
 
 impl Painter<'_> {
+    fn chunk(&mut self, id: NodeId, part: u32) {
+        self.scene.begin_chunk(ChunkKey {
+            node: id.data().as_ffi(),
+            part,
+        });
+    }
+
     fn node(&mut self, id: NodeId, opacity: f32) {
         let doc = self.doc;
         let Some(node) = doc.nodes.get(id) else {
@@ -94,11 +114,13 @@ impl Painter<'_> {
                 if let Some(sel) = &doc.state.selection
                     && let Some((a, b)) = node_range(doc, sel, id)
                 {
+                    self.chunk(id, part::SELECTION);
                     let color = fade(c.selection_color, opacity);
                     for r in t.layout.range_rects(a, b, node.abs.x, node.abs.y) {
                         self.scene.fill(r, color, node.clip_shape());
                     }
                 }
+                self.chunk(id, part::CONTENT);
                 self.text_layout(
                     &t.layout,
                     node.abs.origin(),
@@ -112,6 +134,7 @@ impl Painter<'_> {
             _ => {}
         }
 
+        self.chunk(id, part::BOX);
         self.box_decorations(id, opacity);
 
         if let NodeKind::Edit(_) = &node.kind {
@@ -122,6 +145,7 @@ impl Painter<'_> {
             self.node(child, opacity);
         }
 
+        self.chunk(id, part::AFTER);
         self.scrollbars(id, opacity);
         self.outline(id, opacity);
     }
@@ -261,6 +285,7 @@ impl Painter<'_> {
         let focused = doc.state.focused == Some(id);
 
         if edit.has_selection() && edit.preedit.is_none() {
+            self.chunk(id, part::SELECTION);
             let (a, b) = edit.selection_range();
             let color = if focused && doc.state.window_focused {
                 c.selection_color
@@ -272,6 +297,7 @@ impl Painter<'_> {
             }
         }
 
+        self.chunk(id, part::CONTENT);
         if edit.text.is_empty() && edit.preedit.is_none() && !edit.placeholder.is_empty() {
             let color = c.color.with_alpha(c.color.a * 0.45);
             self.text_layout(
@@ -319,6 +345,7 @@ impl Painter<'_> {
             let elapsed = self.now.saturating_duration_since(edit.caret_epoch);
             let on = (elapsed.as_millis() / CARET_BLINK.as_millis()).is_multiple_of(2);
             if on || edit.preedit.is_some() {
+                self.chunk(id, part::CARET);
                 let caret = edit
                     .caret_rect(caret_width(doc))
                     .translate(origin.x, origin.y);

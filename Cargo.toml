@@ -48,3 +48,6 @@ pollster = "1"
 png = "0.18"
 bytemuck = { version = "1.25", features = ["derive"] }
 log = "0.4"
+read-fonts = { version = "0.41", default-features = false, features = ["std"] }
+ash = "0.38"
+libc = "0.2"

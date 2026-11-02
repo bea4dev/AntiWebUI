@@ -1,6 +1,7 @@
 //! Scene → GPU draw calls.
 
 use crate::glyph_cache::{GlyphCache, PlacedGlyph};
+use anti_webui_core::damage::{Damage, primitive_bounds};
 use anti_webui_core::geometry::RectI;
 use anti_webui_core::scene::{Clip, Primitive, Scene};
 use bytemuck::{Pod, Zeroable};
@@ -99,6 +100,8 @@ impl InstanceBuffer {
 pub struct Renderer {
     format: wgpu::TextureFormat,
     quad_pipeline: wgpu::RenderPipeline,
+    /// The quad pipeline without blending, for clearing damaged rectangles.
+    clear_pipeline: wgpu::RenderPipeline,
     glyph_pipeline: wgpu::RenderPipeline,
     globals: wgpu::Buffer,
     globals_bind: wgpu::BindGroup,
@@ -250,27 +253,38 @@ impl Renderer {
             topology: wgpu::PrimitiveTopology::TriangleStrip,
             ..Default::default()
         };
-        let quad_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("quad"),
-            layout: Some(&quad_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_quad"),
-                compilation_options: Default::default(),
-                buffers: &quad_buffers,
-            },
-            primitive,
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_quad"),
-                compilation_options: Default::default(),
-                targets: &targets,
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let quad_pipeline_with = |label, targets: &[Option<wgpu::ColorTargetState>]| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&quad_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_quad"),
+                    compilation_options: Default::default(),
+                    buffers: &quad_buffers,
+                },
+                primitive,
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_quad"),
+                    compilation_options: Default::default(),
+                    targets,
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let quad_pipeline = quad_pipeline_with("quad", &targets);
+        let clear_pipeline = quad_pipeline_with(
+            "clear",
+            &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        );
 
         let glyph_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("glyph"),
@@ -311,6 +325,7 @@ impl Renderer {
         Self {
             format,
             quad_pipeline,
+            clear_pipeline,
             glyph_pipeline,
             globals,
             globals_bind,
@@ -330,13 +345,17 @@ impl Renderer {
     }
 
     /// Builds instance data; grows the atlas and retries if glyphs did not fit.
+    ///
+    /// With `damage`, the first quad instances clear the damaged rectangles (one each) and
+    /// primitives outside of them are dropped.
     fn prepare(
         &mut self,
         device: &wgpu::Device,
         scene: &Scene,
+        damage: Option<&[RectI]>,
     ) -> (Vec<QuadInstance>, Vec<GlyphInstance>, Vec<Batch>) {
         loop {
-            match self.try_prepare(scene) {
+            match self.try_prepare(scene, damage) {
                 Some(r) => return r,
                 None => {
                     let next = (self.glyphs.size * 2).min(self.max_texture);
@@ -352,12 +371,32 @@ impl Renderer {
     fn try_prepare(
         &mut self,
         scene: &Scene,
+        damage: Option<&[RectI]>,
     ) -> Option<(Vec<QuadInstance>, Vec<GlyphInstance>, Vec<Batch>)> {
         let mut quads = Vec::new();
         let mut glyphs = Vec::new();
         let mut batches: Vec<Batch> = Vec::new();
         let mut placed: Vec<PlacedGlyph> = Vec::new();
+        let clear = scene.clear.premultiplied();
+        for r in damage.unwrap_or_default() {
+            quads.push(QuadInstance {
+                rect: rect4(*r),
+                background: clear,
+                border_color: [0.0; 4],
+                border: [0.0; 4],
+                radii: [0.0; 4],
+                clip: rect4(*r),
+                params: [0.0; 4],
+                clip_radii: [0.0; 4],
+            });
+        }
         for prim in &scene.primitives {
+            if let Some(damage) = damage {
+                let bounds = primitive_bounds(prim);
+                if !damage.iter().any(|r| r.intersects(&bounds)) {
+                    continue;
+                }
+            }
             match prim {
                 Primitive::Quad(q) => {
                     let screen = RectI::new(0, 0, scene.width as i32, scene.height as i32);
@@ -437,7 +476,44 @@ impl Renderer {
         view: &wgpu::TextureView,
         scene: &Scene,
     ) {
-        let (quads, glyphs, batches) = self.prepare(device, scene);
+        self.record(device, queue, encoder, view, scene, None);
+    }
+
+    /// Records only the damaged part of the scene into `view`, which must hold the previous
+    /// frame's pixels outside of `damage`. `view` must be the size of the scene.
+    pub fn render_damaged(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        scene: &Scene,
+        damage: &Damage,
+    ) {
+        let screen = RectI::new(0, 0, scene.width as i32, scene.height as i32);
+        let rects: Vec<RectI> = damage
+            .rects()
+            .iter()
+            .map(|r| r.intersect(&screen))
+            .filter(|r| !r.is_empty())
+            .collect();
+        if rects.len() == 1 && rects[0] == screen {
+            self.record(device, queue, encoder, view, scene, None);
+        } else if !rects.is_empty() {
+            self.record(device, queue, encoder, view, scene, Some(&rects));
+        }
+    }
+
+    fn record(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        scene: &Scene,
+        damage: Option<&[RectI]>,
+    ) {
+        let (quads, glyphs, batches) = self.prepare(device, scene, damage);
         for (g, pixels) in self.glyphs.uploads.drain(..) {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -477,6 +553,15 @@ impl Renderer {
             .upload(device, queue, bytemuck::cast_slice(&glyphs));
 
         let c = scene.clear.premultiplied();
+        let load = match damage {
+            Some(_) => wgpu::LoadOp::Load,
+            None => wgpu::LoadOp::Clear(wgpu::Color {
+                r: c[0] as f64,
+                g: c[1] as f64,
+                b: c[2] as f64,
+                a: c[3] as f64,
+            }),
+        };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("anti-webui"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -484,12 +569,7 @@ impl Renderer {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: c[0] as f64,
-                        g: c[1] as f64,
-                        b: c[2] as f64,
-                        a: c[3] as f64,
-                    }),
+                    load,
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -499,7 +579,22 @@ impl Renderer {
             multiview_mask: None,
         });
         pass.set_bind_group(0, &self.globals_bind, &[]);
-        for batch in &batches {
+        let Some(damage) = damage else {
+            self.draw_batches(&mut pass, &batches);
+            return;
+        };
+        // Each rectangle is cleared and then repainted; overlapping rectangles just repeat work.
+        for (i, r) in damage.iter().enumerate() {
+            pass.set_scissor_rect(r.x as u32, r.y as u32, r.width as u32, r.height as u32);
+            pass.set_pipeline(&self.clear_pipeline);
+            pass.set_vertex_buffer(0, self.quad_buffer.buffer.slice(..));
+            pass.draw(0..4, i as u32..i as u32 + 1);
+            self.draw_batches(&mut pass, &batches);
+        }
+    }
+
+    fn draw_batches(&self, pass: &mut wgpu::RenderPass<'_>, batches: &[Batch]) {
+        for batch in batches {
             match batch {
                 Batch::Quads(r) => {
                     pass.set_pipeline(&self.quad_pipeline);

@@ -11,3 +11,7 @@ swash.workspace = true
 bytemuck.workspace = true
 raw-window-handle.workspace = true
 pollster.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ash.workspace = true
+libc.workspace = true

@@ -147,6 +147,33 @@ impl RectI {
         RectI::new(x, y, (r - x).max(0), (b - y).max(0))
     }
 
+    /// The smallest rectangle containing both; an empty side is ignored.
+    pub fn union(&self, other: &RectI) -> RectI {
+        if self.is_empty() {
+            return *other;
+        }
+        if other.is_empty() {
+            return *self;
+        }
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let r = self.right().max(other.right());
+        let b = self.bottom().max(other.bottom());
+        RectI::new(x, y, r - x, b - y)
+    }
+
+    pub fn area(&self) -> i64 {
+        if self.is_empty() {
+            0
+        } else {
+            self.width as i64 * self.height as i64
+        }
+    }
+
+    pub fn intersects(&self, other: &RectI) -> bool {
+        !self.intersect(other).is_empty()
+    }
+
     pub fn translate(&self, dx: i32, dy: i32) -> RectI {
         RectI::new(self.x + dx, self.y + dy, self.width, self.height)
     }

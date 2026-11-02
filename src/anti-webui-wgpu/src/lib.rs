@@ -1,6 +1,10 @@
 //! The wgpu renderer for AntiWebUI scenes.
 
+#[cfg(target_os = "linux")]
+pub mod dmabuf;
 mod glyph_cache;
+#[cfg(target_os = "linux")]
+pub mod linux_sync;
 mod renderer;
 
 use anti_webui_core::scene::Scene;
@@ -15,6 +19,8 @@ pub enum GpuError {
     Surface(wgpu::CreateSurfaceError),
     Adapter(wgpu::RequestAdapterError),
     Device(wgpu::RequestDeviceError),
+    /// Our own display buffers are unavailable; use a surface instead.
+    Dmabuf(String),
 }
 
 impl std::fmt::Display for GpuError {
@@ -23,6 +29,7 @@ impl std::fmt::Display for GpuError {
             GpuError::Surface(e) => write!(f, "failed to create surface: {e}"),
             GpuError::Adapter(e) => write!(f, "no suitable GPU adapter: {e}"),
             GpuError::Device(e) => write!(f, "failed to create GPU device: {e}"),
+            GpuError::Dmabuf(e) => write!(f, "dmabuf presentation unavailable: {e}"),
         }
     }
 }
@@ -206,34 +213,54 @@ impl Gpu {
 
     /// Renders a scene offscreen and returns tightly packed RGBA8 pixels.
     pub fn render_to_rgba(&self, renderer: &mut Renderer, scene: &Scene) -> Vec<u8> {
-        let (w, h) = (scene.width.max(1), scene.height.max(1));
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+        let target = Offscreen::new(self, renderer.format(), scene.width, scene.height);
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        renderer.render(&self.device, &self.queue, &mut encoder, &target.view, scene);
+        self.queue.submit([encoder.finish()]);
+        target.read_rgba(self)
+    }
+}
+
+/// An offscreen render target that keeps its pixels between frames.
+pub struct Offscreen {
+    pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+}
+
+impl Offscreen {
+    pub fn new(gpu: &Gpu, format: wgpu::TextureFormat, width: u32, height: u32) -> Self {
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen"),
             size: wgpu::Extent3d {
-                width: w,
-                height: h,
+                width: width.max(1),
+                height: height.max(1),
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: renderer.format(),
+            format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&Default::default());
+        Self { texture, view }
+    }
+
+    /// Reads the pixels back as tightly packed RGBA8.
+    pub fn read_rgba(&self, gpu: &Gpu) -> Vec<u8> {
+        let (w, h) = (self.texture.width(), self.texture.height());
         let padded = (w * 4).div_ceil(256) * 256;
-        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: (padded * h) as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        renderer.render(&self.device, &self.queue, &mut encoder, &view, scene);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &texture,
+                texture: &self.texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -252,12 +279,12 @@ impl Gpu {
                 depth_or_array_layers: 1,
             },
         );
-        self.queue.submit([encoder.finish()]);
+        gpu.queue.submit([encoder.finish()]);
         let slice = buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
         let data = slice.get_mapped_range().expect("readback buffer is mapped");
-        let bgra = renderer.format() == wgpu::TextureFormat::Bgra8Unorm;
+        let bgra = self.texture.format() == wgpu::TextureFormat::Bgra8Unorm;
         let mut out = Vec::with_capacity((w * h * 4) as usize);
         for row in 0..h {
             let start = (row * padded) as usize;
