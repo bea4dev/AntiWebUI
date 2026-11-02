@@ -27,6 +27,7 @@ use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1;
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1;
 use wayland_protocols::wp::linux_drm_syncobj::v1::client::wp_linux_drm_syncobj_manager_v1;
+use wayland_protocols::wp::pointer_gestures::zv1::client::zwp_pointer_gestures_v1;
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_device_manager_v1;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3;
 use wayland_protocols::wp::viewporter::client::wp_viewporter;
@@ -262,6 +263,9 @@ pub fn run<H: WaylandHandler>(options: WindowOptions, mut handler: H) -> Result<
         .ok();
     state.text_input_manager = globals
         .bind::<zwp_text_input_manager_v3::ZwpTextInputManagerV3, _, _>(&qh, 1..=1, ())
+        .ok();
+    state.pointer_gestures = globals
+        .bind::<zwp_pointer_gestures_v1::ZwpPointerGesturesV1, _, _>(&qh, 3..=3, ())
         .ok();
     state.data_device_manager = globals.bind(&qh, 1..=3, ()).ok();
     state.primary_manager = globals

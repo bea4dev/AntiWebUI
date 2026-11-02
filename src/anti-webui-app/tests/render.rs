@@ -204,6 +204,9 @@ fn damaged_repaint_matches_full_repaint() {
                 delta_x: 0.0,
                 delta_y: 37.0,
                 modifiers: Modifiers::default(),
+                source: ScrollSource::Unknown,
+                phase: ScrollPhase::Single,
+                time: 0,
             })
         }),
         Box::new(move |ui| {
@@ -365,6 +368,9 @@ fn scroll_layers_match_a_fresh_render() {
             delta_x: *dx,
             delta_y: *dy,
             modifiers: Modifiers::default(),
+            source: ScrollSource::Unknown,
+            phase: ScrollPhase::Single,
+            time: 0,
         });
         // Now and then the content changes too: hover follows whatever is under the pointer.
         if i % 7 == 3 {
@@ -401,12 +407,61 @@ fn scroll_layers_match_a_fresh_render() {
         prev = scene;
     }
 
+    // Inertia at full speed on a diagonal, which moves further than a screen every few frames.
+    let m = Modifiers::default();
+    for (phase, time) in [
+        (ScrollPhase::Began, 1000),
+        (ScrollPhase::Moved, 1010),
+        (ScrollPhase::Moved, 1020),
+        (ScrollPhase::Lifted { fling: true }, 1025),
+    ] {
+        let lifted = matches!(phase, ScrollPhase::Lifted { .. });
+        ui.handle_event(WindowEvent::Scroll {
+            position: center,
+            delta_x: if lifted { 0.0 } else { 60.0 },
+            delta_y: if lifted { 0.0 } else { 200.0 },
+            modifiers: m,
+            source: ScrollSource::Touchpad,
+            phase,
+            time,
+        });
+    }
+    assert!(ui.animating());
+    let start = Instant::now();
+    let mut frame = 0;
+    while ui.animating() {
+        frame += 1;
+        ui.animate(start + std::time::Duration::from_millis(frame * 16));
+        ui.update();
+        let scene = ui.paint(now);
+        let d = damage::diff(&prev, &scene);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        cached.render_damaged(
+            &gpu.device,
+            &gpu.queue,
+            &mut encoder,
+            &target.view,
+            &scene,
+            &d,
+        );
+        gpu.queue.submit([encoder.finish()]);
+        let pixels = target.read_rgba(&gpu);
+        fresh.clear_layer_caches();
+        let expected = gpu.render_to_rgba(&mut fresh, &scene);
+        assert!(pixels == expected, "inertia frame {frame} differs");
+        prev = scene;
+    }
+    assert!(frame > 5, "only {frame} frames of inertia");
+
     // A nested scroller redraws only itself in the outer layer.
     ui.handle_event(WindowEvent::Scroll {
         position: center,
         delta_x: -5000.0,
         delta_y: -5000.0,
         modifiers: Modifiers::default(),
+        source: ScrollSource::Unknown,
+        phase: ScrollPhase::Single,
+        time: 0,
     });
     ui.update();
     let at_start = ui.paint(now);
@@ -427,6 +482,9 @@ fn scroll_layers_match_a_fresh_render() {
         delta_x: 0.0,
         delta_y: 15.0,
         modifiers: Modifiers::default(),
+        source: ScrollSource::Unknown,
+        phase: ScrollPhase::Single,
+        time: 0,
     });
     ui.update();
     let scene = ui.paint(now);

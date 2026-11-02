@@ -16,6 +16,7 @@
 | `zwp_primary_selection_v1` | 中クリック貼り付け | 任意 |
 | `zwp_linux_dmabuf_v1`（v4 以上） | 自前のバッファ管理（ダメージトラッキング） | 推奨（無ければ wgpu Surface） |
 | `wp_linux_drm_syncobj_manager_v1` | 明示的同期 | 任意（無ければ暗黙的同期） |
+| `zwp_pointer_gestures_v1`（v3 以上） | 指を置いて慣性を止める | 任意（無ければ次の指の移動で止まる） |
 
 ## スケールとサイズ
 
@@ -39,6 +40,23 @@ loop {
 - wake pipe: クリップボード読み込みスレッドなど、他スレッドからの通知用。
 - フレームコールバック: 描画のたびに `wl_surface.frame` を要求するが、何も提示しなかったフレーム（変更矩形が空など）では commit せず、要求は次の commit まで保留する。何も変わらない commit にはコンポジタがコールバックを返さないことがあり、待つと描画が止まるため。
 - 提示できなかったフレーム（空きバッファが無い）は、数ミリ秒後に再試行する。
+
+## スクロール
+
+`wl_pointer` のイベントは `frame` までまとめて、1 つの `WindowEvent::Scroll` にする（[08](08-scrolling-and-settings.md)）。
+
+| `axis_source` | source | phase |
+|---|---|---|
+| `finger`（列の最初） | `Touchpad` | `Began` |
+| `finger`（続き） | `Touchpad` | `Moved` |
+| `axis_stop` のみのフレーム（指を動かしている間だけ） | `Touchpad` | `Lifted { fling: true }` |
+| `wheel` / `wheel_tilt`（`axis_value120` あり） | `Wheel` | `Single` |
+| それ以外（`continuous`、不明、`axis_value120` なしのホイール） | `Unknown` | `Single` |
+
+- `finger` と `continuous` は移動量を `AXIS_MOTION_GAIN`（5.0）倍して渡す（[08](08-scrolling-and-settings.md)）。
+- `axis_stop` が必ず届くのは `finger` だけなので（プロトコルの規定）、他のソースでは慣性を始めない。
+- 片方の軸だけの `axis_stop` と、もう片方の軸の移動が同じフレームに来たら、指はまだ動いている。
+- `zwp_pointer_gesture_hold_v1` の `begin` は `Held` にする。
 
 ## キーボード
 

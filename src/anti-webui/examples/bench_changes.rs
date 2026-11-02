@@ -203,10 +203,46 @@ fn bench(gpu: &Gpu, rows: usize) {
                 delta_x: 0.0,
                 delta_y: if i % 120 < 60 { 24.0 } else { -24.0 },
                 modifiers: m,
+                source: ScrollSource::Unknown,
+                phase: ScrollPhase::Single,
+                time: 0,
             })
         });
     }
     report("scroll", &t);
+
+    // At the top speed, which moves further than a screen every few frames.
+    let mut t = Times::default();
+    let mut fling = (std::time::Instant::now(), 0);
+    let mut down = true;
+    for _ in 0..STEPS {
+        b.frame(&mut t, |ui| {
+            if !ui.animating() {
+                down = !down;
+                let dy = if down { 300.0 } else { -300.0 };
+                for (phase, time, dy) in [
+                    (ScrollPhase::Began, 0, dy),
+                    (ScrollPhase::Moved, 10, dy),
+                    (ScrollPhase::Moved, 20, dy),
+                    (ScrollPhase::Lifted { fling: true }, 25, 0.0),
+                ] {
+                    ui.handle_event(WindowEvent::Scroll {
+                        position: PointF::new(400.0, 800.0),
+                        delta_x: 0.0,
+                        delta_y: dy,
+                        modifiers: m,
+                        source: ScrollSource::Touchpad,
+                        phase,
+                        time,
+                    });
+                }
+                fling = (std::time::Instant::now(), 0);
+            }
+            fling.1 += 1;
+            ui.animate(fling.0 + std::time::Duration::from_millis(fling.1 * 16));
+        });
+    }
+    report("inertia", &t);
 }
 
 fn main() {

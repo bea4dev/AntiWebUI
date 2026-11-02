@@ -147,6 +147,9 @@ fn scroll(ui: &mut Ui, p: PointF, dx: f32, dy: f32) {
         delta_x: dx,
         delta_y: dy,
         modifiers: Modifiers::default(),
+        source: ScrollSource::Unknown,
+        phase: ScrollPhase::Single,
+        time: 0,
     });
     ui.update();
 }

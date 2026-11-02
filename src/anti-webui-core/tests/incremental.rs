@@ -371,7 +371,7 @@ fn random_changes(seed: u64) {
             rng.next(size.width as u32) as f32,
             rng.next(size.height as u32) as f32,
         );
-        let what = rng.next(20);
+        let what = rng.next(21);
         // Like a real pointer, it gets to a place before doing anything there.
         ui.handle_event(WindowEvent::PointerMoved {
             position: p,
@@ -406,7 +406,38 @@ fn random_changes(seed: u64) {
                 delta_x: rng.next(300) as f32 - 150.0,
                 delta_y: rng.next(900) as f32 - 450.0,
                 modifiers: m,
+                source: ScrollSource::Unknown,
+                phase: ScrollPhase::Single,
+                time: 0,
             }),
+            20 => {
+                // Fingers leaving, then some frames of inertia that the other changes interrupt.
+                let dy = rng.next(120) as f32 - 60.0;
+                for (i, phase) in [
+                    ScrollPhase::Began,
+                    ScrollPhase::Moved,
+                    ScrollPhase::Moved,
+                    ScrollPhase::Lifted { fling: true },
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    ui.handle_event(WindowEvent::Scroll {
+                        position: p,
+                        delta_x: 0.0,
+                        delta_y: dy,
+                        modifiers: m,
+                        source: ScrollSource::Touchpad,
+                        phase,
+                        time: step * 1000 + i as u32 * 10,
+                    });
+                }
+                check(&mut ui, now, "flick");
+                for i in 1..=rng.next(5) {
+                    ui.animate(Instant::now() + std::time::Duration::from_millis(i as u64 * 60));
+                    check(&mut ui, now, "inertia");
+                }
+            }
             8 => s.color.set(rng.next(0xffffff)),
             9 => s.size.set(10.0 + rng.next(10) as f32),
             10 => s.gap.set(rng.next(8) as f32),
@@ -504,6 +535,9 @@ fn culling_keeps_what_sticks_out() {
             delta_x: if step % 5 == 0 { 40.0 } else { 0.0 },
             delta_y: 70.0,
             modifiers: m,
+            source: ScrollSource::Unknown,
+            phase: ScrollPhase::Single,
+            time: 0,
         });
         ui.update();
         let scene = ui.paint(now);
@@ -660,6 +694,9 @@ fn scrolled_content_keeps_window_coordinates_outside() {
         delta_x: 0.0,
         delta_y: 700.0,
         modifiers: m,
+        source: ScrollSource::Unknown,
+        phase: ScrollPhase::Single,
+        time: 0,
     });
     ui.update();
     let r = button.rect().unwrap();
@@ -720,6 +757,9 @@ fn scrolled_content_keeps_window_coordinates_outside() {
         delta_x: 0.0,
         delta_y: 30.0,
         modifiers: m,
+        source: ScrollSource::Unknown,
+        phase: ScrollPhase::Single,
+        time: 0,
     });
     ui.update();
     let moved = ui
@@ -739,6 +779,9 @@ fn scrolled_content_keeps_window_coordinates_outside() {
         delta_x: 0.0,
         delta_y: 700.0,
         modifiers: m,
+        source: ScrollSource::Unknown,
+        phase: ScrollPhase::Single,
+        time: 0,
     });
     ui.update();
     let a = above.rect().unwrap();
@@ -816,6 +859,9 @@ fn selecting_scrolled_text() {
         delta_x: 0.0,
         delta_y: 550.0,
         modifiers: m,
+        source: ScrollSource::Unknown,
+        phase: ScrollPhase::Single,
+        time: 0,
     });
     ui.update();
     let (ra, rb) = (a.rect().unwrap(), b.rect().unwrap());

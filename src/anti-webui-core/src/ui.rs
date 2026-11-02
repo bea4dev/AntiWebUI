@@ -10,6 +10,8 @@ use crate::paint::{CARET_BLINK, caret_width, edit_text_origin, paint_document};
 use crate::platform::{CursorIcon, ImeState, PlatformRequest};
 use crate::reactive::{Owner, batch, create_root};
 use crate::scene::Scene;
+use crate::scroll::{Booster, FLING_SPEED_RATIO, Fling, VelocityTracker};
+use crate::settings::with_settings;
 use crate::text::edit::{EditOutcome, Motion};
 use crate::text::selection::{self, Granularity};
 use crate::text::with_text;
@@ -18,9 +20,12 @@ use crate::view::IntoView;
 use anti_webui_style::{AlignItems, Display, FlexDirection, Overflow, Style, UserSelect};
 use std::cell::Cell;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const DOUBLE_CLICK_MS: u32 = 500;
+/// Logical pixels the pointer may move before it stops inertia: fingers rarely leave a touchpad at
+/// the same moment, and the last one can still move the pointer a little.
+const MOMENTUM_MOVE_SLOP: f32 = 8.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Drag {
@@ -39,6 +44,32 @@ struct Press {
     drag: Drag,
 }
 
+/// A touchpad gesture from its first motion to the end of its inertia, which goes to the same
+/// nodes however the content moves under the pointer.
+struct ScrollGesture {
+    position: PointF,
+    /// The nodes under the pointer when it began, innermost first.
+    chain: Vec<NodeId>,
+    /// What it scrolls, once there was motion in a direction something can scroll to.
+    scroller: Option<NodeId>,
+    source: ScrollSource,
+    /// Shift turns vertical motion into horizontal scrolling.
+    shift: bool,
+    velocity: VelocityTracker,
+    /// The fingers left; only inertia follows.
+    lifted: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Scrolled {
+    /// A handler took it.
+    Handled,
+    /// The content moved, or would with more motion.
+    Moving,
+    /// There is nothing to scroll in this direction.
+    Stuck,
+}
+
 pub struct Ui {
     owner: Owner,
     pointer: Option<PointF>,
@@ -49,6 +80,11 @@ pub struct Ui {
     ime_sent: Option<Option<ImeState>>,
     /// Where a pending paste should go.
     paste_target: Option<NodeId>,
+    gesture: Option<ScrollGesture>,
+    fling: Option<Fling>,
+    booster: Option<Booster>,
+    /// The fraction of a pixel not yet scrolled, and the node it belongs to.
+    scroll_rest: Option<(NodeId, f32, f32)>,
 }
 
 fn pointer_event(
@@ -104,6 +140,10 @@ impl Ui {
             cursor: None,
             ime_sent: None,
             paste_target: None,
+            gesture: None,
+            fling: None,
+            booster: None,
+            scroll_rest: None,
         }
     }
 
@@ -174,7 +214,27 @@ impl Ui {
     }
 
     pub fn needs_redraw(&self) -> bool {
-        with_doc(|d| d.dirty.paint || Self::needs_update(d))
+        self.fling.is_some() || with_doc(|d| d.dirty.paint || Self::needs_update(d))
+    }
+
+    /// Whether frames must keep coming even if nothing else changes. See [`Ui::animate`].
+    pub fn animating(&self) -> bool {
+        self.fling.is_some()
+    }
+
+    /// Advances animations to `now`. Call before [`Ui::update`] when producing a frame.
+    pub fn animate(&mut self, now: Instant) {
+        let Some(fling) = &mut self.fling else {
+            return;
+        };
+        let (dx, dy, mut done) = fling.step(now);
+        if dx != 0.0 || dy != 0.0 {
+            let p = self.pointer;
+            done |= self.deliver_scroll(p, dx, dy, ScrollPhase::Momentum) == Scrolled::Stuck;
+        }
+        if done {
+            self.end_scroll_gesture();
+        }
     }
 
     /// Produces the frame. Call [`Ui::update`] first.
@@ -230,9 +290,16 @@ impl Ui {
                 modifiers,
             } => {
                 self.modifiers = modifiers;
+                if self.gesture.as_ref().is_some_and(|g| {
+                    let slop = MOMENTUM_MOVE_SLOP * with_doc(|d| d.scale).as_f64() as f32;
+                    g.lifted && (position.x - g.position.x).hypot(position.y - g.position.y) > slop
+                }) {
+                    self.end_scroll_gesture();
+                }
                 self.pointer_moved(position);
             }
             WindowEvent::PointerLeft => {
+                self.end_scroll_gesture();
                 self.pointer = None;
                 if self.press.is_none() {
                     self.set_hovered(Vec::new());
@@ -248,6 +315,7 @@ impl Ui {
                 self.modifiers = modifiers;
                 self.pointer = Some(position);
                 if pressed {
+                    self.end_scroll_gesture();
                     self.pointer_down(position, button, time);
                 } else {
                     self.pointer_up(position, button);
@@ -258,12 +326,18 @@ impl Ui {
                 delta_x,
                 delta_y,
                 modifiers,
+                source,
+                phase,
+                time,
             } => {
                 self.modifiers = modifiers;
-                self.scroll(position, delta_x, delta_y);
+                self.scroll(position, delta_x, delta_y, source, phase, time);
             }
             WindowEvent::Key(key) => {
                 self.modifiers = key.modifiers;
+                if key.pressed {
+                    self.end_scroll_gesture();
+                }
                 self.key(key);
             }
             WindowEvent::Ime(update) => self.ime(update),
@@ -619,13 +693,139 @@ impl Ui {
         });
     }
 
-    fn scroll(&mut self, p: PointF, dx: f32, dy: f32) {
+    fn scroll(
+        &mut self,
+        p: PointF,
+        dx: f32,
+        dy: f32,
+        source: ScrollSource,
+        phase: ScrollPhase,
+        time: u32,
+    ) {
+        let factor = with_settings(|s| match source {
+            ScrollSource::Wheel => s.scroll.wheel_step * with_doc(|d| d.scale).as_f64() as f32,
+            ScrollSource::Touchpad => s.scroll.touchpad_factor,
+            ScrollSource::Unknown => 1.0,
+        });
+        let (dx, dy) = (dx * factor, dy * factor);
+        match phase {
+            ScrollPhase::Single => {
+                self.end_scroll_gesture();
+                self.begin_scroll_gesture(p, source);
+                self.deliver_scroll(Some(p), dx, dy, phase);
+                self.gesture = None;
+            }
+            ScrollPhase::Began | ScrollPhase::Moved => {
+                if phase == ScrollPhase::Began || self.gesture.as_ref().is_none_or(|g| g.lifted) {
+                    self.interrupt_scroll_gesture(time);
+                    self.begin_scroll_gesture(p, source);
+                }
+                if let Some(g) = &mut self.gesture {
+                    g.velocity.record(time, dx, dy);
+                }
+                let scale = with_doc(|d| d.scale).as_f64() as f32;
+                if self
+                    .booster
+                    .as_mut()
+                    .is_some_and(|b| !b.motion(time, dx / scale, dy / scale))
+                {
+                    self.booster = None;
+                }
+                self.deliver_scroll(Some(p), dx, dy, phase);
+            }
+            ScrollPhase::Lifted { fling } => self.scroll_lifted(p, fling, time),
+            ScrollPhase::Held => self.interrupt_scroll_gesture(time),
+            ScrollPhase::MomentumEnded => self.end_scroll_gesture(),
+            ScrollPhase::Momentum => {
+                if self.gesture.as_ref().is_some_and(|g| g.lifted) {
+                    self.deliver_scroll(Some(p), dx, dy, phase);
+                }
+            }
+        }
+    }
+
+    fn begin_scroll_gesture(&mut self, p: PointF, source: ScrollSource) {
         self.ensure_layout();
-        let Some(target) = self.hit_test(p) else {
+        self.gesture = self.hit_test(p).map(|target| ScrollGesture {
+            position: p,
+            chain: with_doc(|d| d.ancestors(target)),
+            scroller: None,
+            source,
+            shift: self.modifiers.shift,
+            velocity: VelocityTracker::default(),
+            lifted: false,
+        });
+    }
+
+    fn scroll_lifted(&mut self, p: PointF, fling: bool, time: u32) {
+        let Some(g) = &mut self.gesture else {
             return;
         };
-        let chain = with_doc(|d| d.ancestors(target));
-        for &id in &chain {
+        g.lifted = true;
+        let velocity = g.velocity.velocity(time);
+        let since_last = g.velocity.since_last(time);
+        self.deliver_scroll(Some(p), 0.0, 0.0, ScrollPhase::Lifted { fling });
+        let booster = self.booster.take();
+        let (scale, size) = with_doc(|d| (d.scale.as_f64() as f32, d.viewport));
+        let kinetic = with_settings(|s| s.scroll.kinetic.clone());
+        self.fling = (fling && kinetic.enabled && self.press.is_none())
+            .then_some(velocity)
+            .flatten()
+            .and_then(|v| {
+                let v = (
+                    v.0 / scale * FLING_SPEED_RATIO,
+                    v.1 / scale * FLING_SPEED_RATIO,
+                );
+                let (v, boost) = booster
+                    .as_ref()
+                    .and_then(|b| b.boost(time, v))
+                    .unwrap_or((v, 1.0));
+                // It takes over from the last motion, not from when that was noticed to be it.
+                let now = Instant::now();
+                let start = now
+                    .checked_sub(Duration::from_millis(since_last as u64))
+                    .unwrap_or(now);
+                let window = (size.width as f32 / scale, size.height as f32 / scale);
+                Fling::new(v, boost, &kinetic, window, scale, start)
+            });
+        // Without inertia the gesture is over, and so is what the platform may still send.
+        if !kinetic.enabled || (fling && self.fling.is_none()) {
+            self.gesture = None;
+        }
+    }
+
+    /// Ends the current gesture because fingers came back, keeping what they need to add to its
+    /// inertia. Every new gesture passes through here, so nothing older is left to add to.
+    fn interrupt_scroll_gesture(&mut self, time: u32) {
+        let booster = self.fling.as_ref().map(|f| Booster::new(f, time));
+        self.end_scroll_gesture();
+        self.booster = booster;
+    }
+
+    /// Ends the current gesture and its inertia. Inertia from the platform is ignored from here
+    /// on, up to the next gesture.
+    fn end_scroll_gesture(&mut self) {
+        self.fling = None;
+        if self.gesture.as_ref().is_some_and(|g| g.lifted) {
+            self.deliver_scroll(None, 0.0, 0.0, ScrollPhase::MomentumEnded);
+        }
+        self.gesture = None;
+    }
+
+    /// Passes motion of the current gesture to the handlers, then to the node it scrolls.
+    fn deliver_scroll(
+        &mut self,
+        p: Option<PointF>,
+        dx: f32,
+        dy: f32,
+        phase: ScrollPhase,
+    ) -> Scrolled {
+        self.ensure_layout();
+        let Some(g) = &self.gesture else {
+            return Scrolled::Stuck;
+        };
+        let source = g.source;
+        for &id in &g.chain {
             let handler = with_doc(|d| {
                 d.get(id)
                     .filter(|n| !n.disabled)
@@ -636,39 +836,66 @@ impl Ui {
                     delta_x: dx,
                     delta_y: dy,
                     modifiers: self.modifiers,
+                    source,
+                    phase,
                     stopped: Cell::new(false),
                 };
                 batch(|| h(&ev));
                 if ev.stopped.get() {
-                    return;
+                    return Scrolled::Handled;
                 }
             }
         }
-        // Shift turns vertical wheel motion into horizontal scrolling.
-        let (dx, dy) = if self.modifiers.shift && dx == 0.0 {
+        if dx == 0.0 && dy == 0.0 {
+            return Scrolled::Stuck;
+        }
+        let (dx, dy) = if g.shift && dx == 0.0 {
             (dy, 0.0)
         } else {
             (dx, dy)
         };
-        let scrolled = with_doc(|d| {
-            for id in chain {
-                if scroll_node(d, id, dx, dy) {
-                    return true;
-                }
-            }
-            false
+        let Some(id) = g.scroller.or_else(|| {
+            with_doc(|d| {
+                g.chain
+                    .iter()
+                    .copied()
+                    .find(|&id| can_scroll(d, id, dx, dy))
+            })
+        }) else {
+            return Scrolled::Stuck;
+        };
+        if let Some(g) = &mut self.gesture {
+            g.scroller = Some(id);
+        }
+        let mut rest = match self.scroll_rest {
+            Some((node, x, y)) if node == id => (x, y),
+            _ => (0.0, 0.0),
+        };
+        let (scrolled, moving) = with_doc(|d| {
+            let scrolled = scroll_node(d, id, dx, dy, &mut rest);
+            (scrolled, can_scroll(d, id, dx, dy))
         });
+        self.scroll_rest = Some((id, rest.0, rest.1));
         if scrolled {
             self.ensure_layout();
             // Keep extending an in-progress selection while the content scrolls under it.
-            if matches!(
-                self.press.as_ref().map(|p| p.drag),
-                Some(Drag::Select | Drag::Edit(_))
-            ) {
-                self.pointer_moved(p);
-            } else {
-                self.update_hover(p);
+            match p {
+                Some(p)
+                    if matches!(
+                        self.press.as_ref().map(|p| p.drag),
+                        Some(Drag::Select | Drag::Edit(_))
+                    ) =>
+                {
+                    self.pointer_moved(p)
+                }
+                Some(p) => self.update_hover(p),
+                None => {}
             }
+        }
+        if moving {
+            Scrolled::Moving
+        } else {
+            Scrolled::Stuck
         }
     }
 
@@ -1214,35 +1441,62 @@ fn cursor_for(doc: &Document, target: Option<NodeId>) -> CursorIcon {
     CursorIcon::Default
 }
 
-fn scroll_node(doc: &mut Document, id: NodeId, dx: f32, dy: f32) -> bool {
+/// Whether motion in this direction would move `id`, given enough of it.
+fn can_scroll(doc: &Document, id: NodeId, dx: f32, dy: f32) -> bool {
+    let Some(n) = doc.get(id) else {
+        return false;
+    };
+    let room = |scroll: i32, max: i32, delta: f32| {
+        (delta > 0.0 && scroll < max) || (delta < 0.0 && scroll > 0)
+    };
+    let pad = n.padding_abs();
+    (n.computed.overflow_y == Overflow::Scroll
+        && room(n.scroll.y, n.content_size.height - pad.height, dy))
+        || (n.computed.overflow_x == Overflow::Scroll
+            && room(n.scroll.x, n.content_size.width - pad.width, dx))
+        || n.edit().is_some_and(|e| {
+            e.multiline && room(e.scroll.y, e.content_size.height - pad.height, dy)
+        })
+}
+
+/// Moves `scroll` by whole pixels of `delta` and `rest`, leaving the fraction in `rest`. There is
+/// no fraction to keep at the ends.
+fn advance(scroll: &mut i32, delta: f32, max: i32, rest: &mut f32) -> bool {
+    let total = *rest + delta;
+    let step = total.round();
+    let wanted = *scroll + step as i32;
+    let next = wanted.clamp(0, max.max(0));
+    *rest = if next == wanted { total - step } else { 0.0 };
+    let changed = next != *scroll;
+    *scroll = next;
+    changed
+}
+
+fn scroll_node(doc: &mut Document, id: NodeId, dx: f32, dy: f32, rest: &mut (f32, f32)) -> bool {
     let Some(n) = doc.get_mut(id) else {
         return false;
     };
     let pad = n.padding_abs();
     let mut changed = false;
     if n.computed.overflow_y == Overflow::Scroll && dy != 0.0 {
-        let max = (n.content_size.height - pad.height).max(0);
-        let next = (n.scroll.y + dy.round() as i32).clamp(0, max);
-        changed |= next != n.scroll.y;
-        n.scroll.y = next;
+        let max = n.content_size.height - pad.height;
+        changed |= advance(&mut n.scroll.y, dy, max, &mut rest.1);
     }
     if n.computed.overflow_x == Overflow::Scroll && dx != 0.0 {
-        let max = (n.content_size.width - pad.width).max(0);
-        let next = (n.scroll.x + dx.round() as i32).clamp(0, max);
-        changed |= next != n.scroll.x;
-        n.scroll.x = next;
+        let max = n.content_size.width - pad.width;
+        changed |= advance(&mut n.scroll.x, dx, max, &mut rest.0);
     }
     if changed {
         doc.mark_scrolled(id);
         return true;
     }
-    if let Some(e) = n.edit_mut() {
+    if let Some(e) = n.edit_mut()
+        && e.multiline
+        && dy != 0.0
+    {
         // Edits scroll their own text.
-        let view = pad;
-        let max_y = (e.content_size.height - view.height).max(0);
-        let next = (e.scroll.y + dy.round() as i32).clamp(0, max_y);
-        if e.multiline && next != e.scroll.y {
-            e.scroll.y = next;
+        let max = e.content_size.height - pad.height;
+        if advance(&mut e.scroll.y, dy, max, &mut rest.1) {
             doc.mark_paint();
             return true;
         }

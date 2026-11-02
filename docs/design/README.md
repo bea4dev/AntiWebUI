@@ -12,6 +12,7 @@ AntiWebUI は WebView に頼らず、wgpu による自前描画とネイティ�
 | 05 | [rendering](05-rendering.md) | wgpu レンダラ |
 | 06 | [platform-wayland](06-platform-wayland.md) | Wayland バックエンド |
 | 07 | [roadmap](07-roadmap.md) | マイルストーン |
+| 08 | [scrolling-and-settings](08-scrolling-and-settings.md) | 慣性スクロールと全体設定 |
 
 ## 用語
 

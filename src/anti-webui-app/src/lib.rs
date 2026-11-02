@@ -4,7 +4,10 @@ pub mod headless;
 #[cfg(target_os = "linux")]
 mod present;
 
+use anti_webui_core::settings::{Settings, update_settings};
 use anti_webui_core::view::IntoView;
+
+type SettingsChange = Box<dyn FnOnce(&mut Settings)>;
 
 /// Application entry point.
 ///
@@ -17,6 +20,7 @@ pub struct App {
     app_id: String,
     width: i32,
     height: i32,
+    settings: Vec<SettingsChange>,
 }
 
 impl Default for App {
@@ -32,6 +36,7 @@ impl App {
             app_id: "dev.antiwebui.app".into(),
             width: 800,
             height: 600,
+            settings: Vec::new(),
         }
     }
 
@@ -52,11 +57,29 @@ impl App {
         self
     }
 
+    /// Changes the framework settings before the window opens. See also
+    /// [`update_settings`] for changes while running.
+    ///
+    /// ```no_run
+    /// anti_webui_app::App::new().settings(|s| s.scroll.touchpad_factor = 1.5);
+    /// ```
+    pub fn settings(mut self, f: impl FnOnce(&mut Settings) + 'static) -> Self {
+        self.settings.push(Box::new(f));
+        self
+    }
+
+    fn apply_settings(&mut self) {
+        for f in self.settings.drain(..) {
+            update_settings(f);
+        }
+    }
+
     /// Opens the window and runs until it is closed.
     pub fn run<V: IntoView>(
-        self,
+        mut self,
         root: impl FnOnce() -> V,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.apply_settings();
         #[cfg(target_os = "linux")]
         {
             wayland::run(self, root)
@@ -66,6 +89,24 @@ impl App {
             let _ = root;
             Err("no platform backend is available for this OS yet".into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anti_webui_core::settings::settings;
+
+    #[test]
+    fn settings_apply_in_order_and_keep_earlier_changes() {
+        update_settings(|s| s.scroll.wheel_step = 10.0);
+        let mut app = App::new()
+            .settings(|s| s.scroll.touchpad_factor = 2.0)
+            .settings(|s| s.scroll.touchpad_factor *= 1.5);
+        assert_eq!(settings().scroll.touchpad_factor, 1.0);
+        app.apply_settings();
+        assert_eq!(settings().scroll.touchpad_factor, 3.0);
+        assert_eq!(settings().scroll.wheel_step, 10.0);
     }
 }
 
@@ -127,10 +168,12 @@ mod wayland {
                     }
                 }
             }
+            let now = Instant::now();
+            self.ui.animate(now);
             self.ui.update();
             // Not `process`: the frame painted below is the redraw it would ask for.
             self.handle_requests(ctx);
-            let scene = self.ui.paint(Instant::now());
+            let scene = self.ui.paint(now);
             let presenter = self.presenter.as_mut().unwrap();
             let presented = presenter.present(ctx, scene);
             if presented == Presented::Yes
@@ -161,8 +204,13 @@ mod wayland {
                     );
                 }
             }
-            if presented == Presented::Retry {
+            // Nothing was committed, so no frame callback will pace the next try.
+            if presented == Presented::Retry
+                || (presented == Presented::Unchanged && self.ui.animating())
+            {
                 ctx.request_redraw_after(std::time::Duration::from_millis(4));
+            } else if self.ui.animating() {
+                ctx.request_redraw();
             }
             presented == Presented::Yes
         }

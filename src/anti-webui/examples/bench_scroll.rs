@@ -72,6 +72,9 @@ fn bench(name: &str, gpu: &Gpu, root: impl FnOnce() -> Div) {
             delta_x: 0.0,
             delta_y,
             modifiers: Modifiers::default(),
+            source: ScrollSource::Unknown,
+            phase: ScrollPhase::Single,
+            time: 0,
         });
         ui.update();
         let t1 = Instant::now();

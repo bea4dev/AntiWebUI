@@ -102,6 +102,40 @@ pub enum ClipboardKind {
     Primary,
 }
 
+/// Logical pixels the content moves per unit of a Wayland touchpad axis. Chosen by feel on real
+/// hardware: GTK's and Chromium's newer 2.5 felt slow, and 6 too fast.
+pub const AXIS_MOTION_GAIN: f32 = 5.0;
+
+/// What produced a scroll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScrollSource {
+    /// A wheel with notches. Deltas from the platform are in notches.
+    Wheel,
+    /// Fingers on a touch surface. Deltas are in physical pixels.
+    Touchpad,
+    /// Anything else. Deltas are in physical pixels.
+    Unknown,
+}
+
+/// Where a scroll is in a gesture (see `docs/design/08-scrolling-and-settings.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScrollPhase {
+    /// Input without a beginning or an end, like a wheel.
+    Single,
+    Began,
+    Moved,
+    /// The fingers left. With `fling` the platform has no inertia of its own and the UI computes
+    /// it; otherwise `Momentum` events follow from the platform.
+    Lifted {
+        fling: bool,
+    },
+    /// The fingers rest on the device, which stops inertia. Not delivered to handlers.
+    Held,
+    /// Motion from inertia.
+    Momentum,
+    MomentumEnded,
+}
+
 /// Events sent by the platform layer to a window. Coordinates are physical pixels.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WindowEvent {
@@ -123,12 +157,16 @@ pub enum WindowEvent {
         /// Milliseconds, monotonic, platform-defined origin.
         time: u32,
     },
-    /// Scroll deltas in physical pixels (positive = content moves up / left).
+    /// Positive deltas move the content up / left. See [`ScrollSource`] for their unit.
     Scroll {
         position: PointF,
         delta_x: f32,
         delta_y: f32,
         modifiers: Modifiers,
+        source: ScrollSource,
+        phase: ScrollPhase,
+        /// Milliseconds, monotonic, platform-defined origin.
+        time: u32,
     },
     Key(KeyEvent),
     Ime(ImeUpdate),
@@ -186,9 +224,12 @@ impl KeyboardEvent {
 
 #[derive(Debug)]
 pub struct ScrollEvent {
+    /// In physical pixels, with the scroll settings applied.
     pub delta_x: f32,
     pub delta_y: f32,
     pub modifiers: Modifiers,
+    pub source: ScrollSource,
+    pub phase: ScrollPhase,
     pub(crate) stopped: Cell<bool>,
 }
 

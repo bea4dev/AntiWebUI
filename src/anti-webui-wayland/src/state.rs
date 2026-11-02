@@ -1,7 +1,10 @@
 //! Wayland protocol state and event dispatch.
 
 use crate::keyboard::{Keyboard, Repeat};
-use anti_webui_core::event::{ClipboardKind, ImeUpdate, PointerButton, WindowEvent};
+use anti_webui_core::event::{
+    AXIS_MOTION_GAIN, ClipboardKind, ImeUpdate, PointerButton, ScrollPhase, ScrollSource,
+    WindowEvent,
+};
 use anti_webui_core::geometry::{PointF, Scale, SizeI};
 use anti_webui_core::platform::{CursorIcon, ImePurpose, ImeState};
 use std::collections::HashMap;
@@ -23,6 +26,9 @@ use wayland_protocols::wp::cursor_shape::v1::client::{
 };
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
+};
+use wayland_protocols::wp::pointer_gestures::zv1::client::{
+    zwp_pointer_gesture_hold_v1, zwp_pointer_gestures_v1,
 };
 use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1,
@@ -60,6 +66,9 @@ pub struct PointerFrame {
     pub wheel_x: i32,
     pub wheel_y: i32,
     pub has_scroll: bool,
+    pub source: Option<wl_pointer::AxisSource>,
+    pub stopped: bool,
+    pub time: u32,
 }
 
 pub struct State {
@@ -92,6 +101,10 @@ pub struct State {
     pub pointer_pos: (f64, f64),
     pub cursor: CursorIcon,
     pub frame: PointerFrame,
+    /// Fingers are moving on a touch surface: `axis_stop` will end the sequence.
+    pub finger_scrolling: bool,
+    pub pointer_gestures: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
+    pub hold_gesture: Option<zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1>,
     pub keyboard: Option<wl_keyboard::WlKeyboard>,
     pub kb: Keyboard,
     pub input_serial: u32,
@@ -164,6 +177,9 @@ impl State {
             pointer_pos: (0.0, 0.0),
             cursor: CursorIcon::Default,
             frame: PointerFrame::default(),
+            finger_scrolling: false,
+            pointer_gestures: None,
+            hold_gesture: None,
             keyboard: None,
             kb: Keyboard::new(),
             input_serial: 0,
@@ -549,6 +565,9 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
             if let Some(mgr) = &state.cursor_shape_manager {
                 state.cursor_device = Some(mgr.get_pointer(&pointer, qh, ()));
             }
+            if let Some(mgr) = &state.pointer_gestures {
+                state.hold_gesture = Some(mgr.get_hold_gesture(&pointer, qh, ()));
+            }
             state.pointer = Some(pointer);
         }
         if caps.contains(wl_seat::Capability::Keyboard) && state.keyboard.is_none() {
@@ -633,8 +652,12 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     time,
                 });
             }
-            wl_pointer::Event::Axis { axis, value, .. } => {
+            wl_pointer::Event::AxisSource {
+                axis_source: WEnum::Value(source),
+            } => state.frame.source = Some(source),
+            wl_pointer::Event::Axis { time, axis, value } => {
                 state.frame.has_scroll = true;
+                state.frame.time = time;
                 match axis {
                     WEnum::Value(wl_pointer::Axis::VerticalScroll) => state.frame.scroll_y += value,
                     WEnum::Value(wl_pointer::Axis::HorizontalScroll) => {
@@ -655,30 +678,26 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     _ => {}
                 }
             }
+            wl_pointer::Event::AxisStop { time, .. } => {
+                state.frame.stopped = true;
+                state.frame.time = time;
+            }
             wl_pointer::Event::Frame => {
                 let f = std::mem::take(&mut state.frame);
-                if f.has_scroll {
-                    // Wheels scroll three 16px lines per notch, like browsers; touchpads move
-                    // the content with the fingers.
-                    let line = 16.0 * 3.0;
-                    let dx = if f.wheel_x != 0 {
-                        f.wheel_x as f64 / 120.0 * line
-                    } else {
-                        f.scroll_x
-                    };
-                    let dy = if f.wheel_y != 0 {
-                        f.wheel_y as f64 / 120.0 * line
-                    } else {
-                        f.scroll_y
-                    };
-                    let s = state.scale.as_f64();
-                    let (x, y) = state.pointer_pos;
-                    let position = state.physical(x, y);
+                let scale = state.scale.as_f64();
+                let (x, y) = state.pointer_pos;
+                let position = state.physical(x, y);
+                for (delta_x, delta_y, source, phase) in
+                    f.scrolls(scale, &mut state.finger_scrolling)
+                {
                     state.events.push(WindowEvent::Scroll {
                         position,
-                        delta_x: (dx * s) as f32,
-                        delta_y: (dy * s) as f32,
+                        delta_x: delta_x as f32,
+                        delta_y: delta_y as f32,
                         modifiers,
+                        source,
+                        phase,
+                        time: f.time,
                     });
                 }
             }
@@ -686,6 +705,88 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
         }
     }
 }
+
+impl PointerFrame {
+    /// What the axis events of this `wl_pointer.frame` mean: `(dx, dy, source, phase)`. Keeps
+    /// `finger_scrolling` for the next frame.
+    fn scrolls(
+        &self,
+        scale: f64,
+        finger_scrolling: &mut bool,
+    ) -> Vec<(f64, f64, ScrollSource, ScrollPhase)> {
+        let mut out = Vec::new();
+        let pixels = (self.scroll_x * scale, self.scroll_y * scale);
+        let moved = (
+            pixels.0 * AXIS_MOTION_GAIN as f64,
+            pixels.1 * AXIS_MOTION_GAIN as f64,
+        );
+        if self.has_scroll {
+            if self.source == Some(wl_pointer::AxisSource::Finger) {
+                let phase = if std::mem::replace(finger_scrolling, true) {
+                    ScrollPhase::Moved
+                } else {
+                    ScrollPhase::Began
+                };
+                out.push((moved.0, moved.1, ScrollSource::Touchpad, phase));
+            } else if self.wheel_x != 0 || self.wheel_y != 0 {
+                out.push((
+                    self.wheel_x as f64 / 120.0,
+                    self.wheel_y as f64 / 120.0,
+                    ScrollSource::Wheel,
+                    ScrollPhase::Single,
+                ));
+            } else if self.source == Some(wl_pointer::AxisSource::Continuous) {
+                out.push((moved.0, moved.1, ScrollSource::Unknown, ScrollPhase::Single));
+            } else {
+                out.push((
+                    pixels.0,
+                    pixels.1,
+                    ScrollSource::Unknown,
+                    ScrollPhase::Single,
+                ));
+            }
+        }
+        // One axis can stop while the fingers keep moving along the other.
+        if self.stopped && self.scroll_x == 0.0 && self.scroll_y == 0.0 && *finger_scrolling {
+            *finger_scrolling = false;
+            out.push((
+                0.0,
+                0.0,
+                ScrollSource::Touchpad,
+                ScrollPhase::Lifted { fling: true },
+            ));
+        }
+        out
+    }
+}
+
+impl Dispatch<zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1,
+        event: zwp_pointer_gesture_hold_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwp_pointer_gesture_hold_v1::Event::Begin { time, .. } = event {
+            let (x, y) = state.pointer_pos;
+            let position = state.physical(x, y);
+            let modifiers = state.kb.modifiers;
+            state.events.push(WindowEvent::Scroll {
+                position,
+                delta_x: 0.0,
+                delta_y: 0.0,
+                modifiers,
+                source: ScrollSource::Touchpad,
+                phase: ScrollPhase::Held,
+                time,
+            });
+        }
+    }
+}
+
+delegate_noop!(State: ignore zwp_pointer_gestures_v1::ZwpPointerGesturesV1);
 
 impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
     fn event(
@@ -948,6 +1049,108 @@ impl Dispatch<zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1, ()> 
                 source.destroy();
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FINGER: Option<wl_pointer::AxisSource> = Some(wl_pointer::AxisSource::Finger);
+
+    fn motion(source: Option<wl_pointer::AxisSource>, dy: f64) -> PointerFrame {
+        PointerFrame {
+            scroll_y: dy,
+            has_scroll: true,
+            source,
+            ..Default::default()
+        }
+    }
+
+    fn stop() -> PointerFrame {
+        PointerFrame {
+            source: FINGER,
+            stopped: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fingers_begin_move_and_lift() {
+        let mut fingers = false;
+        let f = motion(FINGER, 10.0);
+        assert_eq!(
+            f.scrolls(2.0, &mut fingers),
+            [(0.0, 100.0, ScrollSource::Touchpad, ScrollPhase::Began)]
+        );
+        assert_eq!(
+            f.scrolls(2.0, &mut fingers),
+            [(0.0, 100.0, ScrollSource::Touchpad, ScrollPhase::Moved)]
+        );
+        let lifted = (
+            0.0,
+            0.0,
+            ScrollSource::Touchpad,
+            ScrollPhase::Lifted { fling: true },
+        );
+        assert_eq!(stop().scrolls(2.0, &mut fingers), [lifted]);
+        assert!(!fingers);
+        // The next motion is a new gesture; a stray stop is nothing.
+        assert!(stop().scrolls(2.0, &mut fingers).is_empty());
+        assert_eq!(f.scrolls(2.0, &mut fingers)[0].3, ScrollPhase::Began);
+    }
+
+    #[test]
+    fn one_axis_stopping_is_not_the_fingers_leaving() {
+        let mut fingers = true;
+        let f = PointerFrame {
+            stopped: true,
+            ..motion(FINGER, 10.0)
+        };
+        assert_eq!(f.scrolls(1.0, &mut fingers).len(), 1);
+        assert_eq!(f.scrolls(1.0, &mut fingers)[0].3, ScrollPhase::Moved);
+        assert!(fingers);
+    }
+
+    #[test]
+    fn wheels_are_in_notches() {
+        let mut fingers = false;
+        for source in [
+            Some(wl_pointer::AxisSource::Wheel),
+            Some(wl_pointer::AxisSource::WheelTilt),
+            None,
+        ] {
+            let f = PointerFrame {
+                wheel_y: 60,
+                ..motion(source, 7.5)
+            };
+            assert_eq!(
+                f.scrolls(2.0, &mut fingers),
+                [(0.0, 0.5, ScrollSource::Wheel, ScrollPhase::Single)]
+            );
+        }
+        assert!(!fingers);
+    }
+
+    #[test]
+    fn other_sources_never_start_inertia() {
+        let mut fingers = false;
+        for (source, dy) in [
+            (Some(wl_pointer::AxisSource::Continuous), 50.0),
+            (Some(wl_pointer::AxisSource::Wheel), 10.0),
+            (None, 10.0),
+        ] {
+            assert_eq!(
+                motion(source, 5.0).scrolls(2.0, &mut fingers),
+                [(0.0, dy, ScrollSource::Unknown, ScrollPhase::Single)]
+            );
+            let f = PointerFrame {
+                source,
+                stopped: true,
+                ..Default::default()
+            };
+            assert!(f.scrolls(2.0, &mut fingers).is_empty());
         }
     }
 }
