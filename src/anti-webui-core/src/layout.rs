@@ -291,6 +291,8 @@ fn same_content(a: &ComputedStyle, b: &ComputedStyle) -> bool {
     let mut b = b.clone();
     b.translate_x = a.translate_x;
     b.translate_y = a.translate_y;
+    b.move_x = a.move_x;
+    b.move_y = a.move_y;
     b.scale_x = a.scale_x;
     b.scale_y = a.scale_y;
     b.rotate = a.rotate;
@@ -360,6 +362,7 @@ fn resolve_node(
     if !node.transitions.is_empty() || !computed.transitions.is_empty() || node.presence.is_some() {
         apply_transitions(doc, id, &mut computed);
     }
+    apply_move(doc, id, &mut computed);
     let Some(node) = doc.nodes.get(id) else {
         return;
     };
@@ -486,6 +489,25 @@ fn apply_transitions(doc: &mut Document, id: NodeId, target: &mut ComputedStyle)
     if node.transitions.is_empty() {
         doc.transitioning.remove(&id);
     } else {
+        doc.transitioning.insert(id);
+    }
+}
+
+/// Puts a node where it is on its way to its place in a list, and ends that once it is there.
+fn apply_move(doc: &mut Document, id: NodeId, computed: &mut ComputedStyle) {
+    let Some(node) = doc.nodes.get_mut(id) else {
+        return;
+    };
+    let Some(m) = &node.moving else {
+        return;
+    };
+    if m.finished {
+        node.moving = None;
+        if node.transitions.is_empty() {
+            doc.transitioning.remove(&id);
+        }
+    } else {
+        (computed.move_x, computed.move_y) = m.current;
         doc.transitioning.insert(id);
     }
 }

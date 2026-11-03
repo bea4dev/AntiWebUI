@@ -1,6 +1,7 @@
 //! The renderer-independent display list produced each frame. Coordinates are physical pixels.
 
 use crate::geometry::{Affine, PointI, RectI};
+use crate::shader::ShaderPaint;
 use anti_webui_style::Color;
 pub use parley::FontData;
 use std::sync::Arc;
@@ -245,12 +246,30 @@ impl PartialEq for Layer {
     }
 }
 
+/// A box painted by a shader, cut to its rounded shape. See `docs/design/14-shaders.md`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShaderDraw {
+    pub paint: ShaderPaint,
+    pub rect: RectI,
+    /// Top, right, bottom, left.
+    pub border: [i32; 4],
+    /// Top, right, bottom, left.
+    pub padding: [i32; 4],
+    /// Top-left, top-right, bottom-right, bottom-left, in physical pixels.
+    pub radii: [f32; 4],
+    /// Physical pixels per logical pixel.
+    pub scale: f32,
+    pub opacity: f32,
+    pub clip: Clip,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Primitive {
     Shadow(Shadow),
     Quad(Quad),
     Glyphs(GlyphRun),
     Layer(Layer),
+    Shader(ShaderDraw),
 }
 
 /// Identifies a run of primitives across frames: one part of what a node paints.

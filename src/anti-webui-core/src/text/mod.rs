@@ -6,13 +6,18 @@ pub mod edit;
 pub mod selection;
 
 use crate::geometry::{RectI, Scale, SizeI};
+use crate::tree::{Document, with_doc};
 use anti_webui_style::{
     ComputedStyle, FontFamily, FontStyle, FontWeight, LineHeight, TextAlign, WhiteSpace,
 };
+use icu_properties::props::Script as IcuScript;
+use icu_properties::{CodePointMapData, PropertyNamesShort};
+use parley::fontique::{Blob, FallbackKey, FontInfoOverride, Script};
 use parley::{
     Alignment, AlignmentOptions, FontContext, Layout, LayoutContext, StyleProperty, TextWrapMode,
 };
 use std::cell::RefCell;
+use std::sync::Arc;
 
 pub use parley::{Affinity, Cursor, Selection as LayoutSelection};
 
@@ -24,6 +29,10 @@ pub struct TextSystem {
     pub fcx: FontContext,
     pub lcx: LayoutContext<Brush>,
     pub locale: Option<parley::Language>,
+    /// The scripts [`TextSystem::prepare_fallbacks`] has been through.
+    prepared: Vec<IcuScript>,
+    /// How many times fonts were added: what was shaped before may look different now.
+    fonts_generation: u64,
 }
 
 impl TextSystem {
@@ -41,12 +50,115 @@ impl TextSystem {
             fcx: FontContext::new(),
             lcx: LayoutContext::new(),
             locale,
+            prepared: Vec::new(),
+            fonts_generation: 0,
+        }
+    }
+
+    /// fontique doesn't keep what fontconfig says for a script and a locale it doesn't track, such
+    /// as Latin in any locale, and would ask again for every text (see `docs/design/04-text.md`).
+    /// For those it uses what it has for the script alone, which is the same question: ask it once.
+    fn prepare_fallbacks(&mut self, text: &str) {
+        // What has no script of its own counts as Latin.
+        self.prepare_fallback(IcuScript::Latin);
+        if text.is_ascii() {
+            return;
+        }
+        let scripts = CodePointMapData::<IcuScript>::new();
+        let mut last = IcuScript::Latin;
+        for c in text.chars() {
+            let script = scripts.get(c);
+            if script != last {
+                last = script;
+                self.prepare_fallback(script);
+            }
+        }
+    }
+
+    fn prepare_fallback(&mut self, script: IcuScript) {
+        if self.prepared.contains(&script) {
+            return;
+        }
+        self.prepared.push(script);
+        let Some(script) = PropertyNamesShort::<IcuScript>::new()
+            .get(script)
+            .and_then(|name| Script::parse(name).ok())
+        else {
+            return;
+        };
+        if !FallbackKey::new(script, self.locale.as_ref()).is_tracked() {
+            let _ = self.fcx.collection.fallback_families(script);
         }
     }
 }
 
 thread_local! {
     static TEXT: RefCell<TextSystem> = RefCell::new(TextSystem::new());
+}
+
+/// The data given to [`register_font`] holds no font that can be used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotAFont;
+
+impl std::fmt::Display for NotAFont {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the data holds no font that can be used")
+    }
+}
+
+impl std::error::Error for NotAFont {}
+
+/// Makes the fonts in a font file that comes with the application available by their names, like
+/// `@font-face` in CSS. Returns the names of the families. Text already shown is shaped again.
+///
+/// ```no_run
+/// use anti_webui_core::prelude::*;
+///
+/// # let font_file: &'static [u8] = &[];
+/// register_font(font_file).unwrap();
+/// let view = text("Hello").font_family("Example");
+/// ```
+pub fn register_font(
+    data: impl AsRef<[u8]> + Send + Sync + 'static,
+) -> Result<Vec<String>, NotAFont> {
+    register(data, None)
+}
+
+/// Like [`register_font`], under a name of your choosing.
+pub fn register_font_as(
+    data: impl AsRef<[u8]> + Send + Sync + 'static,
+    family: &str,
+) -> Result<Vec<String>, NotAFont> {
+    register(data, Some(family))
+}
+
+fn register(
+    data: impl AsRef<[u8]> + Send + Sync + 'static,
+    family: Option<&str>,
+) -> Result<Vec<String>, NotAFont> {
+    let names = with_text(|ts| {
+        let info = family.map(|name| FontInfoOverride {
+            family_name: Some(name),
+            ..Default::default()
+        });
+        let found = ts
+            .fcx
+            .collection
+            .register_fonts(Blob::new(Arc::new(data)), info);
+        ts.fonts_generation += 1;
+        let mut names: Vec<String> = found
+            .iter()
+            .filter_map(|(id, _)| ts.fcx.collection.family_name(*id).map(str::to_owned))
+            .collect();
+        names.dedup();
+        names
+    });
+    if names.is_empty() {
+        return Err(NotAFont);
+    }
+    // What fell back because the font wasn't there can use it now.
+    with_doc(Document::invalidate_all_layout);
+    Ok(names)
 }
 
 pub fn with_text<R>(f: impl FnOnce(&mut TextSystem) -> R) -> R {
@@ -89,6 +201,7 @@ impl ShapeStyle {
 #[derive(Clone, Debug, PartialEq)]
 struct ShapeKey {
     version: u64,
+    fonts: u64,
     style: ShapeStyle,
 }
 
@@ -114,11 +227,13 @@ impl TextLayout {
     ) -> bool {
         let key = ShapeKey {
             version,
+            fonts: ts.fonts_generation,
             style: style.clone(),
         };
         if self.key.as_ref() == Some(&key) {
             return false;
         }
+        ts.prepare_fallbacks(text);
         let locale = ts.locale;
         let mut builder = ts.lcx.ranged_builder(&mut ts.fcx, text, 1.0, true);
         builder.push_default(StyleProperty::FontFamily(parley::FontFamily::Source(
@@ -292,5 +407,79 @@ impl TextLayout {
             }
         }
         last
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn japanese() -> TextSystem {
+        let mut ts = TextSystem::new();
+        ts.locale = parley::Language::parse("ja-JP").ok();
+        ts
+    }
+
+    #[test]
+    fn each_script_of_a_text_is_prepared_once() {
+        let mut ts = japanese();
+        ts.prepare_fallbacks("abc 123");
+        assert_eq!(ts.prepared, [IcuScript::Latin]);
+        ts.prepare_fallbacks("abc 123");
+        assert_eq!(ts.prepared.len(), 1);
+        ts.prepare_fallbacks("ひらがな、カタカナ abc ไทย");
+        for script in [IcuScript::Hiragana, IcuScript::Katakana, IcuScript::Thai] {
+            assert!(ts.prepared.contains(&script), "{script:?}");
+        }
+        let count = ts.prepared.len();
+        ts.prepare_fallbacks("カタカナ ไทย ひらがな");
+        assert_eq!(ts.prepared.len(), count);
+    }
+
+    #[test]
+    fn shaping_prepares_what_it_needs() {
+        let mut ts = japanese();
+        let style = ShapeStyle {
+            family: FontFamily::default(),
+            size: 14.0,
+            weight: FontWeight::NORMAL,
+            style: FontStyle::Normal,
+            line_height: None,
+            letter_spacing: 0.0,
+            wrap: true,
+        };
+        TextLayout::default().shape(&mut ts, "ไทย", 1, &style);
+        assert!(ts.prepared.contains(&IcuScript::Thai));
+    }
+
+    /// What preparing relies on: otherwise every text goes all the way to fontconfig again.
+    #[test]
+    fn a_pair_that_is_not_tracked_takes_what_there_is_for_the_script() {
+        let mut ts = japanese();
+        let latin = Script::from_bytes(*b"Latn");
+        let key = FallbackKey::new(latin, ts.locale.as_ref());
+        assert!(!key.is_tracked());
+        ts.fcx.collection.set_fallbacks(latin, std::iter::empty());
+        assert_eq!(ts.fcx.collection.fallback_families(key).count(), 0);
+    }
+
+    /// One tracked for its locale has an answer of its own, which preparing must not replace.
+    #[test]
+    fn a_tracked_pair_is_left_alone() {
+        let mut ts = japanese();
+        let han = Script::from_bytes(*b"Hani");
+        assert!(FallbackKey::new(han, ts.locale.as_ref()).is_tracked());
+        let own: Vec<_> = ts
+            .fcx
+            .collection
+            .fallback_families(FallbackKey::new(han, ts.locale.as_ref()))
+            .collect();
+        ts.prepare_fallbacks("漢字");
+        let after: Vec<_> = ts
+            .fcx
+            .collection
+            .fallback_families(FallbackKey::new(han, ts.locale.as_ref()))
+            .collect();
+        assert_eq!(own, after);
     }
 }

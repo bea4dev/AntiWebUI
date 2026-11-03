@@ -12,6 +12,7 @@ pub mod reactive;
 pub mod scene;
 mod scroll;
 pub mod settings;
+pub mod shader;
 pub mod text;
 pub mod tree;
 pub mod ui;
@@ -32,9 +33,11 @@ pub mod prelude {
         Memo, Owner, Signal, batch, create_root, effect, memo, on_cleanup, signal, untrack,
     };
     pub use crate::settings::{FrameAdvance, Settings, settings, update_settings};
+    pub use crate::shader::{Shader, ShaderPaint, ShaderParams};
+    pub use crate::text::{NotAFont, register_font, register_font_as};
     pub use crate::view::{
         Div, ForEach, IntoTextSource, IntoView, NodeRef, Popup, Show, Text, TextInput, View, div,
-        dyn_view, for_each, fragment, node_ref, popup, show, text, text_area, text_input,
+        dyn_view, for_each, fragment, node_ref, popup, shader, show, text, text_area, text_input,
     };
     pub use anti_webui_style::*;
 }

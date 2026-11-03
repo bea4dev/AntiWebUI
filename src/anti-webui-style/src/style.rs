@@ -109,6 +109,10 @@ define_style! {
     /// Logical pixels. Moves what is painted without affecting layout, like the other transforms.
     translate_x: f32 = 0.0, local;
     translate_y: f32 = 0.0, local;
+    /// Physical pixels. How far a `for_each` still has the node to go to its place: on top of
+    /// `translate`, whatever that is doing. Not for setting directly.
+    move_x: f32 = 0.0, local;
+    move_y: f32 = 0.0, local;
     scale_x: f32 = 1.0, local;
     scale_y: f32 = 1.0, local;
     /// Degrees, clockwise.
@@ -148,6 +152,8 @@ impl ComputedStyle {
     pub fn has_transform(&self) -> bool {
         self.translate_x != 0.0
             || self.translate_y != 0.0
+            || self.move_x != 0.0
+            || self.move_y != 0.0
             || self.scale_x != 1.0
             || self.scale_y != 1.0
             || self.rotate != 0.0

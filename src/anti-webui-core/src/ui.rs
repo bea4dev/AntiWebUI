@@ -80,6 +80,8 @@ pub struct Ui {
     modifiers: Modifiers,
     press: Option<Press>,
     last_click: Option<(u32, PointF, PointerButton, u32)>,
+    /// The focus being set is reached with the keyboard.
+    focus_by_keyboard: bool,
     cursor: Option<CursorIcon>,
     ime_sent: Option<Option<ImeState>>,
     /// Where a pending paste should go.
@@ -141,6 +143,7 @@ impl Ui {
             modifiers: Modifiers::default(),
             press: None,
             last_click: None,
+            focus_by_keyboard: false,
             cursor: None,
             ime_sent: None,
             paste_target: None,
@@ -209,6 +212,9 @@ impl Ui {
                     doc.dirty.paint = true;
                     doc.dirty.content = true;
                     changed = true;
+                }
+                if !doc.list_places.is_empty() {
+                    animation::start_moves(doc);
                 }
                 if doc.dirty.carets {
                     doc.dirty.carets = false;
@@ -681,7 +687,7 @@ impl Ui {
         if button == PointerButton::Primary {
             if let Some(t) = target {
                 let chain = with_doc(|d| d.ancestors(t));
-                with_doc(|d| d.set_active(chain));
+                set_active(chain);
             }
             if let Some((id, vertical, grab)) =
                 with_doc(|d| target.and_then(|t| scrollbar_hit(d, t, p)))
@@ -801,7 +807,7 @@ impl Ui {
             }),
             _ => {}
         }
-        with_doc(|d| d.set_active(Vec::new()));
+        set_active(Vec::new());
         self.update_hover(p);
     }
 
@@ -821,8 +827,8 @@ impl Ui {
             {
                 e.drag = None;
             }
-            d.set_active(Vec::new());
         });
+        set_active(Vec::new());
     }
 
     fn scroll(
@@ -1046,6 +1052,7 @@ impl Ui {
     }
 
     fn set_focus(&mut self, next: Option<NodeId>) {
+        let keyboard = self.focus_by_keyboard;
         let (prev, handlers) = with_doc(|d| {
             let prev = d.state.focused;
             if prev == next {
@@ -1058,6 +1065,11 @@ impl Ui {
                     continue;
                 };
                 if let Some(h) = n.listeners.focus.clone() {
+                    handlers.push((h, focused));
+                }
+                if let Some(h) = n.listeners.focus_visible.clone()
+                    && (!focused || keyboard)
+                {
                     handlers.push((h, focused));
                 }
             }
@@ -1116,7 +1128,9 @@ impl Ui {
             Some(order[i])
         });
         if let Some(n) = next {
+            self.focus_by_keyboard = true;
             self.set_focus(Some(n));
+            self.focus_by_keyboard = false;
             with_doc(|d| {
                 if let Some(e) = d.get_mut(n).and_then(Node::edit_mut) {
                     e.select_all();
@@ -1502,21 +1516,45 @@ impl Drop for Ui {
     }
 }
 
+/// Listeners to tell, and what to tell them.
+type ActiveChanges = Vec<(Rc<dyn Fn(bool)>, bool)>;
+
+/// Sets the pressed nodes, and tells those that listen.
+fn set_active(chain: Vec<NodeId>) {
+    let listeners = with_doc(|d| d.set_active(chain));
+    if !listeners.is_empty() {
+        batch(|| {
+            for (f, active) in listeners {
+                f(active);
+            }
+        });
+    }
+}
+
 impl Document {
-    /// Sets the pressed nodes, invalidating those whose style depends on it.
-    fn set_active(&mut self, chain: Vec<NodeId>) {
+    /// Sets the pressed nodes, invalidating those whose style depends on it. Returns who to tell.
+    fn set_active(&mut self, chain: Vec<NodeId>) -> ActiveChanges {
         let old = std::mem::replace(&mut self.state.active, chain);
         let new = self.state.active.clone();
-        for id in old.iter().filter(|i| !new.contains(i)) {
-            if self.get(*id).is_some_and(|n| n.style.active.is_some()) {
-                self.mark_style_of(*id);
+        let mut listeners = Vec::new();
+        let changes = old
+            .iter()
+            .filter(|i| !new.contains(i))
+            .map(|i| (*i, false))
+            .chain(new.iter().filter(|i| !old.contains(i)).map(|i| (*i, true)));
+        for (id, active) in changes {
+            let Some(n) = self.get(id) else {
+                continue;
+            };
+            let has_style = n.style.active.is_some();
+            if let Some(f) = n.listeners.active.clone().filter(|_| !n.disabled) {
+                listeners.push((f, active));
+            }
+            if has_style {
+                self.mark_style_of(id);
             }
         }
-        for id in new.iter().filter(|i| !old.contains(i)) {
-            if self.get(*id).is_some_and(|n| n.style.active.is_some()) {
-                self.mark_style_of(*id);
-            }
-        }
+        listeners
     }
 
     /// Caret or selection moved without changing text: repaint and re-scroll only.

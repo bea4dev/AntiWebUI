@@ -1,0 +1,15 @@
+[package]
+name = "anti-webui-md3e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Material 3 Expressive components for AntiWebUI"
+
+[features]
+default = ["bundled-fonts"]
+## Embeds Roboto Flex, so that text looks the same where it isn't installed.
+bundled-fonts = []
+
+[dependencies]
+anti-webui.workspace = true
+# Everything goes through the public API on purpose: see docs/design/15-md3e.md.

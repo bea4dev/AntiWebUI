@@ -5,7 +5,10 @@ use crate::geometry::Affine;
 use crate::geometry::{PointI, RectI};
 use crate::layout::{child_clip, mark_outer_layers_stale};
 use crate::platform::PopupId;
-use crate::scene::{ChunkKey, Clip, Glyph, GlyphRun, Layer, Primitive, Quad, Scene, Shadow};
+use crate::scene::{
+    ChunkKey, Clip, Glyph, GlyphRun, Layer, Primitive, Quad, Scene, ShaderDraw, Shadow,
+};
+use crate::shader::ShaderPaint;
 use crate::text::selection::node_range;
 use crate::text::{Brush, TextLayout};
 use crate::tree::{Document, LayerMemo, Node, NodeId, NodeKind, popup_id};
@@ -147,6 +150,7 @@ fn paints_overlapping(doc: &Document, id: NodeId) -> bool {
                     (b.top | b.right | b.bottom | b.left) != 0 && !c.border_color.is_transparent();
                 *things += u32::from(!c.background.is_transparent() || border);
                 *things += c.shadows.len() as u32;
+                *things += u32::from(node.fill.is_some()) + u32::from(node.overlay.is_some());
                 *things += u32::from(c.outline_width > 0.0);
                 if c.overflow_x == Overflow::Scroll || c.overflow_y == Overflow::Scroll {
                     *things += 2;
@@ -253,6 +257,8 @@ mod part {
     /// Painted after the children: scrollbars and the outline.
     pub const AFTER: u32 = 4;
     pub const LAYER: u32 = 5;
+    /// A shader above the box. On its own so that one coming and going doesn't damage the shadow.
+    pub const OVERLAY: u32 = 6;
 }
 
 struct Painter<'a> {
@@ -633,6 +639,10 @@ impl Painter<'_> {
                 inset: false,
             }));
         }
+        if let Some(paint) = &node.fill {
+            let draw = self.shader_draw(node, radii, paint, opacity);
+            self.scene.primitives.push(draw);
+        }
         if !c.background.is_transparent() || has_border {
             self.scene.primitives.push(Primitive::Quad(Quad {
                 rect: node.abs,
@@ -678,6 +688,33 @@ impl Painter<'_> {
                 }));
             }
         }
+        if let Some(paint) = &node.overlay {
+            let draw = self.shader_draw(node, radii, paint, opacity);
+            self.chunk(id, part::OVERLAY);
+            self.scene.primitives.push(draw);
+        }
+    }
+
+    /// What it takes to paint the box of `node` with a shader.
+    fn shader_draw(
+        &self,
+        node: &Node,
+        radii: [f32; 4],
+        paint: &ShaderPaint,
+        opacity: f32,
+    ) -> Primitive {
+        let b = &node.resolved.border;
+        let p = &node.resolved.padding;
+        Primitive::Shader(ShaderDraw {
+            paint: paint.clone(),
+            rect: node.abs,
+            border: [b.top, b.right, b.bottom, b.left],
+            padding: [p.top, p.right, p.bottom, p.left],
+            radii,
+            scale: self.doc.scale.as_f32(),
+            opacity: snapped_opacity(opacity),
+            clip: node.clip_shape(),
+        })
     }
 
     fn outline(&mut self, id: NodeId, opacity: f32) {

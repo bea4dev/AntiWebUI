@@ -10,3 +10,4 @@ anti-webui-style.workspace = true
 anti-webui-widgets.workspace = true
 anti-webui-app.workspace = true
 anti-webui-wgpu.workspace = true
+anti-webui-macros.workspace = true

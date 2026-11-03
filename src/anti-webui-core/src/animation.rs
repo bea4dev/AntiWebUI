@@ -2,8 +2,9 @@
 //! values that move by themselves, and the transitions of styles (see
 //! `docs/design/13-animation.md`).
 
+use crate::geometry::PointI;
 use crate::reactive::{Signal, batch, signal};
-use crate::tree::Document;
+use crate::tree::{Document, NodeId};
 use anti_webui_style::{AnimatedValue, Color, Style, Transition};
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
@@ -140,6 +141,69 @@ impl RunningTransition {
     }
 }
 
+/// A node on its way to where a `for_each` with `moves` has put it.
+pub(crate) struct Moving {
+    /// How far from its place it was, in physical pixels.
+    from: (f32, f32),
+    /// How far from its place it is.
+    pub current: (f32, f32),
+    start: Instant,
+    timing: Transition,
+    /// It got there: style resolution ends this.
+    pub finished: bool,
+}
+
+impl Moving {
+    fn advance(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.start);
+        if elapsed >= self.timing.duration {
+            self.current = (0.0, 0.0);
+            self.finished = true;
+            return;
+        }
+        let t = elapsed.as_secs_f32() / self.timing.duration.as_secs_f32();
+        let left = 1.0 - self.timing.easing.apply(t);
+        self.current = (self.from.0 * left, self.from.1 * left);
+    }
+}
+
+/// Where the things in a list were before it changed.
+pub(crate) struct ListPlaces {
+    pub list: NodeId,
+    pub timing: Transition,
+    pub before: Vec<(NodeId, PointI)>,
+}
+
+/// Has what a list change moved go there from where it is shown. Call after positioning.
+pub(crate) fn start_moves(doc: &mut Document) {
+    let now = Instant::now();
+    for places in std::mem::take(&mut doc.list_places) {
+        for (id, before) in places.before {
+            let Some(n) = doc.nodes.get(id).filter(|n| n.visible) else {
+                continue;
+            };
+            let (dx, dy) = (before.x - n.rect.x, before.y - n.rect.y);
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let current = n.moving.as_ref().map_or((0.0, 0.0), |m| m.current);
+            if n.moving.is_none() && !doc.can_be_seen(n, n.abs.union(&n.abs.translate(dx, dy))) {
+                continue;
+            }
+            let from = (current.0 + dx as f32, current.1 + dy as f32);
+            doc.nodes[id].moving = Some(Box::new(Moving {
+                from,
+                current: from,
+                start: now,
+                timing: places.timing,
+                finished: false,
+            }));
+            doc.transitioning.insert(id);
+            doc.mark_style_of(id);
+        }
+    }
+}
+
 /// Moves every transition on to `now`. The rest is what any change of style goes through.
 pub(crate) fn advance_transitions(doc: &mut Document, now: Instant) {
     if doc.transitioning.is_empty() {
@@ -153,6 +217,9 @@ pub(crate) fn advance_transitions(doc: &mut Document, now: Instant) {
         };
         for r in &mut node.transitions {
             r.advance(now);
+        }
+        if let Some(m) = &mut node.moving {
+            m.advance(now);
         }
         doc.mark_style_of(id);
     }
@@ -211,6 +278,18 @@ pub struct Spring {
     pub stiffness: f32,
     pub damping: f32,
     pub mass: f32,
+}
+
+impl Spring {
+    /// A spring of mass 1 described by how far it is from just not bouncing: 1 doesn't bounce,
+    /// less does.
+    pub fn from_ratio(stiffness: f32, ratio: f32) -> Self {
+        Self {
+            stiffness,
+            damping: 2.0 * ratio * stiffness.sqrt(),
+            mass: 1.0,
+        }
+    }
 }
 
 impl Default for Spring {

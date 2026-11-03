@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anti-webui-style.workspace = true
 parley.workspace = true
+icu_properties.workspace = true
 slotmap.workspace = true
 unicode-segmentation.workspace = true
 read-fonts.workspace = true

@@ -20,10 +20,12 @@ Web 技術の資産そのもの（HTML/JS）の流用は目標にしない。代
 ├──────────────────────────────────────────────────────────────┤
 │ anti-webui-app        プラットフォーム × レンダラ × core の結線   │
 │ anti-webui-widgets    Button / Checkbox / TextInput など        │
+│ anti-webui-md3e       Material 3 Expressive の部品（任意）       │
 ├──────────────────────────────────────────────────────────────┤
 │ anti-webui-core       リアクティブ・ノードツリー・スタイル解決・   │
 │                       レイアウト・テキスト・選択・編集・イベント   │
 │ anti-webui-style      スタイル型（論理値）・将来の CSS サブセット  │
+│ anti-webui-macros     `derive(ShaderParams)`                    │
 ├──────────────────────────────────────────────────────────────┤
 │ anti-webui-wgpu       描画リスト → GPU（矩形 SDF・グリフアトラス）│
 │ anti-webui-wayland    Wayland バックエンド                      │

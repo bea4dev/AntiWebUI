@@ -290,6 +290,15 @@ pub(crate) struct Pacing {
     started: i64,
     callback: Option<i64>,
     ui_done: i64,
+    /// Going by the last frame shown.
+    refresh: Option<Duration>,
+}
+
+/// The first refresh after `now`, of those that `last` was the start of one of.
+fn next_refresh(last: Instant, refresh: Duration, now: Instant) -> Instant {
+    let since = now.saturating_duration_since(last).as_nanos();
+    let refreshes = since / refresh.as_nanos().max(1) + 1;
+    last + Duration::from_nanos((refreshes * refresh.as_nanos()) as u64)
 }
 
 /// Reads `auto`, `on`, `off` or a number.
@@ -320,6 +329,7 @@ impl Pacing {
             started: 0,
             callback: None,
             ui_done: 0,
+            refresh: None,
         }
     }
 
@@ -355,6 +365,14 @@ impl Pacing {
             token: self.next_token,
             ..Default::default()
         }
+    }
+
+    /// How long until the frame callback that would come if something had been committed, going
+    /// by the last one. `None` before there has been one, or if the refresh isn't known.
+    pub fn until_next_refresh(&self, ctx: &mut Ctx<'_>, now: Instant) -> Option<Duration> {
+        let last = ctx.last_frame_callback(SurfaceId::Window)?;
+        let refresh = self.refresh?;
+        Some(next_refresh(last, refresh, now).saturating_duration_since(now))
     }
 
     pub fn end_frame(&mut self, trace: PresentTrace, presented: bool, feedback: bool) {
@@ -430,6 +448,10 @@ impl Pacing {
     }
 
     fn apply_presentation(&mut self, p: &Presentation) {
+        // Zero means that the output has no constant rate.
+        if let Some(s) = p.shown.filter(|s| s.refresh_ns > 0) {
+            self.refresh = Some(Duration::from_nanos(s.refresh_ns as u64));
+        }
         let offset = self.presentation_offset.unwrap_or(0);
         let Some(f) = self.flying.iter_mut().find(|f| f.record.token == p.token) else {
             return;
@@ -456,6 +478,20 @@ impl Pacing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_next_refresh_keeps_in_step_with_the_last_callback() {
+        let last = Instant::now();
+        let refresh = Duration::from_micros(8333);
+        let at = |us| last + Duration::from_micros(us);
+        assert_eq!(next_refresh(last, refresh, last), at(8333));
+        assert_eq!(next_refresh(last, refresh, at(300)), at(8333));
+        assert_eq!(next_refresh(last, refresh, at(8332)), at(8333));
+        assert_eq!(next_refresh(last, refresh, at(8333)), at(16666));
+        assert_eq!(next_refresh(last, refresh, at(80_000)), at(83330));
+        // A clock that says it is earlier than the callback can't happen by much.
+        assert_eq!(next_refresh(at(100), refresh, last), at(8433));
+    }
 
     const MS: i64 = 1_000_000;
     const REFRESH: i64 = 8 * MS;

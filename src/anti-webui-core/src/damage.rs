@@ -240,6 +240,7 @@ pub fn primitive_bounds(p: &Primitive) -> RectI {
         Primitive::Shadow(s) => s.bounds().intersect(&s.clip.rect),
         Primitive::Glyphs(run) => glyph_run_bounds(run).intersect(&run.clip.rect),
         Primitive::Layer(l) => l.bounds_on_parent(),
+        Primitive::Shader(s) => s.rect.intersect(&s.clip.rect),
     }
 }
 

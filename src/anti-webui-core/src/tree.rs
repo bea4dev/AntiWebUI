@@ -5,6 +5,7 @@ use crate::geometry::{Affine, PointF, PointI, RectI, Scale, SizeI};
 use crate::layout::{MeasureCache, MeasureKey, Resolved, child_clip};
 use crate::platform::{Placement, PlatformRequest, PopupId, PopupKind, PopupParams};
 use crate::scene::Scene;
+use crate::shader::ShaderPaint;
 use crate::text::TextLayout;
 use crate::text::edit::EditData;
 use crate::text::selection::DocSelection;
@@ -34,6 +35,8 @@ pub struct Listeners {
     pub key_up: Option<Handler<KeyboardEvent>>,
     pub scroll: Option<Handler<ScrollEvent>>,
     pub focus: Option<Rc<dyn Fn(bool)>>,
+    pub active: Option<Rc<dyn Fn(bool)>>,
+    pub focus_visible: Option<Rc<dyn Fn(bool)>>,
 }
 
 /// Style layers, applied in order: base → dynamic → hover → focus → active.
@@ -126,6 +129,10 @@ pub struct Node {
     pub listeners: Listeners,
     pub focusable: bool,
     pub disabled: bool,
+    /// Paints the box below its background. See `docs/design/14-shaders.md`.
+    pub fill: Option<ShaderPaint>,
+    /// Paints the box above its background and border, below its children.
+    pub overlay: Option<ShaderPaint>,
 
     pub computed: ComputedStyle,
     pub resolved: Resolved,
@@ -170,6 +177,8 @@ pub struct Node {
     pub(crate) transitions: Vec<crate::animation::RunningTransition>,
     /// When it comes and goes as part of a `show` with `enter` or `exit`.
     pub(crate) presence: Option<Box<crate::animation::Presence>>,
+    /// On its way to where a `for_each` with `moves` has put it.
+    pub(crate) moving: Option<Box<crate::animation::Moving>>,
     /// Nodes in the subtree that are not `display: none`, itself included.
     pub(crate) subtree_nodes: u32,
     /// The children may have moved since the node was last positioned.
@@ -193,6 +202,8 @@ impl Node {
             listeners: Listeners::default(),
             focusable: false,
             disabled: false,
+            fill: None,
+            overlay: None,
             computed: ComputedStyle::default(),
             resolved: Resolved::default(),
             rect: RectI::default(),
@@ -214,6 +225,7 @@ impl Node {
             child_bounds: Vec::new(),
             transitions: Vec::new(),
             presence: None,
+            moving: None,
             subtree_nodes: 0,
             position_dirty: true,
             style_dirty: false,
@@ -296,8 +308,8 @@ impl Node {
             self.abs.y as f64 + self.abs.height as f64 * c.transform_origin_y as f64,
         );
         Affine::translation(
-            origin.0 + scale.pxf(c.translate_x) as f64,
-            origin.1 + scale.pxf(c.translate_y) as f64,
+            origin.0 + scale.pxf(c.translate_x) as f64 + c.move_x as f64,
+            origin.1 + scale.pxf(c.translate_y) as f64 + c.move_y as f64,
         )
         .then_apply(&Affine::rotation(c.rotate as f64))
         .then_apply(&Affine::scaling(c.scale_x as f64, c.scale_y as f64))
@@ -375,6 +387,8 @@ pub struct Document {
     pub settling: bool,
     /// Nodes with transitions going on.
     pub(crate) transitioning: HashSet<NodeId>,
+    /// Where things were in lists that changed since the last layout.
+    pub(crate) list_places: Vec<crate::animation::ListPlaces>,
     /// Nodes whose style must be resolved again; see `style_all`.
     pub style_dirty: Vec<NodeId>,
     /// Every node's style must be resolved again.
@@ -419,6 +433,7 @@ thread_local! {
         transform_moved: false,
         settling: false,
         transitioning: HashSet::new(),
+        list_places: Vec::new(),
         style_dirty: Vec::new(),
         style_all: false,
         reposition: Vec::new(),
@@ -576,7 +591,13 @@ impl Document {
     /// The part of the node that is not clipped away, in window coordinates.
     pub fn visible_window_rect(&self, id: NodeId) -> Option<RectI> {
         let n = self.nodes.get(id)?;
-        let mut rect = n.abs.intersect(&n.clip);
+        Some(self.visible_part(n, n.abs))
+    }
+
+    /// The part of a rectangle in a node's coordinates that is not clipped away, in window
+    /// coordinates.
+    pub(crate) fn visible_part(&self, n: &Node, rect: RectI) -> RectI {
+        let mut rect = rect.intersect(&n.clip);
         let mut space = n.space;
         while let Some(r) = space.and_then(|s| self.nodes.get(s)) {
             let Some((m, next)) = space.and_then(|s| self.step_out(s)) else {
@@ -594,7 +615,15 @@ impl Document {
             }
             space = next;
         }
-        Some(rect)
+        rect
+    }
+
+    /// Whether any of a rectangle in a node's coordinates could be seen.
+    pub(crate) fn can_be_seen(&self, n: &Node, rect: RectI) -> bool {
+        let rect = self.visible_part(n, rect);
+        let window = RectI::new(0, 0, self.viewport.width, self.viewport.height);
+        // A popup is free to leave the window.
+        !rect.is_empty() && (!self.popups.is_empty() || !rect.intersect(&window).is_empty())
     }
 
     pub fn get(&self, id: NodeId) -> Option<&Node> {
@@ -661,6 +690,20 @@ impl Document {
     pub fn mark_paint(&mut self) {
         self.dirty.paint = true;
         self.dirty.content = true;
+    }
+
+    /// Only what a node's shader paints changed. This can happen on every frame, so of the layers
+    /// only those it is in paint again. Marking more ancestors than are layers costs nothing.
+    pub fn mark_shader_of(&mut self, id: NodeId) {
+        self.dirty.paint = true;
+        let mut cur = Some(id);
+        while let Some(i) = cur {
+            let Some(n) = self.nodes.get(i) else {
+                break;
+            };
+            self.stale_layers.insert(i);
+            cur = if n.is_popup() { None } else { n.parent };
+        }
     }
 
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {

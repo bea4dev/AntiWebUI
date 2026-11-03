@@ -318,6 +318,8 @@ struct Doc {
     shown: Signal<bool>,
     hidden: Signal<bool>,
     glow: Signal<bool>,
+    /// What shaders paint some of the rows with.
+    painted: Signal<u32>,
     corner: Signal<f32>,
     fills: Signal<bool>,
     box_corner: Signal<f32>,
@@ -334,6 +336,22 @@ struct Doc {
     field: NodeRef,
 }
 
+struct Painted(f32);
+
+impl ShaderParams for Painted {
+    const FIELDS: &'static [anti_webui_core::shader::ParamField] =
+        &[anti_webui_core::shader::ParamField {
+            name: "value",
+            ty: anti_webui_core::shader::ParamType::F32,
+        }];
+
+    fn write(&self, out: &mut anti_webui_core::shader::ParamWriter) {
+        anti_webui_core::shader::ParamValue::write(&self.0, out);
+    }
+}
+
+static PAINT: Shader<Painted> = Shader::new("paint", "");
+
 /// Only what keeps boxes as boxes: what the hit test finds is then easy to work out.
 fn transformed(st: Style, how: u32) -> Style {
     match how {
@@ -348,6 +366,7 @@ fn transformed(st: Style, how: u32) -> Style {
 fn view(s: &Doc) -> impl IntoView + use<> {
     let (color, size, gap, label, items) = (s.color, s.size, s.gap, s.label, s.items);
     let (shown, hidden, glow, corner, fills) = (s.shown, s.hidden, s.glow, s.corner, s.fills);
+    let painted = s.painted;
     let (outer, inner, field) = (s.outer, s.inner, s.field);
     let box_corner = s.box_corner;
     let (row_z, overlays, faded) = (s.row_z, s.overlays, s.faded);
@@ -443,6 +462,15 @@ fn view(s: &Doc) -> impl IntoView + use<> {
                                         } else {
                                             0
                                         }))
+                                        .fill(move || {
+                                            let on = i.is_multiple_of(3) && painted.get() % 2 == 1;
+                                            on.then(|| PAINT.params(Painted(painted.get() as f32)))
+                                        })
+                                        .overlay(move || {
+                                            let on = i.is_multiple_of(4)
+                                                && !painted.get().is_multiple_of(3);
+                                            on.then(|| PAINT.params(Painted(painted.get() as f32)))
+                                        })
                                         .dyn_style(move |st| {
                                             if glow.get() && i % 3 == 0 {
                                                 st.shadow_md()
@@ -476,7 +504,8 @@ fn view(s: &Doc) -> impl IntoView + use<> {
                             )
                             .enter(|st| st.opacity(0.0).h(0.0))
                             .exit(|st| st.opacity(0.0).translate_x(10.0))
-                            .transition(Transition::ms(100)),
+                            .transition(Transition::ms(100))
+                            .moves(Transition::ms(100)),
                         )
                         .child(rounded_box())
                         .child(show(
@@ -550,6 +579,7 @@ fn random_changes(seed: u64) {
         shown: signal(true),
         hidden: signal(false),
         glow: signal(false),
+        painted: signal(0),
         corner: signal(0.0),
         fills: signal(true),
         box_corner: signal(0.0),
@@ -673,7 +703,11 @@ fn random_changes(seed: u64) {
             }
             13 => s.shown.update(|v| *v = !*v),
             14 => s.hidden.update(|v| *v = !*v),
-            15 => s.glow.update(|v| *v = !*v),
+            15 => {
+                s.glow.update(|v| *v = !*v);
+                // Goes through the values rather than taking from `rng`, which would change every later step.
+                s.painted.update(|v| *v = (*v + 1) % 6);
+            }
             16 => s.corner.set(rng.next(20) as f32),
             17 => s.fills.update(|v| *v = !*v),
             18 => s.box_corner.set(rng.next(16) as f32),

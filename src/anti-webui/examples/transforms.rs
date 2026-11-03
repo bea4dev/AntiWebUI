@@ -219,9 +219,10 @@ fn main() {
                                             .child(text(format!("item {i}: click to remove")))
                                     },
                                 )
-                                .enter(|s| s.opacity(0.0).h(0.0).mb(0.0).translate_x(-20.0))
-                                .exit(|s| s.opacity(0.0).h(0.0).mb(0.0).translate_x(20.0))
-                                .transition(Transition::ms(600).ease_out()),
+                                .enter(|s| s.opacity(0.0).translate_x(-20.0))
+                                .exit(|s| s.opacity(0.0).translate_x(20.0))
+                                .transition(Transition::ms(300).ease_out())
+                                .moves(Transition::ms(600).ease_out()),
                             ),
                         ),
                 )

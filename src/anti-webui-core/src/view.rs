@@ -3,16 +3,19 @@
 //! A builder only collects configuration; nodes are created in [`IntoView::into_view`], inside
 //! the current reactive owner, and removed again when that owner is disposed.
 
-use crate::animation::request_frame;
+use crate::animation::{ListPlaces, request_frame};
 use crate::event::{KeyboardEvent, PointerEvent, ScrollEvent};
-use crate::geometry::RectI;
+use crate::geometry::{PointI, RectI};
 use crate::platform::{ImePurpose, Placement, PopupKind};
 use crate::reactive::{
     Owner, Signal, create_child_owner, create_root, effect, memo, on_cleanup, signal, untrack,
 };
+use crate::shader::ShaderPaint;
 use crate::text::TextLayout;
 use crate::text::edit::{EditData, TextCallback};
-use crate::tree::{Document, Listeners, Node, NodeId, NodeKind, PopupData, TextData, with_doc};
+use crate::tree::{
+    Document, Handler, Listeners, Node, NodeId, NodeKind, PopupData, TextData, with_doc,
+};
 use anti_webui_style::{
     AlignItems, Display as Layout, FlexDirection, Style, Styled, Transition, UserSelect,
 };
@@ -111,6 +114,49 @@ fn bind_dynamic_styles(id: NodeId, layers: Vec<StyleFn>) {
     }
 }
 
+type PaintFn = Box<dyn Fn() -> Option<ShaderPaint>>;
+
+/// Keeps what a node's shader paints in sync with its closure. `slot` says which one it is.
+fn bind_paint(id: NodeId, f: PaintFn, slot: fn(&mut Node) -> &mut Option<ShaderPaint>) {
+    effect(move || {
+        let paint = f();
+        with_doc(|d| {
+            if let Some(n) = d.get_mut(id)
+                && *slot(n) != paint
+            {
+                *slot(n) = paint;
+                d.mark_shader_of(id);
+            }
+        });
+    });
+}
+
+/// Adds a listener to those a node already has: what builds an element and what uses it can each
+/// listen without knowing of the other.
+fn also<E: 'static>(old: Option<Handler<E>>, f: impl Fn(&E) + 'static) -> Option<Handler<E>> {
+    Some(match old {
+        Some(old) => Rc::new(move |e| {
+            old(e);
+            f(e);
+        }),
+        None => Rc::new(f),
+    })
+}
+
+/// The same for listeners that are told whether something is so.
+fn also_bool(
+    old: Option<Rc<dyn Fn(bool)>>,
+    f: impl Fn(bool) + 'static,
+) -> Option<Rc<dyn Fn(bool)>> {
+    Some(match old {
+        Some(old) => Rc::new(move |v| {
+            old(v);
+            f(v);
+        }),
+        None => Rc::new(f),
+    })
+}
+
 /// Common element configuration shared by `div` and `text_input`.
 #[derive(Default)]
 struct ElementConfig {
@@ -119,6 +165,8 @@ struct ElementConfig {
     focus: Option<Style>,
     active: Option<Style>,
     dynamic: Vec<StyleFn>,
+    fill: Option<PaintFn>,
+    overlay: Option<PaintFn>,
     listeners: Listeners,
     focusable: bool,
     disabled: Option<Box<dyn Fn() -> bool>>,
@@ -135,6 +183,12 @@ impl ElementConfig {
         node.focusable |= self.focusable;
         let id = create_node(node);
         bind_dynamic_styles(id, self.dynamic);
+        if let Some(f) = self.fill {
+            bind_paint(id, f, |n| &mut n.fill);
+        }
+        if let Some(f) = self.overlay {
+            bind_paint(id, f, |n| &mut n.overlay);
+        }
         if let Some(disabled) = self.disabled {
             effect(move || {
                 let v = disabled();
@@ -180,47 +234,80 @@ macro_rules! element_methods {
         }
 
         pub fn on_click(mut self, f: impl Fn(&PointerEvent) + 'static) -> Self {
-            self.cfg.listeners.click = Some(Rc::new(f));
+            self.cfg.listeners.click = also(self.cfg.listeners.click.take(), f);
             self
         }
 
         pub fn on_pointer_down(mut self, f: impl Fn(&PointerEvent) + 'static) -> Self {
-            self.cfg.listeners.pointer_down = Some(Rc::new(f));
+            self.cfg.listeners.pointer_down = also(self.cfg.listeners.pointer_down.take(), f);
             self
         }
 
         pub fn on_pointer_up(mut self, f: impl Fn(&PointerEvent) + 'static) -> Self {
-            self.cfg.listeners.pointer_up = Some(Rc::new(f));
+            self.cfg.listeners.pointer_up = also(self.cfg.listeners.pointer_up.take(), f);
             self
         }
 
         pub fn on_pointer_move(mut self, f: impl Fn(&PointerEvent) + 'static) -> Self {
-            self.cfg.listeners.pointer_move = Some(Rc::new(f));
+            self.cfg.listeners.pointer_move = also(self.cfg.listeners.pointer_move.take(), f);
             self
         }
 
         pub fn on_hover(mut self, f: impl Fn(bool) + 'static) -> Self {
-            self.cfg.listeners.hover = Some(Rc::new(f));
+            self.cfg.listeners.hover = also_bool(self.cfg.listeners.hover.take(), f);
             self
         }
 
         pub fn on_key_down(mut self, f: impl Fn(&KeyboardEvent) + 'static) -> Self {
-            self.cfg.listeners.key_down = Some(Rc::new(f));
+            self.cfg.listeners.key_down = also(self.cfg.listeners.key_down.take(), f);
             self
         }
 
         pub fn on_key_up(mut self, f: impl Fn(&KeyboardEvent) + 'static) -> Self {
-            self.cfg.listeners.key_up = Some(Rc::new(f));
+            self.cfg.listeners.key_up = also(self.cfg.listeners.key_up.take(), f);
             self
         }
 
         pub fn on_scroll(mut self, f: impl Fn(&ScrollEvent) + 'static) -> Self {
-            self.cfg.listeners.scroll = Some(Rc::new(f));
+            self.cfg.listeners.scroll = also(self.cfg.listeners.scroll.take(), f);
             self
         }
 
         pub fn on_focus_change(mut self, f: impl Fn(bool) + 'static) -> Self {
-            self.cfg.listeners.focus = Some(Rc::new(f));
+            self.cfg.listeners.focus = also_bool(self.cfg.listeners.focus.take(), f);
+            self
+        }
+
+        /// Like [`on_focus_change`](Self::on_focus_change), for focus that should be shown: what
+        /// was reached with the keyboard, and not what was clicked (CSS `:focus-visible`).
+        pub fn on_focus_visible(mut self, f: impl Fn(bool) + 'static) -> Self {
+            self.cfg.listeners.focus_visible =
+                also_bool(self.cfg.listeners.focus_visible.take(), f);
+            self
+        }
+
+        /// Told when the node (or a descendant) starts and stops being pressed, also when the
+        /// pointer is released somewhere else.
+        pub fn on_active(mut self, f: impl Fn(bool) + 'static) -> Self {
+            self.cfg.listeners.active = also_bool(self.cfg.listeners.active.take(), f);
+            self
+        }
+
+        /// Paints the box with a shader, above its outer shadows and below its background, cut to
+        /// its rounded shape. `f` runs again whenever the signals it reads change. See
+        /// `docs/design/14-shaders.md`.
+        pub fn fill<P: Into<Option<ShaderPaint>>>(mut self, f: impl Fn() -> P + 'static) -> Self {
+            self.cfg.fill = Some(Box::new(move || f().into()));
+            self
+        }
+
+        /// Paints the box with a shader, above its background and border and below its children,
+        /// cut to its rounded shape. Returning `None` paints nothing and costs nothing.
+        pub fn overlay<P: Into<Option<ShaderPaint>>>(
+            mut self,
+            f: impl Fn() -> P + 'static,
+        ) -> Self {
+            self.cfg.overlay = Some(Box::new(move || f().into()));
             self
         }
 
@@ -252,6 +339,11 @@ pub struct Div {
 
 pub fn div() -> Div {
     Div::default()
+}
+
+/// A box painted by a shader: `div().fill(f)`.
+pub fn shader<P: Into<Option<ShaderPaint>>>(f: impl Fn() -> P + 'static) -> Div {
+    div().fill(f)
 }
 
 impl Styled for Div {
@@ -708,6 +800,7 @@ where
         key: Box::new(key),
         view: Box::new(move |item| view(item).into_view()),
         presence: PresenceConfig::default(),
+        moves: None,
     }
 }
 
@@ -717,10 +810,47 @@ pub struct ForEach<T, K> {
     key: Box<dyn Fn(&T) -> K>,
     view: Box<dyn Fn(T) -> View>,
     presence: PresenceConfig,
+    moves: Option<Transition>,
 }
 
 impl<T, K> ForEach<T, K> {
     presence_methods!();
+
+    /// Has items go to their new place when the list changes, from where they are shown, instead
+    /// of being there at once.
+    pub fn moves(mut self, timing: Transition) -> Self {
+        self.moves = Some(timing).filter(|t| !t.duration.is_zero());
+        self
+    }
+}
+
+/// Keeps where the boxes of `roots` are for when the next layout has them elsewhere.
+fn remember_places(
+    d: &mut Document,
+    list: NodeId,
+    timing: Transition,
+    roots: impl Iterator<Item = NodeId>,
+) {
+    // What was there before the first of these changes is what is on screen.
+    if d.list_places.iter().any(|p| p.list == list) {
+        return;
+    }
+    let mut targets = Vec::new();
+    for root in roots {
+        presence_targets(d, root, &mut targets);
+    }
+    let before = targets
+        .into_iter()
+        .filter_map(|t| {
+            let n = d.get(t).filter(|n| n.visible)?;
+            Some((t, PointI::new(n.rect.x, n.rect.y)))
+        })
+        .collect();
+    d.list_places.push(ListPlaces {
+        list,
+        timing,
+        before,
+    });
 }
 
 struct Row {
@@ -737,6 +867,7 @@ struct Rows<K> {
     /// The keys of what is going.
     going: Vec<K>,
     waiting: bool,
+    moves: Option<Transition>,
 }
 
 impl<K> Default for Rows<K> {
@@ -746,6 +877,7 @@ impl<K> Default for Rows<K> {
             shown: Vec::new(),
             going: Vec::new(),
             waiting: false,
+            moves: None,
         }
     }
 }
@@ -779,7 +911,11 @@ fn wait_for_rows<K: Eq + Hash + Clone + 'static>(state: Rc<RefCell<Rows<K>>>, id
     request_frame(move |_| {
         let mut s = state.borrow_mut();
         let Rows {
-            rows, shown, going, ..
+            rows,
+            shown,
+            going,
+            moves,
+            ..
         } = &mut *s;
         let mut done = Vec::new();
         with_doc(|d| {
@@ -791,6 +927,9 @@ fn wait_for_rows<K: Eq + Hash + Clone + 'static>(state: Rc<RefCell<Rows<K>>>, id
                 !gone
             });
             if !done.is_empty() {
+                if let Some(timing) = *moves {
+                    remember_places(d, id, timing, rows.values().map(|r| r.root));
+                }
                 shown.retain(|k| rows.contains_key(k));
                 let order = shown.iter().map(|k| rows[k].root).collect();
                 d.set_children(id, order);
@@ -819,10 +958,12 @@ where
             key,
             view,
             presence,
+            moves,
         } = self;
         let id = create_node(Node::new(NodeKind::Fragment));
         let outer = Owner::current();
         let state: Rc<RefCell<Rows<K>>> = Rc::default();
+        state.borrow_mut().moves = moves;
         on_cleanup({
             let state = state.clone();
             move || {
@@ -838,6 +979,9 @@ where
             let list = items();
             let starting = !first.replace(false) || presence.appear;
             let mut old = std::mem::take(&mut state.borrow_mut().rows);
+            if let Some(timing) = moves.filter(|_| !old.is_empty()) {
+                with_doc(|d| remember_places(d, id, timing, old.values().map(|r| r.root)));
+            }
             let mut next = HashMap::with_capacity(list.len());
             let mut order = Vec::with_capacity(list.len());
             let mut keys = Vec::new();

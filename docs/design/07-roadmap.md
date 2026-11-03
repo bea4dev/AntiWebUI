@@ -20,8 +20,11 @@
 - [x] CSS と同じ影（外側・内側）、`z_index`、ポップアップ、プルダウンリスト（[09](09-shadows-stacking-popups.md)）
 - [x] フレームの先行（Auto / Enable / Disable / Custom）、フレーム計測、`request_frame`（[10](10-frame-pacing.md)）
 - [x] `translate` / `scale` / `rotate` と合成レイヤー（[12](12-transform.md)）
-- [x] `transition`、`animated`、`Spring`、`show` と `for_each` の `enter` / `exit`（[13](13-animation.md)）
+- [x] `transition`、`animated`、`Spring`、`show` と `for_each` の `enter` / `exit`、`for_each` の `moves`（[13](13-animation.md)）
 - [x] グループ不透明度（[12](12-transform.md)）
+- [x] カスタムシェーダーの `fill` / `overlay`（[14](14-shaders.md)）
+- [x] アプリに同梱したフォントの登録（[04](04-text.md)）
+- [x] Material 3 Expressive の部品の最小版（[15](15-md3e.md)）
 
 ### M1 の既知の制限
 
@@ -30,9 +33,12 @@
 - 選択ドラッグがウィンドウ端に達したときの自動スクロールは未実装
 - パスワード入力のマスク表示は未実装（`ImePurpose::Password` は IME へのヒントのみ）
 - サーバ側装飾が無いコンポジタではタイトルバーが出ない（CSD は M2）
+- カスタムシェーダーと MD3E の部品は、内蔵 GPU をコンポジタの出力にした状態と 60 Hz での性能が未計測
 
 ## M2: 実用性
 
+- `filter`、ブラー（Dual Kawase）、backdrop、カスタム影（[14](14-shaders.md)）
+- MD3E の残りの部品（[15](15-md3e.md)）
 - CSS サブセット（スタイルシート・クラス・ホットリロード）
 - `flex-wrap`、Grid
 - 画像（PNG/JPEG/SVG）

@@ -1564,3 +1564,143 @@ fn faded_layers_repaint_the_same_in_parts_as_at_once() {
         prev = scene;
     }
 }
+
+#[test]
+fn rows_that_move_are_shown_where_they_were_and_repaint_the_same_in_parts_as_at_once() {
+    use anti_webui_core::Ui;
+    use anti_webui_core::damage;
+    use anti_webui_core::event::{Modifiers, WindowEvent};
+    use anti_webui_core::geometry::{PointF, Scale, SizeI};
+    use anti_webui_wgpu::{Gpu, Offscreen, Renderer, wgpu};
+    use std::time::{Duration, Instant};
+
+    let gpu = match Gpu::headless() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
+    let (w, h) = (200u32, 200u32);
+    let color = |i: usize| rgb(0x204060 + 0x301008 * (i as u32 % 5));
+    let items = signal((0..30).collect::<Vec<usize>>());
+    let mut ui = Ui::new(move || {
+        div()
+            .bg(Color::WHITE)
+            .h(pct(100.0))
+            .overflow_y_scroll()
+            .child(
+                for_each(
+                    move || items.get(),
+                    |i: &usize| *i,
+                    move |i| div().h(20.0).bg(color(i)).child(text(format!("row {i}"))),
+                )
+                .exit(|s| s.opacity(0.0))
+                .transition(Transition::ms(40).linear())
+                .moves(Transition::ms(100).linear()),
+            )
+    });
+    ui.handle_event(WindowEvent::Resized {
+        size: SizeI::new(w as i32, h as i32),
+        scale: Scale::ONE,
+    });
+    ui.update();
+
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut partial_renderer = Renderer::new(&gpu.device, format);
+    let mut full_renderer = Renderer::new(&gpu.device, format);
+    let target = Offscreen::new(&gpu, format, w, h);
+    let start = Instant::now();
+    let mut prev = ui.paint(start);
+    let before = gpu.render_to_rgba(&mut full_renderer, &prev);
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    partial_renderer.render(&gpu.device, &gpu.queue, &mut encoder, &target.view, &prev);
+    gpu.queue.submit([encoder.finish()]);
+
+    let mut compare = |ui: &mut Ui, at: u64, what: &str| {
+        let now = start + Duration::from_millis(at);
+        ui.animate(now);
+        ui.update();
+        let scene = ui.paint(now);
+        let d = damage::diff(&prev, &scene);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        partial_renderer.render_damaged(
+            &gpu.device,
+            &gpu.queue,
+            &mut encoder,
+            &target.view,
+            &scene,
+            &d,
+        );
+        gpu.queue.submit([encoder.finish()]);
+        let partial = target.read_rgba(&gpu);
+        full_renderer.clear_layer_caches();
+        let full = gpu.render_to_rgba(&mut full_renderer, &scene);
+        let differing = different_pixels(&partial, &full, 0);
+        assert_eq!(
+            differing, 0,
+            "{what}: {differing} pixels differ (damage {d:?})"
+        );
+        prev = scene;
+        full
+    };
+
+    // Going: nothing moves while it does, so what is below it is where it was.
+    items.update(|l| {
+        l.remove(0);
+    });
+    let frame = compare(&mut ui, 1, "going");
+    let row_below = |rgba: &[u8]| rgba[(4 * (w * 150 + 150)) as usize..][..3].to_vec();
+    assert_eq!(row_below(&frame), row_below(&before));
+
+    // It has gone, and the rest is on its way up from where it was.
+    let mut at = 8;
+    while at < 60 {
+        compare(&mut ui, at, "gone");
+        at += 8;
+    }
+    let frame = compare(&mut ui, at, "moving");
+    assert_ne!(row_below(&frame), [255, 255, 255]);
+
+    items.update(|l| l.reverse());
+    at += 8;
+    compare(&mut ui, at, "reversed");
+    ui.handle_event(WindowEvent::Scroll {
+        position: PointF::new(100.0, 100.0),
+        delta_x: 0.0,
+        delta_y: 37.0,
+        modifiers: Modifiers::default(),
+        source: ScrollSource::Unknown,
+        phase: ScrollPhase::Single,
+        time: 0,
+    });
+    at += 8;
+    compare(&mut ui, at, "scrolled while moving");
+    // What moves in its content like this leaves what it held in the texture around it.
+    items.update(|l| {
+        l.remove(3);
+        l.insert(1, 100);
+    });
+    let mut frames = 0;
+    while ui.animating() {
+        // What starts now goes by the real clock, which is ahead of this one on a busy machine.
+        at = (at + 8).max(start.elapsed().as_millis() as u64);
+        compare(&mut ui, at, "on the way");
+        frames += 1;
+        assert!(frames < 600, "never ends");
+    }
+    let scene = ui.paint(start + Duration::from_millis(at));
+    let scroller = scene.primitives.iter().find_map(|p| match p {
+        anti_webui_core::scene::Primitive::Layer(l) => Some(l),
+        _ => None,
+    });
+    assert!(
+        !scroller
+            .unwrap()
+            .content
+            .primitives
+            .iter()
+            .any(|p| matches!(p, anti_webui_core::scene::Primitive::Layer(_))),
+        "drawn directly once it arrived"
+    );
+}

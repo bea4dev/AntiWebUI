@@ -12,5 +12,6 @@ pub use anti_webui_app::App;
 pub mod prelude {
     pub use anti_webui_app::App;
     pub use anti_webui_core::prelude::*;
+    pub use anti_webui_macros::ShaderParams;
     pub use anti_webui_widgets::*;
 }

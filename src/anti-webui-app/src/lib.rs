@@ -273,8 +273,13 @@ mod wayland {
                 }
             }
             // Nothing was committed, so no frame callback will pace the next try.
-            if retry || (!committed && self.ui.animating()) {
-                ctx.request_redraw_after(std::time::Duration::from_millis(4));
+            let soon = std::time::Duration::from_millis(4);
+            if retry {
+                ctx.request_redraw_after(soon);
+            } else if !committed && self.ui.animating() {
+                // Nothing to show this time: it may have something at the next refresh.
+                let wait = self.pacing.until_next_refresh(ctx, Instant::now());
+                ctx.request_redraw_after(wait.unwrap_or(soon));
             } else if self.ui.animating() {
                 ctx.request_redraw();
             }

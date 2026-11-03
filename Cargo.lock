@@ -46,6 +46,7 @@ name = "anti-webui-core"
 version = "0.1.0"
 dependencies = [
  "anti-webui-style",
+ "icu_properties",
  "parley",
  "read-fonts",
  "slotmap",
@@ -65,6 +66,7 @@ version = "0.1.0"
 dependencies = [
  "anti-webui-app",
  "anti-webui-core",
+ "anti-webui-macros",
  "anti-webui-style",
  "anti-webui-wgpu",
  "anti-webui-widgets",
@@ -73,6 +75,22 @@ dependencies = [
 [[package]]
 name = "anti-webui-macos"
 version = "0.1.0"
+
+[[package]]
+name = "anti-webui-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "anti-webui-md3e"
+version = "0.1.0"
+dependencies = [
+ "anti-webui",
+]
 
 [[package]]
 name = "anti-webui-style"
@@ -99,6 +117,7 @@ dependencies = [
  "ash",
  "bytemuck",
  "libc",
+ "naga",
  "pollster",
  "raw-window-handle",
  "swash",

@@ -18,6 +18,8 @@ AntiWebUI は WebView に頼らず、wgpu による自前描画とネイティ�
 | 11 | [gpu-fill](11-gpu-fill.md) | GPU の塗りの効率（単色の経路と箱の分割、Chromium との比較） |
 | 12 | [transform](12-transform.md) | transform と合成レイヤー（カスタムシェーダーへの備えを含む） |
 | 13 | [animation](13-animation.md) | `transition`、`animated`、`Spring`、`enter` / `exit`、リアクティブの計算量 |
+| 14 | [shaders](14-shaders.md) | カスタムシェーダー（`fill`、`overlay`）と、次の段階の方針 |
+| 15 | [md3e](15-md3e.md) | Material 3 Expressive の部品（`anti_webui_md3e`） |
 
 ## 用語
 

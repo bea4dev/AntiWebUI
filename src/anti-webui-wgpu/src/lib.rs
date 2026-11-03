@@ -1,5 +1,6 @@
 //! The wgpu renderer for AntiWebUI scenes.
 
+mod custom_shader;
 #[cfg(target_os = "linux")]
 pub mod dmabuf;
 mod glyph_cache;
@@ -8,6 +9,7 @@ pub mod linux_sync;
 mod renderer;
 
 use anti_webui_core::scene::Scene;
+pub use custom_shader::check_shader;
 use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, RawDisplayHandle, RawWindowHandle,
 };

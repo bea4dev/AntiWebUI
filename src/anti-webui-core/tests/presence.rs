@@ -946,3 +946,466 @@ fn a_key_given_twice_is_shown_once() {
     ui.update();
     assert_eq!(shown(&r), [1]);
 }
+
+fn moving_list(l: ForEach<usize, usize>) -> ForEach<usize, usize> {
+    l.moves(Transition::ms(100).linear())
+}
+
+/// Where it is shown, and where its place is.
+fn shown_and_place(n: NodeRef) -> (i32, i32) {
+    with_doc(|d| {
+        let id = n.get().unwrap();
+        (d.window_rect(id).unwrap().y, d.get(id).unwrap().rect.y)
+    })
+}
+
+#[test]
+fn what_stays_goes_to_its_new_place_from_where_it_was() {
+    let items = signal(vec![0, 1, 2]);
+    let r = refs(3);
+    let (rr, builds) = (r.clone(), Rc::new(Cell::new(0)));
+    let mut ui = Ui::new(move || list(items, rr.clone(), builds.clone(), moving_list));
+    window(&mut ui);
+    assert_eq!(shown_and_place(r[2]), (2 * ROW, 2 * ROW));
+
+    let start = Instant::now();
+    items.set(vec![1, 2]);
+    ui.update();
+    assert!(!there(r[0]));
+    assert_eq!(shown_and_place(r[2]), (2 * ROW, ROW), "it hasn't moved yet");
+    assert_eq!(shown_and_place(r[1]), (ROW, 0));
+
+    frame_at(&mut ui, start, 50);
+    let (y, place) = shown_and_place(r[2]);
+    assert_eq!(place, ROW);
+    assert!((y - (ROW + ROW / 2)).abs() <= 1, "{y}");
+
+    run_out(&mut ui, start, 50);
+    assert_eq!(shown_and_place(r[2]), (ROW, ROW));
+    let drawn_directly = with_doc(|d| !d.get(r[2].get().unwrap()).unwrap().transformed);
+    assert!(drawn_directly, "and it ends up as it was");
+}
+
+#[test]
+fn without_moves_nothing_glides() {
+    let items = signal(vec![0, 1]);
+    let r = refs(2);
+    let (rr, builds) = (r.clone(), Rc::new(Cell::new(0)));
+    let mut ui = Ui::new(move || list(items, rr.clone(), builds.clone(), |l| l));
+    window(&mut ui);
+    items.set(vec![1]);
+    ui.update();
+    assert_eq!(shown_and_place(r[1]), (0, 0));
+    assert!(!ui.animating());
+
+    // Taking no time is the same as not being asked for.
+    let items = signal(vec![0, 1]);
+    let r = refs(2);
+    let (rr, builds) = (r.clone(), Rc::new(Cell::new(0)));
+    let mut ui = Ui::new(move || {
+        list(items, rr.clone(), builds.clone(), |l| {
+            l.moves(Transition::ms(0))
+        })
+    });
+    window(&mut ui);
+    items.set(vec![1]);
+    ui.update();
+    assert_eq!(shown_and_place(r[1]), (0, 0));
+    assert!(!ui.animating());
+}
+
+#[test]
+fn reordering_moves_both_ways_and_new_ones_are_just_there() {
+    let items = signal(vec![0, 1]);
+    let r = refs(3);
+    let (rr, builds) = (r.clone(), Rc::new(Cell::new(0)));
+    let mut ui = Ui::new(move || list(items, rr.clone(), builds.clone(), moving_list));
+    window(&mut ui);
+    items.set(vec![1, 2, 0]);
+    ui.update();
+    assert_eq!(shown_and_place(r[0]), (0, 2 * ROW));
+    assert_eq!(shown_and_place(r[1]), (ROW, 0));
+    assert_eq!(shown_and_place(r[2]), (ROW, ROW), "nothing to come from");
+}
+
+#[test]
+fn changing_the_list_again_goes_on_from_where_it_is_shown() {
+    let items = signal(vec![0, 1, 2]);
+    let r = refs(3);
+    let (rr, builds) = (r.clone(), Rc::new(Cell::new(0)));
+    let mut ui = Ui::new(move || list(items, rr.clone(), builds.clone(), moving_list));
+    window(&mut ui);
+    let start = Instant::now();
+    items.set(vec![1, 2]);
+    ui.update();
+    frame_at(&mut ui, start, 50);
+    let (reached, _) = shown_and_place(r[2]);
+    assert!(reached > ROW && reached < 2 * ROW, "{reached}");
+
+    let again = Instant::now();
+    items.set(vec![2]);
+    ui.update();
+    assert_eq!(shown_and_place(r[2]), (reached, 0), "no jump");
+    // It takes all of the time again from there.
+    frame_at(&mut ui, again, 50);
+    let (y, _) = shown_and_place(r[2]);
+    assert!((y - reached / 2).abs() <= 1, "{y} from {reached}");
+    run_out(&mut ui, again, 50);
+    assert_eq!(shown_and_place(r[2]), (0, 0));
+}
+
+#[test]
+fn several_changes_before_a_frame_go_from_what_was_on_screen() {
+    let items = signal(vec![0, 1, 2]);
+    let r = refs(3);
+    let (rr, builds) = (r.clone(), Rc::new(Cell::new(0)));
+    let mut ui = Ui::new(move || list(items, rr.clone(), builds.clone(), moving_list));
+    window(&mut ui);
+    items.set(vec![1, 2]);
+    items.set(vec![2]);
+    ui.update();
+    assert_eq!(shown_and_place(r[2]), (2 * ROW, 0));
+}
+
+#[test]
+fn what_follows_what_went_moves_up_once_it_has_gone() {
+    let items = signal(vec![0, 1]);
+    let r = refs(2);
+    let (rr, builds) = (r.clone(), Rc::new(Cell::new(0)));
+    let mut ui = Ui::new(move || {
+        list(items, rr.clone(), builds.clone(), |l| {
+            fading_list(l).moves(Transition::ms(100).linear())
+        })
+    });
+    window(&mut ui);
+    let start = Instant::now();
+    items.set(vec![1]);
+    ui.update();
+    frame_at(&mut ui, start, 50);
+    assert_eq!(
+        shown_and_place(r[1]),
+        (ROW, ROW),
+        "its place is still there"
+    );
+
+    let mut at = 50;
+    while there(r[0]) {
+        at += 8;
+        frame_at(&mut ui, start, at);
+        assert!(at < 1000);
+    }
+    let gone = Instant::now();
+    assert_eq!(shown_and_place(r[1]), (ROW, 0), "and then it moves up");
+    frame_at(&mut ui, gone, 50);
+    let (y, _) = shown_and_place(r[1]);
+    assert!((y - ROW / 2).abs() <= 1, "{y}");
+    run_out(&mut ui, gone, 50);
+    assert_eq!(shown_and_place(r[1]), (0, 0));
+}
+
+/// What goes doesn't wait to arrive anywhere.
+#[test]
+fn what_goes_is_gone_when_its_exit_is_over_even_if_it_is_moving() {
+    let items = signal(vec![0, 1, 2]);
+    let r = refs(3);
+    let (rr, builds) = (r.clone(), Rc::new(Cell::new(0)));
+    let mut ui = Ui::new(move || {
+        list(items, rr.clone(), builds.clone(), |l| {
+            fading_list(l).moves(Transition::ms(1000).linear())
+        })
+    });
+    window(&mut ui);
+    let start = Instant::now();
+    items.set(vec![1, 2]);
+    ui.update();
+    frame_at(&mut ui, start, 10);
+    items.set(vec![2]);
+    ui.update();
+    // The first row left, so the second is moving while it goes.
+    let mut at = 10;
+    while there(r[0]) {
+        at += 8;
+        frame_at(&mut ui, start, at);
+        assert!(at < 500);
+    }
+    assert!(at < 500);
+    frame_at(&mut ui, start, at + 8);
+    frame_at(&mut ui, start, at + 16);
+    assert!(!there(r[1]), "gone at {at} ms already");
+}
+
+/// Its own `translate` goes on as if nothing else was going on, and the other way around.
+#[test]
+fn moving_adds_to_what_it_does_on_its_own() {
+    let (items, pushed) = (signal(vec![0, 1]), signal(false));
+    let n = node_ref();
+    let mut ui = Ui::new(move || {
+        div().size_full().flex().flex_col().child(
+            for_each(
+                move || items.get(),
+                |i: &usize| *i,
+                move |i| {
+                    let row = div().w(100.0).h(ROW as f32);
+                    if i == 1 {
+                        row.node_ref(n)
+                            .transition(Transition::ms(100).linear())
+                            .dyn_style(move |s| {
+                                s.translate_x(if pushed.get() { 40.0 } else { 0.0 })
+                            })
+                    } else {
+                        row
+                    }
+                },
+            )
+            .moves(Transition::ms(100).linear()),
+        )
+    });
+    window(&mut ui);
+    let x = || with_doc(|d| d.window_rect(n.get().unwrap()).unwrap().x);
+
+    let start = Instant::now();
+    items.set(vec![1]);
+    ui.update();
+    assert_eq!(x(), 0, "moving doesn't start its transition");
+    pushed.set(true);
+    ui.update();
+    frame_at(&mut ui, start, 50);
+    assert!((x() - 20).abs() <= 3, "{}", x());
+    let (y, _) = shown_and_place(n);
+    assert!((y - ROW / 2).abs() <= 1, "{y}");
+    run_out(&mut ui, start, 50);
+    assert_eq!(x(), 40);
+    assert_eq!(shown_and_place(n), (0, 0));
+}
+
+/// Rows that close themselves move what follows every frame, with no list change to go from.
+#[test]
+fn what_follows_a_closing_row_does_not_lag_behind_it() {
+    let items = signal(vec![0, 1]);
+    let r = refs(2);
+    let (rr, builds) = (r.clone(), Rc::new(Cell::new(0)));
+    let mut ui = Ui::new(move || {
+        list(items, rr.clone(), builds.clone(), |l| {
+            l.exit(|s| s.h(0.0))
+                .transition(Transition::ms(100).linear())
+                .moves(Transition::ms(100).linear())
+        })
+    });
+    window(&mut ui);
+    let start = Instant::now();
+    items.set(vec![1]);
+    ui.update();
+    let mut at = 0;
+    while ui.animating() {
+        at += 8;
+        frame_at(&mut ui, start, at);
+        let (y, place) = shown_and_place(r[1]);
+        assert_eq!(y, place, "at {at} ms");
+        assert!(at < 1000);
+    }
+    assert_eq!(shown_and_place(r[1]), (0, 0));
+}
+
+#[test]
+fn only_what_can_be_seen_moves() {
+    let items = signal((0..200).collect::<Vec<usize>>());
+    let r = refs(200);
+    let rr = r.clone();
+    let mut ui = Ui::new(move || {
+        let rr = rr.clone();
+        div().h(100.0).overflow_y_scroll().child(
+            for_each(
+                move || items.get(),
+                |i: &usize| *i,
+                move |i| div().w(100.0).h(ROW as f32).node_ref(rr[i]),
+            )
+            .moves(Transition::ms(100).linear()),
+        )
+    });
+    window(&mut ui);
+    let moved = |i: usize| with_doc(|d| d.get(r[i].get().unwrap()).unwrap().computed.move_y != 0.0);
+    items.update(|l| {
+        l.remove(0);
+    });
+    ui.update();
+    assert!(moved(1), "at the top");
+    assert!(moved(9), "still in view");
+    assert!(moved(10), "comes into view");
+    assert!(!moved(11), "just out of view");
+    assert!(!moved(199));
+    assert_eq!(shown_and_place(r[11]).1, 10 * ROW);
+
+    // And what leaves the view on the way.
+    let start = Instant::now();
+    run_out(&mut ui, start, 500);
+    items.update(|l| l.insert(0, 0));
+    ui.update();
+    assert!(!moved(0), "it is new again, nothing to come from");
+    assert!(moved(10), "was in view, and moves out of it");
+    assert!(!moved(11), "wasn't, and isn't");
+}
+
+#[test]
+fn what_is_moving_takes_the_pointer_where_it_is_shown() {
+    let items = signal(vec![0, 1]);
+    let r = refs(2);
+    let (rr, builds) = (r.clone(), Rc::new(Cell::new(0)));
+    let mut ui = Ui::new(move || list(items, rr.clone(), builds.clone(), moving_list));
+    window(&mut ui);
+    let start = Instant::now();
+    items.set(vec![1]);
+    ui.update();
+    frame_at(&mut ui, start, 1);
+    // Its place is at the top; it is still shown below that.
+    let position = PointF::new(50.0, ROW as f32 + 5.0);
+    ui.handle_event(WindowEvent::PointerMoved {
+        position,
+        modifiers: Modifiers::default(),
+    });
+    ui.update();
+    let hovered = with_doc(|d| d.state.hovered.first().copied());
+    assert_eq!(hovered, r[1].get());
+}
+
+#[test]
+fn what_is_moving_goes_with_its_list() {
+    let (items, on) = (signal(vec![0, 1]), signal(true));
+    let n = node_ref();
+    let mut ui = Ui::new(move || {
+        div().size_full().child(show(
+            move || on.get(),
+            move || {
+                for_each(
+                    move || items.get(),
+                    |i: &usize| *i,
+                    move |_| div().w(10.0).h(10.0).node_ref(n),
+                )
+                .moves(Transition::ms(100).linear())
+            },
+        ))
+    });
+    window(&mut ui);
+    let start = Instant::now();
+    items.set(vec![1]);
+    ui.update();
+    on.set(false);
+    ui.update();
+    assert!(!there(n));
+    run_out(&mut ui, start, 0);
+    assert!(!ui.animating());
+}
+
+/// A row with a `transition` of its own is one that style resolution looks at for transitions.
+#[test]
+fn a_row_with_a_transition_of_its_own_gets_there_too() {
+    let (items, pushed) = (signal(vec![0, 1]), signal(false));
+    let n = node_ref();
+    let mut ui = Ui::new(move || {
+        div().size_full().flex().flex_col().child(
+            for_each(
+                move || items.get(),
+                |i: &usize| *i,
+                move |i| {
+                    let row = div().w(100.0).h(ROW as f32);
+                    if i == 1 {
+                        row.node_ref(n)
+                            .transition(Transition::ms(200).linear())
+                            .dyn_style(move |s| {
+                                s.translate_x(if pushed.get() { 40.0 } else { 0.0 })
+                            })
+                    } else {
+                        row
+                    }
+                },
+            )
+            .moves(Transition::ms(50).linear()),
+        )
+    });
+    window(&mut ui);
+    let x = || with_doc(|d| d.window_rect(n.get().unwrap()).unwrap().x);
+
+    // Nothing else going on: it mustn't stop halfway.
+    let start = Instant::now();
+    items.set(vec![1]);
+    ui.update();
+    frame_at(&mut ui, start, 25);
+    assert!(ui.animating(), "it is under way");
+    let (y, _) = shown_and_place(n);
+    assert!((y - ROW / 2).abs() <= 1, "{y}");
+    frame_at(&mut ui, start, 40);
+    let (y, _) = shown_and_place(n);
+    assert!(y < ROW / 2, "{y}");
+    run_out(&mut ui, start, 40);
+    assert_eq!(shown_and_place(n), (0, 0));
+
+    // Its own transition goes on when moving is over before it.
+    items.set(vec![0, 1]);
+    let start = Instant::now();
+    ui.update();
+    pushed.set(true);
+    ui.update();
+    frame_at(&mut ui, start, 100);
+    assert_eq!(shown_and_place(n), (ROW, ROW), "there");
+    assert!((x() - 20).abs() <= 3, "{}", x());
+    frame_at(&mut ui, start, 150);
+    assert!((x() - 30).abs() <= 3, "{}", x());
+    run_out(&mut ui, start, 150);
+    assert_eq!(x(), 40);
+}
+
+#[test]
+fn moving_paints_nothing_again() {
+    let items = signal(vec![0, 1]);
+    let r = refs(2);
+    let (rr, builds) = (r.clone(), Rc::new(Cell::new(0)));
+    let mut ui = Ui::new(move || list(items, rr.clone(), builds.clone(), moving_list));
+    window(&mut ui);
+    let layer = |scene: &Scene| {
+        scene.primitives.iter().find_map(|p| match p {
+            Primitive::Layer(l) => Some((l.content.clone(), l.transform.f)),
+            _ => None,
+        })
+    };
+    let start = Instant::now();
+    items.set(vec![1]);
+    ui.update();
+    let (first, from) = layer(&frame_at(&mut ui, start, 20)).unwrap();
+    let (second, to) = layer(&frame_at(&mut ui, start, 40)).unwrap();
+    assert_ne!(from, to, "it does move");
+    assert!(std::sync::Arc::ptr_eq(&first, &second));
+}
+
+/// What wasn't shown wasn't anywhere: it has nothing to come from.
+#[test]
+fn what_was_hidden_is_just_there() {
+    let (items, hidden) = (signal(vec![0, 1, 2]), signal(false));
+    let n = node_ref();
+    let mut ui = Ui::new(move || {
+        div().size_full().flex().flex_col().child(
+            for_each(
+                move || items.get(),
+                |i: &usize| *i,
+                move |i| {
+                    let row = div().w(100.0).h(ROW as f32);
+                    if i == 2 {
+                        row.node_ref(n)
+                            .dyn_style(move |s| if hidden.get() { s.hidden() } else { s })
+                    } else {
+                        row
+                    }
+                },
+            )
+            .moves(Transition::ms(100).linear()),
+        )
+    });
+    window(&mut ui);
+    hidden.set(true);
+    ui.update();
+    let _ = ui.paint(Instant::now());
+    batch(|| {
+        items.set(vec![1, 2]);
+        hidden.set(false);
+    });
+    ui.update();
+    assert_eq!(shown_and_place(n), (ROW, ROW));
+}

@@ -1,9 +1,11 @@
 //! Scene → GPU draw calls.
 
+use crate::custom_shader::{self, CHUNK, CompiledShader, ShaderInstance};
 use crate::glyph_cache::{GlyphCache, PlacedGlyph};
 use anti_webui_core::damage::{Damage, diff_content, primitive_bounds};
 use anti_webui_core::geometry::{Affine, RectI};
 use anti_webui_core::scene::{Clip, Layer, Primitive, Quad, Scene};
+use anti_webui_core::shader::{ShaderSource, preloads_from};
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -86,6 +88,12 @@ enum Batch {
         linear: bool,
         range: Range<u32>,
     },
+    /// Boxes painted by the shader with this key, whose parameters are in this chunk.
+    Shader {
+        key: usize,
+        chunk: u32,
+        range: Range<u32>,
+    },
 }
 
 /// A texture holding a layer's content, `k` times bigger. A content pixel `(x, y)` lives at texel
@@ -134,6 +142,7 @@ struct Instances {
     quads: Vec<QuadInstance>,
     glyphs: Vec<GlyphInstance>,
     layers: Vec<LayerInstance>,
+    shaders: Vec<ShaderInstance>,
 }
 
 /// Where content goes in the texture being drawn: `k` times bigger, then moved.
@@ -404,6 +413,14 @@ pub struct Renderer {
     quad_buffer: InstanceBuffer,
     glyph_buffer: InstanceBuffer,
     layer_buffer: InstanceBuffer,
+    shader_buffer: InstanceBuffer,
+    /// Shaders written by users, by the address of their source.
+    shaders: HashMap<usize, CompiledShader>,
+    /// What the frame being prepared needs and isn't compiled yet.
+    missing_shader: Option<&'static ShaderSource>,
+    /// How many of the shaders asked to be compiled ahead were seen to.
+    preloaded: usize,
+    shader_params_layout: wgpu::BindGroupLayout,
     max_texture: u32,
     layers: HashMap<u64, LayerCache>,
     /// The target being rendered to, when one renderer serves several.
@@ -705,6 +722,11 @@ impl Renderer {
             quad_buffer: InstanceBuffer::new(device, "quads"),
             glyph_buffer: InstanceBuffer::new(device, "glyphs"),
             layer_buffer: InstanceBuffer::new(device, "layers"),
+            shader_buffer: InstanceBuffer::new(device, "shaders"),
+            shaders: HashMap::new(),
+            missing_shader: None,
+            preloaded: 0,
+            shader_params_layout: custom_shader::params_layout(device),
             max_texture: device.limits().max_texture_dimension_2d,
             layers: HashMap::new(),
             target: 0,
@@ -953,10 +975,18 @@ impl Renderer {
         damage: Option<&[RectI]>,
         plans: &[LayerPlan],
     ) -> Prepared {
+        for source in preloads_from(self.preloaded) {
+            self.preloaded += 1;
+            self.compile_shader(device, source);
+        }
         loop {
             match self.try_prepare(scene, damage, plans) {
                 Some(r) => return r,
                 None => {
+                    if let Some(source) = self.missing_shader.take() {
+                        self.compile_shader(device, source);
+                        continue;
+                    }
                     let next = (self.glyphs.size * 2).min(self.max_texture);
                     self.glyphs.clear(next);
                     let (t, b) = create_atlas(device, &self.atlas_layout, &self.sampler, next);
@@ -967,12 +997,30 @@ impl Renderer {
         }
     }
 
+    fn compile_shader(&mut self, device: &wgpu::Device, source: &'static ShaderSource) {
+        let key = shader_key(source);
+        if !self.shaders.contains_key(&key) {
+            let compiled = custom_shader::compile(
+                device,
+                source,
+                self.format,
+                &self.globals_layout,
+                &self.shader_params_layout,
+            );
+            self.shaders.insert(key, compiled);
+        }
+    }
+
     fn try_prepare(
         &mut self,
         scene: &Scene,
         damage: Option<&[RectI]>,
         plans: &[LayerPlan],
     ) -> Option<Prepared> {
+        for shader in self.shaders.values_mut() {
+            shader.data.clear();
+            shader.count = 0;
+        }
         let mut out = Prepared {
             instances: Instances::default(),
             batches: Vec::new(),
@@ -1080,6 +1128,7 @@ impl Renderer {
             quads,
             glyphs,
             layers: layer_instances,
+            shaders: shader_instances,
         } = instances;
         match prim {
             Primitive::Quad(q) => {
@@ -1198,6 +1247,52 @@ impl Renderer {
                     push_layer(layer, cache, at, target, layer_instances, batches);
                 }
             }
+            Primitive::Shader(s) => {
+                let source = s.paint.source();
+                let key = shader_key(source);
+                let Some(compiled) = self.shaders.get_mut(&key) else {
+                    self.missing_shader = Some(source);
+                    return None;
+                };
+                if compiled.pipeline.is_none() {
+                    return Some(());
+                }
+                let f = k as f32;
+                let rect = s.rect.scaled(k).translate(dx, dy);
+                let clip = s.clip.scaled(k).translated(dx, dy);
+                let area = rect.intersect(&clip.rect).intersect(&target);
+                if area.is_empty() {
+                    return Some(());
+                }
+                let (chunk, index) = compiled.push(s.paint.params());
+                let (clip, clip_radii) = gpu_clip(&clip, target);
+                shader_instances.push(ShaderInstance {
+                    area: rect4(area),
+                    rect: rect4(rect),
+                    rect_radii: s.radii.map(|r| r * f),
+                    clip,
+                    clip_radii,
+                    radii: s.radii,
+                    border: s.border,
+                    padding: s.padding,
+                    size: [s.rect.width, s.rect.height],
+                    misc: [f, s.scale, s.opacity],
+                    index,
+                });
+                let end = shader_instances.len() as u32;
+                match batches.last_mut() {
+                    Some(Batch::Shader {
+                        key: last,
+                        chunk: same,
+                        range,
+                    }) if *last == key && *same == chunk => range.end = end,
+                    _ => batches.push(Batch::Shader {
+                        key,
+                        chunk,
+                        range: end - 1..end,
+                    }),
+                }
+            }
         }
         Some(())
     }
@@ -1295,6 +1390,13 @@ impl Renderer {
             .upload(device, queue, bytemuck::cast_slice(&instances.glyphs));
         self.layer_buffer
             .upload(device, queue, bytemuck::cast_slice(&instances.layers));
+        if !instances.shaders.is_empty() {
+            self.shader_buffer
+                .upload(device, queue, bytemuck::cast_slice(&instances.shaders));
+            for shader in self.shaders.values_mut() {
+                shader.upload(device, queue, &self.shader_params_layout);
+            }
+        }
 
         for (key, ops) in &rasters {
             let cache = &self.layers[key];
@@ -1404,9 +1506,26 @@ impl Renderer {
                     pass.set_vertex_buffer(0, self.layer_buffer.buffer.slice(..));
                     pass.draw(0..4, range.clone());
                 }
+                Batch::Shader { key, chunk, range } => {
+                    let Some(shader) = self.shaders.get(key) else {
+                        continue;
+                    };
+                    let (Some(pipeline), Some(bind)) = (&shader.pipeline, &shader.bind) else {
+                        continue;
+                    };
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(1, bind, &[*chunk * CHUNK as u32]);
+                    pass.set_vertex_buffer(0, self.shader_buffer.buffer.slice(..));
+                    pass.draw(0..4, range.clone());
+                }
             }
         }
     }
+}
+
+/// Identifies a shader: its source lives in a `static`.
+fn shader_key(source: &'static ShaderSource) -> usize {
+    std::ptr::from_ref(source) as usize
 }
 
 fn solid_instance(r: RectI, color: [f32; 4]) -> SolidInstance {
@@ -1434,19 +1553,35 @@ fn push_layer(
         .then_apply(&Affine::scaling(1.0 / k, 1.0 / k));
     let (w, h) = (cache.size.0 as f32, cache.size.1 as f32);
     let start = instances.len() as u32;
-    torus_parts(cache.valid.scaled(cache.k), cache.size, |part, (tx, ty)| {
-        let (tx, ty) = (tx as f32, ty as f32);
-        let (x, y) = m.apply(part.x as f64, part.y as f64);
+    let valid = cache.valid.scaled(cache.k);
+    let linear = !m.is_whole_translation();
+    // Filtering at the very edge would read a texel further, which holds whatever was there before.
+    // Half a texel in, the edge is all it reads, and it is transparent or not shown.
+    let inset = if linear { 0.5 } else { 0.0 };
+    torus_parts(valid, cache.size, |part, (tx, ty)| {
+        let left = if part.x == valid.x { inset } else { 0.0 };
+        let top = if part.y == valid.y { inset } else { 0.0 };
+        let right = if part.right() == valid.right() {
+            inset
+        } else {
+            0.0
+        };
+        let bottom = if part.bottom() == valid.bottom() {
+            inset
+        } else {
+            0.0
+        };
+        let (width, height) = (
+            part.width as f32 - left - right,
+            part.height as f32 - top - bottom,
+        );
+        let (tx, ty) = (tx as f32 + left, ty as f32 + top);
+        let (x, y) = m.apply(part.x as f64 + left as f64, part.y as f64 + top as f64);
         instances.push(LayerInstance {
             matrix: [m.a as f32, m.b as f32, m.c as f32, m.d as f32],
             offset: [x as f32, y as f32],
-            size: [part.width as f32, part.height as f32],
-            uv: [
-                tx / w,
-                ty / h,
-                (tx + part.width as f32) / w,
-                (ty + part.height as f32) / h,
-            ],
+            size: [width, height],
+            uv: [tx / w, ty / h, (tx + width) / w, (ty + height) / h],
             clip,
             clip_radii,
             opacity: layer.opacity,
@@ -1454,7 +1589,7 @@ fn push_layer(
     });
     batches.push(Batch::Layer {
         key: layer.key,
-        linear: !m.is_whole_translation(),
+        linear,
         range: start..instances.len() as u32,
     });
 }
