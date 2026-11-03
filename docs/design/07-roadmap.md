@@ -20,7 +20,7 @@
 - [x] CSS と同じ影（外側・内側）、`z_index`、ポップアップ、プルダウンリスト（[09](09-shadows-stacking-popups.md)）
 - [x] フレームの先行（Auto / Enable / Disable / Custom）、フレーム計測、`request_frame`（[10](10-frame-pacing.md)）
 - [x] `translate` / `scale` / `rotate` と合成レイヤー（[12](12-transform.md)）
-- [x] `transition`、`animated`、`Spring`、`enter` / `exit`（[13](13-animation.md)）
+- [x] `transition`、`animated`、`Spring`、`show` と `for_each` の `enter` / `exit`（[13](13-animation.md)）
 - [x] グループ不透明度（[12](12-transform.md)）
 
 ### M1 の既知の制限

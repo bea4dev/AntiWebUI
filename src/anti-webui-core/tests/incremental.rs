@@ -426,49 +426,58 @@ fn view(s: &Doc) -> impl IntoView + use<> {
                                 .bg(rgb(0xeeffee))
                                 .child(text("may hide")),
                         )
-                        .child(for_each(
-                            move || items.get(),
-                            |i| *i,
-                            move |i| {
-                                div()
-                                    .h(30.0)
-                                    .m(2.0)
-                                    .bg(rgb(0xf4f4f4))
-                                    .hover(|st| st.bg(rgb(0xccccff)).rounded(6.0))
-                                    .active(|st| st.bg(rgb(0xaaaaff)))
-                                    // Some of what changes on the way, every now and then.
-                                    .transition(Transition::ms(if i % 2 == 0 { 100 } else { 0 }))
-                                    .dyn_style(move |st| {
-                                        if glow.get() && i % 3 == 0 {
-                                            st.shadow_md()
+                        .child(
+                            for_each(
+                                move || items.get(),
+                                |i| *i,
+                                move |i| {
+                                    div()
+                                        .h(30.0)
+                                        .m(2.0)
+                                        .bg(rgb(0xf4f4f4))
+                                        .hover(|st| st.bg(rgb(0xccccff)).rounded(6.0))
+                                        .active(|st| st.bg(rgb(0xaaaaff)))
+                                        // Some of what changes on the way, every now and then.
+                                        .transition(Transition::ms(if i % 2 == 0 {
+                                            100
                                         } else {
-                                            st
-                                        }
-                                    })
-                                    .dyn_style(move |st| {
-                                        if row_z.get() != 0 && i % 2 == 0 {
-                                            st.z_index(row_z.get() * (i as i32 % 5 - 2))
-                                        } else {
-                                            st
-                                        }
-                                    })
-                                    .dyn_style(move |st| {
-                                        if i % 3 == 2 {
-                                            transformed(st, moved.get())
-                                        } else {
-                                            st
-                                        }
-                                    })
-                                    .dyn_style(move |st| {
-                                        if faded.get() && i % 4 == 1 {
-                                            st.opacity(0.5)
-                                        } else {
-                                            st
-                                        }
-                                    })
-                                    .child(text(format!("row {i}")))
-                            },
-                        ))
+                                            0
+                                        }))
+                                        .dyn_style(move |st| {
+                                            if glow.get() && i % 3 == 0 {
+                                                st.shadow_md()
+                                            } else {
+                                                st
+                                            }
+                                        })
+                                        .dyn_style(move |st| {
+                                            if row_z.get() != 0 && i % 2 == 0 {
+                                                st.z_index(row_z.get() * (i as i32 % 5 - 2))
+                                            } else {
+                                                st
+                                            }
+                                        })
+                                        .dyn_style(move |st| {
+                                            if i % 3 == 2 {
+                                                transformed(st, moved.get())
+                                            } else {
+                                                st
+                                            }
+                                        })
+                                        .dyn_style(move |st| {
+                                            if faded.get() && i % 4 == 1 {
+                                                st.opacity(0.5)
+                                            } else {
+                                                st
+                                            }
+                                        })
+                                        .child(text(format!("row {i}")))
+                                },
+                            )
+                            .enter(|st| st.opacity(0.0).h(0.0))
+                            .exit(|st| st.opacity(0.0).translate_x(10.0))
+                            .transition(Transition::ms(100)),
+                        )
                         .child(rounded_box())
                         .child(show(
                             move || overlays.get(),

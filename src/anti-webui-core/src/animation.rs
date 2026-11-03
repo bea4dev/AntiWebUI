@@ -50,7 +50,7 @@ pub(crate) fn run_frame_callbacks(now: Instant) {
     });
 }
 
-/// How a node comes and goes as part of a `show`.
+/// How a node comes and goes as part of a `show` or a `for_each`. Only there while it does.
 pub(crate) struct Presence {
     /// What the first resolution of its style goes from.
     pub starting: Option<Style>,
@@ -60,6 +60,18 @@ pub(crate) struct Presence {
     /// `exiting` just ended: what it does now still counts as part of the exit.
     pub returning: bool,
     pub timing: Transition,
+}
+
+impl Default for Presence {
+    fn default() -> Self {
+        Self {
+            starting: None,
+            exit: Style::default(),
+            exiting: false,
+            returning: false,
+            timing: Transition::ms(0),
+        }
+    }
 }
 
 /// A transition going on in a node.

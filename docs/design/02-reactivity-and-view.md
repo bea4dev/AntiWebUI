@@ -51,7 +51,7 @@ fn counter() -> impl IntoView {
 - 動的な子:
   - `dyn_view(move || ...)`: 依存が変わるたびに中身を作り直す（Fragment ノード + 子オーナー）。
   - `show(when, view)`: 条件表示。
-  - `for_each(items, key, view)`: キー付きリスト。キーが同じ要素はノードを再利用し、並べ替えだけ行う。
+  - `for_each(items, key, view)`: キー付きリスト。キーが同じ要素はノードを再利用し、並べ替えだけ行う。`.enter` / `.exit` で項目の出入りを動かせる（[13](13-animation.md)）。
 
 ## イベント
 

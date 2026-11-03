@@ -1,5 +1,5 @@
 //! Transforms and animations by hand: things that keep moving, cards that grow under the pointer,
-//! `transition`, `animated`, `enter` and `exit`, and transformed rows in a list, to check that clicks and scrolling
+//! `transition`, `animated`, `enter` and `exit` (of a list too), and transformed rows in a list, to check that clicks and scrolling
 //! land where things are shown (see `docs/design/12-transform.md`, `docs/design/13-animation.md`).
 //!
 //! `cargo run --release -p anti-webui --example transforms`
@@ -30,13 +30,25 @@ fn card(label: &'static str) -> Div {
         .child(text("日本語のテキスト abc 0123"))
 }
 
+fn button(label: &'static str) -> Div {
+    div()
+        .px(12.0)
+        .py(4.0)
+        .rounded(6.0)
+        .bg(rgb(0xe8e8e8))
+        .hover(|s| s.bg(rgb(0xd0d0d0)))
+        .child(text(label))
+}
+
 fn main() {
     App::new()
         .title("transforms")
-        .size(900, 880)
+        .size(900, 1060)
         .run(|| {
             let t = signal(0.0_f32);
             tick(t, None);
+            let list = signal(vec![0, 1, 2, 3]);
+            let next = signal(4);
             let clicks = signal(0);
             let tween = animated(0.0_f32);
             let spring = animated(0.0_f32);
@@ -159,6 +171,57 @@ fn main() {
                                 .enter(|s| s.opacity(0.0).scale(0.9))
                                 .exit(|s| s.opacity(0.0))
                                 .transition(Transition::ms(150).ease_out()),
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(16.0)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(8.0)
+                                .child(button("add").on_click(move |_| {
+                                    let n = next.get_untracked();
+                                    next.set(n + 1);
+                                    list.update(|l| l.insert(l.len() / 2, n));
+                                }))
+                                .child(button("shuffle").on_click(move |_| {
+                                    list.update(|l| l.rotate_left(1));
+                                }))
+                                .child(button("replace all").on_click(move |_| {
+                                    let n = next.get_untracked();
+                                    next.set(n + 3);
+                                    list.set(vec![n, n + 1, n + 2]);
+                                })),
+                        )
+                        .child(
+                            div().w(260.0).h(170.0).overflow_y_scroll().child(
+                                for_each(
+                                    move || list.get(),
+                                    |i| *i,
+                                    move |i| {
+                                        div()
+                                            .w(240.0)
+                                            .h(30.0)
+                                            .mb(4.0)
+                                            .px(8.0)
+                                            .rounded(6.0)
+                                            .overflow_hidden()
+                                            .bg(rgb(0xddeeff))
+                                            .hover(|s| s.bg(rgb(0xbbd4ff)))
+                                            .on_click(move |_| {
+                                                list.update(|l| l.retain(|v| *v != i));
+                                            })
+                                            .child(text(format!("item {i}: click to remove")))
+                                    },
+                                )
+                                .enter(|s| s.opacity(0.0).h(0.0).mb(0.0).translate_x(-20.0))
+                                .exit(|s| s.opacity(0.0).h(0.0).mb(0.0).translate_x(20.0))
+                                .transition(Transition::ms(600).ease_out()),
                             ),
                         ),
                 )

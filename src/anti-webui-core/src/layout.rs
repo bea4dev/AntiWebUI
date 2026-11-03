@@ -441,6 +441,9 @@ fn apply_transitions(doc: &mut Document, id: NodeId, target: &mut ComputedStyle)
         if p.exiting || std::mem::take(&mut p.returning) {
             timing_of_presence = Some(p.timing);
         }
+        if !p.exiting {
+            node.presence = None;
+        }
     }
     let old = starting.as_ref().unwrap_or(&node.computed);
     // Nothing to go from: it is new, or wasn't shown.

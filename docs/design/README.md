@@ -17,7 +17,7 @@ AntiWebUI は WebView に頼らず、wgpu による自前描画とネイティ�
 | 10 | [frame-pacing](10-frame-pacing.md) | フレームの先行（トリプルバッファリング）とフレーム計測 |
 | 11 | [gpu-fill](11-gpu-fill.md) | GPU の塗りの効率（単色の経路と箱の分割、Chromium との比較） |
 | 12 | [transform](12-transform.md) | transform と合成レイヤー（カスタムシェーダーへの備えを含む） |
-| 13 | [animation](13-animation.md) | `transition`、`animated`、`Spring`、リアクティブの計算量 |
+| 13 | [animation](13-animation.md) | `transition`、`animated`、`Spring`、`enter` / `exit`、リアクティブの計算量 |
 
 ## 用語
 

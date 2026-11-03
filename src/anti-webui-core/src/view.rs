@@ -3,7 +3,7 @@
 //! A builder only collects configuration; nodes are created in [`IntoView::into_view`], inside
 //! the current reactive owner, and removed again when that owner is disposed.
 
-use crate::animation::{Presence, request_frame};
+use crate::animation::request_frame;
 use crate::event::{KeyboardEvent, PointerEvent, ScrollEvent};
 use crate::geometry::RectI;
 use crate::platform::{ImePurpose, Placement, PopupKind};
@@ -16,7 +16,7 @@ use crate::tree::{Document, Listeners, Node, NodeId, NodeKind, PopupData, TextDa
 use anti_webui_style::{
     AlignItems, Display as Layout, FlexDirection, Style, Styled, Transition, UserSelect,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::hash::Hash;
@@ -425,6 +425,143 @@ pub fn dyn_view<V: IntoView>(f: impl Fn() -> V + 'static) -> View {
     View(id)
 }
 
+/// How something comes and goes, for [`show`] and [`for_each`].
+struct PresenceConfig {
+    enter: Option<Style>,
+    exit: Option<Style>,
+    timing: Transition,
+    appear: bool,
+}
+
+impl Default for PresenceConfig {
+    fn default() -> Self {
+        Self {
+            enter: None,
+            exit: None,
+            timing: Transition::ms(150).ease_out(),
+            appear: false,
+        }
+    }
+}
+
+impl PresenceConfig {
+    /// Gets what was just built under `root` to come, if it is to.
+    fn begin(&self, root: NodeId, starting: bool) {
+        let Some(enter) = self.enter.as_ref().filter(|_| starting) else {
+            return;
+        };
+        with_doc(|d| {
+            let mut targets = Vec::new();
+            presence_targets(d, root, &mut targets);
+            for t in targets {
+                let p = d.nodes[t].presence.get_or_insert_with(Default::default);
+                p.starting = Some(enter.clone());
+                p.timing = self.timing;
+            }
+        });
+    }
+
+    /// Gets what is under `root` going, to `exit`.
+    fn go(&self, root: NodeId, exit: &Style) {
+        with_doc(|d| {
+            let mut targets = Vec::new();
+            presence_targets(d, root, &mut targets);
+            for t in &targets {
+                let p = d.nodes[*t].presence.get_or_insert_with(Default::default);
+                p.exit = exit.clone();
+                p.timing = self.timing;
+                p.exiting = true;
+                p.returning = false;
+                d.mark_style_of(*t);
+            }
+            if let Some(focused) = d.state.focused
+                && targets.iter().any(|t| d.is_ancestor(*t, focused))
+            {
+                d.pending_focus = Some(None);
+            }
+            // It no longer takes the pointer.
+            d.transform_moved = true;
+        });
+    }
+}
+
+macro_rules! presence_methods {
+    () => {
+        /// What it goes from when it comes.
+        pub fn enter(mut self, f: impl FnOnce(Style) -> Style) -> Self {
+            self.presence.enter = Some(f(Style::default()));
+            self
+        }
+
+        /// What it goes to before it goes away.
+        pub fn exit(mut self, f: impl FnOnce(Style) -> Style) -> Self {
+            self.presence.exit = Some(f(Style::default()));
+            self
+        }
+
+        /// How long coming and going takes, and how it goes.
+        pub fn transition(mut self, timing: Transition) -> Self {
+            self.presence.timing = timing;
+            self
+        }
+
+        /// Also goes through `enter` if it is shown from the start.
+        pub fn appear(mut self) -> Self {
+            self.presence.appear = true;
+            self
+        }
+    };
+}
+
+/// Coming and going applies to boxes, so it goes through what doesn't have one.
+fn has_no_box(n: &Node) -> bool {
+    matches!(n.kind, NodeKind::Fragment | NodeKind::Popup(_))
+        || n.computed.display == Layout::Contents
+        || n.style.base.display == Some(Layout::Contents)
+}
+
+fn presence_targets(d: &Document, id: NodeId, out: &mut Vec<NodeId>) {
+    let Some(n) = d.get(id) else {
+        return;
+    };
+    if has_no_box(n) {
+        for &c in &n.children {
+            presence_targets(d, c, out);
+        }
+    } else {
+        out.push(id);
+    }
+}
+
+/// Stops what is under `root` from going: it comes back from where it got to, as the same nodes.
+fn come_back(root: NodeId) {
+    with_doc(|d| {
+        let mut targets = Vec::new();
+        presence_targets(d, root, &mut targets);
+        for t in targets {
+            if let Some(p) = &mut d.nodes[t].presence {
+                p.exiting = false;
+                p.returning = true;
+            }
+            d.mark_style_of(t);
+        }
+        d.transform_moved = true;
+    });
+}
+
+/// Whether what is under `root` has finished going.
+fn has_gone(d: &Document, root: NodeId) -> bool {
+    let Some(n) = d.get(root) else {
+        return true;
+    };
+    if has_no_box(n) {
+        n.children.iter().all(|c| has_gone(d, *c))
+    } else {
+        // What can't be seen has nothing to wait for, whatever goes on in it.
+        !n.visible || (n.transitions.is_empty() && !n.style_dirty)
+    }
+}
+
 /// Shows `view` while `when` returns true. `view` is only rebuilt when `when` flips.
 ///
 /// With [`Show::enter`] and [`Show::exit`] it animates coming and going, which keeps what it shows
@@ -436,10 +573,7 @@ pub fn show<V: IntoView>(
     Show {
         when: Box::new(when),
         view: Box::new(move || view().into_view()),
-        enter: None,
-        exit: None,
-        timing: Transition::ms(150).ease_out(),
-        appear: false,
+        presence: PresenceConfig::default(),
     }
 }
 
@@ -447,36 +581,11 @@ pub fn show<V: IntoView>(
 pub struct Show {
     when: Box<dyn Fn() -> bool>,
     view: Box<dyn Fn() -> View>,
-    enter: Option<Style>,
-    exit: Option<Style>,
-    timing: Transition,
-    appear: bool,
+    presence: PresenceConfig,
 }
 
 impl Show {
-    /// What it goes from when it comes.
-    pub fn enter(mut self, f: impl FnOnce(Style) -> Style) -> Self {
-        self.enter = Some(f(Style::default()));
-        self
-    }
-
-    /// What it goes to before it goes away.
-    pub fn exit(mut self, f: impl FnOnce(Style) -> Style) -> Self {
-        self.exit = Some(f(Style::default()));
-        self
-    }
-
-    /// How long coming and going takes, and how it goes.
-    pub fn transition(mut self, timing: Transition) -> Self {
-        self.timing = timing;
-        self
-    }
-
-    /// Also goes through `enter` if it is shown from the start.
-    pub fn appear(mut self) -> Self {
-        self.appear = true;
-        self
-    }
+    presence_methods!();
 }
 
 /// What is shown now.
@@ -484,23 +593,6 @@ struct Shown {
     root: NodeId,
     owner: Owner,
     exiting: bool,
-}
-
-/// What coming and going applies to: boxes, so what is inside fragments and popups.
-fn presence_targets(d: &Document, id: NodeId, out: &mut Vec<NodeId>) {
-    let Some(n) = d.get(id) else {
-        return;
-    };
-    if matches!(n.kind, NodeKind::Fragment | NodeKind::Popup(_))
-        || n.computed.display == Layout::Contents
-        || n.style.base.display == Some(Layout::Contents)
-    {
-        for &c in &n.children {
-            presence_targets(d, c, out);
-        }
-    } else {
-        out.push(id);
-    }
 }
 
 /// Removes what was shown once it has finished going.
@@ -516,16 +608,7 @@ fn wait_for_exit(state: Rc<RefCell<Option<Shown>>>) {
         if !owner.is_alive() {
             return;
         }
-        let gone = with_doc(|d| {
-            let mut targets = Vec::new();
-            presence_targets(d, root, &mut targets);
-            targets.iter().all(|t| {
-                // What can't be seen has nothing to wait for, whatever goes on in it.
-                d.get(*t)
-                    .is_none_or(|n| !n.visible || (n.transitions.is_empty() && !n.style_dirty))
-            })
-        });
-        if gone {
+        if with_doc(|d| has_gone(d, root)) {
             *state.borrow_mut() = None;
             owner.dispose();
         } else {
@@ -539,13 +622,10 @@ impl IntoView for Show {
         let Show {
             when,
             view,
-            enter,
-            exit,
-            timing,
-            appear,
+            presence,
         } = self;
         let cond = memo(when);
-        if enter.is_none() && exit.is_none() {
+        if presence.enter.is_none() && presence.exit.is_none() {
             return dyn_view(move || {
                 if cond.get() {
                     Some(untrack(&view))
@@ -558,9 +638,9 @@ impl IntoView for Show {
         // What it shows belongs out here: this effect running again doesn't end it.
         let outer = Owner::current();
         let state: Rc<RefCell<Option<Shown>>> = Rc::new(RefCell::new(None));
-        let mut first = true;
-        let run = RefCell::new(move |on: bool| {
-            let starting = !std::mem::take(&mut first) || appear;
+        let first = Cell::new(true);
+        let run = move |on: bool| {
+            let starting = !first.replace(false) || presence.appear;
             let current = state
                 .borrow()
                 .as_ref()
@@ -572,75 +652,27 @@ impl IntoView for Show {
                         Some(o) => o.with(build),
                         None => create_root(&view),
                     };
-                    with_doc(|d| {
-                        let mut targets = Vec::new();
-                        presence_targets(d, root.0, &mut targets);
-                        for t in targets {
-                            d.nodes[t].presence = Some(Box::new(Presence {
-                                starting: enter.clone().filter(|_| starting),
-                                exit: exit.clone().unwrap_or_default(),
-                                exiting: false,
-                                returning: false,
-                                timing,
-                            }));
-                        }
-                        d.set_children(id, vec![root.0]);
-                    });
+                    presence.begin(root.0, starting);
+                    with_doc(|d| d.set_children(id, vec![root.0]));
                     *state.borrow_mut() = Some(Shown {
                         root: root.0,
                         owner,
                         exiting: false,
                     });
                 }
-                // It comes back from where it got to, as the same nodes.
                 (true, Some((root, _, true))) => {
-                    with_doc(|d| {
-                        let mut targets = Vec::new();
-                        presence_targets(d, root, &mut targets);
-                        for t in targets {
-                            if let Some(p) = &mut d.nodes[t].presence {
-                                p.exiting = false;
-                                p.returning = true;
-                            }
-                            d.mark_style_of(t);
-                        }
-                        d.transform_moved = true;
-                    });
+                    come_back(root);
                     if let Some(s) = &mut *state.borrow_mut() {
                         s.exiting = false;
                     }
                 }
                 (false, Some((root, owner, false))) => {
-                    let Some(exit_style) = &exit else {
+                    let Some(exit) = &presence.exit else {
                         *state.borrow_mut() = None;
                         owner.dispose();
                         return;
                     };
-                    with_doc(|d| {
-                        let mut targets = Vec::new();
-                        presence_targets(d, root, &mut targets);
-                        for t in &targets {
-                            let p = d.nodes[*t].presence.get_or_insert_with(|| {
-                                Box::new(Presence {
-                                    starting: None,
-                                    exit: exit_style.clone(),
-                                    exiting: false,
-                                    returning: false,
-                                    timing,
-                                })
-                            });
-                            p.exiting = true;
-                            p.returning = false;
-                            d.mark_style_of(*t);
-                        }
-                        if let Some(focused) = d.state.focused
-                            && targets.iter().any(|t| d.is_ancestor(*t, focused))
-                        {
-                            d.pending_focus = Some(None);
-                        }
-                        // It no longer takes the pointer.
-                        d.transform_moved = true;
-                    });
+                    presence.go(root, exit);
                     if let Some(s) = &mut *state.borrow_mut() {
                         s.exiting = true;
                     }
@@ -648,70 +680,237 @@ impl IntoView for Show {
                 }
                 _ => {}
             }
-        });
+        };
         effect(move || {
             let on = cond.get();
-            untrack(|| run.borrow_mut()(on));
+            untrack(|| run(on));
         });
         View(id)
     }
 }
 
 /// A keyed list. Items whose key survives an update keep their nodes; only new items are built.
+///
+/// With [`ForEach::enter`] and [`ForEach::exit`] items animate coming and going, and what is going
+/// stays behind what was in front of it until it has gone (see `docs/design/13-animation.md`).
 pub fn for_each<T, K, V>(
     items: impl Fn() -> Vec<T> + 'static,
     key: impl Fn(&T) -> K + 'static,
     view: impl Fn(T) -> V + 'static,
-) -> View
+) -> ForEach<T, K>
 where
     T: 'static,
     K: Eq + Hash + Clone + 'static,
     V: IntoView,
 {
-    let id = create_node(Node::new(NodeKind::Fragment));
-    let outer = Owner::current();
-    type Rows<K> = Rc<RefCell<HashMap<K, (NodeId, Option<Owner>)>>>;
-    let rows: Rows<K> = Rc::new(RefCell::new(HashMap::new()));
-    on_cleanup({
-        let rows = rows.clone();
-        move || {
-            for (_, (_, owner)) in rows.borrow_mut().drain() {
-                if let Some(o) = owner {
-                    o.dispose();
+    ForEach {
+        items: Box::new(items),
+        key: Box::new(key),
+        view: Box::new(move |item| view(item).into_view()),
+        presence: PresenceConfig::default(),
+    }
+}
+
+/// See [`for_each`].
+pub struct ForEach<T, K> {
+    items: Box<dyn Fn() -> Vec<T>>,
+    key: Box<dyn Fn(&T) -> K>,
+    view: Box<dyn Fn(T) -> View>,
+    presence: PresenceConfig,
+}
+
+impl<T, K> ForEach<T, K> {
+    presence_methods!();
+}
+
+struct Row {
+    root: NodeId,
+    owner: Owner,
+    going: bool,
+}
+
+/// What a [`for_each`] shows now.
+struct Rows<K> {
+    rows: HashMap<K, Row>,
+    /// The keys in the order they are shown, with what is going. Only kept if things can go.
+    shown: Vec<K>,
+    /// The keys of what is going.
+    going: Vec<K>,
+    waiting: bool,
+}
+
+impl<K> Default for Rows<K> {
+    fn default() -> Self {
+        Self {
+            rows: HashMap::new(),
+            shown: Vec::new(),
+            going: Vec::new(),
+            waiting: false,
+        }
+    }
+}
+
+/// Puts what is going in `rows` back into `list`, each behind what was in front of it in `shown`.
+fn keep_places<K: Eq + Hash + Clone>(shown: &[K], list: Vec<K>, rows: &HashMap<K, Row>) -> Vec<K> {
+    let mut first = Vec::new();
+    let mut behind: HashMap<&K, Vec<&K>> = HashMap::new();
+    let mut front = None;
+    for k in shown {
+        if !rows[k].going {
+            front = Some(k);
+        } else if let Some(front) = front {
+            behind.entry(front).or_default().push(k);
+        } else {
+            first.push(k);
+        }
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    out.extend(first.into_iter().cloned());
+    for k in list {
+        let following = behind.remove(&k);
+        out.push(k);
+        out.extend(following.into_iter().flatten().cloned());
+    }
+    out
+}
+
+/// Removes the rows that have finished going, once they have.
+fn wait_for_rows<K: Eq + Hash + Clone + 'static>(state: Rc<RefCell<Rows<K>>>, id: NodeId) {
+    request_frame(move |_| {
+        let mut s = state.borrow_mut();
+        let Rows {
+            rows, shown, going, ..
+        } = &mut *s;
+        let mut done = Vec::new();
+        with_doc(|d| {
+            going.retain(|k| {
+                let gone = has_gone(d, rows[k].root);
+                if gone {
+                    done.extend(rows.remove(k));
+                }
+                !gone
+            });
+            if !done.is_empty() {
+                shown.retain(|k| rows.contains_key(k));
+                let order = shown.iter().map(|k| rows[k].root).collect();
+                d.set_children(id, order);
+            }
+        });
+        let waiting = !going.is_empty();
+        s.waiting = waiting;
+        drop(s);
+        for row in done {
+            row.owner.dispose();
+        }
+        if waiting {
+            wait_for_rows(state, id);
+        }
+    });
+}
+
+impl<T, K> IntoView for ForEach<T, K>
+where
+    T: 'static,
+    K: Eq + Hash + Clone + 'static,
+{
+    fn into_view(self) -> View {
+        let ForEach {
+            items,
+            key,
+            view,
+            presence,
+        } = self;
+        let id = create_node(Node::new(NodeKind::Fragment));
+        let outer = Owner::current();
+        let state: Rc<RefCell<Rows<K>>> = Rc::default();
+        on_cleanup({
+            let state = state.clone();
+            move || {
+                let rows = std::mem::take(&mut *state.borrow_mut()).rows;
+                for row in rows.into_values() {
+                    row.owner.dispose();
                 }
             }
-        }
-    });
-    effect(move || {
-        let list = items();
-        let mut old = std::mem::take(&mut *rows.borrow_mut());
-        let mut next = HashMap::with_capacity(list.len());
-        let mut order = Vec::with_capacity(list.len());
-        for item in list {
-            let k = key(&item);
-            if next.contains_key(&k) {
-                continue;
-            }
-            let entry = old.remove(&k).unwrap_or_else(|| {
-                let build = || create_child_owner(|| view(item).into_view());
-                let (v, owner) = match outer {
-                    Some(o) => o.with(build),
-                    None => untrack(build),
+        });
+        let animates = presence.enter.is_some() || presence.exit.is_some();
+        let first = Cell::new(true);
+        effect(move || {
+            let list = items();
+            let starting = !first.replace(false) || presence.appear;
+            let mut old = std::mem::take(&mut state.borrow_mut().rows);
+            let mut next = HashMap::with_capacity(list.len());
+            let mut order = Vec::with_capacity(list.len());
+            let mut keys = Vec::new();
+            for item in list {
+                let k = key(&item);
+                if next.contains_key(&k) {
+                    continue;
+                }
+                let row = match old.remove(&k) {
+                    Some(mut row) => {
+                        if std::mem::take(&mut row.going) {
+                            come_back(row.root);
+                        }
+                        row
+                    }
+                    None => {
+                        let (root, owner) = match outer {
+                            Some(o) => o.with(|| create_child_owner(|| view(item))),
+                            None => create_root(|| view(item)),
+                        };
+                        if animates {
+                            presence.begin(root.0, starting);
+                        }
+                        Row {
+                            root: root.0,
+                            owner,
+                            going: false,
+                        }
+                    }
                 };
-                (v.0, Some(owner))
-            });
-            order.push(entry.0);
-            next.insert(k, entry);
-        }
-        for (_, (_, owner)) in old {
-            if let Some(o) = owner {
-                o.dispose();
+                order.push(row.root);
+                if presence.exit.is_some() {
+                    keys.push(k.clone());
+                }
+                next.insert(k, row);
             }
-        }
-        *rows.borrow_mut() = next;
-        with_doc(|d| d.set_children(id, order));
-    });
-    View(id)
+            let mut s = state.borrow_mut();
+            let mut gone = Vec::new();
+            if let Some(exit) = &presence.exit {
+                let mut going = std::mem::take(&mut s.going);
+                going.retain(|k| old.contains_key(k));
+                for (k, mut row) in old {
+                    if !row.going {
+                        row.going = true;
+                        presence.go(row.root, exit);
+                        going.push(k.clone());
+                    }
+                    next.insert(k, row);
+                }
+                if !going.is_empty() {
+                    keys = keep_places(&s.shown, keys, &next);
+                    order = keys.iter().map(|k| next[k].root).collect();
+                }
+                s.going = going;
+                s.shown = keys;
+            } else {
+                gone.extend(old.into_values());
+            }
+            s.rows = next;
+            let wait = !s.going.is_empty() && !std::mem::replace(&mut s.waiting, true);
+            drop(s);
+            with_doc(|d| d.set_children(id, order));
+            // After the children changed in one go: going one by one would take as many walks
+            // along the children.
+            for row in gone {
+                row.owner.dispose();
+            }
+            if wait {
+                wait_for_rows(state.clone(), id);
+            }
+        });
+        View(id)
+    }
 }
 
 /// Content in a surface of its own, above the window and free to leave it. See
