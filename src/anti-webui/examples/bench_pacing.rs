@@ -7,6 +7,7 @@
 //! ```
 //!
 //! - `--cpu-ms`: milliseconds of busy waiting on the UI thread per frame.
+//! - `--heavy`: seconds for which `--cpu-ms` applies, from the first frame (default: all of them).
 //! - `--layers`: full-window layers with big shadows, repainted every frame. Load on the GPU.
 //! - `--bg 0`, `--shadow 0`, `--radius N`: what those layers draw (default: both, radius 12).
 //! - `--rows`: a list of that many rows, scrolled every frame. Real work for the CPU and GPU.
@@ -24,6 +25,7 @@ use std::time::{Duration, Instant};
 struct Load {
     seconds: f64,
     cpu: Duration,
+    heavy: f64,
     layers: usize,
     rows: usize,
     linger: f64,
@@ -38,6 +40,7 @@ fn parse_args() -> Load {
     let mut load = Load {
         seconds: 5.0,
         cpu: Duration::ZERO,
+        heavy: f64::INFINITY,
         layers: 0,
         rows: 0,
         linger: 0.0,
@@ -56,6 +59,7 @@ fn parse_args() -> Load {
         match name.as_str() {
             "--seconds" => load.seconds = value,
             "--cpu-ms" => load.cpu = Duration::from_secs_f64(value / 1000.0),
+            "--heavy" => load.heavy = value,
             "--layers" => load.layers = value as usize,
             "--rows" => load.rows = value as usize,
             "--linger" => load.linger = value,
@@ -90,7 +94,7 @@ fn tick(
             return;
         }
         let spin = Instant::now();
-        while spin.elapsed() < load.cpu {
+        while elapsed < load.heavy && spin.elapsed() < load.cpu {
             std::hint::spin_loop();
         }
         phase.set(elapsed as f32);

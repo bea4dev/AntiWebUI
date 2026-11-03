@@ -37,13 +37,17 @@ const WORTH_IT: f64 = 1.1;
 /// ...how long it isn't tried again if not, doubling every time...
 const FIRST_RETRY: Duration = Duration::from_secs(8);
 const LONGEST_RETRY: Duration = Duration::from_secs(64);
-/// ...and which part of a refresh a frame has to fit in for it to end.
-const CALM_FRACTION: f64 = 0.7;
-/// How long frames have to fit in that before stopping. Doubles if it was too soon.
+/// ...and which part of a refresh a frame has to fit in for it to end. Well below what frames get
+/// skipped at, so that it doesn't keep starting and ending.
+const CALM_FRACTION: f64 = 0.5;
+/// How long frames have to fit in that before stopping, not counting pauses. Doubles if it was too
+/// soon.
 const FIRST_HOLD: Duration = Duration::from_secs(2);
 const LONGEST_HOLD: Duration = Duration::from_secs(16);
 const TOO_SOON: Duration = Duration::from_secs(5);
-/// After this long without frames, what was learned about the load no longer holds.
+/// After this long without frames, the load may have changed, so a trial is worth another try.
+/// Rendering ahead isn't given up for that: it costs little if the load has become lighter, and it
+/// ends by itself.
 const FORGET_AFTER: Duration = Duration::from_secs(5);
 
 /// What the presenter records about one presentation. Times are `CLOCK_MONOTONIC` nanoseconds.
@@ -120,8 +124,8 @@ pub(crate) struct AutoAdvance {
     burst: usize,
     /// There was a trial before [`SETTLED`] that said nothing clear.
     tried_early: bool,
-    /// Since when frames have been fitting well.
-    calm_since: Option<i64>,
+    /// For how long frames have been fitting well.
+    calm: i64,
     hold: Duration,
     retry: Duration,
     /// When rendering ahead last ended.
@@ -151,7 +155,7 @@ impl Default for AutoAdvance {
             looked_at: VecDeque::with_capacity(LOOKED_AT),
             burst: 0,
             tried_early: false,
-            calm_since: None,
+            calm: 0,
             hold: FIRST_HOLD,
             retry: FIRST_RETRY,
             ended: None,
@@ -175,7 +179,7 @@ impl AutoAdvance {
             .last_frame
             .is_some_and(|t| this.start - t > FORGET_AFTER.as_nanos() as i64);
         self.last_frame = Some(this.start);
-        if forgotten {
+        if forgotten && self.state != AutoState::On {
             *self = Self {
                 last_frame: self.last_frame,
                 ..Self::default()
@@ -190,7 +194,7 @@ impl AutoAdvance {
             return;
         };
         self.burst += 1;
-        if self.burst <= WARM_UP && !self.engaged() {
+        if self.burst <= WARM_UP && !matches!(self.state, AutoState::Trying { .. }) {
             self.looked_at.clear();
             return;
         }
@@ -204,7 +208,7 @@ impl AutoAdvance {
             AutoState::Unhelpful { until } if this.start < until => {}
             AutoState::Off | AutoState::Unhelpful { .. } => self.consider_trying(this),
             AutoState::Trying { before, early } => self.judge_trial(before, early, this),
-            AutoState::On => self.consider_ending(this),
+            AutoState::On => self.consider_ending(prev, this),
         }
     }
 
@@ -219,7 +223,7 @@ impl AutoAdvance {
             early,
         };
         self.looked_at.clear();
-        self.calm_since = None;
+        self.calm = 0;
         if self
             .ended
             .is_some_and(|t| this.start - t < TOO_SOON.as_nanos() as i64)
@@ -250,13 +254,13 @@ impl AutoAdvance {
         }
     }
 
-    fn consider_ending(&mut self, this: &FrameRecord) {
+    fn consider_ending(&mut self, prev: &FrameRecord, this: &FrameRecord) {
         if this.elapsed() as f64 > this.refresh as f64 * CALM_FRACTION {
-            self.calm_since = None;
+            self.calm = 0;
             return;
         }
-        let since = *self.calm_since.get_or_insert(this.start);
-        if this.start - since >= self.hold.as_nanos() as i64 {
+        self.calm += this.start - prev.start;
+        if self.calm >= self.hold.as_nanos() as i64 {
             self.state = AutoState::Off;
             self.ended = Some(this.start);
             self.looked_at.clear();
@@ -788,12 +792,81 @@ mod tests {
     }
 
     #[test]
-    fn a_long_pause_forgets_the_load() {
+    fn a_long_pause_keeps_rendering_ahead() {
         let mut auto = AutoAdvance::default();
         let t = turned_on(&mut auto);
-        assert!(auto.engaged());
-        feed(&mut auto, t + 6000 * MS, 2, 2 * MS, REFRESH);
-        assert!(!auto.engaged());
+        feed(&mut auto, t + 100_000 * MS, 2, 10 * MS, REFRESH);
+        assert_eq!(auto.state, AutoState::On);
+    }
+
+    #[test]
+    fn a_long_pause_forgets_that_it_did_not_help() {
+        let mut auto = AutoAdvance::default();
+        let t = start_trial(&mut auto, 0);
+        let t = finish_trial(&mut auto, t, 2 * REFRESH);
+        assert!(matches!(auto.state, AutoState::Unhelpful { .. }));
+        let t = t + 6000 * MS;
+        feed(&mut auto, t, 2, 10 * MS, 2 * REFRESH);
+        assert_eq!(auto.state, AutoState::Off);
+        assert_eq!(auto.retry, FIRST_RETRY);
+    }
+
+    /// A pause, and then frames that fit in a refresh for `wait`.
+    fn light_burst(auto: &mut AutoAdvance, from: i64, wait: Duration) -> i64 {
+        let t = from + 1000 * MS;
+        let mut after_pause = frame(t, 2 * MS, t + REFRESH);
+        after_pause.callback = Some(from);
+        auto.observe(&frame(from - REFRESH, 2 * MS, from), &after_pause);
+        // The first frames of a burst aren't looked at.
+        let warm_up = (WARM_UP + 1) as i64;
+        let count = warm_up + wait.as_nanos() as i64 / REFRESH;
+        feed(auto, t + REFRESH, count, 2 * MS, REFRESH)
+    }
+
+    #[test]
+    fn pauses_do_not_count_as_frames_fitting() {
+        let mut auto = AutoAdvance::default();
+        let t = turned_on(&mut auto);
+        let t = light_burst(&mut auto, t, Duration::from_millis(500));
+        // The pause before this one was longer than the wait.
+        light_burst(&mut auto, t + 10_000 * MS, Duration::from_millis(500));
+        assert_eq!(auto.state, AutoState::On);
+    }
+
+    #[test]
+    fn short_bursts_of_light_frames_add_up() {
+        let mut auto = AutoAdvance::default();
+        let mut t = turned_on(&mut auto);
+        for _ in 0..3 {
+            t = light_burst(&mut auto, t, Duration::from_millis(500));
+            assert_eq!(auto.state, AutoState::On);
+        }
+        light_burst(&mut auto, t, Duration::from_millis(600));
+        assert_eq!(auto.state, AutoState::Off);
+    }
+
+    #[test]
+    fn the_first_frames_after_a_pause_do_not_start_the_wait_over() {
+        let mut auto = AutoAdvance::default();
+        let t = turned_on(&mut auto);
+        let t = light_burst(&mut auto, t, Duration::from_millis(1500));
+        let calm = auto.calm;
+        // Slow, as frames are right after a pause.
+        let at = t + 1000 * MS;
+        let mut after_pause = frame(at, 10 * MS, at + REFRESH);
+        after_pause.callback = Some(t);
+        auto.observe(&frame(t - REFRESH, 2 * MS, t), &after_pause);
+        feed(&mut auto, at + REFRESH, WARM_UP as i64, 7 * MS, REFRESH);
+        assert_eq!(auto.calm, calm);
+    }
+
+    #[test]
+    fn a_frame_a_little_over_half_a_refresh_is_not_clearly_fitting() {
+        let mut auto = AutoAdvance::default();
+        let t = turned_on(&mut auto);
+        let elapsed = REFRESH * 6 / 10;
+        feed(&mut auto, t, 10_000, elapsed, REFRESH);
+        assert_eq!(auto.state, AutoState::On);
     }
 
     #[test]
