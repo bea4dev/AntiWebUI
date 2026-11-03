@@ -1,5 +1,6 @@
 //! The per-window UI state machine: input handling, selection, editing, focus and frames.
 
+use crate::animation;
 use crate::event::*;
 use crate::geometry::PointI;
 use crate::geometry::{PointF, RectI, Scale, SizeI};
@@ -229,16 +230,17 @@ impl Ui {
     }
 
     pub fn needs_redraw(&self) -> bool {
-        self.fling.is_some() || with_doc(|d| d.dirty.paint || Self::needs_update(d))
+        self.animating() || with_doc(|d| d.dirty.paint || Self::needs_update(d))
     }
 
     /// Whether frames must keep coming even if nothing else changes. See [`Ui::animate`].
     pub fn animating(&self) -> bool {
-        self.fling.is_some()
+        self.fling.is_some() || animation::frame_requested()
     }
 
     /// Advances animations to `now`. Call before [`Ui::update`] when producing a frame.
     pub fn animate(&mut self, now: Instant) {
+        animation::run_frame_callbacks(now);
         let Some(fling) = &mut self.fling else {
             return;
         };
@@ -1524,7 +1526,7 @@ impl Document {
 
     /// `id` scrolled. Nothing moves in a scroll root's content; a scroller inside of one is part
     /// of that content.
-    fn mark_scrolled(&mut self, id: NodeId) {
+    pub fn mark_scrolled(&mut self, id: NodeId) {
         self.dirty.paint = true;
         if !self.get(id).is_some_and(|n| n.scroll_root) {
             self.reposition.push(id);

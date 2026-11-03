@@ -1,6 +1,7 @@
 //! The platform- and GPU-independent core of AntiWebUI: reactivity, the node tree, style
 //! resolution, layout, text, selection, editing and input handling.
 
+pub mod animation;
 pub mod damage;
 pub mod event;
 pub mod geometry;
@@ -20,6 +21,7 @@ pub use anti_webui_style as style;
 pub use ui::Ui;
 
 pub mod prelude {
+    pub use crate::animation::request_frame;
     pub use crate::event::{
         Key, KeyboardEvent, Modifiers, NamedKey, PointerButton, PointerEvent, ScrollEvent,
         ScrollPhase, ScrollSource,
@@ -29,7 +31,7 @@ pub mod prelude {
     pub use crate::reactive::{
         Memo, Owner, Signal, batch, create_root, effect, memo, on_cleanup, signal, untrack,
     };
-    pub use crate::settings::{Settings, settings, update_settings};
+    pub use crate::settings::{FrameAdvance, Settings, settings, update_settings};
     pub use crate::view::{
         Div, IntoTextSource, IntoView, NodeRef, Popup, Text, TextInput, View, div, dyn_view,
         for_each, fragment, node_ref, popup, show, text, text_area, text_input,

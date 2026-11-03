@@ -1,6 +1,10 @@
 //! Wires a platform backend, the wgpu renderer and the core together.
 
+#[cfg(target_os = "linux")]
+mod frame_stats;
 pub mod headless;
+#[cfg(target_os = "linux")]
+mod pacing;
 #[cfg(target_os = "linux")]
 mod present;
 
@@ -113,6 +117,8 @@ mod tests {
 #[cfg(target_os = "linux")]
 mod wayland {
     use super::App;
+    use crate::frame_stats::FrameStats;
+    use crate::pacing::Pacing;
     use crate::present::{Presented, Presenter};
     use anti_webui_core::Ui;
     use anti_webui_core::event::WindowEvent;
@@ -127,6 +133,9 @@ mod wayland {
         error: Option<Box<dyn std::error::Error>>,
         /// `ANTIWEBUI_DUMP_FRAME=path.png` writes every presented frame to a file (debugging).
         dump: Option<(String, anti_webui_wgpu::Renderer)>,
+        /// `ANTIWEBUI_FRAME_STATS=path.csv` records what every frame took (see `frame_stats`).
+        stats: Option<FrameStats>,
+        pacing: Pacing,
     }
 
     impl Runner {
@@ -203,6 +212,9 @@ mod wayland {
 
     impl WaylandHandler for Runner {
         fn event(&mut self, ctx: &mut Ctx<'_>, event: WindowEvent) {
+            if let (WindowEvent::Resized { .. }, Some(p)) = (&event, &mut self.presenter) {
+                p.drop_held(SurfaceId::Window);
+            }
             self.ui.handle_event(event);
             self.process(ctx);
         }
@@ -218,6 +230,12 @@ mod wayland {
                     }
                 }
             }
+            let stats = &mut self.stats;
+            self.pacing.begin_frame(ctx, |frame| {
+                if let Some(s) = stats {
+                    s.add(frame);
+                }
+            });
             let now = Instant::now();
             self.ui.animate(now);
             self.ui.update();
@@ -225,11 +243,20 @@ mod wayland {
             self.handle_requests(ctx);
             let frame = self.ui.paint_frame(now);
             let presenter = self.presenter.as_mut().unwrap();
+            presenter.trace_next(self.pacing.trace());
             let window = presenter.present(ctx, SurfaceId::Window, frame.window);
             let mut results = vec![(SurfaceId::Window, window)];
             for (id, scene) in frame.popups {
                 let surface = SurfaceId::Popup(id);
                 results.push((surface, presenter.present(ctx, surface, scene)));
+            }
+            if let Some(trace) = presenter.take_trace() {
+                let feedback = ctx.presentation_clock().is_some();
+                self.pacing
+                    .end_frame(trace, results[0].1 == Presented::Yes, feedback);
+            }
+            if let Some(stats) = &mut self.stats {
+                stats.describe(presenter.gpu(), presenter.path());
             }
             let mut committed = false;
             let mut retry = false;
@@ -253,6 +280,24 @@ mod wayland {
             }
         }
 
+        fn surfaces_ready(&mut self, ctx: &mut Ctx<'_>) {
+            if let Some(p) = &mut self.presenter
+                && let Some((token, time)) = p.commit_held(ctx, SurfaceId::Window)
+            {
+                self.pacing.committed(token, time);
+            }
+        }
+
+        fn may_render_ahead(&mut self, ctx: &mut Ctx<'_>) -> bool {
+            // Popups show what was just asked for, and keep in step with the window.
+            !ctx.has_popups()
+                && ctx.frame_pending(SurfaceId::Window)
+                && self
+                    .presenter
+                    .as_mut()
+                    .is_some_and(|p| p.can_hold_back(SurfaceId::Window, self.pacing.max_advance()))
+        }
+
         fn deadline(&mut self, now: Instant) -> Option<Instant> {
             self.ui.next_deadline(now)
         }
@@ -263,6 +308,10 @@ mod wayland {
         }
 
         fn exit(&mut self) {
+            if let Some(mut stats) = self.stats.take() {
+                self.pacing.drain(&mut |frame| stats.add(frame));
+                stats.finish();
+            }
             // GPU objects must go before the Wayland surface they render to.
             self.dump = None;
             self.presenter = None;
@@ -278,6 +327,8 @@ mod wayland {
             presenter: None,
             error: None,
             dump: None,
+            stats: FrameStats::from_env(),
+            pacing: Pacing::new(),
         };
         let options = WindowOptions {
             title: app.title,

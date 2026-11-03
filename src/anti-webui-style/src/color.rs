@@ -35,6 +35,13 @@ impl Color {
         Self { a, ..self }
     }
 
+    /// The closest color with 8 bits per channel. Colors differing by less than that look the
+    /// same on screen, so they shouldn't cause a repaint.
+    pub fn snapped(self) -> Self {
+        let snap = |v: f32| (v * 255.0).round() / 255.0;
+        Self::new(snap(self.r), snap(self.g), snap(self.b), snap(self.a))
+    }
+
     pub fn is_transparent(&self) -> bool {
         self.a <= 0.0
     }

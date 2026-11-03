@@ -18,10 +18,12 @@
 - [x] CPU 側の差分化（スタイル解決は変わったノードだけ、ペイントとヒットテストは見える範囲だけ）
 - [x] 慣性スクロールと全体設定（[08](08-scrolling-and-settings.md)）
 - [x] CSS と同じ影（外側・内側）、`z_index`、ポップアップ、プルダウンリスト（[09](09-shadows-stacking-popups.md)）
+- [x] フレームの先行（Auto / Enable / Disable / Custom）、フレーム計測、`request_frame`（[10](10-frame-pacing.md)）
 
 ### M1 の既知の制限
 
 - 実機での確認が必要: IME（fcitx5 等）・クリップボード・primary selection の Wayland 往復
+- フレームの先行は、コンポジタが AMD で動く構成で NVIDIA dGPU も有効なときを未確認
 - 選択ドラッグがウィンドウ端に達したときの自動スクロールは未実装
 - パスワード入力のマスク表示は未実装（`ImePurpose::Password` は IME へのヒントのみ）
 - `opacity` は子孫の色に乗算する近似（グループ不透明度ではない）

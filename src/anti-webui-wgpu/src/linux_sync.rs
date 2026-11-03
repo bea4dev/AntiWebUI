@@ -66,6 +66,61 @@ pub fn dmabuf_import_write_fence(
 }
 
 // ---------------------------------------------------------------------------------------------
+// sync files
+
+#[repr(C)]
+struct SyncFenceInfo {
+    obj_name: [u8; 32],
+    driver_name: [u8; 32],
+    status: i32,
+    flags: u32,
+    timestamp_ns: u64,
+}
+
+#[repr(C)]
+struct SyncFileInfo {
+    name: [u8; 32],
+    status: i32,
+    flags: u32,
+    num_fences: u32,
+    pad: u32,
+    fences: u64,
+}
+
+const SYNC_IOC_FILE_INFO: u64 = ioc(IOC_READWRITE, b'>', 4, size_of::<SyncFileInfo>());
+
+/// The `CLOCK_MONOTONIC` time at which the last fence of `sync_file` signaled, or `None` if it
+/// hasn't yet. Doesn't block.
+pub fn sync_file_signal(sync_file: BorrowedFd<'_>) -> io::Result<Option<i64>> {
+    let mut info = SyncFileInfo {
+        name: [0; 32],
+        status: 0,
+        flags: 0,
+        num_fences: 0,
+        pad: 0,
+        fences: 0,
+    };
+    ioctl(sync_file.as_raw_fd(), SYNC_IOC_FILE_INFO, &mut info)?;
+    if info.status < 0 {
+        return Err(io::Error::from_raw_os_error(-info.status));
+    }
+    if info.status == 0 || info.num_fences == 0 {
+        return Ok(None);
+    }
+    let mut fences = Vec::with_capacity(info.num_fences as usize);
+    fences.resize_with(info.num_fences as usize, || SyncFenceInfo {
+        obj_name: [0; 32],
+        driver_name: [0; 32],
+        status: 0,
+        flags: 0,
+        timestamp_ns: 0,
+    });
+    info.fences = fences.as_mut_ptr() as u64;
+    ioctl(sync_file.as_raw_fd(), SYNC_IOC_FILE_INFO, &mut info)?;
+    Ok(fences.iter().map(|f| f.timestamp_ns as i64).max())
+}
+
+// ---------------------------------------------------------------------------------------------
 // DRM syncobj
 
 #[repr(C)]
@@ -237,11 +292,18 @@ impl DrmDevice {
 
 /// The current `CLOCK_MONOTONIC` time in nanoseconds, for syncobj deadlines.
 pub fn monotonic_ns() -> i64 {
+    clock_ns(libc::CLOCK_MONOTONIC as u32).unwrap_or(0)
+}
+
+/// The current time of a clock in nanoseconds.
+pub fn clock_ns(clock: u32) -> io::Result<i64> {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
     // SAFETY: valid pointer to a timespec.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+    if unsafe { libc::clock_gettime(clock as libc::clockid_t, &mut ts) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ts.tv_sec * 1_000_000_000 + ts.tv_nsec)
 }

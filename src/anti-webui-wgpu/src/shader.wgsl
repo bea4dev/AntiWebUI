@@ -53,24 +53,50 @@ fn rrect_coverage(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>) -> f32 {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Solid rectangles on whole pixels, which need no coverage. Most of a large box is one of these.
+
+struct SolidOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) color: vec4<f32>,
+}
+
+@vertex
+fn vs_solid(
+    @builtin(vertex_index) vi: u32,
+    @location(0) rect: vec4<f32>,
+    @location(1) color: vec4<f32>,
+) -> SolidOut {
+    var out: SolidOut;
+    out.position = to_clip(rect.xy + corner(vi) * rect.zw);
+    out.color = color;
+    return out;
+}
+
+@fragment
+fn fs_solid(in: SolidOut) -> @location(0) vec4<f32> {
+    return in.color;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Quads and shadows. They share a pipeline so that a page of boxes with shadows is one draw call.
 
 struct QuadInstance {
-    @location(0) rect: vec4<f32>,         // what this instance draws
-    @location(1) background: vec4<f32>,   // shadows: the color
-    @location(2) border_color: vec4<f32>, // shadows: the shape that is blurred
-    @location(3) border: vec4<f32>,       // top, right, bottom, left; shadows: the cut
-    @location(4) radii: vec4<f32>,        // tl, tr, br, bl; shadows: of the shape
-    @location(5) clip: vec4<f32>,
-    @location(6) clip_radii: vec4<f32>,
-    @location(7) cut_radii: vec4<f32>,    // shadows only
-    @location(8) params: vec2<f32>,       // x: 0 quad, 1 outer shadow, 2 inset shadow; y: sigma
+    @location(0) area: vec4<f32>,         // what this instance draws: all or part of the shape
+    @location(1) shape: vec4<f32>,        // the box; shadows: the shape that is blurred
+    @location(2) background: vec4<f32>,   // shadows: the color
+    @location(3) border_color: vec4<f32>,
+    @location(4) border: vec4<f32>,       // top, right, bottom, left; shadows: the cut
+    @location(5) radii: vec4<f32>,        // tl, tr, br, bl; shadows: of the shape
+    @location(6) clip: vec4<f32>,
+    @location(7) clip_radii: vec4<f32>,
+    @location(8) cut_radii: vec4<f32>,    // shadows only
+    @location(9) params: vec2<f32>,       // x: 0 quad, 1 outer shadow, 2 inset shadow; y: sigma
 }
 
 struct QuadOut {
     @builtin(position) position: vec4<f32>,
     @location(0) local: vec2<f32>,
-    @location(1) @interpolate(flat) rect: vec4<f32>,
+    @location(1) @interpolate(flat) shape: vec4<f32>,
     @location(2) @interpolate(flat) background: vec4<f32>,
     @location(3) @interpolate(flat) border_color: vec4<f32>,
     @location(4) @interpolate(flat) border: vec4<f32>,
@@ -84,10 +110,10 @@ struct QuadOut {
 @vertex
 fn vs_quad(@builtin(vertex_index) vi: u32, inst: QuadInstance) -> QuadOut {
     var out: QuadOut;
-    let p = inst.rect.xy + corner(vi) * inst.rect.zw;
+    let p = inst.area.xy + corner(vi) * inst.area.zw;
     out.position = to_clip(p);
     out.local = p;
-    out.rect = inst.rect;
+    out.shape = inst.shape;
     out.background = inst.background;
     out.border_color = inst.border_color;
     out.border = inst.border;
@@ -107,7 +133,7 @@ fn fs_quad(in: QuadOut) -> @location(0) vec4<f32> {
     }
     if (in.params.x > 0.5) {
         let cut = rrect_coverage(in.local, in.border, in.cut_radii);
-        let shape = blurred_coverage(in.local, in.border_color, in.radii, in.params.y);
+        let shape = blurred_coverage(in.local, in.shape, in.radii, in.params.y);
         var a: f32;
         if (in.params.x > 1.5) {
             a = (1.0 - shape) * cut;
@@ -117,8 +143,8 @@ fn fs_quad(in: QuadOut) -> @location(0) vec4<f32> {
         return in.background * (a * clip_cov);
     }
 
-    let half = in.rect.zw * 0.5;
-    let center = in.rect.xy + half;
+    let half = in.shape.zw * 0.5;
+    let center = in.shape.xy + half;
     let p = in.local - center;
 
     let outer = sd_rounded_box(p, half, in.radii);
@@ -127,8 +153,8 @@ fn fs_quad(in: QuadOut) -> @location(0) vec4<f32> {
 
     let b = in.border;
     if (b.x + b.y + b.z + b.w > 0.0) {
-        let inner_min = in.rect.xy + vec2<f32>(b.w, b.x);
-        let inner_size = max(in.rect.zw - vec2<f32>(b.y + b.w, b.x + b.z), vec2<f32>(0.0));
+        let inner_min = in.shape.xy + vec2<f32>(b.w, b.x);
+        let inner_size = max(in.shape.zw - vec2<f32>(b.y + b.w, b.x + b.z), vec2<f32>(0.0));
         let inner_half = inner_size * 0.5;
         let inner_center = inner_min + inner_half;
         let inner_radii = max(in.radii - vec4<f32>(max(b.w, b.x), max(b.x, b.y), max(b.y, b.z), max(b.z, b.w)), vec4<f32>(0.0));

@@ -1,6 +1,7 @@
 //! Presentation on Wayland: our own dmabuf buffers with damage tracking, or a wgpu surface as
 //! the fallback (see `docs/design/05-rendering.md` and `06-platform-wayland.md`).
 
+use crate::pacing::PresentTrace;
 use anti_webui_core::damage::{self, Damage, DamageHistory};
 use anti_webui_core::scene::Scene;
 use anti_webui_wayland::{
@@ -9,10 +10,10 @@ use anti_webui_wayland::{
 use anti_webui_wgpu::dmabuf::{DRM_FORMAT_ARGB8888, DmabufContext, DmabufImage};
 use anti_webui_wgpu::linux_sync::{self, DrmDevice};
 use anti_webui_wgpu::{FrameResult, Gpu, GpuError, Renderer, WindowRenderer, wgpu};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::AsFd;
 
-/// Buffers beyond this make the compositor wait for us instead.
+/// Buffers beyond this make the compositor wait for us instead. Frames held back use one more each.
 const MAX_BUFFERS: usize = 4;
 
 /// Presents to the window and the popups. They share the GPU, and all but the fallback also the
@@ -23,6 +24,8 @@ pub(crate) struct Presenter {
     dmabuf: Option<DmabufPresenter>,
     gpu: Gpu,
     debug: bool,
+    /// Filled in while presenting to the window, if asked for.
+    trace: Option<PresentTrace>,
 }
 
 /// What is kept per surface.
@@ -65,6 +68,7 @@ impl Presenter {
                         dmabuf: Some(d),
                         gpu,
                         debug,
+                        trace: None,
                     });
                 }
                 Err(e) => {
@@ -86,7 +90,56 @@ impl Presenter {
             dmabuf: None,
             gpu,
             debug,
+            trace: None,
         })
+    }
+
+    /// How buffers get to the compositor, for reports.
+    pub fn path(&self) -> &'static str {
+        match &self.dmabuf {
+            Some(d) => d.sync.name(),
+            None => "wgpu surface",
+        }
+    }
+
+    /// Whether a frame could be rendered and held back now. Only buffers we present ourselves can
+    /// be, and looks at whether one is free so that no work on a frame goes to waste.
+    pub fn can_hold_back(&mut self, surface: SurfaceId, limit: usize) -> bool {
+        let Some(d) = &self.dmabuf else {
+            return false;
+        };
+        match self.targets.get(&surface).map(|t| &t.kind) {
+            Some(TargetKind::Dmabuf(t)) => t.held.len() < limit && d.has_free_slot(t),
+            _ => false,
+        }
+    }
+
+    /// Commits the oldest frame held back. Returns what the frame was traced as, and when.
+    pub fn commit_held(&mut self, ctx: &mut Ctx<'_>, surface: SurfaceId) -> Option<(u64, i64)> {
+        let d = self.dmabuf.as_mut()?;
+        let TargetKind::Dmabuf(t) = &mut self.targets.get_mut(&surface)?.kind else {
+            return None;
+        };
+        let frame = t.held.pop_front()?;
+        let token = frame.token;
+        d.commit(ctx, surface, t, frame);
+        Some((token?, linux_sync::monotonic_ns()))
+    }
+
+    /// Forgets frames held back, which no longer fit the window.
+    pub fn drop_held(&mut self, surface: SurfaceId) {
+        if let Some(TargetKind::Dmabuf(t)) = self.targets.get_mut(&surface).map(|t| &mut t.kind) {
+            t.drop_held();
+        }
+    }
+
+    /// Records the next presentation to the window.
+    pub fn trace_next(&mut self, trace: PresentTrace) {
+        self.trace = Some(trace);
+    }
+
+    pub fn take_trace(&mut self) -> Option<PresentTrace> {
+        self.trace.take()
     }
 
     pub fn gpu(&self) -> &Gpu {
@@ -141,19 +194,35 @@ impl Presenter {
             Some(prev) => damage::diff(prev, &scene),
             None => Damage::full(scene.width, scene.height),
         };
-        if damage.is_empty() {
+        // A dropped frame was what `prev` is, so the compositor still has to get its changes.
+        let unsent = matches!(&target.kind, TargetKind::Dmabuf(t) if t.unsent.is_some());
+        if damage.is_empty() && !unsent {
             if self.debug {
                 eprintln!("[anti-webui] {surface:?}: frame unchanged");
             }
             return Presented::Unchanged;
         }
-        ctx.set_opaque(surface, scene.clear.a >= 1.0);
+        let mut trace = self.trace.as_mut().filter(|_| surface == SurfaceId::Window);
+        if let Some(t) = &mut trace {
+            t.diff_done = linux_sync::monotonic_ns();
+        }
         let result = match &mut target.kind {
             TargetKind::Surface(window) => {
+                ctx.set_opaque(surface, scene.clear.a >= 1.0);
+                if let Some(t) = &trace {
+                    ctx.request_presentation(surface, t.token);
+                }
                 ctx.prepare_commit(surface);
                 match window.present(&self.gpu, &scene) {
                     FrameResult::Presented => {
                         ctx.committed(surface);
+                        if let Some(t) = &mut trace {
+                            t.buffer_ready = t.diff_done;
+                            t.recorded = t.diff_done;
+                            let now = linux_sync::monotonic_ns();
+                            t.submitted = now;
+                            t.committed = now;
+                        }
                         Ok(Some(full_stats(&scene)))
                     }
                     FrameResult::Skipped => Ok(None),
@@ -163,12 +232,26 @@ impl Presenter {
                 .dmabuf
                 .as_mut()
                 .expect("dmabuf targets come with it")
-                .present(&self.gpu, ctx, surface, t, &scene, &damage),
+                .present(
+                    &self.gpu,
+                    ctx,
+                    surface,
+                    t,
+                    &scene,
+                    &damage,
+                    trace.as_deref_mut(),
+                ),
         };
         match result {
             Ok(Some(stats)) => {
                 if self.debug {
                     stats.log(surface, &scene, &damage);
+                }
+                if let Some(t) = &mut trace {
+                    t.damage = damage.area();
+                    t.repaint = stats.repaint;
+                    t.pixels = scene.width as i64 * scene.height as i64;
+                    t.buffers = stats.buffers;
                 }
                 target.prev = Some(scene);
                 Presented::Yes
@@ -313,6 +396,8 @@ struct Slot {
     frame: u64,
     /// Committed and not yet released by the compositor (implicit sync).
     busy: bool,
+    /// Holds a frame that hasn't been committed.
+    held: bool,
     /// Explicit sync: the timeline the compositor signals when done with this buffer.
     release: Option<ReleaseTimeline>,
 }
@@ -358,9 +443,34 @@ struct DmabufPresenter {
 struct DmabufTarget {
     slots: Vec<Slot>,
     history: DamageHistory,
-    /// Frames presented so far.
+    /// Frames rendered so far.
     frame: u64,
     size: (u32, u32),
+    /// Finished frames waiting for the compositor to take the one before, oldest first.
+    held: VecDeque<HeldFrame>,
+    /// What changed in frames that were dropped instead of committed.
+    unsent: Option<Damage>,
+}
+
+/// A finished frame that hasn't been committed.
+struct HeldFrame {
+    slot: usize,
+    damage: Damage,
+    acquire: Option<(TimelineId, u64)>,
+    opaque: bool,
+    token: Option<u64>,
+}
+
+impl DmabufTarget {
+    fn drop_held(&mut self) {
+        for frame in self.held.drain(..) {
+            self.slots[frame.slot].held = false;
+            match &mut self.unsent {
+                Some(d) => d.extend(&frame.damage),
+                None => self.unsent = Some(frame.damage),
+            }
+        }
+    }
 }
 
 impl DmabufPresenter {
@@ -397,6 +507,7 @@ impl DmabufPresenter {
     }
 
     /// Renders and commits a frame. `Ok(None)` means no buffer was free.
+    #[allow(clippy::too_many_arguments)]
     fn present(
         &mut self,
         gpu: &Gpu,
@@ -405,6 +516,7 @@ impl DmabufPresenter {
         target: &mut DmabufTarget,
         scene: &Scene,
         damage: &Damage,
+        mut trace: Option<&mut PresentTrace>,
     ) -> Result<Option<Stats>, GpuError> {
         let size = (scene.width.max(1), scene.height.max(1));
         if size != target.size {
@@ -413,9 +525,15 @@ impl DmabufPresenter {
             target.history.clear();
         }
 
-        let Some(index) = self.free_slot(gpu, ctx, target)? else {
+        // A frame waiting for the compositor is ahead of it already, and shouldn't hold up the
+        // UI to get further ahead.
+        let hold_back = surface == SurfaceId::Window && ctx.frame_pending(surface);
+        let Some(index) = self.free_slot(gpu, ctx, target, !hold_back)? else {
             return Ok(None);
         };
+        if let Some(t) = &mut trace {
+            t.buffer_ready = linux_sync::monotonic_ns();
+        }
         let frame = target.frame + 1;
         let slot = &mut target.slots[index];
         let age = (slot.frame > 0).then(|| frame - slot.frame);
@@ -448,10 +566,16 @@ impl DmabufPresenter {
             scene,
             &repaint,
         );
+        if let Some(t) = &mut trace {
+            t.recorded = linux_sync::monotonic_ns();
+        }
         gpu.queue.submit([encoder.finish()]);
         let done = self.ctx.end_access(&mut slot.image)?;
+        if let Some(t) = &mut trace {
+            t.submitted = linux_sync::monotonic_ns();
+        }
 
-        let sync = match &mut self.sync {
+        let acquire = match &mut self.sync {
             Sync::Explicit {
                 drm,
                 acquire,
@@ -462,12 +586,7 @@ impl DmabufPresenter {
                 *point += 1;
                 drm.set_point(*acquire, *point, *scratch, done.as_ref().map(|f| f.as_fd()))
                     .map_err(|e| GpuError::Dmabuf(format!("setting the acquire point: {e}")))?;
-                let release = slot.release.as_mut().expect("explicit sync slot");
-                release.point += 1;
-                Some(SyncPoints {
-                    acquire: (*acquire_id, *point),
-                    release: (release.id, release.point),
-                })
+                Some((*acquire_id, *point))
             }
             Sync::Implicit => {
                 if let Some(f) = &done {
@@ -477,16 +596,81 @@ impl DmabufPresenter {
                 None
             }
         };
-        ctx.present_buffer(surface, slot.buffer, damage.rects(), sync);
-        slot.busy = true;
         slot.frame = frame;
         target.frame = frame;
         target.history.push(damage.clone());
+        let held = HeldFrame {
+            slot: index,
+            damage: damage.clone(),
+            acquire,
+            opaque: scene.clear.a >= 1.0,
+            token: trace.as_ref().map(|t| t.token),
+        };
+        if hold_back {
+            target.slots[index].held = true;
+            target.held.push_back(held);
+        } else {
+            self.commit(ctx, surface, target, held);
+            if let Some(t) = &mut trace {
+                t.committed = linux_sync::monotonic_ns();
+            }
+        }
+        if let Some(t) = &mut trace {
+            t.fence = done;
+        }
         Ok(Some(Stats {
             age,
             repaint: repaint.area(),
             buffers: target.slots.len(),
         }))
+    }
+
+    /// Hands a finished frame to the compositor.
+    fn commit(
+        &mut self,
+        ctx: &mut Ctx<'_>,
+        surface: SurfaceId,
+        target: &mut DmabufTarget,
+        frame: HeldFrame,
+    ) {
+        let slot = &mut target.slots[frame.slot];
+        let sync = frame.acquire.map(|acquire| {
+            let release = slot.release.as_mut().expect("explicit sync slot");
+            release.point += 1;
+            SyncPoints {
+                acquire,
+                release: (release.id, release.point),
+            }
+        });
+        ctx.set_opaque(surface, frame.opaque);
+        if let Some(token) = frame.token {
+            ctx.request_presentation(surface, token);
+        }
+        let mut damage = frame.damage;
+        if let Some(unsent) = target.unsent.take() {
+            damage.extend(&unsent);
+        }
+        ctx.present_buffer(surface, slot.buffer, damage.rects(), sync);
+        slot.busy = true;
+        slot.held = false;
+    }
+
+    /// Whether the buffer can be rendered to, waiting until `deadline` for that.
+    fn slot_free(&self, s: &Slot, deadline: i64) -> bool {
+        if s.held {
+            return false;
+        }
+        match (&self.sync, &s.release) {
+            (Sync::Explicit { drm, .. }, Some(r)) => {
+                r.point == 0 || drm.wait_point(r.handle, r.point, deadline).unwrap_or(false)
+            }
+            _ => !s.busy,
+        }
+    }
+
+    fn has_free_slot(&self, target: &DmabufTarget) -> bool {
+        target.slots.len() < MAX_BUFFERS + target.held.len()
+            || target.slots.iter().any(|s| self.slot_free(s, 0))
     }
 
     /// The free buffer holding the most recent frame, allocating one if none is free.
@@ -495,29 +679,24 @@ impl DmabufPresenter {
         gpu: &Gpu,
         ctx: &mut Ctx<'_>,
         target: &mut DmabufTarget,
+        may_wait: bool,
     ) -> Result<Option<usize>, GpuError> {
-        let free = |s: &Slot, sync: &Sync, deadline: i64| -> bool {
-            match (sync, &s.release) {
-                (Sync::Explicit { drm, .. }, Some(r)) => {
-                    s.frame == 0 || drm.wait_point(r.handle, r.point, deadline).unwrap_or(false)
-                }
-                _ => !s.busy,
-            }
-        };
         let best = (0..target.slots.len())
-            .filter(|&i| free(&target.slots[i], &self.sync, 0))
+            .filter(|&i| self.slot_free(&target.slots[i], 0))
             .max_by_key(|&i| target.slots[i].frame);
         if best.is_some() {
             return Ok(best);
         }
-        if target.slots.len() < MAX_BUFFERS {
+        if target.slots.len() < MAX_BUFFERS + target.held.len() {
             return self.allocate(gpu, ctx, target).map(Some);
         }
         // All buffers are with the compositor: briefly wait for the oldest (explicit sync).
-        let oldest = (0..target.slots.len()).min_by_key(|&i| target.slots[i].frame);
-        if let (Some(i), Sync::Explicit { .. }) = (oldest, &self.sync) {
+        let oldest = (0..target.slots.len())
+            .filter(|&i| !target.slots[i].held)
+            .min_by_key(|&i| target.slots[i].frame);
+        if let (true, Some(i), Sync::Explicit { .. }) = (may_wait, oldest, &self.sync) {
             let deadline = linux_sync::monotonic_ns() + 50_000_000;
-            if free(&target.slots[i], &self.sync, deadline) {
+            if self.slot_free(&target.slots[i], deadline) {
                 return Ok(Some(i));
             }
         }
@@ -568,12 +747,15 @@ impl DmabufPresenter {
             buffer,
             frame: 0,
             busy: false,
+            held: false,
             release,
         });
         Ok(target.slots.len() - 1)
     }
 
     fn drop_slots(&mut self, target: &mut DmabufTarget, ctx: &mut Ctx<'_>) {
+        target.held.clear();
+        target.unsent = None;
         for slot in target.slots.drain(..) {
             ctx.destroy_buffer(slot.buffer);
             if let Some(r) = slot.release {

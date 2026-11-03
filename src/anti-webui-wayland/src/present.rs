@@ -14,6 +14,7 @@ use wayland_protocols::wp::linux_drm_syncobj::v1::client::{
     wp_linux_drm_syncobj_manager_v1, wp_linux_drm_syncobj_surface_v1,
     wp_linux_drm_syncobj_timeline_v1,
 };
+use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
 
 /// What the compositor can use, from `zwp_linux_dmabuf_feedback_v1`.
 #[derive(Clone, Debug, Default)]
@@ -91,6 +92,25 @@ pub struct SyncPoints {
     pub release: (TimelineId, u64),
 }
 
+/// What the compositor says became of a commit (`wp_presentation`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Presentation {
+    /// What [`crate::Ctx::request_presentation`] was given.
+    pub token: u64,
+    /// `None` if the content never reached the screen.
+    pub shown: Option<Shown>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shown {
+    /// In the clock of [`crate::Ctx::presentation_clock`].
+    pub time_ns: i64,
+    /// The time until the next refresh; 0 if the output has no constant rate.
+    pub refresh_ns: u32,
+    /// `wp_presentation_feedback.kind`.
+    pub flags: u32,
+}
+
 #[derive(Default)]
 pub(crate) struct PresentState {
     pub dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
@@ -103,6 +123,9 @@ pub(crate) struct PresentState {
     pub syncobj_manager: Option<wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1>,
     pub timelines:
         HashMap<TimelineId, wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1>,
+    pub presentation: Option<wp_presentation::WpPresentation>,
+    pub presentation_clock: Option<u32>,
+    pub presentations: Vec<Presentation>,
 }
 
 impl State {
@@ -210,6 +233,17 @@ impl State {
         }
         wl.commit();
         self.committed(surface);
+    }
+
+    /// Asks to be told what becomes of the next commit of the surface.
+    pub(crate) fn request_presentation(&mut self, surface: SurfaceId, token: u64) -> bool {
+        let (Some(presentation), Some(wl)) =
+            (self.present.presentation.clone(), self.wl_surface(surface))
+        else {
+            return false;
+        };
+        presentation.feedback(wl, &self.qh, token);
+        true
     }
 
     pub(crate) fn apply_opaque_region(&mut self, surface: SurfaceId) {
@@ -342,6 +376,59 @@ impl Dispatch<wl_buffer::WlBuffer, BufferId> for State {
 }
 
 delegate_noop!(State: ignore zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1);
+impl Dispatch<wp_presentation::WpPresentation, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wp_presentation::WpPresentation,
+        event: wp_presentation::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wp_presentation::Event::ClockId { clk_id } = event {
+            state.present.presentation_clock = Some(clk_id);
+        }
+    }
+}
+
+impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, u64> for State {
+    fn event(
+        state: &mut Self,
+        _: &wp_presentation_feedback::WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        token: &u64,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let shown = match event {
+            wp_presentation_feedback::Event::Presented {
+                tv_sec_hi,
+                tv_sec_lo,
+                tv_nsec,
+                refresh,
+                flags,
+                ..
+            } => {
+                let secs = ((tv_sec_hi as u64) << 32) | tv_sec_lo as u64;
+                Some(Shown {
+                    time_ns: secs as i64 * 1_000_000_000 + tv_nsec as i64,
+                    refresh_ns: refresh,
+                    flags: match flags {
+                        WEnum::Value(f) => f.bits(),
+                        WEnum::Unknown(f) => f,
+                    },
+                })
+            }
+            wp_presentation_feedback::Event::Discarded => None,
+            _ => return,
+        };
+        state.present.presentations.push(Presentation {
+            token: *token,
+            shown,
+        });
+    }
+}
+
 delegate_noop!(State: ignore wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1);
 delegate_noop!(State: ignore wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1);
 delegate_noop!(State: ignore wp_linux_drm_syncobj_timeline_v1::WpLinuxDrmSyncobjTimelineV1);

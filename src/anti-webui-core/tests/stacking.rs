@@ -126,15 +126,15 @@ fn translucency_makes_a_stacking_context() {
     // And what is in it gets its opacity, wherever it is painted from.
     ui.update();
     let scene = ui.paint(Instant::now());
-    let alpha: Vec<f32> = scene
+    let alpha: Vec<u32> = scene
         .primitives
         .iter()
         .filter_map(|p| match p {
-            Primitive::Quad(q) => Some(q.background.a),
+            Primitive::Quad(q) => Some((q.background.a * 255.0).round() as u32),
             _ => None,
         })
         .collect();
-    assert_eq!(alpha, [0.5, 0.5, 1.0]);
+    assert_eq!(alpha, [128, 128, 255]);
 }
 
 #[test]

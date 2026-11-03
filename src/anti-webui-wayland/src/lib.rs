@@ -6,7 +6,8 @@ mod present;
 mod state;
 
 pub use present::{
-    BufferEvent, BufferId, DmabufFeedback, DmabufPlaneDesc, DmabufTranche, SyncPoints, TimelineId,
+    BufferEvent, BufferId, DmabufFeedback, DmabufPlaneDesc, DmabufTranche, Presentation, Shown,
+    SyncPoints, TimelineId,
 };
 
 use anti_webui_core::event::{ClipboardKind, WindowEvent};
@@ -30,6 +31,7 @@ use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_man
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1;
 use wayland_protocols::wp::linux_drm_syncobj::v1::client::wp_linux_drm_syncobj_manager_v1;
 use wayland_protocols::wp::pointer_gestures::zv1::client::zwp_pointer_gestures_v1;
+use wayland_protocols::wp::presentation_time::client::wp_presentation;
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_device_manager_v1;
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3;
 use wayland_protocols::wp::viewporter::client::wp_viewporter;
@@ -71,6 +73,13 @@ pub trait WaylandHandler {
     fn timer(&mut self, ctx: &mut Ctx<'_>, now: Instant);
     /// Called once before the connection closes; release GPU surfaces here.
     fn exit(&mut self) {}
+    /// The compositor is ready for a commit on every surface: the time to commit what was held
+    /// back.
+    fn surfaces_ready(&mut self, _ctx: &mut Ctx<'_>) {}
+    /// Whether a frame can start now even though the compositor hasn't taken the last one.
+    fn may_render_ahead(&mut self, _ctx: &mut Ctx<'_>) -> bool {
+        false
+    }
 }
 
 impl<H: WaylandHandler> WaylandHandler for &mut H {
@@ -88,6 +97,12 @@ impl<H: WaylandHandler> WaylandHandler for &mut H {
     }
     fn exit(&mut self) {
         (**self).exit()
+    }
+    fn surfaces_ready(&mut self, ctx: &mut Ctx<'_>) {
+        (**self).surfaces_ready(ctx)
+    }
+    fn may_render_ahead(&mut self, ctx: &mut Ctx<'_>) -> bool {
+        (**self).may_render_ahead(ctx)
     }
 }
 
@@ -166,6 +181,38 @@ impl Ctx<'_> {
 
     pub fn take_buffer_events(&mut self) -> Vec<BufferEvent> {
         std::mem::take(&mut self.state.present.buffer_events)
+    }
+
+    /// Asks to be told what becomes of the next commit of the surface, which
+    /// [`Ctx::take_presentations`] later returns. `false` if the compositor can't tell.
+    pub fn request_presentation(&mut self, surface: SurfaceId, token: u64) -> bool {
+        self.state.request_presentation(surface, token)
+    }
+
+    pub fn take_presentations(&mut self) -> Vec<Presentation> {
+        std::mem::take(&mut self.state.present.presentations)
+    }
+
+    /// The clock presentation times are in, as a `clockid_t`.
+    pub fn presentation_clock(&self) -> Option<u32> {
+        self.state.present.presentation_clock
+    }
+
+    /// Whether a commit of the surface is still waiting for its frame callback.
+    pub fn frame_pending(&mut self, surface: SurfaceId) -> bool {
+        self.state
+            .frame_state(surface)
+            .is_some_and(|f| f.pending.is_some())
+    }
+
+    /// Whether there are popups, which have to keep in step with the window.
+    pub fn has_popups(&self) -> bool {
+        !self.state.popups.is_empty()
+    }
+
+    /// When the last frame callback of the surface came.
+    pub fn last_frame_callback(&mut self, surface: SurfaceId) -> Option<Instant> {
+        self.state.frame_state(surface)?.last_callback
     }
 
     /// Whether the compositor supports explicit sync (`linux-drm-syncobj-v1`).
@@ -328,6 +375,9 @@ pub fn run<H: WaylandHandler>(options: WindowOptions, mut handler: H) -> Result<
     state.present.syncobj_manager = globals
         .bind::<wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1, _, _>(&qh, 1..=1, ())
         .ok();
+    state.present.presentation = globals
+        .bind::<wp_presentation::WpPresentation, _, _>(&qh, 1..=2, ())
+        .ok();
 
     surface.commit();
     queue.roundtrip(&mut state).map_err(err)?;
@@ -424,21 +474,34 @@ impl Loop<'_> {
                 state.redraw_at = None;
                 state.redraw_requested = true;
             }
-            if state.configured
-                && state.redraw_requested
-                && state.frame_wait(Instant::now()).is_ok()
-            {
-                state.redraw_requested = false;
+            if state.configured {
+                let ready = state.frame_wait(Instant::now()).is_ok();
                 let mut ctx = Ctx {
                     state,
                     conn,
                     exit: &mut exit,
                 };
-                handler.frame(&mut ctx);
+                if ready {
+                    handler.surfaces_ready(&mut ctx);
+                    // What it committed mustn't wait for the frame that may start below: the
+                    // compositor only takes commits up to some point in a refresh.
+                    conn.flush().map_err(err)?;
+                }
+                if ctx.state.redraw_requested
+                    && (ctx.state.frame_wait(Instant::now()).is_ok()
+                        || handler.may_render_ahead(&mut ctx))
+                {
+                    ctx.state.redraw_requested = false;
+                    handler.frame(&mut ctx);
+                }
             }
 
             conn.flush().map_err(err)?;
 
+            // Nothing may come to wake us up for it.
+            if exit {
+                break;
+            }
             if !state.events.is_empty() {
                 continue;
             }

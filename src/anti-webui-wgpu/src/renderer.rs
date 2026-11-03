@@ -3,7 +3,7 @@
 use crate::glyph_cache::{GlyphCache, PlacedGlyph};
 use anti_webui_core::damage::{Damage, diff_content, primitive_bounds};
 use anti_webui_core::geometry::RectI;
-use anti_webui_core::scene::{Clip, Primitive, Scene, ScrollLayer};
+use anti_webui_core::scene::{Clip, Primitive, Quad, Scene, ScrollLayer};
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -19,11 +19,20 @@ struct Globals {
     _pad: [f32; 2],
 }
 
+/// A rectangle of one premultiplied color on whole pixels.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SolidInstance {
+    rect: [f32; 4],
+    color: [f32; 4],
+}
+
 /// A box or part of a shadow; see the shader for what the fields mean for each.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct QuadInstance {
-    rect: [f32; 4],
+    area: [f32; 4],
+    shape: [f32; 4],
     background: [f32; 4],
     border_color: [f32; 4],
     border: [f32; 4],
@@ -47,6 +56,10 @@ struct GlyphInstance {
 
 enum Batch {
     Quads(Range<u32>),
+    /// Solid instances, blended.
+    Solids(Range<u32>),
+    /// Solid instances of opaque colors, replacing what is there.
+    Opaque(Range<u32>),
     Glyphs(Range<u32>),
     /// Glyph instances that sample the texture of the layer with this key.
     Layer(u64, Range<u32>),
@@ -75,7 +88,7 @@ struct LayerCache {
 /// One rectangle to redraw in a layer's texture.
 struct RasterOp {
     scissor: RectI,
-    /// Index of the quad instance clearing `scissor`.
+    /// Index of the solid instance clearing `scissor`.
     clear: u32,
     batches: Vec<Batch>,
 }
@@ -86,9 +99,15 @@ struct LayerPlan {
     dirty: Vec<RectI>,
 }
 
-struct Prepared {
+#[derive(Default)]
+struct Instances {
+    solids: Vec<SolidInstance>,
     quads: Vec<QuadInstance>,
     glyphs: Vec<GlyphInstance>,
+}
+
+struct Prepared {
+    instances: Instances,
     batches: Vec<Batch>,
     /// Redraws per layer, by key.
     rasters: Vec<(u64, Vec<RasterOp>)>,
@@ -174,6 +193,117 @@ fn gpu_clip(clip: &Clip, target: RectI) -> ([f32; 4], [f32; 4]) {
     }
 }
 
+/// A box drawn in parts, so that most of its pixels skip the quad shader.
+#[derive(Debug, PartialEq)]
+enum Piece {
+    /// One premultiplied color.
+    Solid(RectI, [f32; 4]),
+    /// Needs the quad shader, to draw this area of the box.
+    Shaded(RectI),
+}
+
+/// How many pixels of one color make it worth drawing a box in parts.
+const MIN_SOLID_PIXELS: i64 = 4096;
+
+/// Splits a box into pieces that don't overlap and cover everything it draws. What the quad
+/// shader computes for a solid piece is exactly its color, since the pixels are whole and away
+/// from any corner (see `docs/design/11-gpu-fill.md`).
+fn slice_quad(q: &Quad, rect: RectI, mut f: impl FnMut(Piece)) {
+    let bg = q.background.premultiplied();
+    let [top, right, bottom, left] = q.border_widths;
+    let half = (rect.width as f32 * 0.5).min(rect.height as f32 * 0.5);
+    let [tl, tr, br, bl] = q.radii.map(|r| r.min(half).max(0.0).ceil() as i32);
+    let bordered = q.border_widths != [0; 4];
+    let inner_top = top.max(tl).max(tr);
+    let inner_right = right.max(tr).max(br);
+    let inner_bottom = bottom.max(br).max(bl);
+    let inner_left = left.max(tl).max(bl);
+    let inner = rect.inset(inner_top, inner_right, inner_bottom, inner_left);
+    if inner.is_empty() {
+        f(Piece::Shaded(rect));
+        return;
+    }
+    let mut solid = |r: RectI, color: [f32; 4]| {
+        if !r.is_empty() && color != [0.0; 4] {
+            f(Piece::Solid(r, color));
+        }
+    };
+    let (x, y) = (rect.x, rect.y);
+    let bands = [
+        RectI::new(x, y, rect.width, inner.y - y),
+        RectI::new(
+            x,
+            inner.bottom(),
+            rect.width,
+            rect.bottom() - inner.bottom(),
+        ),
+        RectI::new(x, inner.y, inner.x - x, inner.height),
+        RectI::new(
+            inner.right(),
+            inner.y,
+            rect.right() - inner.right(),
+            inner.height,
+        ),
+    ];
+    match (q.radii != [0.0; 4], bordered) {
+        (false, false) => solid(rect, bg),
+        (false, true) => {
+            let c = q.border_color.premultiplied();
+            let ring = std::array::from_fn(|i| c[i] + bg[i] * (1.0 - c[3]));
+            solid(inner, bg);
+            for band in bands {
+                solid(band, ring);
+            }
+        }
+        (true, false) => {
+            let middle = RectI::new(x, inner.y, rect.width, inner.height);
+            let tops = RectI::new(x + tl, y, rect.width - tl - tr, inner.y - y);
+            let bottoms = RectI::new(
+                x + bl,
+                inner.bottom(),
+                rect.width - bl - br,
+                rect.bottom() - inner.bottom(),
+            );
+            if middle.area() + tops.area() + bottoms.area() < MIN_SOLID_PIXELS {
+                f(Piece::Shaded(rect));
+                return;
+            }
+            solid(middle, bg);
+            solid(tops, bg);
+            solid(bottoms, bg);
+            for corner in [
+                RectI::new(x, y, tl, tops.height),
+                RectI::new(tops.right(), y, tr, tops.height),
+                RectI::new(x, bottoms.y, bl, bottoms.height),
+                RectI::new(bottoms.right(), bottoms.y, br, bottoms.height),
+            ] {
+                if !corner.is_empty() {
+                    f(Piece::Shaded(corner));
+                }
+            }
+        }
+        (true, true) => {
+            if inner.area() < MIN_SOLID_PIXELS {
+                f(Piece::Shaded(rect));
+                return;
+            }
+            solid(inner, bg);
+            for band in bands {
+                if !band.is_empty() {
+                    f(Piece::Shaded(band));
+                }
+            }
+        }
+    }
+}
+
+/// Whether every pixel of `r` is fully inside the clip, so that it needs no clipping in the shader.
+fn inside_clip_corners(r: RectI, clip: &Clip) -> bool {
+    let inset = clip.radii.iter().fold(0.0_f32, |a, b| a.max(*b)).ceil() as i32;
+    let safe = clip.rect.inset(inset, inset, inset, inset);
+    r.x >= safe.x && r.y >= safe.y && r.right() <= safe.right() && r.bottom() <= safe.bottom()
+}
+
 struct InstanceBuffer {
     buffer: wgpu::Buffer,
     capacity: u64,
@@ -213,8 +343,9 @@ impl InstanceBuffer {
 pub struct Renderer {
     format: wgpu::TextureFormat,
     quad_pipeline: wgpu::RenderPipeline,
-    /// The quad pipeline without blending, for clearing damaged rectangles.
-    clear_pipeline: wgpu::RenderPipeline,
+    solid_pipeline: wgpu::RenderPipeline,
+    /// The solid pipeline without blending, for opaque colors and clearing damaged rectangles.
+    opaque_pipeline: wgpu::RenderPipeline,
     glyph_pipeline: wgpu::RenderPipeline,
     globals: wgpu::Buffer,
     globals_bind: wgpu::BindGroup,
@@ -224,12 +355,15 @@ pub struct Renderer {
     atlas_bind: wgpu::BindGroup,
     sampler: wgpu::Sampler,
     glyphs: GlyphCache,
+    solid_buffer: InstanceBuffer,
     quad_buffer: InstanceBuffer,
     glyph_buffer: InstanceBuffer,
     max_texture: u32,
     layers: HashMap<u64, LayerCache>,
     /// The target being rendered to, when one renderer serves several.
     target: u64,
+    /// Off: every box goes through the quad shader, to compare in tests.
+    slice_quads: bool,
 }
 
 fn create_atlas(
@@ -359,7 +493,8 @@ impl Renderer {
         });
         let quad_attrs = wgpu::vertex_attr_array![
             0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4,
-            4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4, 8 => Float32x2
+            4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4, 8 => Float32x4,
+            9 => Float32x2
         ];
         let quad_buffers = [Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<QuadInstance>() as u64,
@@ -370,22 +505,49 @@ impl Renderer {
             topology: wgpu::PrimitiveTopology::TriangleStrip,
             ..Default::default()
         };
-        let quad_pipeline_with = |label, targets: &[Option<wgpu::ColorTargetState>]| {
+        let quad_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("quad"),
+            layout: Some(&quad_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_quad"),
+                compilation_options: Default::default(),
+                buffers: &quad_buffers,
+            },
+            primitive,
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_quad"),
+                compilation_options: Default::default(),
+                targets: &targets,
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let solid_attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
+        let solid_buffers = [Some(wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<SolidInstance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &solid_attrs,
+        })];
+        let solid_pipeline_with = |label, targets: &[Option<wgpu::ColorTargetState>]| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&quad_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
-                    entry_point: Some("vs_quad"),
+                    entry_point: Some("vs_solid"),
                     compilation_options: Default::default(),
-                    buffers: &quad_buffers,
+                    buffers: &solid_buffers,
                 },
                 primitive,
                 depth_stencil: None,
                 multisample: Default::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_quad"),
+                    entry_point: Some("fs_solid"),
                     compilation_options: Default::default(),
                     targets,
                 }),
@@ -393,9 +555,9 @@ impl Renderer {
                 cache: None,
             })
         };
-        let quad_pipeline = quad_pipeline_with("quad", &targets);
-        let clear_pipeline = quad_pipeline_with(
-            "clear",
+        let solid_pipeline = solid_pipeline_with("solid", &targets);
+        let opaque_pipeline = solid_pipeline_with(
+            "opaque",
             &[Some(wgpu::ColorTargetState {
                 format,
                 blend: None,
@@ -442,7 +604,8 @@ impl Renderer {
         Self {
             format,
             quad_pipeline,
-            clear_pipeline,
+            solid_pipeline,
+            opaque_pipeline,
             glyph_pipeline,
             globals,
             globals_bind,
@@ -452,11 +615,13 @@ impl Renderer {
             atlas_bind,
             sampler,
             glyphs: GlyphCache::new(ATLAS_INITIAL),
+            solid_buffer: InstanceBuffer::new(device, "solids"),
             quad_buffer: InstanceBuffer::new(device, "quads"),
             glyph_buffer: InstanceBuffer::new(device, "glyphs"),
             max_texture: device.limits().max_texture_dimension_2d,
             layers: HashMap::new(),
             target: 0,
+            slice_quads: true,
         }
     }
 
@@ -469,6 +634,12 @@ impl Renderer {
     /// Frees what was kept for a target that is gone.
     pub fn forget_target(&mut self, target: u64) {
         self.layers.retain(|_, c| c.owner != target);
+    }
+
+    /// Sends every box through the quad shader, which any drawing must match pixel for pixel.
+    #[doc(hidden)]
+    pub fn set_slice_quads(&mut self, on: bool) {
+        self.slice_quads = on;
     }
 
     pub fn format(&self) -> wgpu::TextureFormat {
@@ -656,15 +827,14 @@ impl Renderer {
         plans: &[LayerPlan],
     ) -> Option<Prepared> {
         let mut out = Prepared {
-            quads: Vec::new(),
-            glyphs: Vec::new(),
+            instances: Instances::default(),
             batches: Vec::new(),
             rasters: Vec::new(),
         };
         let mut placed: Vec<PlacedGlyph> = Vec::new();
         let clear = scene.clear.premultiplied();
         for r in damage.unwrap_or_default() {
-            out.quads.push(clear_instance(*r, clear));
+            out.instances.solids.push(solid_instance(*r, clear));
         }
 
         let layers = std::mem::take(&mut self.layers);
@@ -676,8 +846,8 @@ impl Renderer {
             for dirty in &plan.dirty {
                 torus_parts(*dirty, cache.size, |part, (tx, ty)| {
                     let scissor = RectI::new(tx, ty, part.width, part.height);
-                    let index = out.quads.len() as u32;
-                    out.quads.push(clear_instance(scissor, [0.0; 4]));
+                    let index = out.instances.solids.len() as u32;
+                    out.instances.solids.push(solid_instance(scissor, [0.0; 4]));
                     let mut batches = Vec::new();
                     for (prim, bounds) in cache.content.primitives.iter().zip(&cache.bounds) {
                         if !bounds.intersects(&part) {
@@ -687,8 +857,7 @@ impl Renderer {
                             prim,
                             (tx - part.x, ty - part.y),
                             target,
-                            &mut out.quads,
-                            &mut out.glyphs,
+                            &mut out.instances,
                             &mut batches,
                             &mut placed,
                         );
@@ -716,7 +885,13 @@ impl Renderer {
                 }
                 if let Primitive::Layer(layer) = prim {
                     if let Some(cache) = layers.get(&layer.key) {
-                        push_layer(layer, cache, screen, &mut out.glyphs, &mut out.batches);
+                        push_layer(
+                            layer,
+                            cache,
+                            screen,
+                            &mut out.instances.glyphs,
+                            &mut out.batches,
+                        );
                     }
                     continue;
                 }
@@ -724,8 +899,7 @@ impl Renderer {
                     prim,
                     (0, 0),
                     screen,
-                    &mut out.quads,
-                    &mut out.glyphs,
+                    &mut out.instances,
                     &mut out.batches,
                     &mut placed,
                 )?;
@@ -746,32 +920,71 @@ impl Renderer {
         prim: &Primitive,
         delta: (i32, i32),
         target: RectI,
-        quads: &mut Vec<QuadInstance>,
-        glyphs: &mut Vec<GlyphInstance>,
+        instances: &mut Instances,
         batches: &mut Vec<Batch>,
         placed: &mut Vec<PlacedGlyph>,
     ) -> Option<()> {
         let (dx, dy) = delta;
+        let Instances {
+            solids,
+            quads,
+            glyphs,
+        } = instances;
         match prim {
             Primitive::Quad(q) => {
-                let (clip, clip_radii) = gpu_clip(&q.clip.translated(dx, dy), target);
+                let rect = q.rect.translate(dx, dy);
+                let clip = q.clip.translated(dx, dy);
+                let visible = rect.intersect(&clip.rect).intersect(&target);
+                if visible.is_empty() {
+                    return Some(());
+                }
+                let (gpu_clip, clip_radii) = gpu_clip(&clip, target);
                 let b = q.border_widths;
-                quads.push(QuadInstance {
-                    rect: rect4(q.rect.translate(dx, dy)),
+                let shape = QuadInstance {
+                    area: rect4(visible),
+                    shape: rect4(rect),
                     background: q.background.premultiplied(),
                     border_color: q.border_color.premultiplied(),
                     border: [b[0] as f32, b[1] as f32, b[2] as f32, b[3] as f32],
                     radii: q.radii,
-                    clip,
+                    clip: gpu_clip,
                     clip_radii,
                     cut_radii: [0.0; 4],
                     params: [0.0; 2],
+                };
+                if !self.slice_quads || (clip.is_rounded() && !inside_clip_corners(visible, &clip))
+                {
+                    quads.push(shape);
+                    push_batch(batches, BatchKind::Quads, quads.len() as u32);
+                    return Some(());
+                }
+                slice_quad(q, rect, |piece| match piece {
+                    Piece::Solid(r, color) => {
+                        let r = r.intersect(&visible);
+                        if !r.is_empty() {
+                            solids.push(solid_instance(r, color));
+                            let kind = if color[3] >= 1.0 {
+                                BatchKind::Opaque
+                            } else {
+                                BatchKind::Solids
+                            };
+                            push_batch(batches, kind, solids.len() as u32);
+                        }
+                    }
+                    Piece::Shaded(r) => {
+                        let r = r.intersect(&visible);
+                        if !r.is_empty() {
+                            quads.push(QuadInstance {
+                                area: rect4(r),
+                                ..shape
+                            });
+                            push_batch(batches, BatchKind::Quads, quads.len() as u32);
+                        }
+                    }
                 });
-                push_batch(batches, true, quads.len() as u32 - 1, quads.len() as u32);
             }
             Primitive::Shadow(s) => {
                 let (clip, clip_radii) = gpu_clip(&s.clip.translated(dx, dy), target);
-                let start = quads.len() as u32;
                 let visible = s
                     .bounds()
                     .translate(dx, dy)
@@ -779,9 +992,10 @@ impl Renderer {
                     .intersect(&target);
                 around_hole(visible, s.hole().translate(dx, dy), |area| {
                     quads.push(QuadInstance {
-                        rect: rect4(area),
+                        area: rect4(area),
+                        shape: rect4(s.rect.translate(dx, dy)),
                         background: s.color.premultiplied(),
-                        border_color: rect4(s.rect.translate(dx, dy)),
+                        border_color: [0.0; 4],
                         border: rect4(s.cut.translate(dx, dy)),
                         radii: s.radii,
                         clip,
@@ -789,17 +1003,14 @@ impl Renderer {
                         cut_radii: s.cut_radii,
                         params: [if s.inset { 2.0 } else { 1.0 }, s.blur * 0.5],
                     });
+                    push_batch(batches, BatchKind::Quads, quads.len() as u32);
                 });
-                if quads.len() as u32 > start {
-                    push_batch(batches, true, start, quads.len() as u32);
-                }
             }
             Primitive::Glyphs(run) => {
                 placed.clear();
                 self.glyphs.place_run(run, placed)?;
                 let color = run.color.premultiplied();
                 let (clip, clip_radii) = gpu_clip(&run.clip.translated(dx, dy), target);
-                let start = glyphs.len() as u32;
                 for p in placed.iter() {
                     glyphs.push(GlyphInstance {
                         rect: [
@@ -814,9 +1025,7 @@ impl Renderer {
                         params: [if p.color { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
                         clip_radii,
                     });
-                }
-                if !placed.is_empty() {
-                    push_batch(batches, false, start, glyphs.len() as u32);
+                    push_batch(batches, BatchKind::Glyphs, glyphs.len() as u32);
                 }
             }
             // Layers don't nest; the painter draws inner scrollers as content.
@@ -873,8 +1082,7 @@ impl Renderer {
     ) {
         let plans = self.plan_layers(device, scene, damage);
         let Prepared {
-            quads,
-            glyphs,
+            instances,
             batches,
             rasters,
         } = self.prepare(device, scene, damage, &plans);
@@ -911,10 +1119,12 @@ impl Renderer {
                 _pad: [0.0; 2],
             }),
         );
+        self.solid_buffer
+            .upload(device, queue, bytemuck::cast_slice(&instances.solids));
         self.quad_buffer
-            .upload(device, queue, bytemuck::cast_slice(&quads));
+            .upload(device, queue, bytemuck::cast_slice(&instances.quads));
         self.glyph_buffer
-            .upload(device, queue, bytemuck::cast_slice(&glyphs));
+            .upload(device, queue, bytemuck::cast_slice(&instances.glyphs));
 
         for (key, ops) in &rasters {
             let cache = &self.layers[key];
@@ -938,8 +1148,8 @@ impl Renderer {
             for op in ops {
                 let r = op.scissor;
                 pass.set_scissor_rect(r.x as u32, r.y as u32, r.width as u32, r.height as u32);
-                pass.set_pipeline(&self.clear_pipeline);
-                pass.set_vertex_buffer(0, self.quad_buffer.buffer.slice(..));
+                pass.set_pipeline(&self.opaque_pipeline);
+                pass.set_vertex_buffer(0, self.solid_buffer.buffer.slice(..));
                 pass.draw(0..4, op.clear..op.clear + 1);
                 self.draw_batches(&mut pass, &op.batches);
             }
@@ -979,8 +1189,8 @@ impl Renderer {
         // Each rectangle is cleared and then repainted; overlapping rectangles just repeat work.
         for (i, r) in damage.iter().enumerate() {
             pass.set_scissor_rect(r.x as u32, r.y as u32, r.width as u32, r.height as u32);
-            pass.set_pipeline(&self.clear_pipeline);
-            pass.set_vertex_buffer(0, self.quad_buffer.buffer.slice(..));
+            pass.set_pipeline(&self.opaque_pipeline);
+            pass.set_vertex_buffer(0, self.solid_buffer.buffer.slice(..));
             pass.draw(0..4, i as u32..i as u32 + 1);
             self.draw_batches(&mut pass, &batches);
         }
@@ -992,6 +1202,16 @@ impl Renderer {
                 Batch::Quads(r) => {
                     pass.set_pipeline(&self.quad_pipeline);
                     pass.set_vertex_buffer(0, self.quad_buffer.buffer.slice(..));
+                    pass.draw(0..4, r.clone());
+                }
+                Batch::Solids(r) => {
+                    pass.set_pipeline(&self.solid_pipeline);
+                    pass.set_vertex_buffer(0, self.solid_buffer.buffer.slice(..));
+                    pass.draw(0..4, r.clone());
+                }
+                Batch::Opaque(r) => {
+                    pass.set_pipeline(&self.opaque_pipeline);
+                    pass.set_vertex_buffer(0, self.solid_buffer.buffer.slice(..));
                     pass.draw(0..4, r.clone());
                 }
                 Batch::Glyphs(r) => {
@@ -1014,17 +1234,10 @@ impl Renderer {
     }
 }
 
-fn clear_instance(r: RectI, color: [f32; 4]) -> QuadInstance {
-    QuadInstance {
+fn solid_instance(r: RectI, color: [f32; 4]) -> SolidInstance {
+    SolidInstance {
         rect: rect4(r),
-        background: color,
-        border_color: [0.0; 4],
-        border: [0.0; 4],
-        radii: [0.0; 4],
-        clip: rect4(r),
-        clip_radii: [0.0; 4],
-        cut_radii: [0.0; 4],
-        params: [0.0; 2],
+        color,
     }
 }
 
@@ -1061,20 +1274,103 @@ fn push_layer(
     batches.push(Batch::Layer(layer.key, start..glyphs.len() as u32));
 }
 
-fn push_batch(batches: &mut Vec<Batch>, quad: bool, start: u32, end: u32) {
-    match (batches.last_mut(), quad) {
-        (Some(Batch::Quads(r)), true) | (Some(Batch::Glyphs(r)), false) => r.end = end,
-        _ => batches.push(if quad {
-            Batch::Quads(start..end)
-        } else {
-            Batch::Glyphs(start..end)
-        }),
+#[derive(Clone, Copy)]
+enum BatchKind {
+    Quads,
+    Solids,
+    Opaque,
+    Glyphs,
+}
+
+/// Adds the instance just pushed, which ends at `end`, to the last batch if it is of that kind.
+fn push_batch(batches: &mut Vec<Batch>, kind: BatchKind, end: u32) {
+    match (batches.last_mut(), kind) {
+        (Some(Batch::Quads(r)), BatchKind::Quads)
+        | (Some(Batch::Solids(r)), BatchKind::Solids)
+        | (Some(Batch::Opaque(r)), BatchKind::Opaque)
+        | (Some(Batch::Glyphs(r)), BatchKind::Glyphs) => r.end = end,
+        _ => {
+            let r = end - 1..end;
+            batches.push(match kind {
+                BatchKind::Quads => Batch::Quads(r),
+                BatchKind::Solids => Batch::Solids(r),
+                BatchKind::Opaque => Batch::Opaque(r),
+                BatchKind::Glyphs => Batch::Glyphs(r),
+            });
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quad(rect: RectI, border: [i32; 4], radii: [f32; 4], bg: f32) -> Quad {
+        Quad {
+            rect,
+            background: anti_webui_core::prelude::Color::new(0.2, 0.4, 0.8, bg),
+            border_widths: border,
+            border_color: anti_webui_core::prelude::Color::new(1.0, 0.0, 0.0, 0.5),
+            radii,
+            clip: Clip::NONE,
+        }
+    }
+
+    #[test]
+    fn a_box_is_cut_into_pieces_that_cover_it_once() {
+        let radii = [
+            [0.0; 4],
+            [12.0; 4],
+            [1.5; 4],
+            [0.0, 30.0, 0.0, 5.0],
+            [40.0, 0.0, 0.0, 0.0],
+            [1000.0; 4],
+        ];
+        let borders = [[0; 4], [1; 4], [3, 0, 7, 2], [50, 50, 50, 50]];
+        for (w, h) in [(300, 200), (200, 300), (64, 64), (10, 200), (2, 2)] {
+            let rect = RectI::new(7, 11, w, h);
+            for radii in radii {
+                for border in borders {
+                    let q = quad(rect, border, radii, 0.5);
+                    let mut count = vec![0_u32; (w * h) as usize];
+                    slice_quad(&q, rect, |piece| {
+                        let (Piece::Solid(r, _) | Piece::Shaded(r)) = piece;
+                        for y in r.y..r.bottom() {
+                            for x in r.x..r.right() {
+                                let i = (y - rect.y) * w + (x - rect.x);
+                                count[i as usize] += 1;
+                            }
+                        }
+                    });
+                    assert!(
+                        count.iter().all(|c| *c == 1),
+                        "{w}x{h} radii {radii:?} border {border:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_small_rounded_box_is_not_worth_cutting() {
+        let rect = RectI::new(0, 0, 40, 40);
+        let mut n = 0;
+        slice_quad(&quad(rect, [0; 4], [8.0; 4], 0.5), rect, |_| n += 1);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn a_box_without_a_background_has_no_middle() {
+        let rect = RectI::new(0, 0, 400, 300);
+        let mut pieces = Vec::new();
+        slice_quad(&quad(rect, [2; 4], [0.0; 4], 0.0), rect, |p| pieces.push(p));
+        assert_eq!(pieces.len(), 4);
+        assert!(
+            !pieces
+                .iter()
+                .any(|p| matches!(p, Piece::Solid(r, _) if r.area() > 10000))
+        );
+    }
 
     fn pieces(outer: RectI, hole: RectI) -> Vec<RectI> {
         let mut out = Vec::new();

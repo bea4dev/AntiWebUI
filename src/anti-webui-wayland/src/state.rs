@@ -657,6 +657,7 @@ impl Dispatch<wl_callback::WlCallback, SurfaceId> for State {
             // Any commit takes a queued request along, not only those that present something.
             f.callback_queued = false;
             f.pending = None;
+            f.last_callback = Some(Instant::now());
         }
     }
 }

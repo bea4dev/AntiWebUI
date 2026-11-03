@@ -200,6 +200,7 @@ text(|| format!("倍率: {}", settings().scroll.touchpad_factor));
 | `scroll.kinetic.velocity_factor` | 1.0 | 有効 | 無効 |
 | `scroll.kinetic.deceleration` | 2645.7（論理 px/s²） | 有効 | 無効 |
 | `scroll.kinetic.max_screens` | 3.0（ウィンドウの大きさの倍数） | 有効 | 無効 |
+| `rendering.frame_advance` | `Auto`（[10](10-frame-pacing.md)） | 有効 | 未実装 |
 
 今は開発者が指定する設定だけを持つ。利用者が全アプリに効かせる設定ファイルは、将来この下の層として足せる。キャレットの点滅やダブルクリックの間隔も、必要になれば同じ経路に移す。
 

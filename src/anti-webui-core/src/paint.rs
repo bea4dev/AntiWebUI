@@ -106,9 +106,9 @@ fn paint_root(
 
 fn fade(c: Color, opacity: f32) -> Color {
     if opacity >= 1.0 {
-        c
+        c.snapped()
     } else {
-        c.with_alpha(c.a * opacity)
+        c.with_alpha(c.a * opacity).snapped()
     }
 }
 

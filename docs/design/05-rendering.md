@@ -198,6 +198,7 @@ texel = (content.x mod 幅, content.y mod 高さ)
 ## デバッグ
 
 - `ANTIWEBUI_DEBUG_DAMAGE=1` を指定すると、フレームごとに変更矩形・buffer age・描き直した面積の割合を標準エラーに出す。
+- `ANTIWEBUI_FRAME_STATS=out.csv` を指定すると、CPU の各工程、GPU の完了、画面に出た時刻をフレームごとに記録する（[10](10-frame-pacing.md)）。
 - `ANTIWEBUI_PRESENT=surface` で、自前の presenter を使わず wgpu Surface（全面描画）に固定する。
 
 - `ANTIWEBUI_DUMP_FRAME=out.png` を指定すると、表示したフレームと同じ Scene をオフスクリーンで描画して PNG に書き出す（画面キャプチャ無しで実バッファの内容を確認できる）。

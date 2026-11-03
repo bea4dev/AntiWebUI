@@ -913,3 +913,128 @@ fn a_popup_has_its_own_transparent_scene() {
     let window = gpu.render_to_rgba(&mut renderer, &frame.window);
     assert_eq!(px(&window, 200, 100, 100), [0, 0, 255, 255]);
 }
+
+#[test]
+fn boxes_in_parts_look_the_same_as_through_the_quad_shader() {
+    use anti_webui_core::geometry::RectI;
+    use anti_webui_core::scene::{Clip, Primitive, Quad, Scene};
+    use anti_webui_wgpu::{Gpu, Renderer, wgpu};
+
+    let gpu = match Gpu::headless() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
+    let (w, h) = (640_u32, 480_u32);
+    // A small fixed sequence, so that a failure can be reproduced.
+    let mut state = 0x2545_f491_u32;
+    let mut next = move |n: u32| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state % n
+    };
+    let mut primitives = Vec::new();
+    for _ in 0..200 {
+        let rect = RectI::new(
+            next(500) as i32 - 40,
+            next(400) as i32 - 40,
+            next(420) as i32 + 1,
+            next(300) as i32 + 1,
+        );
+        let mut color = || {
+            let a = [255, 255, 128, 13, 0][next(5) as usize];
+            Color::from_rgba(next(0x1000000) << 8 | a)
+        };
+        let (background, border_color) = (color(), color());
+        let radii = match next(5) {
+            0 => [0.0; 4],
+            1 => [next(40) as f32 + [0.5, 0.9, 0.2][next(3) as usize]; 4],
+            2 => [next(3) as f32 + 0.9; 4],
+            3 => [next(30) as f32, 0.0, next(90) as f32, next(5) as f32],
+            _ => [0.0, next(300) as f32, 0.0, 0.0],
+        };
+        let border_widths = match next(4) {
+            0 | 1 => [0; 4],
+            2 => [next(4) as i32 + 1; 4],
+            _ => [next(9) as i32, next(9) as i32, next(60) as i32, 0],
+        };
+        let clip_rect = RectI::new(
+            next(300) as i32,
+            next(200) as i32,
+            next(400) as i32 + 1,
+            next(300) as i32 + 1,
+        );
+        let clip = match next(3) {
+            0 => Clip::NONE,
+            1 => Clip::from(clip_rect),
+            _ => Clip {
+                rect: clip_rect,
+                radii: [next(30) as f32, next(30) as f32, 3.5, 0.0],
+            },
+        };
+        primitives.push(Primitive::Quad(Quad {
+            rect,
+            background,
+            border_widths,
+            border_color,
+            radii,
+            clip,
+        }));
+    }
+    let scene = Scene {
+        width: w,
+        height: h,
+        clear: Color::WHITE,
+        primitives,
+        chunks: Vec::new(),
+    };
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut parts = Renderer::new(&gpu.device, format);
+    let mut whole = Renderer::new(&gpu.device, format);
+    whole.set_slice_quads(false);
+    let a = gpu.render_to_rgba(&mut parts, &scene);
+    let b = gpu.render_to_rgba(&mut whole, &scene);
+    // The shader gets slightly less than full coverage on some edge pixels from rounding errors.
+    let mut wrong = 0;
+    let mut worst = 0;
+    for (x, y) in a.chunks(4).zip(b.chunks(4)) {
+        let d = (0..4).map(|c| x[c].abs_diff(y[c])).max().unwrap();
+        wrong += (d > 0) as u32;
+        worst = worst.max(d);
+    }
+    assert!(worst <= 1, "{wrong} pixels differ, by up to {worst}");
+    assert!(wrong < 100, "{wrong} pixels differ, by up to {worst}");
+}
+
+#[test]
+fn a_change_too_small_for_8_bits_paints_the_same() {
+    use anti_webui_core::Ui;
+    use anti_webui_core::damage;
+    use anti_webui_core::event::WindowEvent;
+    use anti_webui_core::geometry::{Scale, SizeI};
+    use std::time::Instant;
+
+    let alpha = signal(0.0500_f32);
+    let mut ui = Ui::new(move || {
+        div()
+            .size_full()
+            .dyn_style(move |s| s.bg(Color::new(0.2, 0.4, 0.8, alpha.get())))
+    });
+    ui.handle_event(WindowEvent::Resized {
+        size: SizeI::new(100, 100),
+        scale: Scale::ONE,
+    });
+    ui.update();
+    let first = ui.paint(Instant::now());
+    alpha.set(0.0505);
+    ui.update();
+    let same = ui.paint(Instant::now());
+    assert!(damage::diff(&first, &same).is_empty());
+    alpha.set(0.06);
+    ui.update();
+    let changed = ui.paint(Instant::now());
+    assert!(!damage::diff(&same, &changed).is_empty());
+}

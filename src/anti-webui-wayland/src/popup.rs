@@ -18,6 +18,8 @@ pub(crate) struct SurfaceFrame {
     pub pending: Option<std::time::Instant>,
     /// A frame callback was requested but not committed yet.
     pub callback_queued: bool,
+    /// When the last frame callback came.
+    pub last_callback: Option<std::time::Instant>,
     /// A buffer was committed, so popups can attach to it.
     pub mapped: bool,
     pub opaque: bool,

@@ -14,6 +14,8 @@ AntiWebUI は WebView に頼らず、wgpu による自前描画とネイティ�
 | 07 | [roadmap](07-roadmap.md) | マイルストーン |
 | 08 | [scrolling-and-settings](08-scrolling-and-settings.md) | 慣性スクロールと全体設定 |
 | 09 | [shadows-stacking-popups](09-shadows-stacking-popups.md) | 影、z_index、ポップアップ（xdg_popup / wl_subsurface） |
+| 10 | [frame-pacing](10-frame-pacing.md) | フレームの先行（トリプルバッファリング）とフレーム計測 |
+| 11 | [gpu-fill](11-gpu-fill.md) | GPU の塗りの効率（単色の経路と箱の分割、Chromium との比較） |
 
 ## 用語
 

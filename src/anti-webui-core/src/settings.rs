@@ -6,6 +6,33 @@ use crate::reactive::{Signal, create_root, signal};
 #[non_exhaustive]
 pub struct Settings {
     pub scroll: ScrollSettings,
+    pub rendering: RenderingSettings,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct RenderingSettings {
+    /// Whether frames are produced ahead of what the compositor has taken.
+    pub frame_advance: FrameAdvance,
+}
+
+/// Whether the work on a frame may start before the compositor has taken the last one, so that
+/// the CPU works on one frame while the GPU works on the one before (triple buffering). Frames
+/// that don't fit into a refresh then can still come at every refresh, at the cost of a refresh
+/// of latency for each frame ahead. A frame after a pause is never ahead of anything, so this
+/// doesn't affect typing or clicks. See `docs/design/10-frame-pacing.md`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FrameAdvance {
+    /// Renders one frame ahead only while frames keep being too late without it.
+    #[default]
+    Auto,
+    /// Always renders one frame ahead while frames are continuous.
+    Enable,
+    /// Never renders ahead: the lowest latency, and refreshes skipped when frames are late.
+    Disable,
+    /// Renders up to this many frames ahead while frames are continuous. 0 is the same as
+    /// [`FrameAdvance::Disable`]. More than 4 counts as 4.
+    Custom { max_advance: usize },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -46,6 +73,9 @@ impl Default for Settings {
                     deceleration: 2645.7,
                     max_screens: 3.0,
                 },
+            },
+            rendering: RenderingSettings {
+                frame_advance: FrameAdvance::Auto,
             },
         }
     }
