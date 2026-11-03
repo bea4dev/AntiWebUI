@@ -123,18 +123,27 @@ fn translucency_makes_a_stacking_context() {
             .child(tile(3).z_index(1))
     });
     assert_eq!(order(&mut ui), [1, 2, 3]);
-    // And what is in it gets its opacity, wherever it is painted from.
+    // And what is in it fades as one image with it, wherever it is painted from.
     ui.update();
     let scene = ui.paint(Instant::now());
-    let alpha: Vec<u32> = scene
+    let faded = scene
         .primitives
         .iter()
-        .filter_map(|p| match p {
-            Primitive::Quad(q) => Some((q.background.a * 255.0).round() as u32),
+        .find_map(|p| match p {
+            Primitive::Layer(l) => Some(l),
             _ => None,
         })
-        .collect();
-    assert_eq!(alpha, [128, 128, 255]);
+        .unwrap();
+    assert_eq!((faded.opacity * 255.0).round(), 128.0);
+    let opaque = |scene: &Scene| {
+        scene
+            .primitives
+            .iter()
+            .filter(|p| matches!(p, Primitive::Quad(q) if q.background.a == 1.0))
+            .count()
+    };
+    assert_eq!(opaque(&faded.content), 2);
+    assert_eq!(opaque(&scene), 1);
 }
 
 #[test]

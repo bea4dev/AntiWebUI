@@ -33,7 +33,7 @@ pub mod prelude {
     };
     pub use crate::settings::{FrameAdvance, Settings, settings, update_settings};
     pub use crate::view::{
-        Div, IntoTextSource, IntoView, NodeRef, Popup, Text, TextInput, View, div, dyn_view,
+        Div, IntoTextSource, IntoView, NodeRef, Popup, Show, Text, TextInput, View, div, dyn_view,
         for_each, fragment, node_ref, popup, show, text, text_area, text_input,
     };
     pub use anti_webui_style::*;

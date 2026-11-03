@@ -125,7 +125,7 @@ fn fading_a_layer_is_compositing_it_as_one_image() {
     let b = frame(&mut ui);
     let (la, lb) = (layers(&a)[0], layers(&b)[0]);
     assert!(Arc::ptr_eq(&la.content, &lb.content));
-    assert_eq!(lb.opacity, 0.5);
+    assert_eq!((lb.opacity * 255.0).round(), 128.0);
     assert_eq!(
         damage::diff(&a, &b).bounds(),
         lb.bounds_on_parent(),
@@ -520,4 +520,219 @@ fn a_field_in_a_transform_puts_the_caret_where_it_is_clicked() {
     frame(&mut ui);
     let focus = with_doc(|d| d.get(field.get().unwrap()).unwrap().edit().unwrap().focus);
     assert_eq!(focus, 10, "past the end of the text");
+}
+
+fn faded_layers(scene: &Scene) -> usize {
+    layers(scene).len()
+}
+
+#[test]
+fn only_what_could_show_through_itself_is_faded_as_one_image() {
+    let frame_of = |view: Div| {
+        let mut ui = Ui::new(move || div().size_full().child(view));
+        window(&mut ui, 300, 300);
+        frame(&mut ui)
+    };
+    let one = |s: Div| s.w(50.0).h(50.0).opacity(0.5);
+    let color = rgb(0xff0000);
+    for (what, view, wanted) in [
+        ("nothing", one(div()), 0),
+        ("a box", one(div().bg(color)), 0),
+        ("text", one(div().child(text("a\nb"))), 0),
+        (
+            "a box in a box",
+            one(div().child(div().w(9.0).h(9.0).bg(color))),
+            0,
+        ),
+        ("a box with text", one(div().bg(color).child(text("a"))), 1),
+        ("a shadow and a box", one(div().bg(color).shadow_md()), 1),
+        (
+            "two boxes",
+            one(div()
+                .child(div().bg(color).h(9.0))
+                .child(div().bg(color).h(9.0))),
+            1,
+        ),
+        ("a field", one(div().child(text_input().w(30.0))), 1),
+    ] {
+        assert_eq!(faded_layers(&frame_of(view)), wanted, "{what}");
+    }
+}
+
+#[test]
+fn fading_paints_nothing_again_and_moves_nothing() {
+    let fade = signal(0.8_f32);
+    let (a, under) = (node_ref(), node_ref());
+    let mut ui = Ui::new(move || {
+        div()
+            .size_full()
+            .child(
+                div()
+                    .w(100.0)
+                    .h(100.0)
+                    .bg(rgb(0xff0000))
+                    .node_ref(a)
+                    .dyn_style(move |s| s.opacity(fade.get()))
+                    .child(text("x")),
+            )
+            .child(div().w(10.0).h(10.0).node_ref(under))
+    });
+    window(&mut ui, 300, 300);
+    let first = frame(&mut ui);
+    fade.set(0.4);
+    let second = frame(&mut ui);
+    assert!(Arc::ptr_eq(
+        &layers(&first)[0].content,
+        &layers(&second)[0].content
+    ));
+    assert_eq!((layers(&second)[0].opacity * 255.0).round(), 102.0);
+    assert!(hovered_by(&mut ui, 50.0, 50.0, a) || with_doc(|d| d.state.hovered.len() > 1));
+
+    // Too small a change for 8 bits shows the same.
+    fade.set(0.4 + 0.0005);
+    let third = frame(&mut ui);
+    assert!(damage::diff(&second, &third).is_empty());
+
+    // In and out of being a layer, without anything moving.
+    let at = a.rect().unwrap();
+    let (space, abs_of_child) = with_doc(|d| {
+        let n = d.get(a.get().unwrap()).unwrap();
+        (n.space, d.get(n.children[0]).unwrap().abs)
+    });
+    fade.set(1.0);
+    let opaque = frame(&mut ui);
+    assert!(layers(&opaque).is_empty());
+    assert_eq!(a.rect().unwrap(), at);
+    with_doc(|d| {
+        let n = d.get(a.get().unwrap()).unwrap();
+        assert_eq!(n.space, space);
+        assert_eq!(d.get(n.children[0]).unwrap().abs, abs_of_child);
+    });
+}
+
+#[test]
+fn what_is_inside_a_faded_layer_stays_up_to_date() {
+    let dx = signal(1.0_f32);
+    let scroller = node_ref();
+    let mut ui = Ui::new(move || {
+        div().size_full().child(
+            div()
+                .w(200.0)
+                .h(200.0)
+                .opacity(0.5)
+                .bg(rgb(0xffffff))
+                .child(
+                    div()
+                        .w(50.0)
+                        .h(50.0)
+                        .bg(rgb(0xff0000))
+                        .dyn_style(move |s| s.translate_x(dx.get())),
+                )
+                .child(
+                    div()
+                        .h(60.0)
+                        .overflow_y_scroll()
+                        .node_ref(scroller)
+                        .child(div().h(500.0).bg(rgb(0x00ff00))),
+                ),
+        )
+    });
+    window(&mut ui, 300, 300);
+    let inner = |s: &Scene| -> Vec<(f64, i32)> {
+        layers(&layers(s)[0].content)
+            .iter()
+            .map(|l| (l.transform.e, l.origin.y))
+            .collect()
+    };
+    let a = frame(&mut ui);
+    dx.set(20.0);
+    let b = frame(&mut ui);
+    assert_ne!(inner(&a), inner(&b), "a transform inside moved");
+    ui.handle_event(WindowEvent::Scroll {
+        position: PointF::new(50.0, 80.0),
+        delta_x: 0.0,
+        delta_y: 30.0,
+        modifiers: Modifiers::default(),
+        source: ScrollSource::Unknown,
+        phase: ScrollPhase::Single,
+        time: 0,
+    });
+    let c = frame(&mut ui);
+    assert_ne!(inner(&b), inner(&c), "scrolled inside");
+    assert!(!damage::diff(&b, &c).is_empty());
+}
+
+#[test]
+fn a_faded_layer_in_scrolled_content_shows_its_fading() {
+    let fade = signal(0.5_f32);
+    let mut ui = Ui::new(move || {
+        div().size_full().child(
+            div().h(100.0).overflow_y_scroll().child(
+                div().h(500.0).child(
+                    div()
+                        .h(50.0)
+                        .bg(rgb(0xff0000))
+                        .dyn_style(move |s| s.opacity(fade.get()))
+                        .child(text("x")),
+                ),
+            ),
+        )
+    });
+    window(&mut ui, 300, 300);
+    let opacity = |s: &Scene| layers(&layers(s)[0].content)[0].opacity;
+    let a = frame(&mut ui);
+    assert_eq!((opacity(&a) * 255.0).round(), 128.0);
+    fade.set(0.2);
+    let b = frame(&mut ui);
+    assert_eq!((opacity(&b) * 255.0).round(), 51.0);
+    assert!(!damage::diff(&a, &b).is_empty());
+}
+
+#[test]
+fn a_layer_is_no_bigger_than_what_can_be_seen_of_what_it_draws() {
+    // A shadow that has gone: the node's bounds stay generous until it is positioned again.
+    let shadow = signal(true);
+    let build = move |s: Div| {
+        s.w(50.0)
+            .h(50.0)
+            .bg(rgb(0xff0000))
+            .dyn_style(move |st| if shadow.get() { st.shadow_lg() } else { st })
+            .child(div().w(9.0).h(9.0).bg(rgb(0x00ff00)))
+    };
+    let mut ui = Ui::new(move || {
+        div()
+            .size_full()
+            .child(build(div()).translate(100.0, 0.0))
+            .child(build(div()).opacity(0.5))
+    });
+    window(&mut ui, 400, 300);
+    frame(&mut ui);
+    shadow.set(false);
+    let scene = frame(&mut ui);
+    let [moved, faded] = layers(&scene)[..] else {
+        panic!();
+    };
+    assert_eq!(moved.bounds, RectI::new(0, 0, 50, 50));
+    assert_eq!(faded.bounds, RectI::new(0, 50, 50, 50));
+
+    // What clips a faded layer limits what the renderer keeps of it.
+    let mut ui = Ui::new(move || {
+        div().size_full().child(
+            div().w(100.0).h(40.0).overflow_clip().child(
+                div()
+                    .w(100.0)
+                    .h(100.0)
+                    .opacity(0.5)
+                    .bg(rgb(0xff0000))
+                    .child(div().w(100.0).h(100.0).bg(rgb(0x00ff00))),
+            ),
+        )
+    });
+    window(&mut ui, 400, 300);
+    let scene = frame(&mut ui);
+    assert_eq!(layers(&scene)[0].clip.rect, RectI::new(0, 0, 100, 40));
+    assert_eq!(
+        layers(&scene)[0].bounds_on_parent(),
+        RectI::new(0, 0, 100, 40)
+    );
 }

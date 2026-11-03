@@ -168,6 +168,8 @@ pub struct Node {
     pub child_bounds: Vec<RectI>,
     /// The transitions going on, in no particular order. See `layout::apply_transitions`.
     pub(crate) transitions: Vec<crate::animation::RunningTransition>,
+    /// When it comes and goes as part of a `show` with `enter` or `exit`.
+    pub(crate) presence: Option<Box<crate::animation::Presence>>,
     /// Nodes in the subtree that are not `display: none`, itself included.
     pub(crate) subtree_nodes: u32,
     /// The children may have moved since the node was last positioned.
@@ -211,6 +213,7 @@ impl Node {
             subtree_bounds: RectI::default(),
             child_bounds: Vec::new(),
             transitions: Vec::new(),
+            presence: None,
             subtree_nodes: 0,
             position_dirty: true,
             style_dirty: false,
@@ -318,6 +321,8 @@ pub struct LayerMemo {
     pub content: Arc<Scene>,
     /// What `content` covers, in its own coordinates.
     pub covers: RectI,
+    /// What `content` can touch, in its own coordinates.
+    pub touched: RectI,
     /// The transform as the style has it, before any rounding.
     pub transform: Affine,
     /// The layers directly in `content`.

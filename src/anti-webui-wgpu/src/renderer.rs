@@ -879,11 +879,12 @@ impl Renderer {
         let largest = view.width.max(view.height).max(1) as i64;
         let k = k.min((self.max_texture as i64 / largest).max(1) as i32);
         // Round up so that small resizes keep the texture, and shrink only when it is far
-        // too big.
-        let needed = (
-            ((view.width * k + 127) & !127).min(self.max_texture as i32),
-            ((view.height * k + 127) & !127).min(self.max_texture as i32),
-        );
+        // too big. Not by much for a short row, which there can be a lot of.
+        let round_up = |v: i32| {
+            let step = if v <= 256 { 16 } else { 128 };
+            ((v + step - 1) & !(step - 1)).min(self.max_texture as i32)
+        };
+        let needed = (round_up(view.width * k), round_up(view.height * k));
         let fits = self.layers.get(&layer.key).is_some_and(|c| {
             c.k == k
                 && c.size.0 >= needed.0

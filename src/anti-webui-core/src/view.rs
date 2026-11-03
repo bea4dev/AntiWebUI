@@ -3,16 +3,19 @@
 //! A builder only collects configuration; nodes are created in [`IntoView::into_view`], inside
 //! the current reactive owner, and removed again when that owner is disposed.
 
+use crate::animation::{Presence, request_frame};
 use crate::event::{KeyboardEvent, PointerEvent, ScrollEvent};
 use crate::geometry::RectI;
 use crate::platform::{ImePurpose, Placement, PopupKind};
 use crate::reactive::{
-    Owner, Signal, create_child_owner, effect, memo, on_cleanup, signal, untrack,
+    Owner, Signal, create_child_owner, create_root, effect, memo, on_cleanup, signal, untrack,
 };
 use crate::text::TextLayout;
 use crate::text::edit::{EditData, TextCallback};
-use crate::tree::{Listeners, Node, NodeId, NodeKind, PopupData, TextData, with_doc};
-use anti_webui_style::{AlignItems, Display as Layout, FlexDirection, Style, Styled, UserSelect};
+use crate::tree::{Document, Listeners, Node, NodeId, NodeKind, PopupData, TextData, with_doc};
+use anti_webui_style::{
+    AlignItems, Display as Layout, FlexDirection, Style, Styled, Transition, UserSelect,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -423,18 +426,235 @@ pub fn dyn_view<V: IntoView>(f: impl Fn() -> V + 'static) -> View {
 }
 
 /// Shows `view` while `when` returns true. `view` is only rebuilt when `when` flips.
+///
+/// With [`Show::enter`] and [`Show::exit`] it animates coming and going, which keeps what it shows
+/// around until it has gone (see `docs/design/13-animation.md`).
 pub fn show<V: IntoView>(
     when: impl Fn() -> bool + 'static,
     view: impl Fn() -> V + 'static,
-) -> View {
-    let cond = memo(when);
-    dyn_view(move || {
-        if cond.get() {
-            Some(untrack(&view))
-        } else {
-            None
+) -> Show {
+    Show {
+        when: Box::new(when),
+        view: Box::new(move || view().into_view()),
+        enter: None,
+        exit: None,
+        timing: Transition::ms(150).ease_out(),
+        appear: false,
+    }
+}
+
+/// See [`show`].
+pub struct Show {
+    when: Box<dyn Fn() -> bool>,
+    view: Box<dyn Fn() -> View>,
+    enter: Option<Style>,
+    exit: Option<Style>,
+    timing: Transition,
+    appear: bool,
+}
+
+impl Show {
+    /// What it goes from when it comes.
+    pub fn enter(mut self, f: impl FnOnce(Style) -> Style) -> Self {
+        self.enter = Some(f(Style::default()));
+        self
+    }
+
+    /// What it goes to before it goes away.
+    pub fn exit(mut self, f: impl FnOnce(Style) -> Style) -> Self {
+        self.exit = Some(f(Style::default()));
+        self
+    }
+
+    /// How long coming and going takes, and how it goes.
+    pub fn transition(mut self, timing: Transition) -> Self {
+        self.timing = timing;
+        self
+    }
+
+    /// Also goes through `enter` if it is shown from the start.
+    pub fn appear(mut self) -> Self {
+        self.appear = true;
+        self
+    }
+}
+
+/// What is shown now.
+struct Shown {
+    root: NodeId,
+    owner: Owner,
+    exiting: bool,
+}
+
+/// What coming and going applies to: boxes, so what is inside fragments and popups.
+fn presence_targets(d: &Document, id: NodeId, out: &mut Vec<NodeId>) {
+    let Some(n) = d.get(id) else {
+        return;
+    };
+    if matches!(n.kind, NodeKind::Fragment | NodeKind::Popup(_))
+        || n.computed.display == Layout::Contents
+        || n.style.base.display == Some(Layout::Contents)
+    {
+        for &c in &n.children {
+            presence_targets(d, c, out);
         }
-    })
+    } else {
+        out.push(id);
+    }
+}
+
+/// Removes what was shown once it has finished going.
+fn wait_for_exit(state: Rc<RefCell<Option<Shown>>>) {
+    request_frame(move |_| {
+        let shown = state
+            .borrow()
+            .as_ref()
+            .map(|s| (s.root, s.owner, s.exiting));
+        let Some((root, owner, true)) = shown else {
+            return;
+        };
+        if !owner.is_alive() {
+            return;
+        }
+        let gone = with_doc(|d| {
+            let mut targets = Vec::new();
+            presence_targets(d, root, &mut targets);
+            targets.iter().all(|t| {
+                // What can't be seen has nothing to wait for, whatever goes on in it.
+                d.get(*t)
+                    .is_none_or(|n| !n.visible || (n.transitions.is_empty() && !n.style_dirty))
+            })
+        });
+        if gone {
+            *state.borrow_mut() = None;
+            owner.dispose();
+        } else {
+            wait_for_exit(state);
+        }
+    });
+}
+
+impl IntoView for Show {
+    fn into_view(self) -> View {
+        let Show {
+            when,
+            view,
+            enter,
+            exit,
+            timing,
+            appear,
+        } = self;
+        let cond = memo(when);
+        if enter.is_none() && exit.is_none() {
+            return dyn_view(move || {
+                if cond.get() {
+                    Some(untrack(&view))
+                } else {
+                    None
+                }
+            });
+        }
+        let id = create_node(Node::new(NodeKind::Fragment));
+        // What it shows belongs out here: this effect running again doesn't end it.
+        let outer = Owner::current();
+        let state: Rc<RefCell<Option<Shown>>> = Rc::new(RefCell::new(None));
+        let mut first = true;
+        let run = RefCell::new(move |on: bool| {
+            let starting = !std::mem::take(&mut first) || appear;
+            let current = state
+                .borrow()
+                .as_ref()
+                .map(|s| (s.root, s.owner, s.exiting));
+            match (on, current) {
+                (true, None) => {
+                    let build = || create_child_owner(&view);
+                    let (root, owner) = match outer {
+                        Some(o) => o.with(build),
+                        None => create_root(&view),
+                    };
+                    with_doc(|d| {
+                        let mut targets = Vec::new();
+                        presence_targets(d, root.0, &mut targets);
+                        for t in targets {
+                            d.nodes[t].presence = Some(Box::new(Presence {
+                                starting: enter.clone().filter(|_| starting),
+                                exit: exit.clone().unwrap_or_default(),
+                                exiting: false,
+                                returning: false,
+                                timing,
+                            }));
+                        }
+                        d.set_children(id, vec![root.0]);
+                    });
+                    *state.borrow_mut() = Some(Shown {
+                        root: root.0,
+                        owner,
+                        exiting: false,
+                    });
+                }
+                // It comes back from where it got to, as the same nodes.
+                (true, Some((root, _, true))) => {
+                    with_doc(|d| {
+                        let mut targets = Vec::new();
+                        presence_targets(d, root, &mut targets);
+                        for t in targets {
+                            if let Some(p) = &mut d.nodes[t].presence {
+                                p.exiting = false;
+                                p.returning = true;
+                            }
+                            d.mark_style_of(t);
+                        }
+                        d.transform_moved = true;
+                    });
+                    if let Some(s) = &mut *state.borrow_mut() {
+                        s.exiting = false;
+                    }
+                }
+                (false, Some((root, owner, false))) => {
+                    let Some(exit_style) = &exit else {
+                        *state.borrow_mut() = None;
+                        owner.dispose();
+                        return;
+                    };
+                    with_doc(|d| {
+                        let mut targets = Vec::new();
+                        presence_targets(d, root, &mut targets);
+                        for t in &targets {
+                            let p = d.nodes[*t].presence.get_or_insert_with(|| {
+                                Box::new(Presence {
+                                    starting: None,
+                                    exit: exit_style.clone(),
+                                    exiting: false,
+                                    returning: false,
+                                    timing,
+                                })
+                            });
+                            p.exiting = true;
+                            p.returning = false;
+                            d.mark_style_of(*t);
+                        }
+                        if let Some(focused) = d.state.focused
+                            && targets.iter().any(|t| d.is_ancestor(*t, focused))
+                        {
+                            d.pending_focus = Some(None);
+                        }
+                        // It no longer takes the pointer.
+                        d.transform_moved = true;
+                    });
+                    if let Some(s) = &mut *state.borrow_mut() {
+                        s.exiting = true;
+                    }
+                    wait_for_exit(state.clone());
+                }
+                _ => {}
+            }
+        });
+        effect(move || {
+            let on = cond.get();
+            untrack(|| run.borrow_mut()(on));
+        });
+        View(id)
+    }
 }
 
 /// A keyed list. Items whose key survives an update keep their nodes; only new items are built.

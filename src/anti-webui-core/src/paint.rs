@@ -1,5 +1,6 @@
 //! Turns the laid-out tree into a [`Scene`].
 
+use crate::damage::primitive_bounds;
 use crate::geometry::Affine;
 use crate::geometry::{PointI, RectI};
 use crate::layout::{child_clip, mark_outer_layers_stale};
@@ -116,6 +117,61 @@ fn paint_root(
     *old_layers = painter.old_layers;
     *new_layers = painter.new_layers;
     scene
+}
+
+/// A difference too small for 8 bits looks the same, so it shouldn't cause a repaint.
+fn snapped_opacity(opacity: f32) -> f32 {
+    (opacity * 255.0).round() / 255.0
+}
+
+/// Whether what a subtree paints can overlap, so that fading each thing on its own would show one
+/// through the other. Decided from the tree alone, so that culling has no say in it.
+fn paints_overlapping(doc: &Document, id: NodeId) -> bool {
+    fn count(doc: &Document, id: NodeId, things: &mut u32) {
+        let Some(node) = doc.nodes.get(id).filter(|n| n.visible) else {
+            return;
+        };
+        let c = &node.computed;
+        match &node.kind {
+            NodeKind::Popup(_) => return,
+            // The lines and runs of a text don't overlap.
+            NodeKind::Text(_) => {
+                *things += 1;
+                return;
+            }
+            NodeKind::Edit(_) => *things += 2,
+            NodeKind::Fragment => {}
+            _ => {
+                let b = &node.resolved.border;
+                let border =
+                    (b.top | b.right | b.bottom | b.left) != 0 && !c.border_color.is_transparent();
+                *things += u32::from(!c.background.is_transparent() || border);
+                *things += c.shadows.len() as u32;
+                *things += u32::from(c.outline_width > 0.0);
+                if c.overflow_x == Overflow::Scroll || c.overflow_y == Overflow::Scroll {
+                    *things += 2;
+                }
+            }
+        }
+        for &child in &node.children {
+            if *things > 1 {
+                return;
+            }
+            count(doc, child, things);
+        }
+    }
+    let mut things = 0;
+    count(doc, id, &mut things);
+    things > 1
+}
+
+/// What a layer's content can touch. A node's bounds may be too big, which would only cost
+/// repainting pixels that stay the same.
+fn what_it_touches(content: &Scene) -> RectI {
+    content
+        .primitives
+        .iter()
+        .fold(RectI::default(), |r, p| r.union(&primitive_bounds(p)))
 }
 
 /// The nodes of the layers directly in a scene.
@@ -258,6 +314,7 @@ impl Painter<'_> {
                 nested: nested_layers(&content),
                 content: content.clone(),
                 covers,
+                touched: RectI::INFINITE,
                 transform: Affine::IDENTITY,
             },
         );
@@ -306,9 +363,9 @@ impl Painter<'_> {
         let stale = doc.stale_layers.contains(&id);
         let reused =
             old.filter(|m| self.reuse_layers && !stale && m.covers.intersect(&view) == view);
-        let (content, covers) = if let Some(m) = reused {
+        let (content, covers, touched) = if let Some(m) = reused {
             self.keep_nested(&m.nested);
-            (m.content, m.covers)
+            (m.content, m.covers, m.touched)
         } else {
             let covers = if self.cull {
                 view.outset(self.screen.width.max(self.screen.height))
@@ -317,7 +374,9 @@ impl Painter<'_> {
             };
             let outer = std::mem::take(self.scene);
             self.node_body(id, 1.0, covers);
-            (Arc::new(std::mem::replace(self.scene, outer)), covers)
+            let content = std::mem::replace(self.scene, outer);
+            let touched = what_it_touches(&content);
+            (Arc::new(content), covers, touched)
         };
         self.new_layers.insert(
             id,
@@ -325,6 +384,7 @@ impl Painter<'_> {
                 nested: nested_layers(&content),
                 content: content.clone(),
                 covers,
+                touched,
                 transform: raw,
             },
         );
@@ -334,8 +394,8 @@ impl Painter<'_> {
             clip,
             origin: PointI::default(),
             transform,
-            bounds,
-            opacity,
+            bounds: touched,
+            opacity: snapped_opacity(opacity),
             content,
         }));
     }
@@ -405,9 +465,65 @@ impl Painter<'_> {
         }
         if node.transformed {
             self.transformed_layer(id, opacity, cull);
+        } else if node.computed.opacity < 1.0 && paints_overlapping(doc, id) {
+            self.faded_layer(id, opacity, cull);
         } else {
             self.node_body(id, opacity, cull);
         }
+    }
+
+    /// Paints a node as one image, since what is in it would show through itself otherwise. It
+    /// stays in the coordinates it is in.
+    fn faded_layer(&mut self, id: NodeId, opacity: f32, cull: RectI) {
+        let doc = self.doc;
+        let node = &doc.nodes[id];
+        // What is inside keeps the clips that apply to it, rounded ones too.
+        let clip = Clip::from(node.clip);
+        let bounds = node.subtree_bounds;
+        let view = if self.cull {
+            cull.intersect(&clip.rect).intersect(&bounds)
+        } else {
+            bounds
+        };
+        let stale = doc.stale_layers.contains(&id);
+        // Layers inside can change without anything saying so to this one, which holds them.
+        let reused = self.old_layers.remove(&id).filter(|m| {
+            self.reuse_layers && !stale && m.nested.is_empty() && m.covers.intersect(&view) == view
+        });
+        let (content, covers, touched) = if let Some(m) = reused {
+            (m.content, m.covers, m.touched)
+        } else {
+            let covers = if self.cull {
+                view.outset(self.screen.width.max(self.screen.height))
+            } else {
+                RectI::INFINITE
+            };
+            let outer = std::mem::take(self.scene);
+            self.node_body(id, 1.0, covers);
+            let content = std::mem::replace(self.scene, outer);
+            let touched = what_it_touches(&content);
+            (Arc::new(content), covers, touched)
+        };
+        self.new_layers.insert(
+            id,
+            LayerMemo {
+                nested: nested_layers(&content),
+                content: content.clone(),
+                covers,
+                touched,
+                transform: Affine::IDENTITY,
+            },
+        );
+        self.chunk(id, part::LAYER);
+        self.scene.primitives.push(Primitive::Layer(Layer {
+            key: id.data().as_ffi(),
+            clip,
+            origin: PointI::default(),
+            transform: Affine::IDENTITY,
+            bounds: touched,
+            opacity: snapped_opacity(opacity),
+            content,
+        }));
     }
 
     /// What the node paints in its own coordinates. `opacity` is what to apply to it.

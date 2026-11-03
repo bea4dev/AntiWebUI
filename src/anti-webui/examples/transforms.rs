@@ -1,5 +1,5 @@
 //! Transforms and animations by hand: things that keep moving, cards that grow under the pointer,
-//! `transition` and `animated`, and transformed rows in a list, to check that clicks and scrolling
+//! `transition`, `animated`, `enter` and `exit`, and transformed rows in a list, to check that clicks and scrolling
 //! land where things are shown (see `docs/design/12-transform.md`, `docs/design/13-animation.md`).
 //!
 //! `cargo run --release -p anti-webui --example transforms`
@@ -33,7 +33,7 @@ fn card(label: &'static str) -> Div {
 fn main() {
     App::new()
         .title("transforms")
-        .size(900, 760)
+        .size(900, 880)
         .run(|| {
             let t = signal(0.0_f32);
             tick(t, None);
@@ -41,6 +41,9 @@ fn main() {
             let tween = animated(0.0_f32);
             let spring = animated(0.0_f32);
             let flip = signal(false);
+            let panel = signal(false);
+            let menu = signal(false);
+            let typed = signal(String::new());
             let wave = move |speed: f32| (t.get() * speed).sin();
             div()
                 .size_full()
@@ -118,6 +121,45 @@ fn main() {
                                         },
                                     );
                                 }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(16.0)
+                        .items_center()
+                        .child(
+                            card("enter / exit: click, again midway")
+                                .on_click(move |_| panel.update(|v| *v = !*v)),
+                        )
+                        .child(
+                            show(
+                                move || panel.get(),
+                                move || {
+                                    // Text stays while it goes and when it comes back midway.
+                                    card("in and out").child(text_input().w(160.0).value(typed))
+                                },
+                            )
+                            .enter(|s| s.opacity(0.0).translate_x(-20.0))
+                            .exit(|s| s.opacity(0.0).scale(0.9))
+                            .transition(Transition::ms(600).ease_out()),
+                        )
+                        .child(
+                            card("menu: click").on_click(move |_| menu.set(true)).child(
+                                show(
+                                    move || menu.get(),
+                                    move || {
+                                        popup().on_dismiss(move || menu.set(false)).child(
+                                            card("click to close")
+                                                .on_click(move |_| menu.set(false)),
+                                        )
+                                    },
+                                )
+                                .enter(|s| s.opacity(0.0).scale(0.9))
+                                .exit(|s| s.opacity(0.0))
+                                .transition(Transition::ms(150).ease_out()),
+                            ),
                         ),
                 )
                 .child(

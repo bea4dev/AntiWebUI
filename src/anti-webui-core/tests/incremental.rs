@@ -410,10 +410,15 @@ fn view(s: &Doc) -> impl IntoView + use<> {
                                         .child(text(format!("inner {i}")))
                                 })),
                         )
-                        .child(show(
-                            move || shown.get(),
-                            || div().h(50.0).bg(rgb(0xffeeee)).child(text("shown")),
-                        ))
+                        .child(
+                            show(
+                                move || shown.get(),
+                                || div().h(50.0).bg(rgb(0xffeeee)).child(text("shown")),
+                            )
+                            .enter(|st| st.opacity(0.0).translate_y(10.0))
+                            .exit(|st| st.opacity(0.0).scale(0.5))
+                            .transition(Transition::ms(100)),
+                        )
                         .child(
                             div()
                                 .h(40.0)

@@ -681,3 +681,86 @@ fn scroll_into_view_goes_through_nested_scrollers_on_a_popup() {
         "it stays"
     );
 }
+
+#[test]
+fn a_popup_stays_up_until_what_is_in_it_has_gone() {
+    let open = signal(true);
+    let inside = node_ref();
+    let mut ui = mount(120, move || {
+        div().w(100.0).h(50.0).child(
+            show(
+                move || open.get(),
+                move || {
+                    popup()
+                        .on_dismiss(move || open.set(false))
+                        .child(div().w(100.0).h(40.0).bg(rgb(0xff0000)).node_ref(inside))
+                },
+            )
+            .exit(|s| s.opacity(0.0))
+            .transition(Transition::ms(100).linear()),
+        )
+    });
+    let p = opened(&mut ui, (0, 50));
+    let opacity = || with_doc(|d| d.get(inside.get().unwrap()).unwrap().computed.opacity);
+
+    let start = Instant::now();
+    open.set(false);
+    ui.update();
+    let at = |ms: u64| start + std::time::Duration::from_millis(ms);
+    ui.animate(at(50));
+    ui.update();
+    assert!(
+        (opacity() - 0.5).abs() < 0.06,
+        "goes for what is in it: {}",
+        opacity()
+    );
+    assert!(closes(&ui.take_requests()).is_empty(), "its surface stays");
+    assert_eq!(ui.paint_frame(at(50)).popups.len(), 1);
+
+    let mut ms = 50;
+    while ui.animating() {
+        ms += 8;
+        ui.animate(at(ms));
+        ui.update();
+        assert!(ms < 2000);
+    }
+    assert_eq!(closes(&ui.take_requests()), [p.id]);
+}
+
+#[test]
+fn a_popup_closed_from_outside_has_no_surface_to_go_on() {
+    let open = signal(true);
+    let inside = node_ref();
+    let mut ui = mount(120, move || {
+        div().w(100.0).h(50.0).child(
+            show(
+                move || open.get(),
+                move || {
+                    popup()
+                        .on_dismiss(move || open.set(false))
+                        .child(div().w(100.0).h(40.0).node_ref(inside))
+                },
+            )
+            .exit(|s| s.opacity(0.0))
+            .transition(Transition::ms(10_000).linear()),
+        )
+    });
+    let p = opened(&mut ui, (0, 50));
+    ui.take_requests();
+    // A press outside of it, which is what the platform would dismiss it for.
+    press(&mut ui, 500.0, 300.0, true);
+    press(&mut ui, 500.0, 300.0, false);
+    assert!(!open.get_untracked());
+    let start = Instant::now() + std::time::Duration::from_millis(1);
+    ui.animate(start);
+    ui.update();
+    ui.animate(start + std::time::Duration::from_millis(8));
+    ui.update();
+    assert!(
+        inside
+            .get()
+            .is_none_or(|n| with_doc(|d| d.get(n).is_none())),
+        "doesn't wait for what can't be seen"
+    );
+    assert!(closes(&ui.take_requests()).contains(&p.id));
+}

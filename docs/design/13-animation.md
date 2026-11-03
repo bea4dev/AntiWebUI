@@ -98,6 +98,55 @@ Spring { stiffness: 170.0, damping: 26.0, mass: 1.0 }   // 既定（react-spring
 
 `request_frame` のコールバックはまとめて `batch` の中で実行する。複数の `animated` を読む `dyn_style` でも 1 フレームに 1 回しか呼ばれない。
 
+## `enter` / `exit`
+
+```rust
+show(move || open.get(), view)
+    .enter(|s| s.opacity(0.0).scale(0.95))
+    .exit(|s| s.opacity(0.0).scale(0.95))
+    .transition(Transition::ms(150).ease_out())
+```
+
+- `enter`: 作られたとき、この値から今のスタイルへ動く。
+- `exit`: `when` が偽になったとき、この値へ動き、終わったら破棄する。片方だけでもよい。
+- `transition`: 省略すると `Transition::ms(150).ease_out()`。ノード自身の `.transition` より優先するのは、出入りの間だけ。
+- `appear()`: 最初から `when` が真のときも `enter` を動かす。
+
+`enter` も `exit` も無い `show` は今までと同じ経路を通り、コストは増えない。
+
+### 振る舞い
+
+| 場面 | 振る舞い | 理由 |
+|---|---|---|
+| 最初から `when` が真 | `enter` は動かない（`appear()` で動く） | 画面を開いたときに全部が動き出さないように（Vue の `appear`、Svelte の `intro` と同じ既定） |
+| `exit` の途中で `when` が真に戻る | **同じノード**のまま戻る。入力中の文字やスクロール位置は残る | 作り直すと一瞬ちらつき、状態も失う |
+| `enter` の途中で `when` が偽になる | 今の値から `exit` へ。`exit` が `enter` と同じなら、進んだ分の時間で戻る | [途中で変わったとき](#途中で変わったとき)と同じ |
+| `exit` の途中 | ポインタは素通りする（`pointer_events: false`）。中にフォーカスがあれば外す | 消えていく閉じるボタンを押せたり、見えないものに文字が入ったりしないように |
+| `exit` の途中で親が消える | 待たずに一緒に消える | |
+| 非表示の中 | 待たずに消える | 見えない動きを待つ意味が無い |
+
+### 対象のノード
+
+`view` の一番外の箱に掛かる。フラグメントと `popup` は箱を持たないので、その子に掛かる。
+
+```rust
+show(move || open.get(), || popup().child(card()))
+    .enter(|s| s.opacity(0.0).translate_y(-4.0))
+    .exit(|s| s.opacity(0.0))
+```
+
+ポップアップのサーフェスは `exit` が終わるまで閉じない。ただし:
+
+- コンポジタが先に閉じたとき（`xdg_popup` の外をクリック）は、サーフェスが無くなるので `exit` は見えない。アプリから閉じたとき（メニューの項目を選んだときなど）は見える。
+- サーフェスは箱に合わせた大きさなので、そこからはみ出す動きは切れる。
+
+### 実装
+
+- `enter` は CSS の `@starting-style` と同じ考え方で実装する。最初のスタイル解決で「変更前のスタイル」を `今のスタイル + enter` とみなすだけで、あとは `transition` と同じ。開始の 1 フレームを待たない。
+- `exit` は `Node::presence` に持ち、`resolve_node` がホバーなどの層の上に重ねる。
+- `when` が偽になったら、対象のノードの動きが終わるのを `request_frame` で待ってから、中身の `Owner` を破棄する。破棄を遅らせるだけなので、中の `signal` や `animated` は最後まで生きている。
+- 中身の `Owner` は `show` の外側の `Owner` に属する（`for_each` と同じ）。`show` の effect が再実行されても破棄されず、親が消えれば一緒に消える。
+
 ## リアクティブの計算量
 
 アニメーションでは多くの effect が毎フレーム同時に動くので、2 つ直した。
@@ -127,9 +176,11 @@ Spring { stiffness: 170.0, damping: 26.0, mass: 1.0 }   // 既定（react-spring
 
 実機（ShojiWM、120 Hz、RTX 5070）で、`transition`、`animated`、`Spring` のカードを同時に繰り返し動かすと、4 秒で 471〜475 フレームだった。
 
+影つきのパネル（400×300、文字あり）を `enter` / `exit` で 0.4 秒ごとに開閉すると、1 フレームの CPU は中央値 0.53〜0.79 ms、GPU は 0.40〜0.61 ms だった（4 秒で 338〜341 フレーム。動いていない待ち時間は描かないので 480 より少ない）。
+
 ## やっていないこと
 
-- 要素が消えるときのアニメーション（`show(...).enter(...).exit(...)`）。次の段階。
+- `for_each` の項目の `enter` / `exit`。消える項目を並びのどこに残すかを決める必要がある。
 - キーフレーム、ループ、遅延。`animated` と `request_frame` で書ける。
 - `transition` での `Spring`。
 - `prefers-reduced-motion` に当たる設定。

@@ -248,6 +248,9 @@ pub fn resolve_styles(doc: &mut Document) {
         doc.transform_moved = true;
         mark_outer_layers_stale(doc, id);
     }
+    for id in out.faded {
+        mark_outer_layers_stale(doc, id);
+    }
     doc.dirty.content |= out.content;
     for id in out.spaces {
         // Positioning doesn't go down where nothing seems to have moved.
@@ -259,9 +262,14 @@ pub fn resolve_styles(doc: &mut Document) {
     doc.reposition.extend(out.clips);
 }
 
-/// The layers around a transformed node hold its transform in their content.
+/// The layers around a layer hold how it shows in their content.
 pub(crate) fn mark_outer_layers_stale(doc: &mut Document, id: NodeId) {
-    let mut space = doc.nodes[id].outer_space;
+    let node = &doc.nodes[id];
+    let mut space = if node.transformed {
+        node.outer_space
+    } else {
+        node.space
+    };
     while let Some(s) = space {
         let Some(n) = doc.nodes.get(s) else {
             return;
@@ -303,6 +311,8 @@ struct Resolution {
     clips: Vec<NodeId>,
     /// A transformed node stays one, and its layer may show differently.
     moved: Vec<NodeId>,
+    /// A node faded as a layer stays one, and it may show differently.
+    faded: Vec<NodeId>,
     /// What layers hold may be out of date.
     content: bool,
     /// Nodes that started or stopped being transformed.
@@ -343,7 +353,11 @@ fn resolve_node(
         // Text nodes are inline content: box properties never apply to them.
         computed.display = Display::Block;
     }
-    if !node.transitions.is_empty() || !computed.transitions.is_empty() {
+    if let Some(p) = node.presence.as_ref().filter(|p| p.exiting) {
+        p.exit.apply_to(&mut computed);
+        computed.pointer_events = false;
+    }
+    if !node.transitions.is_empty() || !computed.transitions.is_empty() || node.presence.is_some() {
         apply_transitions(doc, id, &mut computed);
     }
     let Some(node) = doc.nodes.get(id) else {
@@ -369,11 +383,18 @@ fn resolve_node(
     }
     let changed = *old != computed;
     if changed {
-        let stays_a_layer = node.transformed && computed.has_transform();
-        if stays_a_layer {
+        let transformed = node.transformed && computed.has_transform();
+        let faded = !node.transformed
+            && !computed.has_transform()
+            && old.opacity < 1.0
+            && computed.opacity < 1.0
+            && doc.layer_contents.contains_key(&id);
+        if transformed {
             out.moved.push(id);
+        } else if faded {
+            out.faded.push(id);
         }
-        if !stays_a_layer || !same_content(old, &computed) {
+        if !(transformed || faded) || !same_content(old, &computed) {
             out.content = true;
         }
         if old.has_transform() != computed.has_transform() {
@@ -407,13 +428,28 @@ fn resolve_node(
 /// transitions as what it is going to changes (see `docs/design/13-animation.md`).
 fn apply_transitions(doc: &mut Document, id: NodeId, target: &mut ComputedStyle) {
     let node = &mut doc.nodes[id];
-    let old = &node.computed;
+    // What it goes from when it comes, and how long coming and going takes.
+    let mut starting = None;
+    let mut timing_of_presence = None;
+    if let Some(p) = &mut node.presence {
+        if let Some(enter) = p.starting.take() {
+            let mut style = target.clone();
+            enter.apply_to(&mut style);
+            starting = Some(style);
+            timing_of_presence = Some(p.timing);
+        }
+        if p.exiting || std::mem::take(&mut p.returning) {
+            timing_of_presence = Some(p.timing);
+        }
+    }
+    let old = starting.as_ref().unwrap_or(&node.computed);
     // Nothing to go from: it is new, or wasn't shown.
-    let shown = node.visible && old.display != Display::None && target.display != Display::None;
+    let shown = starting.is_some()
+        || (node.visible && old.display != Display::None && target.display != Display::None);
     let now = Instant::now();
     for (i, field) in ANIMATED_FIELDS.iter().enumerate() {
-        let timing = target
-            .transition_for(field.prop)
+        let timing = timing_of_presence
+            .or_else(|| target.transition_for(field.prop))
             .filter(|t| shown && !t.duration.is_zero());
         if let Some(r) = node.transitions.iter().position(|r| r.field == i) {
             let to = (field.get)(target);

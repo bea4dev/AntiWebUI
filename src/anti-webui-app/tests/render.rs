@@ -1350,3 +1350,217 @@ fn transformed_layers_repaint_the_same_in_parts_as_at_once() {
         prev = scene;
     }
 }
+
+#[test]
+fn what_fades_does_so_as_one_image() {
+    let (w, h) = (120, 120);
+    let fades = |s: Div| {
+        s.w(100.0)
+            .h(100.0)
+            .opacity(0.5)
+            .child(div().absolute().w(100.0).h(100.0).bg(rgb(0xff0000)))
+            .child(div().absolute().w(100.0).h(100.0).bg(rgb(0xff0000)))
+    };
+    let Some(p) = render(w, h, 1.0, || {
+        div()
+            .bg(Color::WHITE)
+            .h(pct(100.0))
+            .relative()
+            .child(fades(div()))
+    }) else {
+        return;
+    };
+    // Half of red over white; the second box would make it three quarters otherwise.
+    let [r, g, b, _] = px(&p, w, 50, 50);
+    assert_eq!(r, 255);
+    assert!(
+        (g as i32 - 128).abs() <= 1 && (b as i32 - 128).abs() <= 1,
+        "{g} {b}"
+    );
+}
+
+#[test]
+fn text_on_a_faded_box_does_not_show_the_box_through_it() {
+    let (w, h) = (200, 60);
+    // Black text on a white box, on a black window.
+    let scene = |opacity: f32| {
+        move || {
+            div().bg(Color::BLACK).h(pct(100.0)).child(
+                div()
+                    .h(60.0)
+                    .bg(Color::WHITE)
+                    .text_color(Color::BLACK)
+                    .text_size(40.0)
+                    .opacity(opacity)
+                    .child(text("MMMM")),
+            )
+        }
+    };
+    let Some(faded) = render(w, h, 1.0, scene(0.5)) else {
+        return;
+    };
+    // The inside of a letter is black at half over black, so black, and not lit by the box.
+    let darkest = faded.chunks_exact(4).map(|c| c[0]).min().unwrap();
+    assert!(darkest <= 3, "{darkest}");
+    let brightest = faded.chunks_exact(4).map(|c| c[0]).max().unwrap();
+    assert!((brightest as i32 - 128).abs() <= 2, "{brightest}");
+}
+
+#[test]
+fn a_faded_layer_looks_like_the_opaque_one_faded() {
+    let (w, h) = (320, 200);
+    let card = |s: Div| {
+        s.w(160.0)
+            .h(90.0)
+            .p(8.0)
+            .rounded(12.0)
+            .border(2.0)
+            .border_color(rgb(0x3355aa))
+            .bg(rgb(0xddeeff))
+            .child(text("Hello"))
+    };
+    for scale in [1.0, 1.5] {
+        let Some(opaque) = render(w, h, scale, || {
+            div()
+                .bg(Color::WHITE)
+                .h(pct(100.0))
+                .p(10.0)
+                .child(card(div()))
+        }) else {
+            return;
+        };
+        let faded = render(w, h, scale, || {
+            div()
+                .bg(Color::WHITE)
+                .h(pct(100.0))
+                .p(10.0)
+                .child(card(div()).opacity(0.5))
+        })
+        .unwrap();
+        // Every pixel half way between white and what it was.
+        let off = opaque
+            .chunks_exact(4)
+            .zip(faded.chunks_exact(4))
+            .filter(|(a, b)| (0..3).any(|i| ((a[i] as i32 + 255) / 2 - b[i] as i32).abs() > 2))
+            .count();
+        assert_eq!(off, 0, "scale {scale}");
+    }
+}
+
+#[test]
+fn faded_layers_repaint_the_same_in_parts_as_at_once() {
+    use anti_webui_core::Ui;
+    use anti_webui_core::damage;
+    use anti_webui_core::event::{Modifiers, WindowEvent};
+    use anti_webui_core::geometry::{PointF, Scale, SizeI};
+    use anti_webui_wgpu::{Gpu, Offscreen, Renderer, wgpu};
+    use std::time::Instant;
+
+    let gpu = match Gpu::headless() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
+    let (w, h) = (360u32, 300u32);
+    let (fade, row_fade, color) = (signal(0.8_f32), signal(0.5_f32), signal(0xddeeff_u32));
+    let label = signal("fading".to_string());
+    let mut ui = Ui::new(move || {
+        div()
+            .bg(Color::WHITE)
+            .h(pct(100.0))
+            .child(
+                div()
+                    .w(200.0)
+                    .h(90.0)
+                    .rounded(10.0)
+                    .overflow_clip()
+                    .shadow_md()
+                    .dyn_style(move |s| s.opacity(fade.get()).bg(rgb(color.get())))
+                    .child(text(move || label.get()))
+                    .child(div().w(250.0).h(30.0).bg(rgb(0xff8800))),
+            )
+            .child(
+                div()
+                    .mt(20.0)
+                    .h(150.0)
+                    .overflow_scroll()
+                    .children((0..40).map(move |i| {
+                        let row = div().h(26.0).w(500.0).child(text(format!("row {i}")));
+                        if i % 3 == 0 {
+                            row.bg(rgb(0xeeffee))
+                                .dyn_style(move |s| s.opacity(row_fade.get()))
+                        } else {
+                            row
+                        }
+                    })),
+            )
+    });
+    ui.handle_event(WindowEvent::Resized {
+        size: SizeI::new(w as i32, h as i32),
+        scale: Scale::ONE,
+    });
+    ui.update();
+
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut partial_renderer = Renderer::new(&gpu.device, format);
+    let mut full_renderer = Renderer::new(&gpu.device, format);
+    let target = Offscreen::new(&gpu, format, w, h);
+    let now = Instant::now();
+    let mut prev = ui.paint(now);
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    partial_renderer.render(&gpu.device, &gpu.queue, &mut encoder, &target.view, &prev);
+    gpu.queue.submit([encoder.finish()]);
+
+    let scroll = |ui: &mut Ui, dy: f32| {
+        ui.handle_event(WindowEvent::Scroll {
+            position: PointF::new(100.0, 200.0),
+            delta_x: 0.0,
+            delta_y: dy,
+            modifiers: Modifiers::default(),
+            source: ScrollSource::Unknown,
+            phase: ScrollPhase::Single,
+            time: 0,
+        })
+    };
+    type Step = Box<dyn Fn(&mut Ui)>;
+    let steps: Vec<Step> = vec![
+        Box::new(move |_| fade.set(0.5)),
+        Box::new(move |_| color.set(0xffeedd)),
+        Box::new(move |_| label.set("changed".to_string())),
+        Box::new(move |_| row_fade.set(0.2)),
+        Box::new(move |ui| scroll(ui, 37.0)),
+        Box::new(move |_| row_fade.set(0.9)),
+        Box::new(move |ui| scroll(ui, 200.0)),
+        Box::new(move |_| fade.set(1.0)),
+        Box::new(move |_| fade.set(0.3)),
+        Box::new(move |ui| scroll(ui, -120.0)),
+        Box::new(move |_| row_fade.set(1.0)),
+    ];
+    for (i, step) in steps.iter().enumerate() {
+        step(&mut ui);
+        ui.update();
+        let scene = ui.paint(now);
+        let d = damage::diff(&prev, &scene);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        partial_renderer.render_damaged(
+            &gpu.device,
+            &gpu.queue,
+            &mut encoder,
+            &target.view,
+            &scene,
+            &d,
+        );
+        gpu.queue.submit([encoder.finish()]);
+        let partial = target.read_rgba(&gpu);
+        full_renderer.clear_layer_caches();
+        let full = gpu.render_to_rgba(&mut full_renderer, &scene);
+        let differing = different_pixels(&partial, &full, 0);
+        assert_eq!(
+            differing, 0,
+            "step {i}: {differing} pixels differ (damage {d:?})"
+        );
+        prev = scene;
+    }
+}

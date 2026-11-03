@@ -4,7 +4,7 @@
 
 use crate::reactive::{Signal, batch, signal};
 use crate::tree::Document;
-use anti_webui_style::{AnimatedValue, Color, Transition};
+use anti_webui_style::{AnimatedValue, Color, Style, Transition};
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,18 @@ pub(crate) fn run_frame_callbacks(now: Instant) {
             f(now);
         }
     });
+}
+
+/// How a node comes and goes as part of a `show`.
+pub(crate) struct Presence {
+    /// What the first resolution of its style goes from.
+    pub starting: Option<Style>,
+    /// What it goes to before it is removed.
+    pub exit: Style,
+    pub exiting: bool,
+    /// `exiting` just ended: what it does now still counts as part of the exit.
+    pub returning: bool,
+    pub timing: Transition,
 }
 
 /// A transition going on in a node.

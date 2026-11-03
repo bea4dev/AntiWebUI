@@ -225,12 +225,12 @@ impl Layer {
         }
     }
 
-    /// Whether everything that decides where and how the content shows is the same.
+    /// Whether everything that decides where and how the content shows is the same. `bounds` only
+    /// says what the content can touch: it may be too big, and changes without pixels changing.
     pub fn same_placement(&self, other: &Layer) -> bool {
         self.clip == other.clip
             && self.origin == other.origin
             && self.transform == other.transform
-            && self.bounds == other.bounds
             && self.opacity == other.opacity
     }
 }
