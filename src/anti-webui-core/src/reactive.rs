@@ -10,7 +10,8 @@
 use slotmap::{SlotMap, new_key_type};
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
@@ -44,6 +45,9 @@ struct Node {
     value: Value,
     compute: Option<Compute>,
     sources: Vec<ReactiveId>,
+    /// While it runs: how many of `sources` it has read so far. Those after are stale unless read
+    /// again.
+    read: usize,
     observers: Vec<ReactiveId>,
     owner: Option<ReactiveId>,
     owned: Vec<ReactiveId>,
@@ -57,7 +61,10 @@ struct Runtime {
     observer: Option<ReactiveId>,
     owner: Option<ReactiveId>,
     batch_depth: u32,
-    pending: VecDeque<ReactiveId>,
+    /// Effects to run: the shallowest first, since re-running a parent disposes its children, and
+    /// in the order they were marked among equals.
+    pending: BinaryHeap<Reverse<(u32, u64, ReactiveId)>>,
+    marked: u64,
     flushing: bool,
 }
 
@@ -92,6 +99,7 @@ impl Runtime {
             value: Rc::new(RefCell::new(value)),
             compute,
             sources: Vec::new(),
+            read: 0,
             observers: Vec::new(),
             owner,
             owned: Vec::new(),
@@ -116,12 +124,26 @@ impl Runtime {
         if observer == source || !self.nodes.contains_key(observer) {
             return;
         }
+        // An effect mostly reads what it read last time, in the same order: nothing to change then.
         let obs = &mut self.nodes[observer];
-        if !obs.sources.contains(&source) {
-            obs.sources.push(source);
-            if let Some(src) = self.nodes.get_mut(source) {
-                src.observers.push(observer);
-            }
+        let read = obs.read;
+        if obs.sources.get(read) == Some(&source) {
+            obs.read += 1;
+            return;
+        }
+        if obs.sources[..read].contains(&source) {
+            return;
+        }
+        obs.read += 1;
+        if let Some(i) = obs.sources[read..].iter().position(|s| *s == source) {
+            obs.sources.swap(read, read + i);
+            return;
+        }
+        obs.sources.push(source);
+        let last = obs.sources.len() - 1;
+        obs.sources.swap(read, last);
+        if let Some(src) = self.nodes.get_mut(source) {
+            src.observers.push(observer);
         }
     }
 
@@ -139,7 +161,9 @@ impl Runtime {
                 let was_clean = node.state == State::Clean;
                 node.state = state;
                 if node.kind == Kind::Effect {
-                    self.pending.push_back(o);
+                    let depth = node.depth;
+                    self.marked += 1;
+                    self.pending.push(Reverse((depth, self.marked, o)));
                 }
                 if was_clean {
                     self.mark_observers(o, State::Check);
@@ -149,8 +173,19 @@ impl Runtime {
     }
 
     fn unlink_sources(&mut self, id: ReactiveId) {
-        let sources = std::mem::take(&mut self.nodes[id].sources);
-        for s in sources {
+        self.nodes[id].read = 0;
+        self.unlink_unread_sources(id);
+    }
+
+    /// Forgets the sources that the computation didn't read in its last run.
+    fn unlink_unread_sources(&mut self, id: ReactiveId) {
+        let node = &mut self.nodes[id];
+        let read = node.read;
+        if read == node.sources.len() {
+            return;
+        }
+        let stale = node.sources.split_off(read);
+        for s in stale {
             if let Some(src) = self.nodes.get_mut(s) {
                 src.observers.retain(|o| *o != id);
             }
@@ -213,11 +248,8 @@ fn run(id: ReactiveId) {
         cleanup();
     }
     let prepared = with_rt(|rt| {
-        if !rt.nodes.contains_key(id) {
-            return None;
-        }
-        rt.unlink_sources(id);
-        let node = &rt.nodes[id];
+        let node = rt.nodes.get_mut(id)?;
+        node.read = 0;
         let compute = node.compute.clone()?;
         let value = node.value.clone();
         let prev = (rt.observer.replace(id), rt.owner.replace(id));
@@ -232,9 +264,11 @@ fn run(id: ReactiveId) {
     with_rt(|rt| {
         rt.observer = prev_observer;
         rt.owner = prev_owner;
-        let Some(node) = rt.nodes.get_mut(id) else {
+        if !rt.nodes.contains_key(id) {
             return;
-        };
+        }
+        rt.unlink_unread_sources(id);
+        let node = &mut rt.nodes[id];
         node.state = State::Clean;
         if changed && node.kind == Kind::Memo {
             let observers = node.observers.clone();
@@ -290,15 +324,13 @@ fn flush() {
     with_rt(|rt| rt.flushing = true);
     let mut iterations = 0usize;
     loop {
-        // Run shallower effects first: re-running a parent disposes its children anyway.
         let next = with_rt(|rt| {
-            let (idx, _) = rt
-                .pending
-                .iter()
-                .enumerate()
-                .filter_map(|(i, id)| rt.nodes.get(*id).map(|n| (i, n.depth)))
-                .min_by_key(|(_, d)| *d)?;
-            rt.pending.remove(idx)
+            while let Some(Reverse((_, _, id))) = rt.pending.pop() {
+                if rt.nodes.contains_key(id) {
+                    return Some(id);
+                }
+            }
+            None
         });
         let Some(id) = next else { break };
         iterations += 1;
@@ -675,6 +707,113 @@ mod tests {
             inner.set(1);
             // Only the live inner effect re-runs.
             assert_eq!(inner_runs.get(), 3);
+        });
+        owner.dispose();
+    }
+
+    #[test]
+    fn a_source_read_no_more_is_forgotten_and_one_read_again_is_not_doubled() {
+        let (_, owner) = create_root(|| {
+            let step = signal(0);
+            let (a, b, c) = (signal(0), signal(0), signal(0));
+            let runs = Rc::new(Cell::new(0));
+            let r = runs.clone();
+            effect(move || {
+                r.set(r.get() + 1);
+                // Different sources, in a different order, some of them twice.
+                match step.get() {
+                    0 => {
+                        a.get();
+                        b.get();
+                        c.get();
+                    }
+                    1 => {
+                        c.get();
+                        a.get();
+                        c.get();
+                    }
+                    2 => {
+                        b.get();
+                    }
+                    _ => {}
+                }
+            });
+            let writes = |expected: [bool; 3]| {
+                for (s, expected) in [a, b, c].iter().zip(expected) {
+                    let before = runs.get();
+                    s.update(|v| *v += 1);
+                    assert_eq!(runs.get() - before, expected as i32);
+                }
+            };
+            writes([true, true, true]);
+            step.set(1);
+            writes([true, false, true]);
+            step.set(2);
+            writes([false, true, false]);
+            step.set(3);
+            writes([false, false, false]);
+            step.set(0);
+            writes([true, true, true]);
+        });
+        owner.dispose();
+    }
+
+    #[test]
+    fn a_source_read_twice_observes_once() {
+        let (_, owner) = create_root(|| {
+            let x = signal(0);
+            effect(move || {
+                x.get();
+                x.get();
+            });
+            x.set(1);
+            x.set(2);
+            assert_eq!(with_rt(|rt| rt.nodes[x.id].observers.len()), 1);
+        });
+        owner.dispose();
+    }
+
+    #[test]
+    fn a_parent_runs_before_the_child_it_replaces() {
+        let (_, owner) = create_root(|| {
+            let x = signal(0);
+            let runs = Rc::new(Cell::new(0));
+            let r = runs.clone();
+            effect(move || {
+                let r = r.clone();
+                // The child gets to read it first, so comes first among equals.
+                effect(move || {
+                    x.get();
+                    r.set(r.get() + 1);
+                });
+                x.get();
+            });
+            assert_eq!(runs.get(), 1);
+            x.set(1);
+            assert_eq!(
+                runs.get(),
+                2,
+                "the old child must not run just before it goes"
+            );
+        });
+        owner.dispose();
+    }
+
+    #[test]
+    fn shallower_effects_run_first_and_equals_in_order() {
+        let (_, owner) = create_root(|| {
+            let x = signal(0);
+            let order = Rc::new(RefCell::new(Vec::new()));
+            for name in ["first", "second"] {
+                let order = order.clone();
+                effect(move || {
+                    x.get();
+                    order.borrow_mut().push(name);
+                });
+            }
+            order.borrow_mut().clear();
+            x.set(1);
+            assert_eq!(*order.borrow(), ["first", "second"]);
         });
         owner.dispose();
     }

@@ -106,6 +106,18 @@ define_style! {
     background: Color = Color::TRANSPARENT, local;
     shadows: Vec<BoxShadow> = Vec::new(), local;
     opacity: f32 = 1.0, local;
+    /// Logical pixels. Moves what is painted without affecting layout, like the other transforms.
+    translate_x: f32 = 0.0, local;
+    translate_y: f32 = 0.0, local;
+    scale_x: f32 = 1.0, local;
+    scale_y: f32 = 1.0, local;
+    /// Degrees, clockwise.
+    rotate: f32 = 0.0, local;
+    /// What the transforms keep in place, as a fraction of the border box.
+    transform_origin_x: f32 = 0.5, local;
+    transform_origin_y: f32 = 0.5, local;
+    /// How changes go: for one property, or for all that aren't named later in the list.
+    transitions: Vec<(Option<Prop>, Transition)> = Vec::new(), local;
     /// `None` means `auto`. Anything else creates a stacking context.
     z_index: Option<i32> = None, local;
     overflow_x: Overflow = Overflow::Visible, local;
@@ -132,6 +144,15 @@ define_style! {
 }
 
 impl ComputedStyle {
+    /// Whether the node is painted through a transform. See `docs/design/12-transform.md`.
+    pub fn has_transform(&self) -> bool {
+        self.translate_x != 0.0
+            || self.translate_y != 0.0
+            || self.scale_x != 1.0
+            || self.scale_y != 1.0
+            || self.rotate != 0.0
+    }
+
     pub fn margin(&self) -> Edges<Length> {
         Edges {
             top: self.margin_top,

@@ -19,6 +19,8 @@
 - [x] 慣性スクロールと全体設定（[08](08-scrolling-and-settings.md)）
 - [x] CSS と同じ影（外側・内側）、`z_index`、ポップアップ、プルダウンリスト（[09](09-shadows-stacking-popups.md)）
 - [x] フレームの先行（Auto / Enable / Disable / Custom）、フレーム計測、`request_frame`（[10](10-frame-pacing.md)）
+- [x] `translate` / `scale` / `rotate` と合成レイヤー（[12](12-transform.md)）
+- [x] `transition`、`animated`、`Spring`（[13](13-animation.md)）
 
 ### M1 の既知の制限
 
@@ -26,7 +28,7 @@
 - フレームの先行は、コンポジタが AMD で動く構成で NVIDIA dGPU も有効なときを未確認
 - 選択ドラッグがウィンドウ端に達したときの自動スクロールは未実装
 - パスワード入力のマスク表示は未実装（`ImePurpose::Password` は IME へのヒントのみ）
-- `opacity` は子孫の色に乗算する近似（グループ不透明度ではない）
+- `opacity` は子孫の色に乗算する近似（グループ不透明度ではない）。`transform` のあるノードだけはグループ不透明度になる（[12](12-transform.md)）
 - サーバ側装飾が無いコンポジタではタイトルバーが出ない（CSD は M2）
 
 ## M2: 実用性

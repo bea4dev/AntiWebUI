@@ -103,29 +103,25 @@ pub fn hit_text_point(doc: &Document, p: PointF) -> Option<TextPoint> {
         None => (doc.root?, PointI::default()),
     };
     nearest_text(doc, root, offset, RectI::INFINITE, p, &mut best);
-    let (_, id, vis): ((f32, f32), NodeId, RectI) = best?;
+    let (_, id, at): ((f32, f32), NodeId, PointF) = best?;
     let n = &doc.nodes[id];
     let NodeKind::Text(t) = &n.kind else {
         return None;
     };
-    let q = vis.clamp_point(p);
-    let o = doc.space_offset(n);
-    let (offset, _) = t
-        .layout
-        .hit(q.x - (n.abs.x + o.x) as f32, q.y - (n.abs.y + o.y) as f32);
+    let (offset, _) = t.layout.hit(at.x, at.y);
     Some(TextPoint { node: id, offset })
 }
 
 /// Looks through the selectable text that isn't clipped away, in document order. `offset` takes
 /// the node's coordinates to window coordinates, and `view` is the window rectangle left by the
-/// scroll root it is in.
+/// scroll root it is in. What is found comes with the closest point relative to the text.
 fn nearest_text(
     doc: &Document,
     id: NodeId,
     offset: PointI,
     view: RectI,
     p: PointF,
-    best: &mut Option<((f32, f32), NodeId, RectI)>,
+    best: &mut Option<((f32, f32), NodeId, PointF)>,
 ) {
     let Some(n) = doc.nodes.get(id) else {
         return;
@@ -133,18 +129,33 @@ fn nearest_text(
     if !n.visible {
         return;
     }
+    // `offset` and `view` say nothing about a transformed space.
+    let transformed = n.space.is_some_and(|s| doc.nodes[s].transformed);
     if n.is_text() && n.computed.user_select == UserSelect::Text {
-        let clip = n.clip_shape().translated(offset.x, offset.y).rect;
-        let vis = n
-            .abs
-            .translate(offset.x, offset.y)
-            .intersect(&clip)
-            .intersect(&view);
+        let vis = if transformed {
+            doc.visible_window_rect(id).unwrap_or_default()
+        } else {
+            let clip = n.clip_shape().translated(offset.x, offset.y).rect;
+            n.abs
+                .translate(offset.x, offset.y)
+                .intersect(&clip)
+                .intersect(&view)
+        };
         if !vis.is_empty() {
             let (dx, dy) = vis.axis_distance(p);
             let key = (dy, dx);
             if best.as_ref().is_none_or(|(k, _, _)| key < *k) {
-                *best = Some((key, id, vis));
+                let q = vis.clamp_point(p);
+                let at = if transformed {
+                    let q = doc.from_window(n, q).unwrap_or(q);
+                    PointF::new(q.x - n.abs.x as f32, q.y - n.abs.y as f32)
+                } else {
+                    PointF::new(
+                        q.x - (n.abs.x + offset.x) as f32,
+                        q.y - (n.abs.y + offset.y) as f32,
+                    )
+                };
+                *best = Some((key, id, at));
             }
         }
     }
@@ -161,10 +172,10 @@ fn nearest_text(
         (offset, view)
     };
     for (i, &c) in n.children.iter().enumerate() {
-        let touches = n
-            .child_bounds
-            .get(i)
-            .is_none_or(|b| b.translate(offset.x, offset.y).intersects(&view));
+        let touches = transformed
+            || n.child_bounds
+                .get(i)
+                .is_none_or(|b| b.translate(offset.x, offset.y).intersects(&view));
         if touches {
             nearest_text(doc, c, offset, view, p, best);
         }
@@ -183,8 +194,8 @@ fn unit_at(
     };
     let vis = doc.visible_window_rect(p.node).unwrap_or_default();
     let q = vis.clamp_point(at);
-    let o = doc.space_offset(n);
-    let (x, y) = (q.x - (n.abs.x + o.x) as f32, q.y - (n.abs.y + o.y) as f32);
+    let q = doc.from_window(n, q).unwrap_or(q);
+    let (x, y) = (q.x - n.abs.x as f32, q.y - n.abs.y as f32);
     let (a, b) = match granularity {
         Granularity::Char => (p.offset, p.offset),
         Granularity::Word => t.layout.word_at(x, y),

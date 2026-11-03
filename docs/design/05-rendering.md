@@ -83,7 +83,7 @@ wgpu の Surface は buffer age も変更範囲の通知も公開していない
 
 ### Scene の構造
 
-- `overflow: scroll` で実際にはみ出している要素のうち、最も外側のものを `Primitive::Layer(ScrollLayer)` にする。
+- `overflow: scroll` で実際にはみ出している要素のうち、最も外側のものを `Primitive::Layer(Layer)` にする。`transform` も同じ仕組みを使う（[12](12-transform.md)）。
   - `content: Arc<Scene>`: スクロール内容の描画リスト。座標は**コンテンツ座標**（スクロール量に依存しない）で、クリップもレイヤー自身と祖先のものを含まない。
   - `origin`: コンテンツ座標の原点のウィンドウ上の位置。スクロールで変わるのはここだけ。
   - `clip`: レイヤーを表示する範囲（ウィンドウ座標、角丸あり）。

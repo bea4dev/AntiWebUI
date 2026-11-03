@@ -111,14 +111,18 @@ impl GlyphCache {
         Some((0, y))
     }
 
-    /// Places every glyph of a run, rasterizing missing ones. Returns `None` if the atlas is full.
-    pub fn place_run(&mut self, run: &GlyphRun, out: &mut Vec<PlacedGlyph>) -> Option<()> {
+    /// Places every glyph of a run drawn `k` times bigger, rasterizing missing ones. Returns `None`
+    /// if the atlas is full.
+    pub fn place_run(&mut self, run: &GlyphRun, k: i32, out: &mut Vec<PlacedGlyph>) -> Option<()> {
         let font_id = run.font.data.id();
-        let size_key = (run.size * 64.0).round() as u32;
+        let k = k as f32;
+        let size = run.size * k;
+        let size_key = (size * 64.0).round() as u32;
         let skew = run.skew.map(|s| (s * 100.0).round() as i32);
         for g in &run.glyphs {
-            let fx = g.x.floor();
-            let mut sub = ((g.x - fx) * SUBPIXEL_STEPS).round();
+            let (gx, gy) = (g.x * k, g.y * k);
+            let fx = gx.floor();
+            let mut sub = ((gx - fx) * SUBPIXEL_STEPS).round();
             let mut base_x = fx;
             if sub >= SUBPIXEL_STEPS {
                 sub = 0.0;
@@ -137,7 +141,7 @@ impl GlyphCache {
             let entry = match self.entries.get(&key) {
                 Some(e) => *e,
                 None => {
-                    let e = self.rasterize(run, g.id, sub / SUBPIXEL_STEPS)?;
+                    let e = self.rasterize(run, size, g.id, sub / SUBPIXEL_STEPS)?;
                     self.entries.insert(key, e);
                     e
                 }
@@ -147,7 +151,7 @@ impl GlyphCache {
             out.push(PlacedGlyph {
                 rect: [
                     base_x + e.left as f32,
-                    g.y.round() - e.top as f32,
+                    gy.round() - e.top as f32,
                     e.width as f32,
                     e.height as f32,
                 ],
@@ -167,6 +171,7 @@ impl GlyphCache {
     fn rasterize(
         &mut self,
         run: &GlyphRun,
+        size: f32,
         glyph: u32,
         offset_x: f32,
     ) -> Option<Option<AtlasGlyph>> {
@@ -177,7 +182,7 @@ impl GlyphCache {
         let mut scaler = self
             .scale
             .builder(font)
-            .size(run.size)
+            .size(size)
             .hint(false)
             .normalized_coords(run.normalized_coords.iter().copied())
             .build();
@@ -191,7 +196,7 @@ impl GlyphCache {
             .format(Format::Alpha)
             .offset(Vector::new(offset_x, 0.0));
         if run.embolden {
-            render.embolden(run.size / 24.0);
+            render.embolden(size / 24.0);
         }
         if let Some(skew) = run.skew {
             render.transform(Some(Transform::skew(

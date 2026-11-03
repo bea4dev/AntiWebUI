@@ -154,7 +154,7 @@ fn scroll(ui: &mut Ui, p: PointF, dx: f32, dy: f32) {
     ui.update();
 }
 
-fn layer_of(scene: &anti_webui_core::scene::Scene) -> &anti_webui_core::scene::ScrollLayer {
+fn layer_of(scene: &anti_webui_core::scene::Scene) -> &anti_webui_core::scene::Layer {
     scene
         .primitives
         .iter()

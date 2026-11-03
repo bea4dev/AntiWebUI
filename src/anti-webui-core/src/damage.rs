@@ -1,7 +1,7 @@
 //! Damage tracking: which pixels differ between two frames (see `docs/design/05-rendering.md`).
 
 use crate::geometry::RectI;
-use crate::scene::{ChunkKey, GlyphRun, Primitive, Scene, ScrollLayer};
+use crate::scene::{ChunkKey, GlyphRun, Layer, Primitive, Scene};
 use parley::FontData;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -212,16 +212,15 @@ fn diff_runs(old: &[Primitive], new: &[Primitive], damage: &mut Damage) {
     }
 }
 
-fn diff_layers(old: &ScrollLayer, new: &ScrollLayer, damage: &mut Damage) {
-    if old.clip != new.clip || old.origin != new.origin {
+fn diff_layers(old: &Layer, new: &Layer, damage: &mut Damage) {
+    if !old.same_placement(new) {
         // Everything in it moved on screen.
-        damage.add(old.clip.rect);
-        damage.add(new.clip.rect);
+        damage.add(old.bounds_on_parent());
+        damage.add(new.bounds_on_parent());
     } else if !Arc::ptr_eq(&old.content, &new.content) {
         let changed = diff_content(&old.content, &new.content);
         for r in changed.rects() {
-            let r = r.translate(new.origin.x, new.origin.y);
-            damage.add(r.intersect(&new.clip.rect));
+            damage.add(new.parent_rect(*r).intersect(&new.clip.rect));
         }
     }
 }
@@ -240,7 +239,7 @@ pub fn primitive_bounds(p: &Primitive) -> RectI {
         Primitive::Quad(q) => q.rect.intersect(&q.clip.rect),
         Primitive::Shadow(s) => s.bounds().intersect(&s.clip.rect),
         Primitive::Glyphs(run) => glyph_run_bounds(run).intersect(&run.clip.rect),
-        Primitive::Layer(l) => l.clip.rect,
+        Primitive::Layer(l) => l.bounds_on_parent(),
     }
 }
 

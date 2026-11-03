@@ -1038,3 +1038,315 @@ fn a_change_too_small_for_8_bits_paints_the_same() {
     let changed = ui.paint(Instant::now());
     assert!(!damage::diff(&same, &changed).is_empty());
 }
+
+/// Pixels that differ by more than rounding can explain.
+fn different_pixels(a: &[u8], b: &[u8], tolerance: i32) -> usize {
+    a.chunks_exact(4)
+        .zip(b.chunks_exact(4))
+        .filter(|(a, b)| {
+            a.iter()
+                .zip(b.iter())
+                .any(|(a, b)| (*a as i32 - *b as i32).abs() > tolerance)
+        })
+        .count()
+}
+
+#[test]
+fn moving_by_whole_pixels_looks_the_same_as_being_there() {
+    let card = |s: Div| {
+        s.w(160.0)
+            .h(90.0)
+            .p(8.0)
+            .rounded(12.0)
+            .border(2.0)
+            .border_color(rgb(0x3355aa))
+            .bg(rgb(0xddeeff))
+            .shadow_md()
+            .child(text("Hello transform"))
+    };
+    let (w, h) = (320, 200);
+    for scale in [1.0, 1.5, 2.0] {
+        let Some(there) = render(w, h, scale, || {
+            div()
+                .bg(Color::WHITE)
+                .h(pct(100.0))
+                .child(card(div().ml(20.0).mt(30.0)))
+        }) else {
+            return;
+        };
+        let moved = render(w, h, scale, || {
+            div()
+                .bg(Color::WHITE)
+                .h(pct(100.0))
+                .child(card(div()).translate(20.0, 30.0))
+        })
+        .unwrap();
+        // Drawing on transparent and then compositing rounds differently (see the scroll layers).
+        assert_eq!(different_pixels(&there, &moved, 2), 0, "scale {scale}");
+    }
+}
+
+#[test]
+fn a_layer_fades_as_one_image() {
+    let (w, h) = (100, 100);
+    let overlapping = |s: Div| {
+        s.w(60.0)
+            .h(60.0)
+            .opacity(0.5)
+            .child(div().absolute().w(60.0).h(60.0).bg(rgb(0xff0000)))
+            .child(div().absolute().w(60.0).h(60.0).bg(rgb(0xff0000)))
+    };
+    let Some(transformed) = render(w, h, 1.0, || {
+        div()
+            .bg(Color::WHITE)
+            .h(pct(100.0))
+            .child(overlapping(div()).translate(10.0, 10.0))
+    }) else {
+        return;
+    };
+    let [r, g, b, _] = px(&transformed, w, 40, 40);
+    assert_eq!(r, 255);
+    assert!(
+        (g as i32 - 128).abs() <= 1 && (b as i32 - 128).abs() <= 1,
+        "{g} {b}"
+    );
+}
+
+#[test]
+fn scaling_up_draws_again_at_that_size() {
+    let (w, h) = (200, 200);
+    let Some(p) = render(w, h, 1.0, || {
+        div().bg(Color::WHITE).h(pct(100.0)).child(
+            div()
+                .w(20.0)
+                .h(20.0)
+                .bg(rgb(0xff0000))
+                .scale(3.0)
+                .transform_origin(0.0, 0.0),
+        )
+    }) else {
+        return;
+    };
+    // The edge is one sharp step, not three pixels of filtering.
+    assert_eq!(px(&p, w, 59, 30), [255, 0, 0, 255]);
+    assert_eq!(px(&p, w, 60, 30), [255, 255, 255, 255]);
+    assert_eq!(px(&p, w, 30, 59), [255, 0, 0, 255]);
+    assert_eq!(px(&p, w, 30, 60), [255, 255, 255, 255]);
+}
+
+#[test]
+fn text_scaled_up_is_as_sharp_as_bigger_text() {
+    let (w, h) = (300, 100);
+    let Some(scaled) = render(w, h, 1.0, || {
+        div().bg(Color::WHITE).h(pct(100.0)).child(
+            div()
+                .scale(2.0)
+                .transform_origin(0.0, 0.0)
+                .text_size(14.0)
+                .line_height(LineHeight::Px(20.0))
+                .child(text("Hamburgefonstiv")),
+        )
+    }) else {
+        return;
+    };
+    let bigger = render(w, h, 1.0, || {
+        div().bg(Color::WHITE).h(pct(100.0)).child(
+            div()
+                .text_size(28.0)
+                .line_height(LineHeight::Px(40.0))
+                .child(text("Hamburgefonstiv")),
+        )
+    })
+    .unwrap();
+    let differing = different_pixels(&scaled, &bigger, 40);
+    assert!(differing < 300, "{differing} pixels differ a lot");
+}
+
+#[test]
+fn rotating_keeps_the_box_whole_with_soft_edges() {
+    let (w, h) = (200, 200);
+    let Some(p) = render(w, h, 1.0, || {
+        div()
+            .bg(Color::WHITE)
+            .h(pct(100.0))
+            .p(50.0)
+            .child(div().w(100.0).h(100.0).bg(rgb(0x0000ff)).rotate(45.0))
+    }) else {
+        return;
+    };
+    // A diamond around the center, reaching 70 pixels out along the axes.
+    assert_eq!(px(&p, w, 100, 100), [0, 0, 255, 255]);
+    assert_eq!(px(&p, w, 100, 35), [0, 0, 255, 255]);
+    assert_eq!(px(&p, w, 165, 100), [0, 0, 255, 255]);
+    assert_eq!(px(&p, w, 100, 25), [255, 255, 255, 255]);
+    assert_eq!(
+        px(&p, w, 55, 55),
+        [255, 255, 255, 255],
+        "the old corner is empty"
+    );
+    // Going across an edge passes through something in between.
+    let across: Vec<u8> = (20..40).map(|x| px(&p, w, x, 100)[0]).collect();
+    assert!(
+        across.iter().any(|r| *r > 20 && *r < 235),
+        "no soft edge: {across:?}"
+    );
+}
+
+#[test]
+fn a_rounded_clip_around_a_layer_applies_to_it() {
+    let (w, h) = (200, 200);
+    let Some(p) = render(w, h, 1.0, || {
+        div().bg(Color::WHITE).h(pct(100.0)).p(20.0).child(
+            div()
+                .w(120.0)
+                .h(120.0)
+                .rounded(30.0)
+                .overflow_clip()
+                .child(div().w(120.0).h(120.0).bg(rgb(0xff0000)).translate_y(10.0)),
+        )
+    }) else {
+        return;
+    };
+    assert_eq!(px(&p, w, 80, 80), [255, 0, 0, 255]);
+    // Its own top edge moved down, its corner would be square.
+    assert_eq!(px(&p, w, 80, 25), [255, 255, 255, 255]);
+    assert_eq!(
+        px(&p, w, 22, 137),
+        [255, 255, 255, 255],
+        "out of the rounded corner"
+    );
+    assert_eq!(px(&p, w, 80, 139), [255, 0, 0, 255]);
+    assert_eq!(px(&p, w, 80, 140), [255, 255, 255, 255]);
+}
+
+/// The texture wraps around as a layer scrolls; a transform inside must still show right.
+#[test]
+fn transformed_layers_repaint_the_same_in_parts_as_at_once() {
+    use anti_webui_core::Ui;
+    use anti_webui_core::damage;
+    use anti_webui_core::event::{Modifiers, WindowEvent};
+    use anti_webui_core::geometry::{PointF, Scale, SizeI};
+    use anti_webui_wgpu::{Gpu, Offscreen, Renderer, wgpu};
+    use std::time::Instant;
+
+    let gpu = match Gpu::headless() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
+    let (w, h) = (360u32, 300u32);
+    let (dx, spin, color) = (signal(4.0_f32), signal(0.0_f32), signal(0xddeeff_u32));
+    let inner_dy = signal(0.0_f32);
+    let label = signal("in a layer".to_string());
+    let mut ui = Ui::new(move || {
+        div()
+            .bg(Color::WHITE)
+            .h(pct(100.0))
+            .child(
+                div()
+                    .w(150.0)
+                    .h(100.0)
+                    .rounded(8.0)
+                    .shadow_md()
+                    .dyn_style(move |s| {
+                        s.translate_x(dx.get())
+                            .translate_y(10.0)
+                            .rotate(spin.get())
+                            .bg(rgb(color.get()))
+                    })
+                    .child(text(move || label.get()))
+                    .child(
+                        div()
+                            .w(30.0)
+                            .h(30.0)
+                            .bg(rgb(0xff8800))
+                            .dyn_style(move |s| s.translate_y(inner_dy.get())),
+                    ),
+            )
+            .child(
+                div()
+                    .mt(30.0)
+                    .h(140.0)
+                    .overflow_scroll()
+                    .children((0..40).map(move |i| {
+                        let row = div().h(26.0).w(500.0).child(text(format!("row {i}")));
+                        if i % 4 == 0 {
+                            row.bg(rgb(0xeeffee))
+                                .dyn_style(move |s| s.translate_x(dx.get() * 3.0))
+                        } else {
+                            row
+                        }
+                    })),
+            )
+    });
+    ui.handle_event(WindowEvent::Resized {
+        size: SizeI::new(w as i32, h as i32),
+        scale: Scale::ONE,
+    });
+    ui.update();
+
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut partial_renderer = Renderer::new(&gpu.device, format);
+    let mut full_renderer = Renderer::new(&gpu.device, format);
+    let target = Offscreen::new(&gpu, format, w, h);
+    let now = Instant::now();
+    let mut prev = ui.paint(now);
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    partial_renderer.render(&gpu.device, &gpu.queue, &mut encoder, &target.view, &prev);
+    gpu.queue.submit([encoder.finish()]);
+
+    let scroll = |ui: &mut Ui, dy: f32| {
+        ui.handle_event(WindowEvent::Scroll {
+            position: PointF::new(100.0, 220.0),
+            delta_x: 0.0,
+            delta_y: dy,
+            modifiers: Modifiers::default(),
+            source: ScrollSource::Unknown,
+            phase: ScrollPhase::Single,
+            time: 0,
+        })
+    };
+    type Step = Box<dyn Fn(&mut Ui)>;
+    let steps: Vec<Step> = vec![
+        Box::new(move |_| dx.set(40.0)),
+        Box::new(move |_| dx.set(55.0)),
+        Box::new(move |_| color.set(0xffeedd)),
+        Box::new(move |ui| scroll(ui, 37.0)),
+        Box::new(move |_| dx.set(30.0)),
+        Box::new(move |ui| scroll(ui, 200.0)),
+        Box::new(move |_| label.set("changed".to_string())),
+        Box::new(move |_| inner_dy.set(12.0)),
+        Box::new(move |_| spin.set(30.0)),
+        Box::new(move |_| spin.set(50.0)),
+        Box::new(move |_| color.set(0xeeeeee)),
+        Box::new(move |_| inner_dy.set(25.0)),
+        Box::new(move |ui| scroll(ui, -120.0)),
+    ];
+    for (i, step) in steps.iter().enumerate() {
+        step(&mut ui);
+        ui.update();
+        let scene = ui.paint(now);
+        let d = damage::diff(&prev, &scene);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        partial_renderer.render_damaged(
+            &gpu.device,
+            &gpu.queue,
+            &mut encoder,
+            &target.view,
+            &scene,
+            &d,
+        );
+        gpu.queue.submit([encoder.finish()]);
+        let partial = target.read_rgba(&gpu);
+        full_renderer.clear_layer_caches();
+        let full = gpu.render_to_rgba(&mut full_renderer, &scene);
+        let differing = different_pixels(&partial, &full, 0);
+        assert_eq!(
+            differing, 0,
+            "step {i}: {differing} pixels differ (damage {d:?})"
+        );
+        prev = scene;
+    }
+}

@@ -101,6 +101,148 @@ impl SizeI {
     }
 }
 
+/// A 2D affine transform in physical pixels: `x' = a x + c y + e`, `y' = b x + d y + f`.
+///
+/// `f64` so that a transform far down a long list stays exact after moving back to the target.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Affine {
+    pub a: f64,
+    pub b: f64,
+    pub c: f64,
+    pub d: f64,
+    pub e: f64,
+    pub f: f64,
+}
+
+impl Affine {
+    pub const IDENTITY: Affine = Affine::translation(0.0, 0.0);
+
+    pub const fn translation(x: f64, y: f64) -> Self {
+        Self {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: x,
+            f: y,
+        }
+    }
+
+    pub const fn scaling(x: f64, y: f64) -> Self {
+        Self {
+            a: x,
+            b: 0.0,
+            c: 0.0,
+            d: y,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    /// Clockwise on the screen, where y grows downwards.
+    pub fn rotation(degrees: f64) -> Self {
+        let (s, c) = degrees.to_radians().sin_cos();
+        Self {
+            a: c,
+            b: s,
+            c: -s,
+            d: c,
+            e: 0.0,
+            f: 0.0,
+        }
+    }
+
+    /// Applies `other` first, then `self`.
+    pub fn then_apply(&self, other: &Affine) -> Affine {
+        Affine {
+            a: self.a * other.a + self.c * other.b,
+            b: self.b * other.a + self.d * other.b,
+            c: self.a * other.c + self.c * other.d,
+            d: self.b * other.c + self.d * other.d,
+            e: self.a * other.e + self.c * other.f + self.e,
+            f: self.b * other.e + self.d * other.f + self.f,
+        }
+    }
+
+    pub fn apply(&self, x: f64, y: f64) -> (f64, f64) {
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
+    }
+
+    pub fn apply_point(&self, p: PointF) -> PointF {
+        let (x, y) = self.apply(p.x as f64, p.y as f64);
+        PointF::new(x as f32, y as f32)
+    }
+
+    /// `None` when it flattens everything to a line or a point.
+    pub fn inverse(&self) -> Option<Affine> {
+        let det = self.a * self.d - self.b * self.c;
+        if det.abs() < 1e-12 {
+            return None;
+        }
+        Some(Affine {
+            a: self.d / det,
+            b: -self.b / det,
+            c: -self.c / det,
+            d: self.a / det,
+            e: (self.c * self.f - self.d * self.e) / det,
+            f: (self.b * self.e - self.a * self.f) / det,
+        })
+    }
+
+    pub fn is_translation(&self) -> bool {
+        self.a == 1.0 && self.b == 0.0 && self.c == 0.0 && self.d == 1.0
+    }
+
+    /// Whether pixels stay exactly on pixels.
+    pub fn is_whole_translation(&self) -> bool {
+        // Going through a transform origin and back leaves rounding errors.
+        let whole = |v: f64| (v - v.round()).abs() < 1e-6;
+        self.is_translation() && whole(self.e) && whole(self.f)
+    }
+
+    /// Whether the axes stay along the axes.
+    pub fn is_axis_aligned(&self) -> bool {
+        self.b == 0.0 && self.c == 0.0
+    }
+
+    /// The most it stretches anything.
+    pub fn max_scale(&self) -> f64 {
+        (self.a * self.a + self.b * self.b)
+            .sqrt()
+            .max((self.c * self.c + self.d * self.d).sqrt())
+    }
+
+    /// The smallest whole rectangle around the transformed `r`.
+    pub fn bounds_of(&self, r: RectI) -> RectI {
+        if r.is_empty() {
+            return RectI::default();
+        }
+        let (x0, y0) = (r.x as f64, r.y as f64);
+        let (x1, y1) = (r.right() as f64, r.bottom() as f64);
+        let corners = [
+            self.apply(x0, y0),
+            self.apply(x1, y0),
+            self.apply(x0, y1),
+            self.apply(x1, y1),
+        ];
+        let (mut left, mut top) = corners[0];
+        let (mut right, mut bottom) = corners[0];
+        for (x, y) in &corners[1..] {
+            left = left.min(*x);
+            right = right.max(*x);
+            top = top.min(*y);
+            bottom = bottom.max(*y);
+        }
+        let limit = |v: f64| v.clamp(-(1 << 28) as f64, (1 << 28) as f64);
+        let (left, top) = (limit(left).floor() as i32, limit(top).floor() as i32);
+        let (right, bottom) = (limit(right).ceil() as i32, limit(bottom).ceil() as i32);
+        RectI::new(left, top, right - left, bottom - top)
+    }
+}
+
 /// An integer rectangle in physical pixels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct RectI {
@@ -197,6 +339,11 @@ impl RectI {
             (self.width - left - right).max(0),
             (self.height - top - bottom).max(0),
         )
+    }
+
+    /// The rectangle `k` times bigger, around the origin.
+    pub fn scaled(&self, k: i32) -> RectI {
+        RectI::new(self.x * k, self.y * k, self.width * k, self.height * k)
     }
 
     pub fn outset(&self, amount: i32) -> RectI {

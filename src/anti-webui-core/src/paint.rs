@@ -1,15 +1,16 @@
 //! Turns the laid-out tree into a [`Scene`].
 
+use crate::geometry::Affine;
 use crate::geometry::{PointI, RectI};
-use crate::layout::child_clip;
+use crate::layout::{child_clip, mark_outer_layers_stale};
 use crate::platform::PopupId;
-use crate::scene::{ChunkKey, Clip, Glyph, GlyphRun, Primitive, Quad, Scene, ScrollLayer, Shadow};
+use crate::scene::{ChunkKey, Clip, Glyph, GlyphRun, Layer, Primitive, Quad, Scene, Shadow};
 use crate::text::selection::node_range;
 use crate::text::{Brush, TextLayout};
-use crate::tree::{Document, Node, NodeId, NodeKind, popup_id};
+use crate::tree::{Document, LayerMemo, Node, NodeId, NodeKind, popup_id};
 use anti_webui_style::{Color, Overflow};
 use parley::PositionedLayoutItem;
-use slotmap::Key;
+use slotmap::{Key, KeyData};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,6 +30,7 @@ pub struct Frame {
 pub fn paint_document(doc: &mut Document, now: Instant) -> Frame {
     let mut old_layers = std::mem::take(&mut doc.layer_contents);
     let mut new_layers = HashMap::new();
+    let mut settling = Vec::new();
     let doc_ref = &*doc;
     let window = doc_ref.root.map(|root| {
         let size = (doc_ref.viewport.width, doc_ref.viewport.height);
@@ -40,6 +42,7 @@ pub fn paint_document(doc: &mut Document, now: Instant) -> Frame {
             now,
             &mut old_layers,
             &mut new_layers,
+            &mut settling,
         )
     });
     let popups = doc_ref
@@ -56,25 +59,34 @@ pub fn paint_document(doc: &mut Document, now: Instant) -> Frame {
                 now,
                 &mut old_layers,
                 &mut new_layers,
+                &mut settling,
             );
             Some((popup_id(id), scene))
         })
         .collect();
     doc.layer_contents = new_layers;
+    doc.stale_layers.clear();
+    doc.settling = !settling.is_empty();
+    for id in settling {
+        // They hold it as it was shown, and it is about to be shown differently.
+        mark_outer_layers_stale(doc, id);
+    }
     Frame {
         window: window.unwrap_or_default(),
         popups,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_root(
     doc: &Document,
     root: NodeId,
     size: (i32, i32),
     clear: Color,
     now: Instant,
-    old_layers: &mut HashMap<NodeId, (Arc<Scene>, RectI)>,
-    new_layers: &mut HashMap<NodeId, (Arc<Scene>, RectI)>,
+    old_layers: &mut HashMap<NodeId, LayerMemo>,
+    new_layers: &mut HashMap<NodeId, LayerMemo>,
+    settling: &mut Vec<NodeId>,
 ) -> Scene {
     let mut scene = Scene {
         width: size.0.max(0) as u32,
@@ -93,15 +105,29 @@ fn paint_root(
         new_layers: std::mem::take(new_layers),
         reuse_layers: !doc.dirty.content,
         cull: true,
+        settling: Vec::new(),
     };
     if doc.nodes[root].is_popup() {
         painter.contents(root, 1.0, screen);
     } else {
         painter.node(root, 1.0, screen);
     }
+    settling.append(&mut painter.settling);
     *old_layers = painter.old_layers;
     *new_layers = painter.new_layers;
     scene
+}
+
+/// The nodes of the layers directly in a scene.
+fn nested_layers(scene: &Scene) -> Vec<NodeId> {
+    scene
+        .primitives
+        .iter()
+        .filter_map(|p| match p {
+            Primitive::Layer(l) => Some(NodeId::from(KeyData::from_ffi(l.key))),
+            _ => None,
+        })
+        .collect()
 }
 
 fn fade(c: Color, opacity: f32) -> Color {
@@ -131,6 +157,7 @@ pub fn paint_everything(doc: &Document, now: Instant) -> Scene {
         new_layers: HashMap::new(),
         reuse_layers: false,
         cull: false,
+        settling: Vec::new(),
     };
     if let Some(root) = doc.root {
         painter.node(root, 1.0, RectI::INFINITE);
@@ -177,11 +204,13 @@ struct Painter<'a> {
     scene: &'a mut Scene,
     now: Instant,
     screen: RectI,
-    /// Layer contents of the last frame with what they cover, and whether they are still right.
-    old_layers: HashMap<NodeId, (Arc<Scene>, RectI)>,
-    new_layers: HashMap<NodeId, (Arc<Scene>, RectI)>,
+    /// What layers painted in the last frame, and whether it is still right.
+    old_layers: HashMap<NodeId, LayerMemo>,
+    new_layers: HashMap<NodeId, LayerMemo>,
     reuse_layers: bool,
     cull: bool,
+    /// Transformed nodes shown between pixels.
+    settling: Vec<NodeId>,
 }
 
 impl Painter<'_> {
@@ -202,11 +231,15 @@ impl Painter<'_> {
             .rect
             .intersect(&self.screen)
             .translate(-origin.x, -origin.y);
+        let stale = self.doc.stale_layers.contains(&id);
         let reused = self
             .old_layers
             .remove(&id)
-            .filter(|(_, covers)| self.reuse_layers && covers.intersect(&view) == view);
-        let (content, covers) = reused.unwrap_or_else(|| {
+            .filter(|m| self.reuse_layers && !stale && m.covers.intersect(&view) == view);
+        let (content, covers) = if let Some(m) = reused {
+            self.keep_nested(&m.nested);
+            (m.content, m.covers)
+        } else {
             // A screenful around the view, so that scrolling doesn't paint on every frame.
             let (w, h) = (self.screen.width, self.screen.height);
             let covers = RectI::new(
@@ -218,15 +251,103 @@ impl Painter<'_> {
             let outer = std::mem::take(self.scene);
             self.contents(id, opacity, covers);
             (Arc::new(std::mem::replace(self.scene, outer)), covers)
-        });
-        self.new_layers.insert(id, (content.clone(), covers));
+        };
+        self.new_layers.insert(
+            id,
+            LayerMemo {
+                nested: nested_layers(&content),
+                content: content.clone(),
+                covers,
+                transform: Affine::IDENTITY,
+            },
+        );
         self.chunk(id, part::LAYER);
-        self.scene.primitives.push(Primitive::Layer(ScrollLayer {
+        self.scene.primitives.push(Primitive::Layer(Layer {
             key: id.data().as_ffi(),
             clip,
             origin,
+            transform: Affine::IDENTITY,
+            bounds: RectI::INFINITE,
+            opacity: 1.0,
             content,
         }));
+    }
+
+    /// Paints a transformed node and what is under it as a layer. What can be seen of it through
+    /// `cull` decides what gets painted, as a screenful around it does for scrolling.
+    fn transformed_layer(&mut self, id: NodeId, opacity: f32, cull: RectI) {
+        let doc = self.doc;
+        let node = &doc.nodes[id];
+        let raw = node.layer_matrix(doc.scale);
+        let Some(inverse) = raw.inverse() else {
+            return;
+        };
+        let clip = node.layer_clip;
+        let bounds = node.subtree_bounds;
+        let view = if self.cull {
+            inverse
+                .bounds_of(cull.intersect(&clip.rect))
+                .intersect(&bounds)
+        } else {
+            bounds
+        };
+        let old = self.old_layers.remove(&id);
+        // A translation between pixels is for while it moves: text stays sharp when it stops.
+        let stopped = !self.cull || old.as_ref().is_some_and(|m| m.transform == raw);
+        let mut transform = raw;
+        if raw.is_translation() && !raw.is_whole_translation() {
+            if stopped {
+                transform.e = raw.e.round();
+                transform.f = raw.f.round();
+            } else {
+                self.settling.push(id);
+            }
+        }
+        let stale = doc.stale_layers.contains(&id);
+        let reused =
+            old.filter(|m| self.reuse_layers && !stale && m.covers.intersect(&view) == view);
+        let (content, covers) = if let Some(m) = reused {
+            self.keep_nested(&m.nested);
+            (m.content, m.covers)
+        } else {
+            let covers = if self.cull {
+                view.outset(self.screen.width.max(self.screen.height))
+            } else {
+                RectI::INFINITE
+            };
+            let outer = std::mem::take(self.scene);
+            self.node_body(id, 1.0, covers);
+            (Arc::new(std::mem::replace(self.scene, outer)), covers)
+        };
+        self.new_layers.insert(
+            id,
+            LayerMemo {
+                nested: nested_layers(&content),
+                content: content.clone(),
+                covers,
+                transform: raw,
+            },
+        );
+        self.chunk(id, part::LAYER);
+        self.scene.primitives.push(Primitive::Layer(Layer {
+            key: id.data().as_ffi(),
+            clip,
+            origin: PointI::default(),
+            transform,
+            bounds,
+            opacity,
+            content,
+        }));
+    }
+
+    /// What is inside of a layer stays as it is when the layer does.
+    fn keep_nested(&mut self, nested: &[NodeId]) {
+        for &id in nested {
+            if let Some(m) = self.old_layers.remove(&id) {
+                self.keep_nested(&m.nested);
+                self.new_layers.insert(id, m);
+            }
+        }
     }
 
     /// Paints the children whose bounds touch `cull`.
@@ -257,7 +378,7 @@ impl Painter<'_> {
                 continue;
             };
             let cull = cull.intersect(&n.clip);
-            if !self.cull || n.subtree_bounds.intersects(&cull) {
+            if !self.cull || n.bounds_in_parent(doc.scale).intersects(&cull) {
                 self.node_contents(id, opacity, cull);
             }
         }
@@ -278,11 +399,22 @@ impl Painter<'_> {
         if !node.visible {
             return;
         }
-        let c = &node.computed;
-        let opacity = opacity * c.opacity;
+        let opacity = opacity * node.computed.opacity;
         if opacity <= 0.0 {
             return;
         }
+        if node.transformed {
+            self.transformed_layer(id, opacity, cull);
+        } else {
+            self.node_body(id, opacity, cull);
+        }
+    }
+
+    /// What the node paints in its own coordinates. `opacity` is what to apply to it.
+    fn node_body(&mut self, id: NodeId, opacity: f32, cull: RectI) {
+        let doc = self.doc;
+        let node = &doc.nodes[id];
+        let c = &node.computed;
         match &node.kind {
             NodeKind::Fragment => {
                 self.children(node, opacity, cull);

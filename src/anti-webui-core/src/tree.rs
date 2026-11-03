@@ -1,7 +1,7 @@
 //! The retained node tree (a small DOM) and the per-window document state.
 
 use crate::event::{KeyboardEvent, PointerEvent, ScrollEvent};
-use crate::geometry::{PointF, PointI, RectI, Scale, SizeI};
+use crate::geometry::{Affine, PointF, PointI, RectI, Scale, SizeI};
 use crate::layout::{MeasureCache, MeasureKey, Resolved, child_clip};
 use crate::platform::{Placement, PlatformRequest, PopupId, PopupKind, PopupParams};
 use crate::scene::Scene;
@@ -147,8 +147,16 @@ pub struct Node {
     pub visible: bool,
     /// The outermost scroller that overflows: its descendants don't move when it scrolls.
     pub scroll_root: bool,
-    /// The scroll root whose content this node is part of, or the popup whose surface it is on.
+    /// The scroll root whose content this node is part of, the popup whose surface it is on, or
+    /// the transformed node it is painted through, which may be itself.
     pub space: Option<NodeId>,
+    /// Painted through a transform: `abs` and the descendants are in its own space, and the two
+    /// below say how it sits in its parent's (see `docs/design/12-transform.md`).
+    pub transformed: bool,
+    /// When `transformed`: the clip that applies in the parent's coordinates.
+    pub layer_clip: crate::scene::Clip,
+    /// When `transformed`: the `space` of the parent's coordinates.
+    pub outer_space: Option<NodeId>,
     /// Painted from its stacking context's list instead of in tree order.
     pub stacked: bool,
     /// Its stacked descendants are ordered among themselves, and stay above its background.
@@ -158,6 +166,8 @@ pub struct Node {
     pub subtree_bounds: RectI,
     /// The `subtree_bounds` of each child, so that culling doesn't need to touch the children.
     pub child_bounds: Vec<RectI>,
+    /// The transitions going on, in no particular order. See `layout::apply_transitions`.
+    pub(crate) transitions: Vec<crate::animation::RunningTransition>,
     /// Nodes in the subtree that are not `display: none`, itself included.
     pub(crate) subtree_nodes: u32,
     /// The children may have moved since the node was last positioned.
@@ -193,10 +203,14 @@ impl Node {
             visible: false,
             scroll_root: false,
             space: None,
+            transformed: false,
+            layer_clip: crate::scene::Clip::NONE,
+            outer_space: None,
             stacked: false,
             stacking_context: false,
             subtree_bounds: RectI::default(),
             child_bounds: Vec::new(),
+            transitions: Vec::new(),
             subtree_nodes: 0,
             position_dirty: true,
             style_dirty: false,
@@ -270,6 +284,44 @@ impl Node {
         let b = &self.resolved.border;
         self.abs.inset(b.top, b.right, b.bottom, b.left)
     }
+
+    /// From the coordinates of a transformed node to its parent's.
+    pub fn layer_matrix(&self, scale: Scale) -> Affine {
+        let c = &self.computed;
+        let origin = (
+            self.abs.x as f64 + self.abs.width as f64 * c.transform_origin_x as f64,
+            self.abs.y as f64 + self.abs.height as f64 * c.transform_origin_y as f64,
+        );
+        Affine::translation(
+            origin.0 + scale.pxf(c.translate_x) as f64,
+            origin.1 + scale.pxf(c.translate_y) as f64,
+        )
+        .then_apply(&Affine::rotation(c.rotate as f64))
+        .then_apply(&Affine::scaling(c.scale_x as f64, c.scale_y as f64))
+        .then_apply(&Affine::translation(-origin.0, -origin.1))
+    }
+
+    /// What the subtree can touch, in the parent's coordinates.
+    pub fn bounds_in_parent(&self, scale: Scale) -> RectI {
+        if self.transformed {
+            self.layer_matrix(scale)
+                .bounds_of(self.subtree_bounds.outset(1))
+                .intersect(&self.layer_clip.rect)
+        } else {
+            self.subtree_bounds
+        }
+    }
+}
+
+/// What a layer painted last.
+pub struct LayerMemo {
+    pub content: Arc<Scene>,
+    /// What `content` covers, in its own coordinates.
+    pub covers: RectI,
+    /// The transform as the style has it, before any rounding.
+    pub transform: Affine,
+    /// The layers directly in `content`.
+    pub nested: Vec<NodeId>,
 }
 
 /// What needs recomputing before the next frame.
@@ -307,9 +359,17 @@ pub struct Document {
     pub requests: Vec<PlatformRequest>,
     /// Programmatic focus change requested through a `NodeRef`.
     pub pending_focus: Option<Option<NodeId>>,
-    /// What each scroll layer painted last and the rectangle it covers, reused while the content
-    /// is unchanged and the view stays inside the rectangle.
-    pub layer_contents: HashMap<NodeId, (Arc<Scene>, RectI)>,
+    /// What each layer painted last, reused while the content is unchanged and the view stays
+    /// inside the rectangle it covers.
+    pub layer_contents: HashMap<NodeId, LayerMemo>,
+    /// Layers to paint again although `dirty.content` isn't set: a transform inside moved.
+    pub stale_layers: HashSet<NodeId>,
+    /// A transform changed, so what is under the pointer may have too.
+    pub transform_moved: bool,
+    /// A translation is between pixels: one more frame shows it on whole pixels if it stops.
+    pub settling: bool,
+    /// Nodes with transitions going on.
+    pub(crate) transitioning: HashSet<NodeId>,
     /// Nodes whose style must be resolved again; see `style_all`.
     pub style_dirty: Vec<NodeId>,
     /// Every node's style must be resolved again.
@@ -350,6 +410,10 @@ thread_local! {
         requests: Vec::new(),
         pending_focus: None,
         layer_contents: HashMap::new(),
+        stale_layers: HashSet::new(),
+        transform_moved: false,
+        settling: false,
+        transitioning: HashSet::new(),
         style_dirty: Vec::new(),
         style_all: false,
         reposition: Vec::new(),
@@ -441,44 +505,91 @@ impl Document {
         })
     }
 
-    /// What to add to a node's coordinates to get window coordinates.
-    pub fn space_offset(&self, node: &Node) -> PointI {
-        let mut offset = PointI::default();
-        let mut space = node.space.and_then(|r| self.nodes.get(r));
-        while let Some(r) = space {
-            if let Some(popup) = r.popup() {
-                offset.x += popup.origin.x;
-                offset.y += popup.origin.y;
-                break;
-            }
-            offset.x += r.abs.x - r.scroll.x;
-            offset.y += r.abs.y - r.scroll.y;
-            space = r.space.and_then(|s| self.nodes.get(s));
+    /// The next space out from `space`, and how its coordinates map to it.
+    fn step_out(&self, space: NodeId) -> Option<(Affine, Option<NodeId>)> {
+        let r = self.nodes.get(space)?;
+        if let Some(popup) = r.popup() {
+            let o = popup.origin;
+            return Some((Affine::translation(o.x as f64, o.y as f64), None));
         }
-        offset
+        if r.transformed {
+            return Some((r.layer_matrix(self.scale), r.outer_space));
+        }
+        Some((
+            Affine::translation((r.abs.x - r.scroll.x) as f64, (r.abs.y - r.scroll.y) as f64),
+            r.space,
+        ))
+    }
+
+    /// From a node's coordinates to window coordinates.
+    pub fn to_window(&self, node: &Node, p: PointF) -> PointF {
+        let (mut x, mut y) = (p.x as f64, p.y as f64);
+        let mut space = node.space;
+        while let Some((m, next)) = space.and_then(|s| self.step_out(s)) {
+            (x, y) = m.apply(x, y);
+            space = next;
+        }
+        PointF::new(x as f32, y as f32)
+    }
+
+    /// A rectangle in a node's coordinates, in window coordinates: the box around it if it isn't
+    /// axis-aligned anymore.
+    pub fn rect_to_window(&self, node: &Node, r: RectI) -> RectI {
+        let mut r = r;
+        let mut space = node.space;
+        while let Some((m, next)) = space.and_then(|s| self.step_out(s)) {
+            r = if m.is_whole_translation() {
+                r.translate(m.e.round() as i32, m.f.round() as i32)
+            } else {
+                m.bounds_of(r)
+            };
+            space = next;
+        }
+        r
+    }
+
+    /// From window coordinates to a node's. `None` if a transform flattens it away.
+    pub fn from_window(&self, node: &Node, p: PointF) -> Option<PointF> {
+        self.from_window_space(node.space, p)
+    }
+
+    /// From window coordinates to the coordinates of a space.
+    pub fn from_window_space(&self, space: Option<NodeId>, p: PointF) -> Option<PointF> {
+        let Some((m, next)) = space.and_then(|s| self.step_out(s)) else {
+            return Some(p);
+        };
+        let outer = self.from_window_space(next, p)?;
+        Some(m.inverse()?.apply_point(outer))
     }
 
     /// The node's border box in window coordinates.
     pub fn window_rect(&self, id: NodeId) -> Option<RectI> {
         let n = self.nodes.get(id)?;
-        let o = self.space_offset(n);
-        Some(n.abs.translate(o.x, o.y))
+        Some(self.rect_to_window(n, n.abs))
     }
 
     /// The part of the node that is not clipped away, in window coordinates.
     pub fn visible_window_rect(&self, id: NodeId) -> Option<RectI> {
         let n = self.nodes.get(id)?;
-        let o = self.space_offset(n);
-        let clip = n.clip_shape().translated(o.x, o.y).rect;
-        let rect = n.abs.translate(o.x, o.y).intersect(&clip);
-        Some(match n.space.and_then(|r| self.nodes.get(r)) {
-            Some(root) if !root.is_popup() => {
-                let o = self.space_offset(root);
-                let clip = child_clip(root, self.scale, root.clip_shape());
-                rect.intersect(&clip.rect.translate(o.x, o.y))
+        let mut rect = n.abs.intersect(&n.clip);
+        let mut space = n.space;
+        while let Some(r) = space.and_then(|s| self.nodes.get(s)) {
+            let Some((m, next)) = space.and_then(|s| self.step_out(s)) else {
+                break;
+            };
+            rect = if m.is_whole_translation() {
+                rect.translate(m.e.round() as i32, m.f.round() as i32)
+            } else {
+                m.bounds_of(rect)
+            };
+            if r.transformed {
+                rect = rect.intersect(&r.layer_clip.rect);
+            } else if !r.is_popup() {
+                rect = rect.intersect(&child_clip(r, self.scale, r.clip_shape()).rect);
             }
-            _ => rect,
-        })
+            space = next;
+        }
+        Some(rect)
     }
 
     pub fn get(&self, id: NodeId) -> Option<&Node> {
@@ -501,7 +612,6 @@ impl Document {
         }
         self.dirty.style = true;
         self.dirty.paint = true;
-        self.dirty.content = true;
     }
 
     /// Something every style depends on changed.
@@ -643,6 +753,7 @@ impl Document {
         }
         self.edits.retain(|e| *e != id);
         self.stacked.remove(&id);
+        self.transitioning.remove(&id);
         self.stacking_dirty = true;
         self.layer_contents.remove(&id);
         self.mark_paint();

@@ -272,3 +272,48 @@ fn fs_glyph(in: GlyphOut) -> @location(0) vec4<f32> {
     }
     return in.color * (texel.a * clip_cov);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Layers: content kept in a texture, shown through a transform. See docs/design/12-transform.md.
+// This is where an effect on the content as a whole would go.
+
+struct LayerInstance {
+    @location(0) matrix: vec4<f32>,  // a, b, c, d
+    @location(1) offset: vec2<f32>,
+    @location(2) size: vec2<f32>,    // in texels
+    @location(3) uv: vec4<f32>,
+    @location(4) clip: vec4<f32>,
+    @location(5) clip_radii: vec4<f32>,
+    @location(6) opacity: f32,
+}
+
+struct LayerOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) clip: vec4<f32>,
+    @location(2) @interpolate(flat) clip_radii: vec4<f32>,
+    @location(3) @interpolate(flat) opacity: f32,
+}
+
+@vertex
+fn vs_layer(@builtin(vertex_index) vi: u32, inst: LayerInstance) -> LayerOut {
+    var out: LayerOut;
+    let c = corner(vi);
+    let p = c * inst.size;
+    let m = inst.matrix;
+    out.position = to_clip(vec2<f32>(m.x * p.x + m.z * p.y, m.y * p.x + m.w * p.y) + inst.offset);
+    out.uv = mix(inst.uv.xy, inst.uv.zw, c);
+    out.clip = inst.clip;
+    out.clip_radii = inst.clip_radii;
+    out.opacity = inst.opacity;
+    return out;
+}
+
+@fragment
+fn fs_layer(in: LayerOut) -> @location(0) vec4<f32> {
+    let clip_cov = clip_coverage(in.position.xy, in.clip, in.clip_radii);
+    if (clip_cov <= 0.0) {
+        discard;
+    }
+    return textureSampleLevel(atlas, atlas_sampler, in.uv, 0.0) * (in.opacity * clip_cov);
+}

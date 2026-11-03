@@ -3,14 +3,17 @@
 //! All sizes are physical pixels (`i32`) and boxes use `box-sizing: border-box`.
 //! See `docs/design/03-layout.md`.
 
+use crate::animation::RunningTransition;
 use crate::geometry::{PointI, RectI, Scale, SizeI};
 use crate::scene::Clip;
 use crate::text::{ShapeStyle, TextSystem};
 use crate::tree::{Document, Node, NodeId, NodeKind, PopupSurface};
 use anti_webui_style::{
-    AlignItems, ComputedStyle, Display, Edges, JustifyContent, Length, Overflow, Position,
+    ANIMATED_FIELDS, AlignItems, ComputedStyle, Display, Edges, JustifyContent, Length, Overflow,
+    Position,
 };
 use std::collections::BinaryHeap;
+use std::time::Instant;
 
 /// A length after conversion to physical pixels; percentages stay unresolved until the
 /// containing block is known.
@@ -240,7 +243,54 @@ pub fn resolve_styles(doc: &mut Document) {
     for id in out.visual {
         grow_bounds(doc, id);
     }
+    for id in out.moved {
+        grow_bounds(doc, id);
+        doc.transform_moved = true;
+        mark_outer_layers_stale(doc, id);
+    }
+    doc.dirty.content |= out.content;
+    for id in out.spaces {
+        // Positioning doesn't go down where nothing seems to have moved.
+        for a in doc.ancestors(id) {
+            doc.nodes[a].position_dirty = true;
+        }
+        doc.dirty.position = true;
+    }
     doc.reposition.extend(out.clips);
+}
+
+/// The layers around a transformed node hold its transform in their content.
+pub(crate) fn mark_outer_layers_stale(doc: &mut Document, id: NodeId) {
+    let mut space = doc.nodes[id].outer_space;
+    while let Some(s) = space {
+        let Some(n) = doc.nodes.get(s) else {
+            return;
+        };
+        if n.is_popup() {
+            return;
+        }
+        space = if n.transformed {
+            n.outer_space
+        } else {
+            n.space
+        };
+        doc.stale_layers.insert(s);
+    }
+}
+
+/// Whether all that differs is what compositing a transformed node's layer applies.
+fn same_content(a: &ComputedStyle, b: &ComputedStyle) -> bool {
+    let mut b = b.clone();
+    b.translate_x = a.translate_x;
+    b.translate_y = a.translate_y;
+    b.scale_x = a.scale_x;
+    b.scale_y = a.scale_y;
+    b.rotate = a.rotate;
+    b.transform_origin_x = a.transform_origin_x;
+    b.transform_origin_y = a.transform_origin_y;
+    b.opacity = a.opacity;
+    b.transitions.clone_from(&a.transitions);
+    *a == b
 }
 
 #[derive(Default)]
@@ -251,6 +301,12 @@ struct Resolution {
     visual: Vec<NodeId>,
     /// The clip for the descendants changed without affecting layout.
     clips: Vec<NodeId>,
+    /// A transformed node stays one, and its layer may show differently.
+    moved: Vec<NodeId>,
+    /// What layers hold may be out of date.
+    content: bool,
+    /// Nodes that started or stopped being transformed.
+    spaces: Vec<NodeId>,
 }
 
 fn resolve_node(
@@ -287,6 +343,12 @@ fn resolve_node(
         // Text nodes are inline content: box properties never apply to them.
         computed.display = Display::Block;
     }
+    if !node.transitions.is_empty() || !computed.transitions.is_empty() {
+        apply_transitions(doc, id, &mut computed);
+    }
+    let Some(node) = doc.nodes.get(id) else {
+        return;
+    };
     let resolved = Resolved::from_computed(&computed, doc.scale);
     if node.resolved != resolved || !same_layout(&node.computed, &computed) {
         out.layout.push(id);
@@ -306,6 +368,18 @@ fn resolve_node(
         out.clips.push(id);
     }
     let changed = *old != computed;
+    if changed {
+        let stays_a_layer = node.transformed && computed.has_transform();
+        if stays_a_layer {
+            out.moved.push(id);
+        }
+        if !stays_a_layer || !same_content(old, &computed) {
+            out.content = true;
+        }
+        if old.has_transform() != computed.has_transform() {
+            out.spaces.push(id);
+        }
+    }
     let children = (all || changed).then(|| node.children.clone());
     let node = doc.nodes.get_mut(id).unwrap();
     node.style_dirty = false;
@@ -329,6 +403,54 @@ fn resolve_node(
     }
 }
 
+/// Turns the style a node is going to into the one to show now, starting or redirecting
+/// transitions as what it is going to changes (see `docs/design/13-animation.md`).
+fn apply_transitions(doc: &mut Document, id: NodeId, target: &mut ComputedStyle) {
+    let node = &mut doc.nodes[id];
+    let old = &node.computed;
+    // Nothing to go from: it is new, or wasn't shown.
+    let shown = node.visible && old.display != Display::None && target.display != Display::None;
+    let now = Instant::now();
+    for (i, field) in ANIMATED_FIELDS.iter().enumerate() {
+        let timing = target
+            .transition_for(field.prop)
+            .filter(|t| shown && !t.duration.is_zero());
+        if let Some(r) = node.transitions.iter().position(|r| r.field == i) {
+            let to = (field.get)(target);
+            let running = &mut node.transitions[r];
+            if running.to == to {
+                let finished = running.finished;
+                (field.set)(target, running.current.clone());
+                if finished {
+                    node.transitions.swap_remove(r);
+                }
+            } else if let Some(timing) = timing {
+                let current = running.current.clone();
+                running.redirect(to, timing, now);
+                (field.set)(target, current);
+            } else {
+                node.transitions.swap_remove(r);
+            }
+        } else if !(field.same)(old, target)
+            && let Some(timing) = timing
+        {
+            let from = (field.get)(old);
+            let to = (field.get)(target);
+            // Nothing in between: it just changes.
+            if from.interpolate(&to, 0.0).is_some() {
+                (field.set)(target, from.clone());
+                node.transitions
+                    .push(RunningTransition::new(i, from, to, timing, now));
+            }
+        }
+    }
+    if node.transitions.is_empty() {
+        doc.transitioning.remove(&id);
+    } else {
+        doc.transitioning.insert(id);
+    }
+}
+
 /// Whether a node is painted from a stacking context's list, and whether it is a stacking context.
 /// See `docs/design/09-shadows-stacking-popups.md`.
 fn stacking_role(kind: &NodeKind, c: &ComputedStyle, root: bool) -> (bool, bool) {
@@ -340,6 +462,7 @@ fn stacking_role(kind: &NodeKind, c: &ComputedStyle, root: bool) -> (bool, bool)
         || matches!(kind, NodeKind::Popup(_))
         || c.z_index.is_some()
         || c.opacity < 1.0
+        || c.has_transform()
         || c.overflow_x == Overflow::Scroll
         || c.overflow_y == Overflow::Scroll;
     (stacked, context)
@@ -392,7 +515,7 @@ fn grow_bounds(doc: &mut Document, id: NodeId) {
     };
     let own = own_bounds(n, doc.scale);
     n.subtree_bounds = n.subtree_bounds.union(&own);
-    let mut bounds = n.subtree_bounds;
+    let mut bounds = n.bounds_in_parent(doc.scale);
     let mut child = id;
     let mut parent = n.parent;
     while let Some(p) = parent {
@@ -414,7 +537,7 @@ fn grow_bounds(doc: &mut Document, id: NodeId) {
             return;
         }
         n.subtree_bounds = grown;
-        bounds = grown;
+        bounds = n.bounds_in_parent(scale);
         child = p;
         parent = n.parent;
     }
@@ -610,13 +733,19 @@ fn position_node(
     // Layout places a fragment's children from its parent, without visiting the fragment.
     let fragment =
         matches!(node.kind, NodeKind::Fragment) || node.computed.display == Display::Contents;
+    let transformed =
+        !fragment && !matches!(node.kind, NodeKind::Popup(_)) && node.computed.has_transform();
+    let placed_in = if node.transformed {
+        (node.layer_clip, node.outer_space)
+    } else {
+        (node.clip_shape(), node.space)
+    };
     if !fragment
         && !node.position_dirty
         && node.visible
         && node.abs == abs
-        && node.clip == clip.rect
-        && node.clip_radii == clip.radii
-        && node.space == space
+        && node.transformed == transformed
+        && placed_in == (clip, space)
         && node.doc_order == *order
     {
         *order += node.subtree_nodes;
@@ -627,9 +756,19 @@ fn position_node(
     node.position_dirty = false;
     node.visible = true;
     node.abs = abs;
-    node.clip = clip.rect;
-    node.clip_radii = clip.radii;
-    node.space = space;
+    node.transformed = transformed;
+    if transformed {
+        // Its own space: what is outside of it applies when the layer is composited.
+        node.layer_clip = clip;
+        node.outer_space = space;
+        node.clip = Clip::NONE.rect;
+        node.clip_radii = Clip::NONE.radii;
+        node.space = Some(id);
+    } else {
+        node.clip = clip.rect;
+        node.clip_radii = clip.radii;
+        node.space = space;
+    }
     node.doc_order = first;
     let max_x = (node.content_size.width - node.padding_abs().width).max(0);
     let max_y = (node.content_size.height - node.padding_abs().height).max(0);
@@ -643,8 +782,9 @@ fn position_node(
     } else {
         0
     };
-    // Layers don't nest; a popup's surface is like a window to them.
+    // Scroll layers aren't inside of other layers; a popup's surface is like a window to them.
     let scroller = overflows(node);
+    let space = node.space;
     let scroll_root = scroller && space.is_none_or(|s| doc.nodes[s].is_popup());
     doc.nodes[id].scroll_root = scroll_root;
     position_children(doc, id, order);
@@ -680,7 +820,7 @@ fn position_children(doc: &mut Document, id: NodeId, order: &mut u32) {
             .nodes
             .get(c)
             .filter(|_| !popup)
-            .map_or(RectI::default(), |n| n.subtree_bounds);
+            .map_or(RectI::default(), |n| n.bounds_in_parent(scale));
         bounds.push(b);
         union = union.union(&b);
     }

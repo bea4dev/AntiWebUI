@@ -201,6 +201,9 @@ impl Ui {
                     doc.dirty.paint = true;
                     changed = true;
                 }
+                if std::mem::take(&mut doc.transform_moved) {
+                    changed = true;
+                }
                 if doc.stacking_dirty {
                     build_stacking(doc);
                     doc.dirty.paint = true;
@@ -235,12 +238,15 @@ impl Ui {
 
     /// Whether frames must keep coming even if nothing else changes. See [`Ui::animate`].
     pub fn animating(&self) -> bool {
-        self.fling.is_some() || animation::frame_requested()
+        self.fling.is_some()
+            || animation::frame_requested()
+            || with_doc(|d| d.settling || !d.transitioning.is_empty())
     }
 
     /// Advances animations to `now`. Call before [`Ui::update`] when producing a frame.
     pub fn animate(&mut self, now: Instant) {
         animation::run_frame_callbacks(now);
+        with_doc(|d| animation::advance_transitions(d, now));
         let Some(fling) = &mut self.fling else {
             return;
         };
@@ -609,9 +615,9 @@ impl Ui {
                 }
             }),
             Drag::Edit(id) => with_doc(|d| {
-                let origin = edit_window_origin(d, id);
+                let at = edit_point(d, id, p);
                 if let Some(e) = d.get_mut(id).and_then(Node::edit_mut) {
-                    e.pointer_drag(p.x - origin.x as f32, p.y - origin.y as f32);
+                    e.pointer_drag(at.x, at.y);
                     d.mark_paint();
                 }
             }),
@@ -686,14 +692,9 @@ impl Ui {
             {
                 let extend = self.modifiers.shift;
                 with_doc(|d| {
-                    let origin = edit_window_origin(d, edit);
+                    let at = edit_point(d, edit, p);
                     if let Some(e) = d.get_mut(edit).and_then(Node::edit_mut) {
-                        e.pointer_down(
-                            p.x - origin.x as f32,
-                            p.y - origin.y as f32,
-                            clicks,
-                            extend,
-                        );
+                        e.pointer_down(at.x, at.y, clicks, extend);
                     }
                     if d.state.selection.take().is_some() {
                         d.mark_paint();
@@ -728,9 +729,9 @@ impl Ui {
                 target.filter(|t| with_doc(|d| d.get(*t).is_some_and(Node::is_edit)))
         {
             with_doc(|d| {
-                let origin = edit_window_origin(d, edit);
+                let at = edit_point(d, edit, p);
                 if let Some(e) = d.get_mut(edit).and_then(Node::edit_mut) {
-                    e.pointer_down(p.x - origin.x as f32, p.y - origin.y as f32, 1, false);
+                    e.pointer_down(at.x, at.y, 1, false);
                     e.drag = None;
                 }
                 d.request(PlatformRequest::Paste(ClipboardKind::Primary));
@@ -1468,9 +1469,9 @@ impl Ui {
             if e.read_only {
                 return Some(None);
             }
-            let origin = edit_window_origin(d, id);
+            let origin = edit_text_origin(d, id);
             let caret = e.caret_rect(caret_width(d)).translate(origin.x, origin.y);
-            Some(Some(e.ime_state(caret)))
+            Some(Some(e.ime_state(d.rect_to_window(n, caret))))
         });
         let state = match state {
             Some(s) => s,
@@ -1535,20 +1536,28 @@ impl Document {
     }
 }
 
-/// Where an edit node's text origin is, in window coordinates.
-fn edit_window_origin(doc: &Document, id: NodeId) -> PointI {
+/// A point in window coordinates relative to an edit node's text origin.
+fn edit_point(doc: &Document, id: NodeId, p: PointF) -> PointF {
     let origin = edit_text_origin(doc, id);
-    let offset = doc
-        .nodes
-        .get(id)
-        .map_or(PointI::default(), |n| doc.space_offset(n));
-    PointI::new(origin.x + offset.x, origin.y + offset.y)
+    let p = doc.get(id).and_then(|n| doc.from_window(n, p)).unwrap_or(p);
+    PointF::new(p.x - origin.x as f32, p.y - origin.y as f32)
 }
 
 /// `p` is in the same coordinates as the node.
 fn hit(doc: &Document, id: NodeId, p: PointF) -> Option<NodeId> {
     let node = doc.get(id)?;
-    if !node.visible || !node.clip.contains(p) {
+    if !node.visible {
+        return None;
+    }
+    let p = if node.transformed {
+        if !node.layer_clip.rect.contains(p) {
+            return None;
+        }
+        node.layer_matrix(doc.scale).inverse()?.apply_point(p)
+    } else {
+        p
+    };
+    if !node.clip.contains(p) {
         return None;
     }
     // A scroll root's children are in content coordinates and clipped by the root only here.
@@ -1593,7 +1602,7 @@ fn hit(doc: &Document, id: NodeId, p: PointF) -> Option<NodeId> {
 fn hit_stacked(doc: &Document, nodes: &[NodeId], p: PointF) -> Option<NodeId> {
     nodes.iter().rev().find_map(|&id| {
         doc.get(id)
-            .filter(|n| n.subtree_bounds.contains(p))
+            .filter(|n| n.bounds_in_parent(doc.scale).contains(p))
             .and_then(|_| hit(doc, id, p))
     })
 }
@@ -1682,8 +1691,10 @@ fn scrollbar_hit(doc: &Document, target: NodeId, p: PointF) -> Option<(NodeId, b
         if n.is_popup() {
             return None;
         }
-        let offset = doc.space_offset(n);
-        let pad = n.padding_abs().translate(offset.x, offset.y);
+        let Some(p) = doc.from_window(n, p) else {
+            continue;
+        };
+        let pad = n.padding_abs();
         if n.computed.overflow_y == Overflow::Scroll
             && n.content_size.height > pad.height
             && p.x >= pad.right() as f32 - grab_width
@@ -1707,11 +1718,11 @@ fn scrollbar_hit(doc: &Document, target: NodeId, p: PointF) -> Option<(NodeId, b
 }
 
 fn scrollbar_drag(doc: &mut Document, id: NodeId, vertical: bool, grab: f32, p: PointF) {
-    let Some(offset) = doc.get(id).map(|n| doc.space_offset(n)) else {
+    let Some(p) = doc.get(id).and_then(|n| doc.from_window(n, p)) else {
         return;
     };
     let Some(n) = doc.get_mut(id) else { return };
-    let pad = n.padding_abs().translate(offset.x, offset.y);
+    let pad = n.padding_abs();
     if vertical {
         let ratio = n.content_size.height as f32 / pad.height.max(1) as f32;
         let max = (n.content_size.height - pad.height).max(0);
@@ -1737,8 +1748,7 @@ fn scroll_into_view(doc: &mut Document, id: NodeId) {
         if n.is_popup() {
             return;
         }
-        let offset = doc.space_offset(n);
-        let pad = n.padding_abs().translate(offset.x, offset.y);
+        let pad = doc.rect_to_window(n, n.padding_abs());
         let (c, content) = (&n.computed, n.content_size);
         let wanted = |lo: i32, hi: i32, view_lo: i32, view_hi: i32| {
             if lo < view_lo {

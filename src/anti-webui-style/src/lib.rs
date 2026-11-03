@@ -7,9 +7,11 @@
 mod color;
 mod style;
 mod styled;
+mod transition;
 mod types;
 
 pub use color::*;
 pub use style::*;
 pub use styled::*;
+pub use transition::*;
 pub use types::*;

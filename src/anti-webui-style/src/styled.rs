@@ -93,6 +93,14 @@ pub trait Styled: Sized {
         bg => background: Color;
         opacity => opacity: f32;
 
+        translate_x => translate_x: f32;
+        translate_y => translate_y: f32;
+        scale => scale_x, scale_y: f32;
+        scale_x => scale_x: f32;
+        scale_y => scale_y: f32;
+        /// Degrees, clockwise.
+        rotate => rotate: f32;
+
         text_color => color: Color;
         text_size => font_size: f32;
         font_family => font_family: FontFamily;
@@ -207,6 +215,40 @@ pub trait Styled: Sized {
     /// Paints above or below what comes in tree order, and makes the node a stacking context.
     fn z_index(mut self, z: i32) -> Self {
         self.style_mut().z_index = Some(Some(z));
+        self
+    }
+
+    /// Moves what is painted by logical pixels, without affecting layout.
+    fn translate(mut self, x: f32, y: f32) -> Self {
+        let style = self.style_mut();
+        style.translate_x = Some(x);
+        style.translate_y = Some(y);
+        self
+    }
+
+    /// What `scale` and `rotate` keep in place, as a fraction of the border box. The center by
+    /// default.
+    fn transform_origin(mut self, x: f32, y: f32) -> Self {
+        let style = self.style_mut();
+        style.transform_origin_x = Some(x);
+        style.transform_origin_y = Some(y);
+        self
+    }
+
+    /// Makes changes of every animatable property go smoothly.
+    fn transition(mut self, transition: Transition) -> Self {
+        self.style_mut().transitions = Some(vec![(None, transition)]);
+        self
+    }
+
+    /// Makes changes of these properties go smoothly, on top of what is already said here.
+    fn transition_of(
+        mut self,
+        props: impl IntoIterator<Item = Prop>,
+        transition: Transition,
+    ) -> Self {
+        let list = self.style_mut().transitions.get_or_insert_default();
+        list.extend(props.into_iter().map(|p| (Some(p), transition)));
         self
     }
 

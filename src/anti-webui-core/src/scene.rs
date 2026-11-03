@@ -1,6 +1,6 @@
 //! The renderer-independent display list produced each frame. Coordinates are physical pixels.
 
-use crate::geometry::{PointI, RectI};
+use crate::geometry::{Affine, PointI, RectI};
 use anti_webui_style::Color;
 pub use parley::FontData;
 use std::sync::Arc;
@@ -32,6 +32,18 @@ impl Clip {
             Clip {
                 rect: self.rect.translate(dx, dy),
                 radii: self.radii,
+            }
+        }
+    }
+
+    /// The clip for content drawn `k` times bigger.
+    pub fn scaled(&self, k: i32) -> Clip {
+        if self.rect == RectI::INFINITE {
+            *self
+        } else {
+            Clip {
+                rect: self.rect.scaled(k),
+                radii: self.radii.map(|r| r * k as f32),
             }
         }
     }
@@ -72,7 +84,36 @@ pub struct Shadow {
     pub inset: bool,
 }
 
+impl Quad {
+    /// The same box drawn `k` times bigger.
+    pub fn scaled(&self, k: i32) -> Quad {
+        Quad {
+            rect: self.rect.scaled(k),
+            background: self.background,
+            border_widths: self.border_widths.map(|w| w * k),
+            border_color: self.border_color,
+            radii: self.radii.map(|r| r * k as f32),
+            clip: self.clip.scaled(k),
+        }
+    }
+}
+
 impl Shadow {
+    /// The same shadow drawn `k` times bigger.
+    pub fn scaled(&self, k: i32) -> Shadow {
+        let f = k as f32;
+        Shadow {
+            rect: self.rect.scaled(k),
+            radii: self.radii.map(|r| r * f),
+            blur: self.blur * f,
+            color: self.color,
+            clip: self.clip.scaled(k),
+            cut: self.cut.scaled(k),
+            cut_radii: self.cut_radii.map(|r| r * f),
+            inset: self.inset,
+        }
+    }
+
     /// How far the blur reaches past [`Shadow::rect`]: three standard deviations.
     pub fn extent(&self) -> i32 {
         (self.blur * 1.5 + 1.0).ceil() as i32
@@ -127,26 +168,77 @@ pub struct GlyphRun {
     pub clip: Clip,
 }
 
-/// Scrolled content, which the renderer keeps in a texture so that scrolling only draws what
-/// it exposes (see `docs/design/05-rendering.md`).
+/// Content the renderer keeps in a texture and composites: scrolled content, so that scrolling
+/// only draws what it exposes (see `docs/design/05-rendering.md`), or a transformed subtree (see
+/// `docs/design/12-transform.md`).
 #[derive(Clone, Debug)]
-pub struct ScrollLayer {
+pub struct Layer {
     /// Identifies the layer across frames.
     pub key: u64,
-    /// Where the layer shows, in window coordinates.
+    /// Where the layer may show, in the coordinates of the scene it is in.
     pub clip: Clip,
-    /// The window position of the content's origin. Scrolling only changes this.
+    /// The position of the content's origin. Scrolling only changes this.
     pub origin: PointI,
-    /// What to draw, in content coordinates and without this layer's clip. Layers don't nest.
-    /// Sharing the allocation means the content is unchanged.
+    /// Applied after `origin`.
+    pub transform: Affine,
+    /// What the content can touch, in its own coordinates. [`RectI::INFINITE`] for scrolled
+    /// content, which `clip` limits instead.
+    pub bounds: RectI,
+    /// Applied to the content as one image.
+    pub opacity: f32,
+    /// What to draw, in content coordinates and without this layer's clip. Sharing the allocation
+    /// means the content is unchanged.
     pub content: Arc<Scene>,
 }
 
-impl PartialEq for ScrollLayer {
+impl Layer {
+    /// From the content's coordinates to those of the scene the layer is in.
+    pub fn matrix(&self) -> Affine {
+        self.transform.then_apply(&Affine::translation(
+            self.origin.x as f64,
+            self.origin.y as f64,
+        ))
+    }
+
+    /// Whether content pixels land exactly on pixels of the scene it is in.
+    pub fn is_pixel_aligned(&self) -> bool {
+        self.transform.is_whole_translation()
+    }
+
+    /// What the layer can touch in the scene it is in.
+    pub fn bounds_on_parent(&self) -> RectI {
+        if self.bounds == RectI::INFINITE {
+            self.clip.rect
+        } else {
+            self.parent_rect(self.bounds).intersect(&self.clip.rect)
+        }
+    }
+
+    /// What a rectangle of the content can touch in the scene the layer is in.
+    pub fn parent_rect(&self, r: RectI) -> RectI {
+        if self.is_pixel_aligned() {
+            let m = self.matrix();
+            r.translate(m.e.round() as i32, m.f.round() as i32)
+        } else {
+            // Filtering reads one pixel further.
+            self.matrix().bounds_of(r.outset(1))
+        }
+    }
+
+    /// Whether everything that decides where and how the content shows is the same.
+    pub fn same_placement(&self, other: &Layer) -> bool {
+        self.clip == other.clip
+            && self.origin == other.origin
+            && self.transform == other.transform
+            && self.bounds == other.bounds
+            && self.opacity == other.opacity
+    }
+}
+
+impl PartialEq for Layer {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key
-            && self.clip == other.clip
-            && self.origin == other.origin
+            && self.same_placement(other)
             && (Arc::ptr_eq(&self.content, &other.content)
                 || (self.content.primitives == other.content.primitives
                     && self.content.chunks == other.content.chunks))
@@ -158,7 +250,7 @@ pub enum Primitive {
     Shadow(Shadow),
     Quad(Quad),
     Glyphs(GlyphRun),
-    Layer(ScrollLayer),
+    Layer(Layer),
 }
 
 /// Identifies a run of primitives across frames: one part of what a node paints.

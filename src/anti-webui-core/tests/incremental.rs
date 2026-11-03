@@ -5,6 +5,7 @@ use anti_webui_core::Ui;
 use anti_webui_core::damage;
 use anti_webui_core::event::*;
 use anti_webui_core::geometry::{PointF, RectI, Scale, SizeI};
+use anti_webui_core::layout::child_clip;
 use anti_webui_core::paint::paint_everything;
 use anti_webui_core::prelude::*;
 use anti_webui_core::scene::{Primitive, Scene};
@@ -23,6 +24,9 @@ struct NodeState {
     clip_radii: [f32; 4],
     scroll_root: bool,
     space: Option<NodeId>,
+    transformed: bool,
+    layer_clip: anti_webui_core::scene::Clip,
+    outer_space: Option<NodeId>,
     doc_order: u32,
     visible: bool,
 }
@@ -43,6 +47,13 @@ fn snapshot() -> Vec<(NodeState, RectI)> {
                         clip_radii: n.clip_radii,
                         scroll_root: n.scroll_root,
                         space: n.space,
+                        transformed: n.transformed,
+                        layer_clip: if n.transformed {
+                            n.layer_clip
+                        } else {
+                            anti_webui_core::scene::Clip::NONE
+                        },
+                        outer_space: n.transformed.then_some(n.outer_space).flatten(),
                         doc_order: n.doc_order,
                         visible: n.visible,
                     },
@@ -69,28 +80,24 @@ fn in_view(prims: &[Primitive], view: RectI) -> Vec<&Primitive> {
 /// Panics unless the scenes draw the same things, in the same order, where they can be seen.
 fn assert_same_in_view(all: &Scene, culled: &Scene, what: &str) {
     let screen = RectI::new(0, 0, all.width as i32, all.height as i32);
-    let (a, b) = (
-        in_view(&all.primitives, screen),
-        in_view(&culled.primitives, screen),
-    );
+    same_primitives_in_view(&all.primitives, &culled.primitives, screen, what);
+}
+
+fn same_primitives_in_view(all: &[Primitive], culled: &[Primitive], view: RectI, what: &str) {
+    let (a, b) = (in_view(all, view), in_view(culled, view));
     assert_eq!(a.len(), b.len(), "{what}: primitives lost by culling");
     for (a, b) in a.iter().zip(&b) {
         let (Primitive::Layer(a), Primitive::Layer(b)) = (a, b) else {
             assert_eq!(a, b, "{what}: primitive changed by culling");
             continue;
         };
-        assert_eq!((a.clip, a.origin), (b.clip, b.origin), "{what}: layer");
-        let view = a
-            .clip
-            .rect
-            .intersect(&screen)
-            .translate(-a.origin.x, -a.origin.y);
-        let (x, y) = (
-            in_view(&a.content.primitives, view),
-            in_view(&b.content.primitives, view),
-        );
-        assert_eq!(x.len(), y.len(), "{what}: layer primitives lost by culling");
-        assert!(x == y, "{what}: layer primitive changed by culling");
+        assert!(a.same_placement(b), "{what}: layer {a:?} vs {b:?}");
+        let inner = a
+            .matrix()
+            .inverse()
+            .unwrap()
+            .bounds_of(a.bounds_on_parent().intersect(&view));
+        same_primitives_in_view(&a.content.primitives, &b.content.primitives, inner, what);
     }
 }
 
@@ -107,6 +114,7 @@ fn paint_order(d: &Document) -> Vec<NodeId> {
             && (d.root == Some(id)
                 || n.computed.z_index.is_some()
                 || n.computed.opacity < 1.0
+                || n.computed.has_transform()
                 || n.computed.overflow_x == Overflow::Scroll
                 || n.computed.overflow_y == Overflow::Scroll)
     }
@@ -150,6 +158,41 @@ fn paint_order(d: &Document) -> Vec<NodeId> {
     out
 }
 
+/// Whether what `id` paints can be seen at `p`, going through every space it is in.
+fn shows_at(d: &Document, id: NodeId, p: PointF) -> bool {
+    let n = d.get(id).unwrap();
+    let Some(q) = d.from_window(n, p) else {
+        return false;
+    };
+    if !n.abs.contains(q) || !n.clip.contains(q) {
+        return false;
+    }
+    let mut space = n.space;
+    while let Some(r) = space.map(|s| d.get(s).unwrap()) {
+        if r.is_popup() {
+            break;
+        }
+        let next = if r.transformed {
+            r.outer_space
+        } else {
+            r.space
+        };
+        let Some(q) = d.from_window_space(next, p) else {
+            return false;
+        };
+        let clip = if r.transformed {
+            r.layer_clip.rect
+        } else {
+            child_clip(r, d.scale, r.clip_shape()).rect
+        };
+        if !clip.contains(q) {
+            return false;
+        }
+        space = next;
+    }
+    true
+}
+
 /// What hit testing should find, by looking at every node: the last one in paint order that
 /// isn't clipped away at `p`.
 fn hit_by_brute_force(p: PointF) -> Option<NodeId> {
@@ -159,7 +202,7 @@ fn hit_by_brute_force(p: PointF) -> Option<NodeId> {
             n.visible
                 && n.computed.pointer_events
                 && !matches!(n.kind, NodeKind::Fragment)
-                && d.visible_window_rect(*id).unwrap().contains(p)
+                && shows_at(d, *id, p)
         })
     })
 }
@@ -199,7 +242,12 @@ fn check_finding(p: PointF, pressed: bool, what: &str) {
 
 fn check(ui: &mut Ui, now: Instant, what: &str) {
     ui.update();
-    let incremental_scene = ui.paint(now);
+    let mut incremental_scene = ui.paint(now);
+    if with_doc(|d| d.settling) {
+        ui.update();
+        incremental_scene = ui.paint(now);
+        assert!(!with_doc(|d| d.settling), "{what}: one frame must do");
+    }
     assert_same_in_view(&paint_all(now), &incremental_scene, what);
 
     let incremental = snapshot();
@@ -234,10 +282,9 @@ fn check(ui: &mut Ui, now: Instant, what: &str) {
             b.visible,
             a.computed == b.computed,
         );
-        // Bounds may be too big after growing, never too small.
-        assert_eq!(
-            a_bounds.intersect(b_bounds),
-            *b_bounds,
+        // Bounds may be too big after growing, never too small. Nothing is inside of empty ones.
+        assert!(
+            b_bounds.is_empty() || a_bounds.intersect(b_bounds) == *b_bounds,
             "{what}: bounds {a_bounds:?} vs {b_bounds:?}"
         );
     }
@@ -279,9 +326,23 @@ struct Doc {
     /// Overlapping stacked boxes, in the scroller and over everything.
     overlays: Signal<bool>,
     faded: Signal<bool>,
+    /// How some rows and boxes are transformed, and the scroller with all of that in it.
+    moved: Signal<u32>,
+    moved_scroller: Signal<u32>,
     outer: NodeRef,
     inner: NodeRef,
     field: NodeRef,
+}
+
+/// Only what keeps boxes as boxes: what the hit test finds is then easy to work out.
+fn transformed(st: Style, how: u32) -> Style {
+    match how {
+        1 => st.translate(7.0, 3.0),
+        2 => st.scale(2.0).transform_origin(0.0, 0.0),
+        3 => st.translate(-4.5, 10.25).opacity(0.5),
+        4 => st.scale_x(0.5).translate_y(20.0),
+        _ => st,
+    }
 }
 
 fn view(s: &Doc) -> impl IntoView + use<> {
@@ -290,6 +351,7 @@ fn view(s: &Doc) -> impl IntoView + use<> {
     let (outer, inner, field) = (s.outer, s.inner, s.field);
     let box_corner = s.box_corner;
     let (row_z, overlays, faded) = (s.row_z, s.overlays, s.faded);
+    let (moved, moved_scroller) = (s.moved, s.moved_scroller);
     // Clips without scrolling; its child's clip follows the corners without any layout.
     let rounded_box = move || {
         div()
@@ -297,6 +359,7 @@ fn view(s: &Doc) -> impl IntoView + use<> {
             .w(120.0)
             .overflow_clip()
             .dyn_style(move |st| st.rounded(box_corner.get()))
+            .dyn_style(move |st| transformed(st, moved.get()))
             .child(
                 div()
                     .h(30.0)
@@ -321,6 +384,7 @@ fn view(s: &Doc) -> impl IntoView + use<> {
                 .border(3.0)
                 .overflow_scroll()
                 .dyn_style(move |st| st.rounded(corner.get()))
+                .dyn_style(move |st| transformed(st, moved_scroller.get()))
                 .child(
                     div()
                         .w(900.0)
@@ -367,6 +431,8 @@ fn view(s: &Doc) -> impl IntoView + use<> {
                                     .bg(rgb(0xf4f4f4))
                                     .hover(|st| st.bg(rgb(0xccccff)).rounded(6.0))
                                     .active(|st| st.bg(rgb(0xaaaaff)))
+                                    // Some of what changes on the way, every now and then.
+                                    .transition(Transition::ms(if i % 2 == 0 { 100 } else { 0 }))
                                     .dyn_style(move |st| {
                                         if glow.get() && i % 3 == 0 {
                                             st.shadow_md()
@@ -377,6 +443,13 @@ fn view(s: &Doc) -> impl IntoView + use<> {
                                     .dyn_style(move |st| {
                                         if row_z.get() != 0 && i % 2 == 0 {
                                             st.z_index(row_z.get() * (i as i32 % 5 - 2))
+                                        } else {
+                                            st
+                                        }
+                                    })
+                                    .dyn_style(move |st| {
+                                        if i % 3 == 2 {
+                                            transformed(st, moved.get())
                                         } else {
                                             st
                                         }
@@ -469,6 +542,8 @@ fn random_changes(seed: u64) {
         row_z: signal(0),
         overlays: signal(false),
         faded: signal(false),
+        moved: signal(0),
+        moved_scroller: signal(0),
         outer: node_ref(),
         inner: node_ref(),
         field: node_ref(),
@@ -492,7 +567,7 @@ fn random_changes(seed: u64) {
             rng.next(size.width as u32) as f32,
             rng.next(size.height as u32) as f32,
         );
-        let what = rng.next(24);
+        let what = rng.next(26);
         // Like a real pointer, it gets to a place before doing anything there.
         ui.handle_event(WindowEvent::PointerMoved {
             position: p,
@@ -591,6 +666,8 @@ fn random_changes(seed: u64) {
             21 => s.row_z.set(rng.next(4) as i32 - 1),
             22 => s.overlays.update(|v| *v = !*v),
             23 => s.faded.update(|v| *v = !*v),
+            24 => s.moved.set(rng.next(5)),
+            25 => s.moved_scroller.set(rng.next(5)),
             _ => {
                 size = SizeI::new(300 + rng.next(400) as i32, 200 + rng.next(400) as i32);
                 let scale = Scale(120 + rng.next(120));

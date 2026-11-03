@@ -255,7 +255,7 @@ RTX 5070 Laptop、電源接続、各 8 秒の後ろ 3/4。fps / 遅延 p50（ms�
 
 ## 毎フレームの処理
 
-`request_frame(|now| …)` は `requestAnimationFrame` に当たる。次のフレームを作る前に UI スレッドで 1 回呼ばれ、中でもう一度呼ぶと毎フレーム動き続ける。
+`request_frame(|now| …)` は `requestAnimationFrame` に当たる。次のフレームを作る前に UI スレッドで 1 回呼ばれ、中でもう一度呼ぶと毎フレーム動き続ける。多くの場合は `transition` や `animated` の方が手軽（[13](13-animation.md)）。
 
 ```rust
 fn spin(angle: Signal<f32>) {

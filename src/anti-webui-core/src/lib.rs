@@ -21,7 +21,7 @@ pub use anti_webui_style as style;
 pub use ui::Ui;
 
 pub mod prelude {
-    pub use crate::animation::request_frame;
+    pub use crate::animation::{Animatable, Animated, Spring, animated, request_frame};
     pub use crate::event::{
         Key, KeyboardEvent, Modifiers, NamedKey, PointerButton, PointerEvent, ScrollEvent,
         ScrollPhase, ScrollSource,

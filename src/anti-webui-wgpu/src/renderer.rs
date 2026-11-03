@@ -2,8 +2,8 @@
 
 use crate::glyph_cache::{GlyphCache, PlacedGlyph};
 use anti_webui_core::damage::{Damage, diff_content, primitive_bounds};
-use anti_webui_core::geometry::RectI;
-use anti_webui_core::scene::{Clip, Primitive, Quad, Scene, ScrollLayer};
+use anti_webui_core::geometry::{Affine, RectI};
+use anti_webui_core::scene::{Clip, Layer, Primitive, Quad, Scene};
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -11,6 +11,11 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 const ATLAS_INITIAL: u32 = 1024;
+
+/// A layer is never drawn bigger than this, however far it is scaled up.
+const MAX_K: i32 = 4;
+/// How big a rotated layer is drawn, so that filtering doesn't soften its text much.
+const ROTATED_K: i32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -54,6 +59,19 @@ struct GlyphInstance {
     clip_radii: [f32; 4],
 }
 
+/// A part of a layer's texture shown through a transform.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LayerInstance {
+    matrix: [f32; 4],
+    offset: [f32; 2],
+    size: [f32; 2],
+    uv: [f32; 4],
+    clip: [f32; 4],
+    clip_radii: [f32; 4],
+    opacity: f32,
+}
+
 enum Batch {
     Quads(Range<u32>),
     /// Solid instances, blended.
@@ -61,12 +79,17 @@ enum Batch {
     /// Solid instances of opaque colors, replacing what is there.
     Opaque(Range<u32>),
     Glyphs(Range<u32>),
-    /// Glyph instances that sample the texture of the layer with this key.
-    Layer(u64, Range<u32>),
+    /// Layer instances that sample the texture of the layer with this key.
+    Layer {
+        key: u64,
+        /// Texels don't land on pixels.
+        linear: bool,
+        range: Range<u32>,
+    },
 }
 
-/// A texture holding a scroll layer's content. A content pixel `(x, y)` lives at texel
-/// `(x mod width, y mod height)`, so what is already drawn stays put as the layer scrolls in any
+/// A texture holding a layer's content, `k` times bigger. A content pixel `(x, y)` lives at texel
+/// `(kx mod width, ky mod height)`, so what is already drawn stays put as the layer scrolls in any
 /// direction (see `docs/design/05-rendering.md`).
 struct LayerCache {
     /// The target it is shown on, which decides when it is no longer in use.
@@ -74,12 +97,18 @@ struct LayerCache {
     view: wgpu::TextureView,
     /// Binds the texture like the glyph atlas, for compositing.
     bind: wgpu::BindGroup,
+    /// The same with bilinear filtering.
+    bind_linear: wgpu::BindGroup,
     /// Globals for rendering into the texture.
     globals_bind: wgpu::BindGroup,
     size: (i32, i32),
+    /// How many texels a content pixel takes. See `docs/design/12-transform.md`.
+    k: i32,
     content: Arc<Scene>,
     /// Bounds of the content's primitives, to find those touching a rectangle quickly.
     bounds: Vec<RectI>,
+    /// Which of the content's primitives are layers.
+    nested: Vec<u32>,
     /// The content rectangle the texture holds.
     valid: RectI,
     used: bool,
@@ -104,6 +133,19 @@ struct Instances {
     solids: Vec<SolidInstance>,
     quads: Vec<QuadInstance>,
     glyphs: Vec<GlyphInstance>,
+    layers: Vec<LayerInstance>,
+}
+
+/// Where content goes in the texture being drawn: `k` times bigger, then moved.
+#[derive(Clone, Copy)]
+struct Placement {
+    k: i32,
+    dx: i32,
+    dy: i32,
+}
+
+impl Placement {
+    const NONE: Placement = Placement { k: 1, dx: 0, dy: 0 };
 }
 
 struct Prepared {
@@ -347,6 +389,7 @@ pub struct Renderer {
     /// The solid pipeline without blending, for opaque colors and clearing damaged rectangles.
     opaque_pipeline: wgpu::RenderPipeline,
     glyph_pipeline: wgpu::RenderPipeline,
+    layer_pipeline: wgpu::RenderPipeline,
     globals: wgpu::Buffer,
     globals_bind: wgpu::BindGroup,
     globals_layout: wgpu::BindGroupLayout,
@@ -354,10 +397,13 @@ pub struct Renderer {
     atlas: wgpu::Texture,
     atlas_bind: wgpu::BindGroup,
     sampler: wgpu::Sampler,
+    /// Wraps around, since a layer's texture does.
+    linear_sampler: wgpu::Sampler,
     glyphs: GlyphCache,
     solid_buffer: InstanceBuffer,
     quad_buffer: InstanceBuffer,
     glyph_buffer: InstanceBuffer,
+    layer_buffer: InstanceBuffer,
     max_texture: u32,
     layers: HashMap<u64, LayerCache>,
     /// The target being rendered to, when one renderer serves several.
@@ -464,6 +510,14 @@ impl Renderer {
             label: Some("atlas"),
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("layer"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         let (atlas, atlas_bind) = create_atlas(device, &atlas_layout, &sampler, ATLAS_INITIAL);
@@ -600,6 +654,36 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        let layer_attrs = wgpu::vertex_attr_array![
+            0 => Float32x4, 1 => Float32x2, 2 => Float32x2, 3 => Float32x4, 4 => Float32x4,
+            5 => Float32x4, 6 => Float32
+        ];
+        let layer_buffers = [Some(wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<LayerInstance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &layer_attrs,
+        })];
+        let layer_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("layer"),
+            layout: Some(&glyph_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_layer"),
+                compilation_options: Default::default(),
+                buffers: &layer_buffers,
+            },
+            primitive,
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_layer"),
+                compilation_options: Default::default(),
+                targets: &targets,
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
 
         Self {
             format,
@@ -607,6 +691,7 @@ impl Renderer {
             solid_pipeline,
             opaque_pipeline,
             glyph_pipeline,
+            layer_pipeline,
             globals,
             globals_bind,
             globals_layout,
@@ -614,10 +699,12 @@ impl Renderer {
             atlas,
             atlas_bind,
             sampler,
+            linear_sampler,
             glyphs: GlyphCache::new(ATLAS_INITIAL),
             solid_buffer: InstanceBuffer::new(device, "solids"),
             quad_buffer: InstanceBuffer::new(device, "quads"),
             glyph_buffer: InstanceBuffer::new(device, "glyphs"),
+            layer_buffer: InstanceBuffer::new(device, "layers"),
             max_texture: device.limits().max_texture_dimension_2d,
             layers: HashMap::new(),
             target: 0,
@@ -654,11 +741,12 @@ impl Renderer {
     fn create_layer_cache(
         &self,
         device: &wgpu::Device,
-        layer: &ScrollLayer,
+        layer: &Layer,
         size: (i32, i32),
+        k: i32,
     ) -> LayerCache {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("scroll layer"),
+            label: Some("layer"),
             size: wgpu::Extent3d {
                 width: size.0 as u32,
                 height: size.1 as u32,
@@ -672,22 +760,26 @@ impl Renderer {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("scroll layer"),
-            layout: &self.atlas_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
+        let bind_with = |sampler: &wgpu::Sampler| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("layer"),
+                layout: &self.atlas_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            })
+        };
+        let bind = bind_with(&self.sampler);
+        let bind_linear = bind_with(&self.linear_sampler);
         let globals = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("scroll layer globals"),
+            label: Some("layer globals"),
             contents: bytemuck::bytes_of(&Globals {
                 viewport: [size.0 as f32, size.1 as f32],
                 _pad: [0.0; 2],
@@ -695,26 +787,25 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let globals_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("scroll layer globals"),
+            label: Some("layer globals"),
             layout: &self.globals_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: globals.as_entire_binding(),
             }],
         });
+        let (bounds, nested) = index_content(&layer.content);
         LayerCache {
             owner: self.target,
             view,
             bind,
+            bind_linear,
             globals_bind,
             size,
+            k,
             content: layer.content.clone(),
-            bounds: layer
-                .content
-                .primitives
-                .iter()
-                .map(primitive_bounds)
-                .collect(),
+            bounds,
+            nested,
             valid: RectI::default(),
             used: true,
         }
@@ -735,64 +826,119 @@ impl Renderer {
         }
         let mut plans = Vec::new();
         for prim in &scene.primitives {
-            let Primitive::Layer(layer) = prim else {
-                continue;
-            };
-            if let Some(cache) = self.layers.get_mut(&layer.key) {
-                cache.used = true;
-            }
-            let visible = layer.clip.rect.intersect(&screen);
-            if visible.is_empty()
-                || damage.is_some_and(|d| !d.iter().any(|r| r.intersects(&visible)))
-            {
-                continue;
-            }
-            // Round up so that small resizes keep the texture, and shrink only when it is far
-            // too big.
-            let needed = (
-                ((visible.width + 127) & !127).min(self.max_texture as i32),
-                ((visible.height + 127) & !127).min(self.max_texture as i32),
-            );
-            let fits = self.layers.get(&layer.key).is_some_and(|c| {
-                c.size.0 >= needed.0
-                    && c.size.1 >= needed.1
-                    && (c.size.0 as i64 * c.size.1 as i64) <= 2 * needed.0 as i64 * needed.1 as i64
-            });
-            if !fits {
-                let cache = self.create_layer_cache(device, layer, needed);
-                self.layers.insert(layer.key, cache);
-            }
-            let cache = self.layers.get_mut(&layer.key).expect("just inserted");
-
-            let view = visible.translate(-layer.origin.x, -layer.origin.y);
-            let kept = cache.valid.intersect(&view);
-            let mut dirty = Damage::new();
-            if !Arc::ptr_eq(&cache.content, &layer.content) {
-                if !kept.is_empty() {
-                    let changed = diff_content(&cache.content, &layer.content);
-                    for r in changed.rects() {
-                        dirty.add(r.intersect(&kept));
-                    }
-                }
-                cache.content = layer.content.clone();
-                cache.bounds = layer
-                    .content
-                    .primitives
-                    .iter()
-                    .map(primitive_bounds)
-                    .collect();
-            }
-            subtract(view, kept, &mut dirty);
-            cache.valid = view;
-            if !dirty.is_empty() {
-                plans.push(LayerPlan {
-                    key: layer.key,
-                    dirty: dirty.rects().to_vec(),
-                });
+            if let Primitive::Layer(layer) = prim {
+                self.plan_layer(device, layer, screen, damage, 1, &mut plans);
             }
         }
         self.layers.retain(|_, c| c.used || c.owner != target);
         plans
+    }
+
+    /// Plans a layer in a scene that shows `region` and redraws `within`, at `parent_k` texels per
+    /// pixel. What is inside of it comes first in `plans`: it has to be drawn before it is used.
+    fn plan_layer(
+        &mut self,
+        device: &wgpu::Device,
+        layer: &Layer,
+        region: RectI,
+        within: Option<&[RectI]>,
+        parent_k: i32,
+        plans: &mut Vec<LayerPlan>,
+    ) {
+        let shown = layer.bounds_on_parent().intersect(&region);
+        let matrix = layer.matrix();
+        let inverse = matrix.inverse();
+        let Some(inverse) = inverse.filter(|_| {
+            !shown.is_empty() && within.is_none_or(|d| d.iter().any(|r| r.intersects(&shown)))
+        }) else {
+            self.keep_layer(layer.key);
+            return;
+        };
+        let view = if layer.is_pixel_aligned() {
+            shown.translate(-matrix.e.round() as i32, -matrix.f.round() as i32)
+        } else {
+            // The pixel around it stays transparent: filtering fades the edge into it.
+            inverse
+                .bounds_of(shown)
+                .outset(1)
+                .intersect(&layer.bounds.outset(1))
+        };
+        let wanted = (matrix.max_scale() * parent_k as f64 - 0.01).ceil() as i32;
+        let wanted = if matrix.is_axis_aligned() {
+            wanted
+        } else {
+            wanted.max(ROTATED_K)
+        };
+        let k = self
+            .layers
+            .get(&layer.key)
+            .map_or(1, |c| c.k)
+            .max(wanted)
+            .clamp(1, MAX_K);
+        // A bigger texture isn't possible: rather than failing, show less sharp.
+        let largest = view.width.max(view.height).max(1) as i64;
+        let k = k.min((self.max_texture as i64 / largest).max(1) as i32);
+        // Round up so that small resizes keep the texture, and shrink only when it is far
+        // too big.
+        let needed = (
+            ((view.width * k + 127) & !127).min(self.max_texture as i32),
+            ((view.height * k + 127) & !127).min(self.max_texture as i32),
+        );
+        let fits = self.layers.get(&layer.key).is_some_and(|c| {
+            c.k == k
+                && c.size.0 >= needed.0
+                && c.size.1 >= needed.1
+                && (c.size.0 as i64 * c.size.1 as i64) <= 2 * needed.0 as i64 * needed.1 as i64
+        });
+        if !fits {
+            let cache = self.create_layer_cache(device, layer, needed, k);
+            self.layers.insert(layer.key, cache);
+        }
+        let cache = self.layers.get_mut(&layer.key).expect("just inserted");
+        cache.used = true;
+
+        let kept = cache.valid.intersect(&view);
+        let mut dirty = Damage::new();
+        if !Arc::ptr_eq(&cache.content, &layer.content) {
+            if !kept.is_empty() {
+                let changed = diff_content(&cache.content, &layer.content);
+                for r in changed.rects() {
+                    dirty.add(r.intersect(&kept));
+                }
+            }
+            cache.content = layer.content.clone();
+            (cache.bounds, cache.nested) = index_content(&layer.content);
+        }
+        subtract(view, kept, &mut dirty);
+        cache.valid = view;
+        let dirty = dirty.rects().to_vec();
+        let nested = cache.nested.clone();
+        for i in nested {
+            if let Primitive::Layer(inner) = &layer.content.primitives[i as usize] {
+                self.plan_layer(device, inner, view, Some(&dirty), k, plans);
+            }
+        }
+        if !dirty.is_empty() {
+            plans.push(LayerPlan {
+                key: layer.key,
+                dirty,
+            });
+        }
+    }
+
+    /// Marks a layer and what is inside of it as still in use, although not touched this frame.
+    fn keep_layer(&mut self, key: u64) {
+        let Some(cache) = self.layers.get_mut(&key) else {
+            return;
+        };
+        cache.used = true;
+        let content = cache.content.clone();
+        let nested = cache.nested.clone();
+        for i in nested {
+            if let Primitive::Layer(inner) = &content.primitives[i as usize] {
+                self.keep_layer(inner.key);
+            }
+        }
     }
 
     /// Builds instance data; grows the atlas and retries if glyphs did not fit.
@@ -842,21 +988,34 @@ impl Renderer {
             let cache = &layers[&plan.key];
             let mut ops = Vec::new();
             let target = RectI::new(0, 0, cache.size.0, cache.size.1);
+            let k = cache.k;
             let mut failed = false;
             for dirty in &plan.dirty {
-                torus_parts(*dirty, cache.size, |part, (tx, ty)| {
+                torus_parts(dirty.scaled(k), cache.size, |part, (tx, ty)| {
                     let scissor = RectI::new(tx, ty, part.width, part.height);
                     let index = out.instances.solids.len() as u32;
                     out.instances.solids.push(solid_instance(scissor, [0.0; 4]));
                     let mut batches = Vec::new();
+                    let at = Placement {
+                        k,
+                        dx: tx - part.x,
+                        dy: ty - part.y,
+                    };
+                    let touched = RectI::new(
+                        part.x.div_euclid(k),
+                        part.y.div_euclid(k),
+                        part.width / k + 2,
+                        part.height / k + 2,
+                    );
                     for (prim, bounds) in cache.content.primitives.iter().zip(&cache.bounds) {
-                        if !bounds.intersects(&part) {
+                        if !bounds.intersects(&touched) {
                             continue;
                         }
                         let placed_ok = self.push_primitive(
                             prim,
-                            (tx - part.x, ty - part.y),
+                            at,
                             target,
+                            &layers,
                             &mut out.instances,
                             &mut batches,
                             &mut placed,
@@ -883,22 +1042,11 @@ impl Renderer {
                 {
                     continue;
                 }
-                if let Primitive::Layer(layer) = prim {
-                    if let Some(cache) = layers.get(&layer.key) {
-                        push_layer(
-                            layer,
-                            cache,
-                            screen,
-                            &mut out.instances.glyphs,
-                            &mut out.batches,
-                        );
-                    }
-                    continue;
-                }
                 self.push_primitive(
                     prim,
-                    (0, 0),
+                    Placement::NONE,
                     screen,
+                    &layers,
                     &mut out.instances,
                     &mut out.batches,
                     &mut placed,
@@ -912,26 +1060,35 @@ impl Renderer {
         Some(out)
     }
 
-    /// Adds the instances for a primitive, moved by `delta`, to a pass rendering into `target`.
+    /// Adds the instances for a primitive, placed by `at`, to a pass rendering into `target`.
     /// Returns `None` if the glyph atlas is full.
     #[allow(clippy::too_many_arguments)]
     fn push_primitive(
         &mut self,
         prim: &Primitive,
-        delta: (i32, i32),
+        at: Placement,
         target: RectI,
+        layers: &HashMap<u64, LayerCache>,
         instances: &mut Instances,
         batches: &mut Vec<Batch>,
         placed: &mut Vec<PlacedGlyph>,
     ) -> Option<()> {
-        let (dx, dy) = delta;
+        let Placement { k, dx, dy } = at;
         let Instances {
             solids,
             quads,
             glyphs,
+            layers: layer_instances,
         } = instances;
         match prim {
             Primitive::Quad(q) => {
+                let scaled;
+                let q = if k == 1 {
+                    q
+                } else {
+                    scaled = q.scaled(k);
+                    &scaled
+                };
                 let rect = q.rect.translate(dx, dy);
                 let clip = q.clip.translated(dx, dy);
                 let visible = rect.intersect(&clip.rect).intersect(&target);
@@ -984,6 +1141,13 @@ impl Renderer {
                 });
             }
             Primitive::Shadow(s) => {
+                let scaled;
+                let s = if k == 1 {
+                    s
+                } else {
+                    scaled = s.scaled(k);
+                    &scaled
+                };
                 let (clip, clip_radii) = gpu_clip(&s.clip.translated(dx, dy), target);
                 let visible = s
                     .bounds()
@@ -1008,9 +1172,9 @@ impl Renderer {
             }
             Primitive::Glyphs(run) => {
                 placed.clear();
-                self.glyphs.place_run(run, placed)?;
+                self.glyphs.place_run(run, k, placed)?;
                 let color = run.color.premultiplied();
-                let (clip, clip_radii) = gpu_clip(&run.clip.translated(dx, dy), target);
+                let (clip, clip_radii) = gpu_clip(&run.clip.scaled(k).translated(dx, dy), target);
                 for p in placed.iter() {
                     glyphs.push(GlyphInstance {
                         rect: [
@@ -1028,8 +1192,11 @@ impl Renderer {
                     push_batch(batches, BatchKind::Glyphs, glyphs.len() as u32);
                 }
             }
-            // Layers don't nest; the painter draws inner scrollers as content.
-            Primitive::Layer(_) => {}
+            Primitive::Layer(layer) => {
+                if let Some(cache) = layers.get(&layer.key) {
+                    push_layer(layer, cache, at, target, layer_instances, batches);
+                }
+            }
         }
         Some(())
     }
@@ -1125,11 +1292,13 @@ impl Renderer {
             .upload(device, queue, bytemuck::cast_slice(&instances.quads));
         self.glyph_buffer
             .upload(device, queue, bytemuck::cast_slice(&instances.glyphs));
+        self.layer_buffer
+            .upload(device, queue, bytemuck::cast_slice(&instances.layers));
 
         for (key, ops) in &rasters {
             let cache = &self.layers[key];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("scroll layer"),
+                label: Some("layer"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &cache.view,
                     depth_slice: None,
@@ -1220,14 +1389,19 @@ impl Renderer {
                     pass.set_vertex_buffer(0, self.glyph_buffer.buffer.slice(..));
                     pass.draw(0..4, r.clone());
                 }
-                Batch::Layer(key, r) => {
+                Batch::Layer { key, linear, range } => {
                     let Some(cache) = self.layers.get(key) else {
                         continue;
                     };
-                    pass.set_pipeline(&self.glyph_pipeline);
-                    pass.set_bind_group(1, &cache.bind, &[]);
-                    pass.set_vertex_buffer(0, self.glyph_buffer.buffer.slice(..));
-                    pass.draw(0..4, r.clone());
+                    pass.set_pipeline(&self.layer_pipeline);
+                    let bind = if *linear {
+                        &cache.bind_linear
+                    } else {
+                        &cache.bind
+                    };
+                    pass.set_bind_group(1, bind, &[]);
+                    pass.set_vertex_buffer(0, self.layer_buffer.buffer.slice(..));
+                    pass.draw(0..4, range.clone());
                 }
             }
         }
@@ -1241,37 +1415,60 @@ fn solid_instance(r: RectI, color: [f32; 4]) -> SolidInstance {
     }
 }
 
-/// Adds the textured quads that show a layer. They use the glyph pipeline as "color glyphs":
-/// premultiplied texels, clipped in the shader.
+/// Adds the textured quads that show what a layer's texture holds.
 fn push_layer(
-    layer: &ScrollLayer,
+    layer: &Layer,
     cache: &LayerCache,
-    screen: RectI,
-    glyphs: &mut Vec<GlyphInstance>,
+    at: Placement,
+    target: RectI,
+    instances: &mut Vec<LayerInstance>,
     batches: &mut Vec<Batch>,
 ) {
-    let visible = layer.clip.rect.intersect(&screen);
-    let view = visible.translate(-layer.origin.x, -layer.origin.y);
-    let (clip, clip_radii) = gpu_clip(&layer.clip, screen);
+    let (clip, clip_radii) = gpu_clip(&layer.clip.scaled(at.k).translated(at.dx, at.dy), target);
+    let (k, parent) = (cache.k as f64, at.k as f64);
+    // From texels to the target.
+    let m = Affine::translation(at.dx as f64, at.dy as f64)
+        .then_apply(&Affine::scaling(parent, parent))
+        .then_apply(&layer.matrix())
+        .then_apply(&Affine::scaling(1.0 / k, 1.0 / k));
     let (w, h) = (cache.size.0 as f32, cache.size.1 as f32);
-    let start = glyphs.len() as u32;
-    torus_parts(view, cache.size, |part, (tx, ty)| {
+    let start = instances.len() as u32;
+    torus_parts(cache.valid.scaled(cache.k), cache.size, |part, (tx, ty)| {
         let (tx, ty) = (tx as f32, ty as f32);
-        glyphs.push(GlyphInstance {
-            rect: rect4(part.translate(layer.origin.x, layer.origin.y)),
+        let (x, y) = m.apply(part.x as f64, part.y as f64);
+        instances.push(LayerInstance {
+            matrix: [m.a as f32, m.b as f32, m.c as f32, m.d as f32],
+            offset: [x as f32, y as f32],
+            size: [part.width as f32, part.height as f32],
             uv: [
                 tx / w,
                 ty / h,
                 (tx + part.width as f32) / w,
                 (ty + part.height as f32) / h,
             ],
-            color: [1.0; 4],
             clip,
-            params: [1.0, 0.0, 0.0, 0.0],
             clip_radii,
+            opacity: layer.opacity,
         });
     });
-    batches.push(Batch::Layer(layer.key, start..glyphs.len() as u32));
+    batches.push(Batch::Layer {
+        key: layer.key,
+        linear: !m.is_whole_translation(),
+        range: start..instances.len() as u32,
+    });
+}
+
+/// The bounds of a layer's primitives, and which of them are layers.
+fn index_content(content: &Scene) -> (Vec<RectI>, Vec<u32>) {
+    let bounds = content.primitives.iter().map(primitive_bounds).collect();
+    let nested = content
+        .primitives
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| matches!(p, Primitive::Layer(_)))
+        .map(|(i, _)| i as u32)
+        .collect();
+    (bounds, nested)
 }
 
 #[derive(Clone, Copy)]
