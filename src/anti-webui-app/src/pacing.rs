@@ -15,9 +15,20 @@ const CONTINUOUS_NS: i64 = 2_000_000;
 /// What the compositor hasn't said by then, it won't say.
 const GIVE_UP_NS: i64 = 1_000_000_000;
 
+/// The first frames of a burst are slow whatever the load, so they say nothing.
+const WARM_UP: usize = 4;
 /// How many of the frames looked at are skipped before rendering ahead is tried out...
 const LOOKED_AT: usize = 32;
 const SKIPS_TO_TRY: usize = 4;
+/// A longer gap between frames is a pause, not a frame that started a little late.
+const PAUSE_NS: i64 = 100_000_000;
+/// Frames come slowly for a while after a pause, whether or not they are ahead. Until this many,
+/// rendering ahead looks better than it is...
+const SETTLED: usize = 64;
+/// ...so a trial that early is shorter, and stays only if the gain is more than that can explain.
+/// A smaller one is tried again once settled.
+const EARLY_TRIAL: usize = 16;
+const CLEAR_GAIN: f64 = 1.5;
 /// A gap on the screen counts for at most this many refreshes when comparing rates: what is
 /// compared is how frames come, not the odd stall.
 const LONGEST_GAP: i64 = 4;
@@ -105,9 +116,10 @@ pub(crate) struct AutoAdvance {
     /// The last frames looked at: whether a refresh was skipped before each, and the time since
     /// the frame before on the screen.
     looked_at: VecDeque<(bool, i64)>,
-    /// How many frames in a row were continuous. The first [`LOOKED_AT`] of them say little: frames
-    /// come slowly for a moment after a pause, whether or not they are ahead.
+    /// How many frames in a row were continuous.
     burst: usize,
+    /// There was a trial before [`SETTLED`] that said nothing clear.
+    tried_early: bool,
     /// Since when frames have been fitting well.
     calm_since: Option<i64>,
     hold: Duration,
@@ -127,6 +139,7 @@ enum AutoState {
     /// Rendering ahead, to see if frames come faster than the time between them before.
     Trying {
         before: f64,
+        early: bool,
     },
     On,
 }
@@ -137,6 +150,7 @@ impl Default for AutoAdvance {
             state: AutoState::Off,
             looked_at: VecDeque::with_capacity(LOOKED_AT),
             burst: 0,
+            tried_early: false,
             calm_since: None,
             hold: FIRST_HOLD,
             retry: FIRST_RETRY,
@@ -170,11 +184,13 @@ impl AutoAdvance {
         let (Some(skipped), Some(shown), Some(before)) =
             (this.skipped_after(prev), this.presented, prev.presented)
         else {
-            self.burst = 0;
+            if this.start - prev.end > PAUSE_NS {
+                self.burst = 0;
+            }
             return;
         };
         self.burst += 1;
-        if self.burst <= LOOKED_AT && !self.engaged() {
+        if self.burst <= WARM_UP && !self.engaged() {
             self.looked_at.clear();
             return;
         }
@@ -187,18 +203,20 @@ impl AutoAdvance {
         match self.state {
             AutoState::Unhelpful { until } if this.start < until => {}
             AutoState::Off | AutoState::Unhelpful { .. } => self.consider_trying(this),
-            AutoState::Trying { before } => self.judge_trial(before, this),
+            AutoState::Trying { before, early } => self.judge_trial(before, early, this),
             AutoState::On => self.consider_ending(this),
         }
     }
 
     fn consider_trying(&mut self, this: &FrameRecord) {
         let skips = self.looked_at.iter().filter(|&&(s, _)| s).count();
-        if skips < SKIPS_TO_TRY || self.looked_at.len() < LOOKED_AT {
+        let early = self.burst < SETTLED;
+        if skips < SKIPS_TO_TRY || (early && self.tried_early) {
             return;
         }
         self.state = AutoState::Trying {
             before: self.mean_interval(),
+            early,
         };
         self.looked_at.clear();
         self.calm_since = None;
@@ -210,13 +228,19 @@ impl AutoAdvance {
         }
     }
 
-    fn judge_trial(&mut self, before: f64, this: &FrameRecord) {
-        if self.looked_at.len() < LOOKED_AT {
+    fn judge_trial(&mut self, before: f64, early: bool, this: &FrameRecord) {
+        let frames = if early { EARLY_TRIAL } else { LOOKED_AT };
+        if self.looked_at.len() < frames {
             return;
         }
-        if self.mean_interval() * WORTH_IT <= before {
+        let needed = if early { CLEAR_GAIN } else { WORTH_IT };
+        if self.mean_interval() * needed <= before {
             self.state = AutoState::On;
             self.retry = FIRST_RETRY;
+        } else if early && self.mean_interval() * WORTH_IT <= before {
+            self.state = AutoState::Off;
+            self.tried_early = true;
+            self.looked_at.clear();
         } else {
             self.state = AutoState::Unhelpful {
                 until: this.start + self.retry.as_nanos() as i64,
@@ -511,7 +535,14 @@ mod tests {
 
     /// Frames on the screen every other refresh, until rendering ahead is being tried.
     fn start_trial(auto: &mut AutoAdvance, from: i64) -> i64 {
-        feed(auto, from, 2 * LOOKED_AT as i64, 10 * MS, 2 * REFRESH)
+        let mut t = from;
+        for _ in 0..=SETTLED {
+            t = feed(auto, t, 1, 10 * MS, 2 * REFRESH);
+            if auto.engaged() {
+                return t;
+            }
+        }
+        panic!("no trial");
     }
 
     /// Frames on the screen every other refresh, for `wait`.
@@ -520,9 +551,16 @@ mod tests {
         feed(auto, from, count, 10 * MS, 2 * REFRESH)
     }
 
-    /// Enough frames to judge the trial by, on the screen every `step`.
+    /// Frames on the screen every `step`, until the trial has been judged.
     fn finish_trial(auto: &mut AutoAdvance, from: i64, step: i64) -> i64 {
-        feed(auto, from, LOOKED_AT as i64 + 1, 10 * MS, step)
+        let mut t = from;
+        for _ in 0..=LOOKED_AT {
+            t = feed(auto, t, 1, 10 * MS, step);
+            if !matches!(auto.state, AutoState::Trying { .. }) {
+                return t;
+            }
+        }
+        panic!("no verdict");
     }
 
     fn turned_on(auto: &mut AutoAdvance) -> i64 {
@@ -566,21 +604,34 @@ mod tests {
     #[test]
     fn the_first_frames_of_a_burst_do_not_start_a_trial() {
         let mut auto = AutoAdvance::default();
-        feed(&mut auto, 0, 2 * LOOKED_AT as i64 - 2, 10 * MS, 2 * REFRESH);
+        feed(&mut auto, 0, WARM_UP as i64, 10 * MS, 2 * REFRESH);
         assert!(!auto.engaged());
+    }
+
+    #[test]
+    fn a_trial_starts_soon_after_the_first_frames() {
+        let mut auto = AutoAdvance::default();
+        feed(
+            &mut auto,
+            0,
+            (WARM_UP + SKIPS_TO_TRY + 2) as i64,
+            10 * MS,
+            2 * REFRESH,
+        );
+        assert!(auto.engaged());
     }
 
     #[test]
     fn a_pause_starts_a_burst_over() {
         let mut auto = AutoAdvance::default();
-        let t = feed(&mut auto, 0, 2 * LOOKED_AT as i64 - 2, 10 * MS, 2 * REFRESH);
-        let mut after_pause = frame(t + 100 * MS, 10 * MS, t + 120 * MS);
+        let t = feed(&mut auto, 0, WARM_UP as i64, 10 * MS, 2 * REFRESH);
+        let mut after_pause = frame(t + 200 * MS, 10 * MS, t + 220 * MS);
         after_pause.callback = Some(t);
         auto.observe(&frame(t - 2 * REFRESH, 10 * MS, t), &after_pause);
         feed(
             &mut auto,
-            t + 200 * MS,
-            LOOKED_AT as i64,
+            t + 300 * MS,
+            WARM_UP as i64,
             10 * MS,
             2 * REFRESH,
         );
@@ -588,16 +639,53 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_starting_a_little_late_is_not_a_pause() {
+        let mut auto = AutoAdvance::default();
+        let t = feed(&mut auto, 0, 10, 2 * MS, REFRESH);
+        let mut late = frame(t + 5 * MS, 2 * MS, t + 2 * REFRESH);
+        late.callback = Some(t);
+        auto.observe(&frame(t - REFRESH, 2 * MS, t), &late);
+        assert_eq!(auto.burst, 10);
+    }
+
+    #[test]
     fn an_odd_stall_does_not_make_a_trial_look_good() {
         let mut auto = AutoAdvance::default();
         // Frames on the screen every other refresh, also during the trial, apart from a long
         // stall before it. Without a limit, that would make the rate look better afterwards.
-        let t = feed(&mut auto, 0, LOOKED_AT as i64 + 8, 10 * MS, 2 * REFRESH);
+        let t = feed(&mut auto, 0, WARM_UP as i64 + 3, 10 * MS, 2 * REFRESH);
         let t = feed(&mut auto, t, 1, 10 * MS, 500 * MS);
-        let t = feed(&mut auto, t, LOOKED_AT as i64 - 9, 10 * MS, 2 * REFRESH);
-        assert!(auto.engaged());
+        let t = start_trial(&mut auto, t);
         finish_trial(&mut auto, t, 2 * REFRESH);
         assert!(!auto.engaged());
+    }
+
+    #[test]
+    fn a_clear_gain_stays_right_away() {
+        let mut auto = AutoAdvance::default();
+        let t = start_trial(&mut auto, 0);
+        feed(&mut auto, t, EARLY_TRIAL as i64 + 1, 10 * MS, REFRESH);
+        assert_eq!(auto.state, AutoState::On);
+    }
+
+    #[test]
+    fn a_small_early_gain_is_tried_again_once_settled() {
+        let mut auto = AutoAdvance::default();
+        let t = start_trial(&mut auto, 0);
+        // 1.3 times as fast: frames after a pause could look like that without any real gain.
+        let step = 2 * REFRESH * 10 / 13;
+        let t = feed(&mut auto, t, EARLY_TRIAL as i64 + 1, 10 * MS, step);
+        assert!(!auto.engaged());
+        let frames = SETTLED - auto.burst - 1;
+        let t = feed(&mut auto, t, frames as i64, 10 * MS, 2 * REFRESH);
+        assert!(!auto.engaged(), "not settled yet");
+        let t = feed(&mut auto, t, 3, 10 * MS, 2 * REFRESH);
+        assert!(auto.engaged());
+        // Now the same gain is enough, once it has been seen for longer.
+        let t = feed(&mut auto, t, EARLY_TRIAL as i64 + 1, 10 * MS, step);
+        assert!(matches!(auto.state, AutoState::Trying { .. }));
+        finish_trial(&mut auto, t, step);
+        assert_eq!(auto.state, AutoState::On);
     }
 
     #[test]
@@ -690,9 +778,7 @@ mod tests {
         let t = turned_on(&mut auto);
         let t = feed(&mut auto, t, 2 * per_second + 2, 2 * MS, REFRESH);
         assert!(!auto.engaged());
-        // Frames have been continuous, so it takes less than after a pause.
-        let t = feed(&mut auto, t, LOOKED_AT as i64, 10 * MS, 2 * REFRESH);
-        assert!(auto.engaged());
+        let t = start_trial(&mut auto, t);
         assert_eq!(auto.hold, FIRST_HOLD * 2);
         let t = finish_trial(&mut auto, t, REFRESH);
         let t = feed(&mut auto, t, 3 * per_second, 2 * MS, REFRESH);

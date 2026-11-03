@@ -10,6 +10,8 @@
 //! - `--layers`: full-window layers with big shadows, repainted every frame. Load on the GPU.
 //! - `--bg 0`, `--shadow 0`, `--radius N`: what those layers draw (default: both, radius 12).
 //! - `--rows`: a list of that many rows, scrolled every frame. Real work for the CPU and GPU.
+//! - `--on`, `--off`: seconds of load and of nothing changing, in turn, to see how frames come
+//!   after a pause.
 //! - `--linger`: seconds to stay open with nothing changing afterwards, to compare the last frame
 //!   on the screen with `ANTIWEBUI_DUMP_FRAME`.
 
@@ -28,6 +30,8 @@ struct Load {
     bg: bool,
     shadow: bool,
     radius: f32,
+    on: f64,
+    off: f64,
 }
 
 fn parse_args() -> Load {
@@ -40,6 +44,8 @@ fn parse_args() -> Load {
         bg: true,
         shadow: true,
         radius: 12.0,
+        on: 1.0,
+        off: 0.0,
     };
     let mut args = std::env::args().skip(1);
     while let Some(name) = args.next() {
@@ -56,6 +62,8 @@ fn parse_args() -> Load {
             "--bg" => load.bg = value != 0.0,
             "--shadow" => load.shadow = value != 0.0,
             "--radius" => load.radius = value as f32,
+            "--on" => load.on = value,
+            "--off" => load.off = value,
             _ => panic!("unknown option {name}"),
         }
     }
@@ -77,7 +85,7 @@ fn tick(
             with_doc(|d| d.request(PlatformRequest::Close));
             return;
         }
-        if elapsed >= load.seconds {
+        if elapsed >= load.seconds || elapsed % (load.on + load.off) >= load.on {
             tick(load, Some(started), phase, frame, scroller);
             return;
         }
