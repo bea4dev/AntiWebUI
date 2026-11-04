@@ -80,3 +80,16 @@ fn what_a_callback_changes_is_in_the_same_frame() {
     ui.update();
     assert!(ui.needs_redraw());
 }
+
+#[test]
+fn a_spring_toward_a_big_number_comes_to_rest() {
+    let mut ui = Ui::new(div);
+    let v = animated(24_290.0f32);
+    v.spring_to(24_291.0, Spring::from_ratio(1500.0, 1.0));
+    let start = Instant::now();
+    for t in 0..2000 {
+        ui.animate(start + std::time::Duration::from_millis(t * 8));
+    }
+    assert_eq!(v.get_untracked(), 24_291.0);
+    assert!(!ui.animating());
+}

@@ -65,8 +65,10 @@ fn positioning(
     match placement {
         Placement::BelowStart => (Anchor::BottomLeft, Gravity::BottomRight, vertical),
         Placement::BelowEnd => (Anchor::BottomRight, Gravity::BottomLeft, vertical),
+        Placement::BelowCenter => (Anchor::Bottom, Gravity::Bottom, vertical),
         Placement::AboveStart => (Anchor::TopLeft, Gravity::TopRight, vertical),
         Placement::AboveEnd => (Anchor::TopRight, Gravity::TopLeft, vertical),
+        Placement::AboveCenter => (Anchor::Top, Gravity::Top, vertical),
         Placement::RightStart => (Anchor::TopRight, Gravity::BottomRight, sideways),
         Placement::LeftStart => (Anchor::TopLeft, Gravity::BottomLeft, sideways),
     }
@@ -112,8 +114,12 @@ impl State {
         match params.placement {
             Placement::RightStart => positioner.set_offset(params.gap, 0),
             Placement::LeftStart => positioner.set_offset(-params.gap, 0),
-            Placement::AboveStart | Placement::AboveEnd => positioner.set_offset(0, -params.gap),
-            Placement::BelowStart | Placement::BelowEnd => positioner.set_offset(0, params.gap),
+            Placement::AboveStart | Placement::AboveEnd | Placement::AboveCenter => {
+                positioner.set_offset(0, -params.gap)
+            }
+            Placement::BelowStart | Placement::BelowEnd | Placement::BelowCenter => {
+                positioner.set_offset(0, params.gap)
+            }
         }
         positioner
     }

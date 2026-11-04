@@ -4,8 +4,10 @@
 
 use anti_webui::prelude::*;
 use anti_webui_md3e::components::{
-    ButtonSize, ButtonStyle, button, elevated_button, icon, loading_indicator, outlined_button,
-    styled_button, text_button, tonal_button, wavy_progress,
+    ButtonSize, ButtonStyle, IconButtonStyle, button, button_group, connected_button_group,
+    elevated_button, extended_fab, fab, filled_icon_button, icon, icon_button, icon_toggle_button,
+    loading_indicator, outlined_button, outlined_icon_button, styled_button, text_button,
+    toggle_button, tonal_button, tonal_icon_button, wavy_progress,
 };
 use anti_webui_md3e::{ColorScheme, color_scheme, icons, set_color_scheme};
 
@@ -16,11 +18,14 @@ fn row() -> Div {
 fn main() {
     App::new()
         .title("Material 3 Expressive")
-        .size(900, 720)
+        .size(900, 900)
         .run(|| {
             let progress = signal(0.4f32);
             let dark = signal(false);
             let off = signal(false);
+            let bold = signal(false);
+            let liked = signal(true);
+            let tab = signal(0usize);
             effect(move || {
                 set_color_scheme(if dark.get() {
                     ColorScheme::dark()
@@ -87,6 +92,45 @@ fn main() {
                         .child(icon(icons::SEARCH))
                         .child(icon(icons::SETTINGS))
                         .child(icon(icons::FAVORITE).font_axis(b"FILL", 1.0)),
+                )
+                .child(
+                    row()
+                        .child(styled_button(
+                            "Save",
+                            ButtonStyle::filled().icon(icons::SAVE),
+                        ))
+                        .child(
+                            toggle_button("Bold", move || bold.get())
+                                .on_click(move |_| bold.update(|b| *b = !*b)),
+                        )
+                        .child(icon_button(icons::SEARCH))
+                        .child(filled_icon_button(icons::ADD))
+                        .child(tonal_icon_button(icons::EDIT))
+                        .child(outlined_icon_button(icons::DELETE))
+                        .child(
+                            icon_toggle_button(
+                                icons::FAVORITE,
+                                move || liked.get(),
+                                IconButtonStyle::standard(),
+                            )
+                            .on_click(move |_| liked.update(|l| *l = !*l)),
+                        ),
+                )
+                .child(
+                    row()
+                        .child(fab(icons::ADD))
+                        .child(extended_fab(icons::EDIT, "Compose"))
+                        .child(button_group([
+                            button("Back"),
+                            tonal_button("Play"),
+                            button("Next"),
+                        ]))
+                        .child(connected_button_group(
+                            ["Day", "Week", "Month"],
+                            ButtonStyle::filled(),
+                            move |i| tab.get() == i,
+                            move |i| tab.set(i),
+                        )),
                 )
         })
         .unwrap();

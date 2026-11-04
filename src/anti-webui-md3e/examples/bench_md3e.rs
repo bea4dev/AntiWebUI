@@ -11,6 +11,7 @@
 //! - `--compile 1`: no window. Prints how long the first frames take without and with the
 //!   components, which is when their shaders compile, and the frames of a press on a page of 30
 //!   buttons. Run it in a new process for each number.
+//! - `--compile 2`: no window. The frames of a press in a button group.
 
 use anti_webui::core::Ui;
 use anti_webui::core::event::WindowEvent;
@@ -20,7 +21,7 @@ use anti_webui::core::platform::PlatformRequest;
 use anti_webui::core::tree::with_doc;
 use anti_webui::prelude::*;
 use anti_webui::wgpu::{Gpu, Renderer, wgpu};
-use anti_webui_md3e::components::{button, loading_indicator, wavy_progress};
+use anti_webui_md3e::components::{button, button_group, loading_indicator, wavy_progress};
 use std::time::Instant;
 
 #[derive(Clone, Copy)]
@@ -30,6 +31,7 @@ struct Load {
     waves: usize,
     buttons: usize,
     compile: bool,
+    group_press: bool,
 }
 
 fn parse_args() -> Load {
@@ -39,6 +41,7 @@ fn parse_args() -> Load {
         waves: 0,
         buttons: 0,
         compile: false,
+        group_press: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(name) = args.next() {
@@ -51,7 +54,10 @@ fn parse_args() -> Load {
             "--loaders" => load.loaders = value as usize,
             "--waves" => load.waves = value as usize,
             "--buttons" => load.buttons = value as usize,
-            "--compile" => load.compile = value != 0.0,
+            "--compile" => {
+                load.compile = value == 1.0;
+                load.group_press = value == 2.0;
+            }
             other => panic!("unknown option {other}"),
         }
     }
@@ -125,6 +131,7 @@ fn compile_times() {
             waves: 1,
             buttons: 5,
             compile: true,
+            group_press: false,
         })
     });
     size(&mut ui);
@@ -137,19 +144,51 @@ fn compile_times() {
          {plain_second:.1}, build {build:.1}, components {first:.1} then {second:.1}, {third:.1} ms",
         gpu.adapter.get_info().name,
     );
-    press_times(&gpu, &mut renderer);
+    press_times(
+        &gpu,
+        &mut renderer,
+        "press on 30 buttons",
+        Ui::new(|| {
+            page(Load {
+                seconds: 0.0,
+                loaders: 0,
+                waves: 0,
+                buttons: 30,
+                compile: true,
+                group_press: false,
+            })
+        }),
+    );
 }
 
-fn press_times(gpu: &Gpu, renderer: &mut Renderer) {
-    let mut ui = Ui::new(|| {
-        page(Load {
-            seconds: 0.0,
-            loaders: 0,
-            waves: 0,
-            buttons: 30,
-            compile: true,
-        })
-    });
+/// A press that changes the layout: the button gets wider, and so do its neighbors the other way.
+fn group_press_times(gpu: &Gpu, renderer: &mut Renderer) {
+    press_times(
+        gpu,
+        renderer,
+        "press in one of 12 groups of 5",
+        Ui::new(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(12.0)
+                .p(12.0)
+                .size_full()
+                .bg(Color::WHITE)
+                .children((0..12).map(|_| {
+                    button_group([
+                        button("First"),
+                        button("Second"),
+                        button("Third"),
+                        button("Fourth"),
+                        button("Fifth"),
+                    ])
+                }))
+        }),
+    );
+}
+
+fn press_times(gpu: &Gpu, renderer: &mut Renderer, name: &str, mut ui: Ui) {
     ui.handle_event(WindowEvent::Resized {
         size: SizeI::new(1620, 1296),
         scale: Scale::from_f64(1.8),
@@ -191,7 +230,7 @@ fn press_times(gpu: &Gpu, renderer: &mut Renderer) {
     ui_ms.sort_by(f64::total_cmp);
     render_ms.sort_by(f64::total_cmp);
     println!(
-        "press on 30 buttons: at rest {at_rest:.2}, {at_rest_again:.2}; input {input:.3}; first \
+        "{name}: at rest {at_rest:.2}, {at_rest_again:.2}; input {input:.3}; first \
          frame ui {:.3} render {:.2}; {frames} frames: ui p50 {:.3} max {:.3}, render p50 {:.2} \
          max {:.2} ms",
         first.0,
@@ -207,6 +246,12 @@ fn main() {
     let load = parse_args();
     if load.compile {
         compile_times();
+        return;
+    }
+    if load.group_press {
+        let gpu = Gpu::headless().unwrap();
+        let mut renderer = Renderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+        group_press_times(&gpu, &mut renderer);
         return;
     }
     App::new()

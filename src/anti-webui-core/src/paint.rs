@@ -116,6 +116,12 @@ fn paint_root(
         painter.contents(root, 1.0, screen);
     } else {
         painter.node(root, 1.0, screen);
+        for &portal in &doc.popups {
+            let node = &doc.nodes[portal];
+            if node.visible && node.popup().is_some_and(|p| p.portal) {
+                painter.contents(portal, 1.0, screen);
+            }
+        }
     }
     settling.append(&mut painter.settling);
     *old_layers = painter.old_layers;

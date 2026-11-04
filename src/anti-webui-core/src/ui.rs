@@ -157,6 +157,13 @@ impl Ui {
     /// Recomputes styles, layout and positions as needed.
     pub fn update(&mut self) {
         self.apply_pending_focus();
+        self.report_scrolled();
+        self.update_layout_and_reports();
+        self.sync_ime();
+        self.sync_popups();
+    }
+
+    fn update_layout_and_reports(&mut self) {
         // Content moving under a stationary pointer can change what is hovered, which can change
         // styles and even layout again.
         for _ in 0..4 {
@@ -167,12 +174,28 @@ impl Ui {
             {
                 self.update_hover(p);
             }
+            // What depends on the size of a node gets it before anything is painted.
+            self.report_resized();
             if !with_doc(|d| Self::needs_update(d)) {
                 break;
             }
         }
-        self.sync_ime();
-        self.sync_popups();
+    }
+
+    fn report_resized(&mut self) {
+        for id in with_doc(|d| std::mem::take(&mut d.resized)) {
+            let found = with_doc(|d| {
+                let n = d.get(id)?;
+                let (w, h) = (
+                    d.scale.to_logical(n.abs.width as f32),
+                    d.scale.to_logical(n.abs.height as f32),
+                );
+                Some((n.listeners.resized.clone()?, w, h))
+            });
+            if let Some((f, w, h)) = found {
+                batch(|| f(w, h));
+            }
+        }
     }
 
     /// Brings styles, layout and positions up to date. Returns whether anything moved.
@@ -228,6 +251,24 @@ impl Ui {
         })
     }
 
+    /// Tells those who wait for it where things scrolled to, in time to react in this frame.
+    fn report_scrolled(&mut self) {
+        let scrolled = with_doc(|d| std::mem::take(&mut d.scrolled));
+        for id in scrolled {
+            let found = with_doc(|d| {
+                let n = d.get(id)?;
+                let at = PointF::new(
+                    d.scale.to_logical(n.scroll.x as f32),
+                    d.scale.to_logical(n.scroll.y as f32),
+                );
+                Some((n.listeners.scrolled.clone()?, at))
+            });
+            if let Some((f, at)) = found {
+                batch(|| f(at));
+            }
+        }
+    }
+
     fn needs_update(d: &Document) -> bool {
         d.dirty.style
             || d.dirty.layout
@@ -239,7 +280,8 @@ impl Ui {
     }
 
     pub fn needs_redraw(&self) -> bool {
-        self.animating() || with_doc(|d| d.dirty.paint || Self::needs_update(d))
+        self.animating()
+            || with_doc(|d| d.dirty.paint || !d.scrolled.is_empty() || Self::needs_update(d))
     }
 
     /// Whether frames must keep coming even if nothing else changes. See [`Ui::animate`].
@@ -374,9 +416,9 @@ impl Ui {
         with_doc(|d| std::mem::take(&mut d.requests))
     }
 
-    /// The next time the UI needs a repaint without input (caret blinking).
+    /// The next time the UI needs to run without input: timers and the blinking caret.
     pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
-        with_doc(|d| {
+        let caret = with_doc(|d| {
             let id = d.state.focused?;
             if !d.state.window_focused {
                 return None;
@@ -385,11 +427,16 @@ impl Ui {
             let elapsed = now.saturating_duration_since(edit.caret_epoch);
             let periods = elapsed.as_millis() / CARET_BLINK.as_millis() + 1;
             Some(edit.caret_epoch + CARET_BLINK * periods as u32)
-        })
+        });
+        match (caret, animation::next_timer()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Call when a deadline from [`Ui::next_deadline`] passes.
-    pub fn tick(&mut self, _now: Instant) {
+    pub fn tick(&mut self, now: Instant) {
+        animation::run_timers(now);
         with_doc(|d| {
             if d.state
                 .focused
@@ -512,7 +559,14 @@ impl Ui {
     fn hit_test(&self, p: PointF) -> Option<NodeId> {
         with_doc(|d| match d.popup_at(p) {
             Some((popup, local)) => hit(d, popup, local),
-            None => d.root.and_then(|r| hit(d, r, p)),
+            None => d
+                .popups
+                .iter()
+                .rev()
+                .filter(|&&id| d.nodes[id].popup().is_some_and(|p| p.portal))
+                // A portal is only what is in it: the rest of the window goes through.
+                .find_map(|&id| hit(d, id, p).filter(|&h| h != id))
+                .or_else(|| d.root.and_then(|r| hit(d, r, p))),
         })
     }
 
@@ -1104,12 +1158,17 @@ impl Ui {
 
     fn focus_next(&mut self, backwards: bool) {
         let next = with_doc(|d| {
+            let modal =
+                d.popups.iter().rev().copied().find(|&id| {
+                    d.nodes[id].visible && d.nodes[id].popup().is_some_and(|p| p.modal)
+                });
             let order: Vec<NodeId> = d
                 .preorder()
                 .into_iter()
                 .filter(|id| {
                     d.get(*id)
                         .is_some_and(|n| n.focusable && n.visible && !n.disabled)
+                        && modal.is_none_or(|m| d.is_ancestor(m, *id))
                 })
                 .collect();
             if order.is_empty() {
@@ -1567,6 +1626,11 @@ impl Document {
     /// of that content.
     pub fn mark_scrolled(&mut self, id: NodeId) {
         self.dirty.paint = true;
+        if self.get(id).is_some_and(|n| n.listeners.scrolled.is_some())
+            && self.scrolled.last() != Some(&id)
+        {
+            self.scrolled.push(id);
+        }
         if !self.get(id).is_some_and(|n| n.scroll_root) {
             self.reposition.push(id);
             self.dirty.content = true;
@@ -1834,7 +1898,7 @@ fn open_menus_outside(doc: &Document, inside: Option<NodeId>) -> Vec<NodeId> {
 fn popup_params(doc: &Document, id: NodeId) -> Option<PopupParams> {
     let node = doc.nodes.get(id)?;
     let data = node.popup()?;
-    if !node.visible || data.dismissed || node.abs.is_empty() {
+    if !node.visible || data.dismissed || data.portal || node.abs.is_empty() {
         return None;
     }
     // A grab has to go on the topmost grabbing popup, or on the window.
@@ -1919,21 +1983,24 @@ fn place_in_window(
     let left = anchor.x - gap - size.width;
     let start_x = anchor.x;
     let end_x = anchor.right() - size.width;
+    let center_x = anchor.x + (anchor.width - size.width) / 2;
     let (x, y) = match placement {
         Placement::BelowStart => (start_x, below),
         Placement::BelowEnd => (end_x, below),
+        Placement::BelowCenter => (center_x, below),
         Placement::AboveStart => (start_x, above),
         Placement::AboveEnd => (end_x, above),
+        Placement::AboveCenter => (center_x, above),
         Placement::RightStart => (right, anchor.y),
         Placement::LeftStart => (left, anchor.y),
     };
     let (x, y) = match placement {
-        Placement::BelowStart | Placement::BelowEnd
+        Placement::BelowStart | Placement::BelowEnd | Placement::BelowCenter
             if y + size.height > window.bottom() && above >= window.y =>
         {
             (x, above)
         }
-        Placement::AboveStart | Placement::AboveEnd
+        Placement::AboveStart | Placement::AboveEnd | Placement::AboveCenter
             if y < window.y && below + size.height <= window.bottom() =>
         {
             (x, below)

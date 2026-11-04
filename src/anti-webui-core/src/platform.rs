@@ -53,8 +53,12 @@ pub enum Placement {
     #[default]
     BelowStart,
     BelowEnd,
+    /// Below, with the middles lined up.
+    BelowCenter,
     AboveStart,
     AboveEnd,
+    /// Above, with the middles lined up.
+    AboveCenter,
     RightStart,
     LeftStart,
 }

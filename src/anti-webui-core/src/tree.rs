@@ -37,6 +37,8 @@ pub struct Listeners {
     pub focus: Option<Rc<dyn Fn(bool)>>,
     pub active: Option<Rc<dyn Fn(bool)>>,
     pub focus_visible: Option<Rc<dyn Fn(bool)>>,
+    pub scrolled: Option<Rc<dyn Fn(PointF)>>,
+    pub resized: Option<Rc<dyn Fn(f32, f32)>>,
 }
 
 /// Style layers, applied in order: base → dynamic → hover → focus → active.
@@ -77,6 +79,10 @@ pub struct PopupData {
     /// At least as wide as the anchor.
     pub match_anchor_width: bool,
     pub on_dismiss: Option<Rc<dyn Fn()>>,
+    /// In the window's own surface, above its content, with the size of the window.
+    pub portal: bool,
+    /// While it exists, Tab stays inside of it.
+    pub modal: bool,
 
     /// The size it would like to have, in physical pixels.
     pub natural: SizeI,
@@ -432,6 +438,10 @@ pub struct Document {
     pub popups: Vec<NodeId>,
     /// Nodes to bring into view after the next layout.
     pub pending_scroll: Vec<NodeId>,
+    /// Nodes that scrolled and have someone waiting to hear about it.
+    pub scrolled: Vec<NodeId>,
+    /// Nodes that got another size and have someone waiting to hear about it.
+    pub resized: Vec<NodeId>,
 }
 
 /// What a stacking context paints above its own background, besides its children in tree order.
@@ -467,6 +477,8 @@ thread_local! {
         stacking_dirty: false,
         popups: Vec::new(),
         pending_scroll: Vec::new(),
+        scrolled: Vec::new(),
+        resized: Vec::new(),
     });
 }
 
@@ -528,7 +540,7 @@ impl Document {
     pub fn popup_of(&self, id: NodeId) -> Option<NodeId> {
         let mut cur = Some(id);
         while let Some(n) = cur.and_then(|c| self.nodes.get(c)) {
-            if n.is_popup() {
+            if n.popup().is_some_and(|p| !p.portal) {
                 return cur;
             }
             cur = n.parent;

@@ -3,7 +3,7 @@
 //! `docs/design/13-animation.md`).
 
 use crate::geometry::PointI;
-use crate::reactive::{Signal, batch, signal};
+use crate::reactive::{Signal, batch, on_cleanup, signal};
 use crate::tree::{Document, NodeId};
 use anti_webui_style::{AnimatedValue, Color, Style, Transition};
 use std::cell::{Cell, RefCell};
@@ -47,6 +47,63 @@ pub(crate) fn run_frame_callbacks(now: Instant) {
     batch(|| {
         for f in callbacks {
             f(now);
+        }
+    });
+}
+
+struct Timer {
+    id: u64,
+    at: Instant,
+    f: Box<dyn FnOnce()>,
+}
+
+thread_local! {
+    static TIMERS: RefCell<Vec<Timer>> = const { RefCell::new(Vec::new()) };
+    static NEXT_TIMER: Cell<u64> = const { Cell::new(0) };
+}
+
+/// A running [`set_timeout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timeout(u64);
+
+impl Timeout {
+    /// Keeps it from running, if it hasn't yet.
+    pub fn cancel(self) {
+        TIMERS.with(|t| t.borrow_mut().retain(|timer| timer.id != self.0));
+    }
+}
+
+/// Runs `f` once after `delay`, without frames in between. It is cancelled along with the owner it
+/// was set up in.
+pub fn set_timeout(delay: Duration, f: impl FnOnce() + 'static) -> Timeout {
+    let id = NEXT_TIMER.with(|n| n.replace(n.get() + 1));
+    let timer = Timer {
+        id,
+        at: Instant::now() + delay,
+        f: Box::new(f),
+    };
+    TIMERS.with(|t| t.borrow_mut().push(timer));
+    let timeout = Timeout(id);
+    on_cleanup(move || timeout.cancel());
+    timeout
+}
+
+pub(crate) fn next_timer() -> Option<Instant> {
+    TIMERS.with(|t| t.borrow().iter().map(|timer| timer.at).min())
+}
+
+/// Runs the timers that are due at `now`, the earliest first.
+pub(crate) fn run_timers(now: Instant) {
+    let mut due = TIMERS.with(|t| {
+        let mut timers = t.borrow_mut();
+        let (due, rest): (Vec<_>, Vec<_>) = timers.drain(..).partition(|timer| timer.at <= now);
+        *timers = rest;
+        due
+    });
+    due.sort_by_key(|timer| timer.at);
+    batch(|| {
+        for timer in due {
+            (timer.f)();
         }
     });
 }
@@ -320,6 +377,8 @@ enum Motion {
     Spring {
         to: [f32; 4],
         spring: Spring,
+        /// Where it is from `to`: in these small numbers, it stays precise near a big `to`.
+        offset: [f32; 4],
         /// How close counts as there.
         rest: f32,
         /// What is left of the last frame's time, less than a step.
@@ -416,6 +475,7 @@ impl<T: Animatable> Animated<T> {
         self.begin(Motion::Spring {
             to,
             spring,
+            offset: std::array::from_fn(|i| from[i] - to[i]),
             rest: (way * SPRING_REST).max(SPRING_MIN_REST),
             left: 0.0,
             last: Instant::now(),
@@ -491,6 +551,7 @@ impl Run {
             Motion::Spring {
                 to,
                 spring,
+                offset,
                 rest,
                 left,
                 last,
@@ -501,22 +562,24 @@ impl Run {
                     .min(Duration::from_secs(4));
                 *last = now;
                 *left += dt.as_secs_f32();
-                let mut at = current;
                 let mut velocity = self.velocity;
                 while *left >= SPRING_STEP {
                     *left -= SPRING_STEP;
                     for i in 0..4 {
-                        let force =
-                            spring.stiffness * (to[i] - at[i]) - spring.damping * velocity[i];
+                        let force = -spring.stiffness * offset[i] - spring.damping * velocity[i];
                         velocity[i] += force / spring.mass * SPRING_STEP;
-                        at[i] += velocity[i] * SPRING_STEP;
+                        offset[i] += velocity[i] * SPRING_STEP;
                     }
                 }
                 self.velocity = velocity;
                 self.velocity_at = now;
-                let settled = (0..4)
-                    .all(|i| (to[i] - at[i]).abs() <= *rest && velocity[i].abs() <= *rest * 10.0);
-                if settled { (*to, false) } else { (at, true) }
+                let settled =
+                    (0..4).all(|i| offset[i].abs() <= *rest && velocity[i].abs() <= *rest * 10.0);
+                if settled {
+                    (*to, false)
+                } else {
+                    (std::array::from_fn(|i| to[i] + offset[i]), true)
+                }
             }
         };
         if !matches!(self.motion, Motion::Spring { .. }) {

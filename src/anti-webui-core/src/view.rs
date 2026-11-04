@@ -5,7 +5,7 @@
 
 use crate::animation::{ListPlaces, request_frame};
 use crate::event::{KeyboardEvent, PointerEvent, ScrollEvent};
-use crate::geometry::{PointI, RectI};
+use crate::geometry::{PointF, PointI, RectI};
 use crate::platform::{ImePurpose, Placement, PopupKind};
 use crate::reactive::{
     Owner, Signal, create_child_owner, create_root, effect, memo, on_cleanup, signal, untrack,
@@ -77,6 +77,44 @@ impl NodeRef {
     pub fn rect(&self) -> Option<RectI> {
         let id = self.0.get_untracked()?;
         with_doc(|d| d.window_rect(id))
+    }
+
+    /// How far a scrolling node has scrolled, in logical pixels.
+    pub fn scroll_offset(&self) -> PointF {
+        self.0
+            .get_untracked()
+            .and_then(|id| {
+                with_doc(|d| {
+                    let n = d.get(id)?;
+                    Some(PointF::new(
+                        d.scale.to_logical(n.scroll.x as f32),
+                        d.scale.to_logical(n.scroll.y as f32),
+                    ))
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    /// Scrolls a scrolling node to this offset in logical pixels, as far as it goes.
+    pub fn scroll_to(&self, x: f32, y: f32) {
+        let Some(id) = self.0.get_untracked() else {
+            return;
+        };
+        with_doc(|d| {
+            let (x, y) = (d.scale.px(x), d.scale.px(y));
+            let Some(n) = d.get_mut(id) else {
+                return;
+            };
+            let pad = n.padding_abs();
+            let to = PointI::new(
+                x.clamp(0, (n.content_size.width - pad.width).max(0)),
+                y.clamp(0, (n.content_size.height - pad.height).max(0)),
+            );
+            if n.scroll != to {
+                n.scroll = to;
+                d.mark_scrolled(id);
+            }
+        });
     }
 
     pub fn focus(&self) {
@@ -194,7 +232,7 @@ struct ElementConfig {
     listeners: Listeners,
     focusable: bool,
     disabled: Option<Box<dyn Fn() -> bool>>,
-    node_ref: Option<NodeRef>,
+    node_ref: Vec<NodeRef>,
 }
 
 impl ElementConfig {
@@ -227,7 +265,7 @@ impl ElementConfig {
                 });
             });
         }
-        if let Some(r) = self.node_ref {
+        for r in self.node_ref {
             r.0.set(Some(id));
         }
         id
@@ -343,6 +381,21 @@ macro_rules! element_methods {
             self
         }
 
+        /// Called when the node has scrolled, however that happened, with its offset in logical
+        /// pixels. Unlike `on_scroll` it doesn't depend on input, and comes before the next frame
+        /// is laid out.
+        pub fn on_scrolled(mut self, f: impl Fn(PointF) + 'static) -> Self {
+            self.cfg.listeners.scrolled = Some(Rc::new(f));
+            self
+        }
+
+        /// Called with the node's width and height in logical pixels when it first gets a size and
+        /// whenever that changes, before anything is painted with it.
+        pub fn on_resized(mut self, f: impl Fn(f32, f32) + 'static) -> Self {
+            self.cfg.listeners.resized = Some(Rc::new(f));
+            self
+        }
+
         /// Makes the node reachable with Tab and focusable by clicking.
         pub fn focusable(mut self) -> Self {
             self.cfg.focusable = true;
@@ -355,8 +408,9 @@ macro_rules! element_methods {
             self
         }
 
+        /// Lets `r` refer to this node. A node can have several of them.
         pub fn node_ref(mut self, r: NodeRef) -> Self {
-            self.cfg.node_ref = Some(r);
+            self.cfg.node_ref.push(r);
             self
         }
     };
@@ -1103,6 +1157,16 @@ pub fn popup() -> Popup {
     Popup::default()
 }
 
+/// Shows its children above the content of the window, as big as the window, wherever it is
+/// declared: nothing around it clips or moves it. It draws in the window's own surface, so it
+/// costs no surface and stays inside of the window. What isn't covered by its children lets the
+/// pointer through. See `docs/design/20-md3e-components.md`.
+pub fn portal() -> Popup {
+    let mut portal = Popup::default();
+    portal.data.portal = true;
+    portal
+}
+
 impl Popup {
     pub fn kind(mut self, kind: PopupKind) -> Self {
         self.data.kind = kind;
@@ -1117,6 +1181,12 @@ impl Popup {
     /// Logical pixels between the anchor and the popup.
     pub fn gap(mut self, gap: i32) -> Self {
         self.data.gap = gap;
+        self
+    }
+
+    /// Keeps Tab inside of it while it exists, and gives the focus back when it goes.
+    pub fn modal(mut self) -> Self {
+        self.data.modal = true;
         self
     }
 
@@ -1153,6 +1223,16 @@ impl Popup {
 
 impl IntoView for Popup {
     fn into_view(self) -> View {
+        if self.data.modal {
+            let before = with_doc(|d| d.state.focused);
+            on_cleanup(move || {
+                with_doc(|d| {
+                    if d.pending_focus.is_none() {
+                        d.pending_focus = Some(before.filter(|&id| d.nodes.contains_key(id)));
+                    }
+                });
+            });
+        }
         let mut node = Node::new(NodeKind::Popup(Box::new(self.data)));
         node.style.base = Style {
             display: Some(Layout::Flex),

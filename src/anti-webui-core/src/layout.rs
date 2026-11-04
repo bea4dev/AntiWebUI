@@ -10,7 +10,7 @@ use crate::text::{ShapeStyle, TextSystem};
 use crate::tree::{Document, Node, NodeId, NodeKind, PopupSurface};
 use anti_webui_style::{
     ANIMATED_FIELDS, AlignItems, ComputedStyle, Display, Edges, JustifyContent, Length, Overflow,
-    Position,
+    Position, WhiteSpace,
 };
 use std::collections::BinaryHeap;
 use std::time::Instant;
@@ -673,7 +673,12 @@ pub fn layout_document(doc: &mut Document, ts: &mut TextSystem) {
     engine.compute(root, size, Some(viewport.width), size, true);
     engine.doc.nodes[root].rect = RectI::new(0, 0, viewport.width, viewport.height);
     for id in engine.doc.popups.clone() {
-        engine.layout_popup(id, size);
+        if engine.doc.nodes[id].popup().is_some_and(|p| p.portal) {
+            engine.compute(id, size, Some(viewport.width), size, true);
+            engine.doc.nodes[id].rect = RectI::new(0, 0, viewport.width, viewport.height);
+        } else {
+            engine.layout_popup(id, size);
+        }
     }
 }
 
@@ -757,6 +762,10 @@ fn position_popup(doc: &mut Document, id: NodeId, order: &mut u32) {
         hide_subtree(doc, id);
         return;
     }
+    if doc.nodes[id].popup().is_some_and(|p| p.portal) {
+        position_node(doc, id, PointI::default(), Clip::NONE, Some(id), order);
+        return;
+    }
     let scale = doc.scale;
     let start = *order;
     position_node(doc, id, PointI::default(), Clip::NONE, Some(id), order);
@@ -832,8 +841,16 @@ fn position_node(
     let first = *order;
     *order += 1;
     node.position_dirty = false;
+    let resized =
+        node.listeners.resized.is_some() && (!node.visible || node.abs.size() != abs.size());
     node.visible = true;
     node.abs = abs;
+    if resized {
+        doc.resized.push(id);
+    }
+    let Some(node) = doc.nodes.get_mut(id) else {
+        return;
+    };
     node.transformed = transformed;
     if transformed {
         // Its own space: what is outside of it applies when the layer is composited.
@@ -850,6 +867,7 @@ fn position_node(
     node.doc_order = first;
     let max_x = (node.content_size.width - node.padding_abs().width).max(0);
     let max_y = (node.content_size.height - node.padding_abs().height).max(0);
+    let scrolled_before = node.scroll;
     node.scroll.x = if node.computed.overflow_x == Overflow::Scroll {
         node.scroll.x.clamp(0, max_x)
     } else {
@@ -860,6 +878,9 @@ fn position_node(
     } else {
         0
     };
+    if node.scroll != scrolled_before && node.listeners.scrolled.is_some() {
+        doc.scrolled.push(id);
+    }
     // Scroll layers aren't inside of other layers; a popup's surface is like a window to them.
     let scroller = overflows(node);
     let space = node.space;
@@ -1148,6 +1169,7 @@ impl Engine<'_> {
         let node = &mut self.doc.nodes[id];
         let style = ShapeStyle::from_computed(&node.computed, scale);
         let align = node.computed.text_align;
+        let wraps = node.computed.white_space == WhiteSpace::PreWrap;
         let NodeKind::Text(data) = &mut node.kind else {
             unreachable!()
         };
@@ -1158,7 +1180,8 @@ impl Engine<'_> {
                 data.layout.break_lines(None);
                 let max = data.layout.size().width;
                 match avail_w {
-                    Some(a) if a < max => {
+                    // What doesn't wrap is as wide as it is, and sticks out if it has to.
+                    Some(a) if a < max && wraps => {
                         data.layout.break_lines(Some(a.max(0)));
                         data.layout.size().width.min(a.max(0))
                     }

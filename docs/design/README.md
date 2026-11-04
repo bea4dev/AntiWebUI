@@ -23,6 +23,8 @@ AntiWebUI は WebView に頼らず、wgpu による自前描画とネイティ�
 | 16 | [filters](16-filters.md) | `filter`、ブラー、backdrop、入力を読むシェーダー |
 | 17 | [font-axes](17-font-axes.md) | 可変フォントの軸の指定とアニメーション |
 | 18 | [icons](18-icons.md) | Material Symbols のアイコンと、その同梱方法 |
+| 19 | [buttons](19-buttons.md) | トグル、アイコンボタン、FAB、ボタングループ |
+| 20 | [md3e-components](20-md3e-components.md) | MD3E の残りの部品、`portal`、タイマー、ショーケース |
 
 ## 用語
 

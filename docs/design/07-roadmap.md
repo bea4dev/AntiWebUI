@@ -28,6 +28,8 @@
 - [x] `filter`、`blur`、`backdrop_blur`、入力を読むシェーダー（[16](16-filters.md)）
 - [x] 可変フォントの軸の指定とアニメーション（[17](17-font-axes.md)）
 - [x] Material Symbols のアイコン（[18](18-icons.md)）
+- [x] MD3E のトグル、アイコンボタン、FAB、ボタングループ（[19](19-buttons.md)）
+- [x] MD3E の残りの部品、`portal`、`set_timeout`、ショーケース（[20](20-md3e-components.md)）
 
 ### M1 の既知の制限
 
@@ -41,7 +43,7 @@
 ## M2: 実用性
 
 - カスタム影（[14](14-shaders.md)）、ウィンドウの後ろのぼかし（`ext-background-effect-v1`）
-- MD3E の残りの部品（[15](15-md3e.md)）
+- MD3E の入力モード（日付、時刻）、ロケール（[20](20-md3e-components.md)）
 - CSS サブセット（スタイルシート・クラス・ホットリロード）
 - `flex-wrap`、Grid
 - 画像（PNG/JPEG/SVG）

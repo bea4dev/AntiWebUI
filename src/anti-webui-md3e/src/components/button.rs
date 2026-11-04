@@ -1,12 +1,12 @@
 //! Buttons. Sizes, colors and timing are those of Jetpack Compose. See `docs/design/15-md3e.md`.
 
-use crate::color::{ColorScheme, color_scheme};
-use crate::motion::default_effects;
+use super::surface::{Colors, Corners, Surface, filling_icon, round, surface};
+use crate::color::ColorScheme;
+use crate::icons::Symbol;
+use crate::motion::{default_effects, fast_spatial};
 use crate::typography::TextStyle;
 use anti_webui::prelude::*;
-use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ButtonKind {
@@ -34,17 +34,65 @@ struct Metrics {
     pressed_radius: f32,
     outline: f32,
     text: TextStyle,
+    icon: f32,
+    icon_gap: f32,
 }
 
 impl ButtonSize {
     fn metrics(self) -> Metrics {
-        let (height, padding, square_radius, pressed_radius, outline, text) = match self {
-            ButtonSize::ExtraSmall => (32.0, 16.0, 12.0, 8.0, 1.0, TextStyle::LABEL_LARGE),
-            ButtonSize::Small => (40.0, 16.0, 12.0, 8.0, 1.0, TextStyle::LABEL_LARGE),
-            ButtonSize::Medium => (56.0, 24.0, 16.0, 12.0, 1.0, TextStyle::TITLE_MEDIUM),
-            ButtonSize::Large => (96.0, 48.0, 28.0, 16.0, 2.0, TextStyle::HEADLINE_SMALL),
-            ButtonSize::ExtraLarge => (136.0, 64.0, 28.0, 16.0, 3.0, TextStyle::HEADLINE_LARGE),
-        };
+        let (height, padding, square_radius, pressed_radius, outline, text, icon, icon_gap) =
+            match self {
+                ButtonSize::ExtraSmall => (
+                    32.0,
+                    16.0,
+                    12.0,
+                    8.0,
+                    1.0,
+                    TextStyle::LABEL_LARGE,
+                    20.0,
+                    4.0,
+                ),
+                ButtonSize::Small => (
+                    40.0,
+                    16.0,
+                    12.0,
+                    8.0,
+                    1.0,
+                    TextStyle::LABEL_LARGE,
+                    20.0,
+                    8.0,
+                ),
+                ButtonSize::Medium => (
+                    56.0,
+                    24.0,
+                    16.0,
+                    12.0,
+                    1.0,
+                    TextStyle::TITLE_MEDIUM,
+                    24.0,
+                    8.0,
+                ),
+                ButtonSize::Large => (
+                    96.0,
+                    48.0,
+                    28.0,
+                    16.0,
+                    2.0,
+                    TextStyle::HEADLINE_SMALL,
+                    32.0,
+                    12.0,
+                ),
+                ButtonSize::ExtraLarge => (
+                    136.0,
+                    64.0,
+                    28.0,
+                    16.0,
+                    3.0,
+                    TextStyle::HEADLINE_LARGE,
+                    40.0,
+                    16.0,
+                ),
+            };
         Metrics {
             height,
             padding,
@@ -52,6 +100,8 @@ impl ButtonSize {
             pressed_radius,
             outline,
             text,
+            icon,
+            icon_gap,
         }
     }
 }
@@ -63,6 +113,31 @@ pub struct ButtonStyle {
     size: ButtonSize,
     square: bool,
     disabled: Option<Rc<dyn Fn() -> bool>>,
+    icon: Option<&'static Symbol>,
+    trailing_icon: Option<&'static Symbol>,
+    joined: Option<Joined>,
+}
+
+/// Where a button is in a row of connected ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Joined {
+    Alone,
+    First,
+    Middle,
+    Last,
+}
+
+impl Joined {
+    /// The shapes at rest, pressed and checked. The tokens are only there for the small size.
+    fn shapes(self, full: f32) -> (Corners, Corners, Corners) {
+        let sides = |inner: f32| match self {
+            Joined::Alone => [full; 4],
+            Joined::First => [full, inner, inner, full],
+            Joined::Middle => [inner; 4],
+            Joined::Last => [inner, full, full, inner],
+        };
+        (sides(8.0), sides(4.0), [full; 4])
+    }
 }
 
 impl ButtonStyle {
@@ -72,6 +147,9 @@ impl ButtonStyle {
             size: ButtonSize::default(),
             square: false,
             disabled: None,
+            icon: None,
+            trailing_icon: None,
+            joined: None,
         }
     }
 
@@ -106,6 +184,23 @@ impl ButtonStyle {
         self
     }
 
+    /// An icon in front of the label.
+    pub fn icon(mut self, symbol: &'static Symbol) -> Self {
+        self.icon = Some(symbol);
+        self
+    }
+
+    /// An icon behind the label.
+    pub fn trailing_icon(mut self, symbol: &'static Symbol) -> Self {
+        self.trailing_icon = Some(symbol);
+        self
+    }
+
+    pub(super) fn joined(mut self, joined: Joined) -> Self {
+        self.joined = Some(joined);
+        self
+    }
+
     /// Doesn't react and looks that way while `f` returns true.
     pub fn disabled_when(mut self, f: impl Fn() -> bool + 'static) -> Self {
         self.disabled = Some(Rc::new(f));
@@ -114,7 +209,7 @@ impl ButtonStyle {
 }
 
 /// The colors of a kind of button: background, label and border.
-fn colors(kind: ButtonKind, c: &ColorScheme) -> (Color, Color, Color) {
+pub(super) fn colors(kind: ButtonKind, c: &ColorScheme) -> Colors {
     let none = Color::TRANSPARENT;
     match kind {
         ButtonKind::Filled => (c.primary, c.on_primary, none),
@@ -125,173 +220,25 @@ fn colors(kind: ButtonKind, c: &ColorScheme) -> (Color, Color, Color) {
     }
 }
 
+/// The same for a toggle button.
+fn toggle_colors(kind: ButtonKind, c: &ColorScheme, checked: bool) -> Colors {
+    let none = Color::TRANSPARENT;
+    match (kind, checked) {
+        (ButtonKind::Filled, false) => (c.surface_container, c.on_surface_variant, none),
+        (ButtonKind::Filled | ButtonKind::Elevated, true) => (c.primary, c.on_primary, none),
+        (ButtonKind::Tonal, true) => (c.secondary, c.on_secondary, none),
+        (ButtonKind::Outlined, true) => (c.inverse_surface, c.inverse_on_surface, none),
+        (ButtonKind::Text, true) => (c.secondary_container, c.on_secondary_container, none),
+        (kind, false) => colors(kind, c),
+    }
+}
+
 /// How high a kind of button is at rest and under the pointer.
-fn elevations(kind: ButtonKind) -> (f32, f32) {
+pub(super) fn elevations(kind: ButtonKind) -> (f32, f32) {
     match kind {
         ButtonKind::Filled | ButtonKind::Tonal => (0.0, 1.0),
         ButtonKind::Elevated => (1.0, 2.0),
         ButtonKind::Outlined | ButtonKind::Text => (0.0, 0.0),
-    }
-}
-
-/// The shadows of a height between levels 0 and 2.
-pub(crate) fn elevation_shadows(level: f32) -> Vec<BoxShadow> {
-    if level <= 0.0 {
-        return Vec::new();
-    }
-    let up = (level - 1.0).clamp(0.0, 1.0);
-    let strength = level.min(1.0);
-    vec![
-        BoxShadow {
-            offset_y: 1.0,
-            blur: 2.0,
-            color: Color::BLACK.with_alpha(0.3 * strength),
-            ..Default::default()
-        },
-        BoxShadow {
-            offset_y: 1.0 + up,
-            blur: 3.0 + 3.0 * up,
-            spread: 1.0 + up,
-            color: Color::BLACK.with_alpha(0.15 * strength),
-            ..Default::default()
-        },
-    ]
-}
-
-#[derive(ShaderParams, Clone, Copy)]
-struct StateLayer {
-    color: Color,
-    state: f32,
-    ripples: [[f32; 4]; 3],
-}
-
-static STATE_LAYER: Shader<StateLayer> = Shader::new(
-    "state_layer",
-    include_str!("../../shaders/state_layer.wgsl"),
-);
-
-pub(super) fn preload_shaders() {
-    STATE_LAYER.preload();
-}
-
-pub(super) fn check_shader() -> Result<(), String> {
-    anti_webui::wgpu::check_shader(&STATE_LAYER)
-}
-
-const HOVER: f32 = 0.08;
-const FOCUS: f32 = 0.10;
-const PRESS: f32 = 0.10;
-const FADE_IN: Duration = Duration::from_millis(75);
-const GROW: Duration = Duration::from_millis(225);
-const FADE_OUT: Duration = Duration::from_millis(150);
-
-#[derive(Clone, Copy)]
-struct Ripple {
-    /// Where it starts and where it goes, unless it stays in the center of the box.
-    path: Option<([f32; 2], [f32; 2])>,
-    started: Instant,
-    released: Option<Instant>,
-}
-
-impl Ripple {
-    /// `(x, y, how far it has grown, how strong it is)`, or `None` when it is over.
-    fn at(&self, now: Instant) -> Option<[f32; 4]> {
-        let elapsed = now.saturating_duration_since(self.started);
-        let grown = (elapsed.as_secs_f32() / GROW.as_secs_f32()).min(1.0);
-        let mut strength = (elapsed.as_secs_f32() / FADE_IN.as_secs_f32()).min(1.0);
-        if let Some(released) = self.released {
-            // It goes once it has grown, however short the press was.
-            let fading = released.max(self.started + GROW);
-            let faded = now.saturating_duration_since(fading).as_secs_f32();
-            strength *= 1.0 - faded / FADE_OUT.as_secs_f32();
-            if strength <= 0.0 {
-                return None;
-            }
-        }
-        let (x, y) = self.path.map_or((-1.0, -1.0), |(from, to)| {
-            (
-                from[0] + (to[0] - from[0]) * grown,
-                from[1] + (to[1] - from[1]) * grown,
-            )
-        });
-        Some([
-            x,
-            y,
-            Easing::CubicBezier(0.4, 0.0, 0.2, 1.0).apply(grown),
-            strength * PRESS,
-        ])
-    }
-}
-
-/// The ripples of a button, which move on by themselves until they are over.
-#[derive(Clone)]
-struct Ripples {
-    list: Rc<RefCell<[Option<Ripple>; 3]>>,
-    shown: Signal<[[f32; 4]; 3]>,
-    ticking: Rc<Cell<bool>>,
-}
-
-impl Ripples {
-    fn new() -> Self {
-        Self {
-            list: Rc::default(),
-            shown: signal([[0.0; 4]; 3]),
-            ticking: Rc::default(),
-        }
-    }
-
-    /// Starts a ripple that goes from a point to the center of the box, or that is there all along.
-    fn press(&self, path: Option<([f32; 2], [f32; 2])>) {
-        let now = Instant::now();
-        let ripple = Ripple {
-            path,
-            started: now,
-            released: None,
-        };
-        {
-            let mut list = self.list.borrow_mut();
-            let slot = list.iter().position(Option::is_none).unwrap_or_else(|| {
-                // The oldest makes room.
-                (0..list.len())
-                    .min_by_key(|i| list[*i].map(|r| r.started))
-                    .unwrap_or(0)
-            });
-            list[slot] = Some(ripple);
-        }
-        self.tick(now);
-    }
-
-    fn release(&self) {
-        let now = Instant::now();
-        for r in self.list.borrow_mut().iter_mut().flatten() {
-            r.released.get_or_insert(now);
-        }
-    }
-
-    /// Shows how things are at `now` and, if something is still going on, comes back.
-    fn tick(&self, now: Instant) {
-        if !self.shown.is_alive() {
-            return;
-        }
-        let mut shown = [[0.0; 4]; 3];
-        let mut going_on = false;
-        for (slot, out) in self.list.borrow_mut().iter_mut().zip(&mut shown) {
-            match slot.as_ref().and_then(|r| r.at(now)) {
-                Some(v) => {
-                    *out = v;
-                    going_on = true;
-                }
-                None => *slot = None,
-            }
-        }
-        self.shown.set(shown);
-        if going_on && !self.ticking.replace(true) {
-            let this = self.clone();
-            request_frame(move |now| {
-                this.ticking.set(false);
-                this.tick(now);
-            });
-        }
     }
 }
 
@@ -318,168 +265,89 @@ pub fn text_button(label: impl IntoTextSource) -> Div {
 
 /// A button of any kind and size.
 pub fn styled_button(label: impl IntoTextSource, style: ButtonStyle) -> Div {
-    crate::ensure_ready();
+    build(label, style, None)
+}
+
+/// A filled button that stays on or off: what it shows follows `checked`, which the program changes
+/// in `on_click`.
+pub fn toggle_button(label: impl IntoTextSource, checked: impl Fn() -> bool + 'static) -> Div {
+    styled_toggle_button(label, checked, ButtonStyle::filled())
+}
+
+/// A toggle button of any kind and size.
+pub fn styled_toggle_button(
+    label: impl IntoTextSource,
+    checked: impl Fn() -> bool + 'static,
+    style: ButtonStyle,
+) -> Div {
+    build(label, style, Some(Rc::new(checked)))
+}
+
+fn build(
+    label: impl IntoTextSource,
+    style: ButtonStyle,
+    checked: Option<Rc<dyn Fn() -> bool>>,
+) -> Div {
     let ButtonStyle {
         kind,
         size,
         square,
         disabled,
+        icon,
+        trailing_icon,
+        joined,
     } = style;
     let metrics = size.metrics();
-    let is_disabled = move || disabled.as_ref().is_some_and(|f| f());
-    let is_disabled = Rc::new(is_disabled);
-    let rest_radius = if square {
-        metrics.square_radius
+    let full = metrics.height / 2.0;
+    let toggles = checked.is_some();
+    // Round first and rounded when checked, or the other way around.
+    let (usual, on_check) = if square {
+        (metrics.square_radius, full)
     } else {
-        metrics.height / 2.0
+        (full, metrics.square_radius)
     };
-    let pressed_radius = metrics.pressed_radius;
-    let outline = metrics.outline;
-    let (rest_level, hover_level) = elevations(kind);
-
-    let radius = animated(rest_radius);
-    let level = animated(rest_level);
-    let state = animated(0.0f32);
-    let hovered = signal(false);
-    let focused = signal(false);
-    let ripples = Ripples::new();
-
-    // How strong the state layer and the shadow should be follow from what is going on. What stays
-    // as it is starts no animation: a page of buttons at rest asks for no frames.
-    let disabled_now = is_disabled.clone();
-    let wanted = Cell::new((0.0, rest_level));
-    effect(move || {
-        let off = disabled_now();
-        let target_state = if off {
-            0.0
-        } else if focused.get() {
-            FOCUS
-        } else if hovered.get() {
-            HOVER
+    let (rest, pressed, checked_shape) = match joined {
+        Some(joined) => joined.shapes(full),
+        None => (round(usual), round(metrics.pressed_radius), round(on_check)),
+    };
+    let root = surface(Surface {
+        colors: Rc::new(move |c, on| {
+            if toggles {
+                toggle_colors(kind, c, on)
+            } else {
+                colors(kind, c)
+            }
+        }),
+        disabled_content: |c| c.on_surface_variant.with_alpha(0.38),
+        rest,
+        pressed,
+        checked_shape,
+        // Plain buttons don't bounce, and toggle buttons do: see `Button.kt` and `ToggleButton.kt`.
+        spring: if toggles {
+            fast_spatial()
+        } else {
+            default_effects()
+        },
+        levels: elevations(kind),
+        outline: if kind == ButtonKind::Outlined {
+            metrics.outline
         } else {
             0.0
-        };
-        let target_level = if off {
-            0.0
-        } else if hovered.get() {
-            hover_level
-        } else {
-            rest_level
-        };
-        let (last_state, last_level) = wanted.replace((target_state, target_level));
-        untrack(|| {
-            if target_state != last_state {
-                state.spring_to(target_state, default_effects());
-            }
-            if target_level != last_level {
-                level.spring_to(target_level, default_effects());
-            }
-        });
-    });
-
-    let looks = is_disabled.clone();
-    let layer_off = is_disabled.clone();
-    let press_off = is_disabled.clone();
-    let key_off = is_disabled.clone();
-    let press_ripples = ripples.clone();
-    let release_ripples = ripples.clone();
-    let key_ripples = ripples.clone();
-    let key_up_ripples = ripples.clone();
-    let focus_ripples = ripples.clone();
-    let shown_ripples = ripples.shown;
-    let root = div()
-        .flex()
-        .flex_row()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .gap(8.0)
-        .h(metrics.height)
-        .px(metrics.padding)
-        .select_none()
-        .cursor(CursorIcon::Pointer)
-        .focusable()
-        .dyn_style(move |s| {
-            let c = color_scheme();
-            let (background, label, border) = colors(kind, &c);
-            let off = looks();
-            let s = s
-                .rounded(radius.get())
-                .shadows(elevation_shadows(level.get()));
-            let s = if off {
-                let label = c.on_surface_variant;
-                let s = s
-                    .text_color(label.with_alpha(0.38))
-                    .cursor(CursorIcon::Default);
-                if background.is_transparent() {
-                    s
-                } else {
-                    s.bg(c.on_surface.with_alpha(0.1))
-                }
-            } else {
-                s.bg(background).text_color(label)
-            };
-            let s = if border.is_transparent() {
-                s
-            } else {
-                s.border(outline).border_color(border)
-            };
-            if focused.get() && !off {
-                s.outline(3.0)
-                    .outline_offset(2.0)
-                    .outline_color(c.secondary)
-            } else {
-                s
-            }
-        })
-        .overlay(move || {
-            let shown = shown_ripples.get();
-            let level = state.get();
-            if layer_off() || (level <= 0.001 && shown.iter().all(|r| r[3] <= 0.0)) {
-                return None;
-            }
-            let (_, label, _) = colors(kind, &color_scheme());
-            Some(STATE_LAYER.params(StateLayer {
-                color: label,
-                state: level,
-                ripples: shown,
-            }))
-        })
-        .on_hover(move |on| hovered.set(on))
-        .on_focus_visible(move |on| focused.set(on))
-        // A key is released somewhere else if the focus moved on.
-        .on_focus_change(move |on| {
-            if !on {
-                focus_ripples.release();
-            }
-        })
-        .on_pointer_down(move |e| {
-            if !press_off() {
-                let center = [e.rect.width as f32 / 2.0, e.rect.height as f32 / 2.0];
-                press_ripples.press(Some(([e.local.x, e.local.y], center)));
-            }
-        })
-        .on_active(move |pressed| {
-            let target = if pressed { pressed_radius } else { rest_radius };
-            radius.spring_to(target, default_effects());
-            if !pressed {
-                release_ripples.release();
-            }
-        })
-        .on_key_down(move |e| {
-            if !e.repeat
-                && matches!(e.key, Key::Named(NamedKey::Enter | NamedKey::Space))
-                && !key_off()
-            {
-                key_ripples.press(None);
-            }
-        })
-        .on_key_up(move |e| {
-            if matches!(e.key, Key::Named(NamedKey::Enter | NamedKey::Space)) {
-                key_up_ripples.release();
-            }
-        })
-        .child(metrics.text.apply(text(label)));
-    let off = is_disabled;
-    root.disabled(move || off())
+        },
+        disabled,
+        checked: checked.clone(),
+    })
+    .gap(metrics.icon_gap)
+    .h(metrics.height)
+    .px(metrics.padding);
+    let icon_of = |symbol| filling_icon(symbol, metrics.icon, checked.clone());
+    let root = match icon {
+        Some(symbol) => root.child(icon_of(symbol)),
+        None => root,
+    };
+    let root = root.child(metrics.text.apply(text(label)));
+    match trailing_icon {
+        Some(symbol) => root.child(icon_of(symbol)),
+        None => root,
+    }
 }

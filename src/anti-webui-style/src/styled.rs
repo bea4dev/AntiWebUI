@@ -162,6 +162,7 @@ pub trait Styled: Sized {
         select_none => user_select = UserSelect::None;
         select_text => user_select = UserSelect::Text;
         pointer_events_none => pointer_events = false;
+        pointer_events_auto => pointer_events = true;
     }
 
     fn cursor(mut self, icon: CursorIcon) -> Self {
