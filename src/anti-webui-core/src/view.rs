@@ -5,7 +5,7 @@
 
 use crate::animation::{ListPlaces, request_frame};
 use crate::event::{KeyboardEvent, PointerEvent, ScrollEvent};
-use crate::geometry::{PointF, PointI, RectI};
+use crate::geometry::{PointF, PointI, RectI, Scale};
 use crate::platform::{ImePurpose, Placement, PopupKind};
 use crate::reactive::{
     Owner, Signal, create_child_owner, create_root, effect, memo, on_cleanup, signal, untrack,
@@ -17,7 +17,7 @@ use crate::tree::{
     Document, Handler, Listeners, Node, NodeId, NodeKind, PopupData, TextData, with_doc,
 };
 use anti_webui_style::{
-    AlignItems, Display as Layout, FlexDirection, Style, Styled, Transition, UserSelect,
+    AlignItems, Display as Layout, FlexDirection, Sheet, Style, Styled, Transition, UserSelect,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -218,9 +218,36 @@ fn also_bool(
     })
 }
 
+thread_local! {
+    static WINDOW_SCALE: Cell<Option<Signal<Scale>>> = const { Cell::new(None) };
+}
+
+fn window_scale_signal() -> Signal<Scale> {
+    WINDOW_SCALE.with(|s| {
+        s.get().unwrap_or_else(|| {
+            // Under a root of its own: it outlives whatever asks for it first.
+            let (signal, _) = create_root(|| signal(with_doc(|d| d.scale)));
+            s.set(Some(signal));
+            signal
+        })
+    })
+}
+
+/// The scale of the window. Reading it tracks it.
+pub fn window_scale() -> Scale {
+    window_scale_signal().get()
+}
+
+pub(crate) fn tell_window_scale(scale: Scale) {
+    window_scale_signal().set_if_changed(scale);
+}
+
+type SheetFn = Box<dyn Fn() -> Rc<Sheet>>;
+
 /// Common element configuration shared by `div` and `text_input`.
 #[derive(Default)]
 struct ElementConfig {
+    sheet: Option<SheetFn>,
     style: Style,
     hover: Option<Style>,
     focus: Option<Style>,
@@ -244,6 +271,23 @@ impl ElementConfig {
         node.listeners = self.listeners;
         node.focusable |= self.focusable;
         let id = create_node(node);
+        if let Some(f) = self.sheet {
+            effect(move || {
+                let sheet = f();
+                with_doc(|d| {
+                    if let Some(n) = d.get_mut(id)
+                        && !n
+                            .style
+                            .sheet
+                            .as_ref()
+                            .is_some_and(|s| Rc::ptr_eq(s, &sheet))
+                    {
+                        n.style.sheet = Some(sheet);
+                        d.mark_style_of(id);
+                    }
+                });
+            });
+        }
         bind_dynamic_styles(id, self.dynamic);
         if let Some(f) = self.fill {
             bind_paint(id, f, |n| &mut n.fill);
@@ -260,6 +304,9 @@ impl ElementConfig {
                 with_doc(|d| {
                     if let Some(n) = d.get_mut(id) {
                         n.disabled = v;
+                    }
+                    if v && d.state.focused == Some(id) {
+                        d.pending_focus = Some(None);
                     }
                     d.mark_style_of(id);
                 });
@@ -295,6 +342,14 @@ macro_rules! element_methods {
         /// A reactive style layer, recomputed whenever the signals it reads change.
         pub fn dyn_style(mut self, f: impl Fn(Style) -> Style + 'static) -> Self {
             self.cfg.dynamic.push(Box::new(f));
+            self
+        }
+
+        /// What the node looks like in each state, below everything else it is given. `f` runs
+        /// again whenever the signals it reads change, and what it returns counts as changed when
+        /// it is another [`Rc`]. See `docs/design/21-widgets.md`.
+        pub fn sheet(mut self, f: impl Fn() -> Rc<Sheet> + 'static) -> Self {
+            self.cfg.sheet = Some(Box::new(f));
             self
         }
 

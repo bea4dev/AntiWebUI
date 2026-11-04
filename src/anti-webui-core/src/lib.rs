@@ -29,7 +29,7 @@ pub mod prelude {
         Key, KeyboardEvent, Modifiers, NamedKey, PointerButton, PointerEvent, ScrollEvent,
         ScrollPhase, ScrollSource,
     };
-    pub use crate::geometry::{PointF, RectI};
+    pub use crate::geometry::{PointF, RectI, Scale};
     pub use crate::platform::{ImePurpose, Placement, PopupKind};
     pub use crate::reactive::{
         Memo, Owner, Signal, batch, create_root, effect, memo, on_cleanup, signal, untrack,
@@ -40,7 +40,7 @@ pub mod prelude {
     pub use crate::view::{
         Div, ForEach, IntoTextSource, IntoView, NodeRef, Popup, Show, Text, TextInput, View, div,
         dyn_view, for_each, fragment, node_ref, popup, portal, shader, show, text, text_area,
-        text_input,
+        text_input, window_scale,
     };
     pub use anti_webui_style::*;
 }

@@ -4,7 +4,6 @@
 //! (add `--features dynamic_linking` for faster rebuilds).
 
 use anti_webui::prelude::*;
-use anti_webui::widgets::theme;
 
 #[derive(Clone)]
 struct Todo {
@@ -36,7 +35,7 @@ fn selection_demo() -> Div {
                         .flex_1()
                         .p(10.0)
                         .rounded(6.0)
-                        .bg(theme::SURFACE_MUTED)
+                        .dyn_style(|s| s.bg(theme().surface_muted))
                         .child(text("Left column: The quick brown fox jumps over the lazy dog.")),
                 )
                 .child(
@@ -44,13 +43,13 @@ fn selection_demo() -> Div {
                         .flex_1()
                         .p(10.0)
                         .rounded(6.0)
-                        .bg(theme::SURFACE_MUTED)
+                        .dyn_style(|s| s.bg(theme().surface_muted))
                         .child(text("右の列: いろはにほへと ちりぬるを わかよたれそ つねならむ 🎌")),
                 ),
         )
         .child(
             text("Selected text is also published to the primary selection, so middle-click pastes it.")
-                .text_color(theme::TEXT_MUTED),
+                .dyn_style(|s| s.text_color(theme().text_muted)),
         )
 }
 
@@ -99,7 +98,7 @@ fn input_demo() -> Div {
             move || !submitted.get().is_empty(),
             move || {
                 text(move || format!("送信された値: {}", submitted.get()))
-                    .text_color(theme::SUCCESS)
+                    .dyn_style(|s| s.text_color(theme().success))
             },
         ))
         .child(label("Notes"))
@@ -109,6 +108,13 @@ fn input_demo() -> Div {
 fn controls_demo() -> Div {
     let agree = signal(true);
     let dark = signal(false);
+    effect(move || {
+        set_theme(if dark.get() {
+            Theme::dark()
+        } else {
+            Theme::light()
+        })
+    });
     let volume = signal(40.0f32);
     div()
         .flex()
@@ -209,7 +215,7 @@ fn todo_demo() -> Div {
                     .child(checkbox(todo.done, ""))
                     .child(text(todo.title.clone()).flex_1().dyn_style(move |s| {
                         if todo.done.get() {
-                            s.strikethrough().text_color(theme::TEXT_MUTED)
+                            s.strikethrough().text_color(theme().text_muted)
                         } else {
                             s
                         }
@@ -231,7 +237,7 @@ fn scroll_demo() -> Div {
     scroll_view()
         .h(160.0)
         .border(1.0)
-        .border_color(theme::BORDER)
+        .dyn_style(|s| s.border_color(theme().border))
         .rounded(6.0)
         .child(div().flex().flex_col().children((1..=40).map(|i| {
             div()
@@ -239,7 +245,7 @@ fn scroll_demo() -> Div {
                 .py(6.0)
                 .dyn_style(move |s| {
                     if i % 2 == 0 {
-                        s.bg(theme::SURFACE_MUTED)
+                        s.bg(theme().surface_muted)
                     } else {
                         s
                     }
@@ -256,7 +262,7 @@ fn shadow_demo() -> Div {
             .w(120.0)
             .h(72.0)
             .rounded(10.0)
-            .bg(theme::SURFACE)
+            .dyn_style(|s| s.bg(theme().surface))
             .flex()
             .items_center()
             .justify_center()
@@ -351,9 +357,9 @@ fn overlay_demo() -> Div {
                                     .p(12.0)
                                     .z_index(10)
                                     .rounded(8.0)
-                                    .bg(theme::SURFACE)
+                                    .dyn_style(|s| s.bg(theme().surface))
                                     .border(1.0)
-                                    .border_color(theme::BORDER)
+                                    .dyn_style(|s| s.border_color(theme().border))
                                     .shadow_lg()
                                     .child(text("後ろの要素より上に描かれます"))
                             },
@@ -414,7 +420,7 @@ fn overlay_demo() -> Div {
             div()
                 .p(16.0)
                 .rounded(6.0)
-                .bg(theme::SURFACE_MUTED)
+                .dyn_style(|s| s.bg(theme().surface_muted))
                 .child(text("ここを右クリックするとメニューが開きます"))
                 .on_pointer_down(move |e| {
                     if e.button == Some(PointerButton::Secondary) {
@@ -435,8 +441,8 @@ fn overlay_demo() -> Div {
                                     .w(160.0)
                                     .rounded(8.0)
                                     .border(1.0)
-                                    .border_color(theme::BORDER)
-                                    .bg(theme::SURFACE)
+                                    .dyn_style(|s| s.border_color(theme().border))
+                                    .dyn_style(|s| s.bg(theme().surface))
                                     .shadow_lg()
                                     .children(["コピー", "貼り付け", "削除"].map(|name| {
                                         div()
@@ -444,7 +450,7 @@ fn overlay_demo() -> Div {
                                             .py(5.0)
                                             .rounded(4.0)
                                             .cursor(CursorIcon::Pointer)
-                                            .hover(|s| s.bg(theme::HOVER))
+                                            .hover(|s| s.bg(theme().hover))
                                             .on_click(move |_| context.set(None))
                                             .child(text(name))
                                     })),
@@ -466,7 +472,7 @@ fn overlay_demo() -> Div {
                         .rounded(8.0)
                         .bg([rgb(0xffd7d5), rgb(0xd8f3dc), rgb(0xcfe2ff), rgb(0xfff3bf)][i])
                         .border(1.0)
-                        .border_color(theme::BORDER_STRONG)
+                        .dyn_style(|s| s.border_color(theme().border_strong))
                         .shadow_sm()
                         .z_index(4 - i as i32)
                         .hover(|s| s.z_index(9))
@@ -480,36 +486,38 @@ fn overlay_demo() -> Div {
 
 /// The whole showcase page. Also used by the `bench_slider` example.
 pub fn root() -> Div {
-    scroll_view().h_full().bg(theme::SURFACE_MUTED).child(
-        div()
-            .flex()
-            .flex_col()
-            .gap(16.0)
-            .p(24.0)
-            .max_w(860.0)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(4.0)
-                    .child(
-                        text("AntiWebUI")
-                            .text_size(28.0)
-                            .font_weight(FontWeight::BOLD),
-                    )
-                    .child(
-                        text("wgpu で描画する軽量ネイティブ UI フレームワーク")
-                            .text_color(theme::TEXT_MUTED),
-                    ),
-            )
-            .child(section("Selectable text", selection_demo()))
-            .child(section("Counter", counter_demo()))
-            .child(section("Text input & IME", input_demo()))
-            .child(section("Controls", controls_demo()))
-            .child(section("Keyed list", todo_demo()))
-            .child(section("Scroll view", scroll_demo()))
-            .child(section("Shadows", shadow_demo()))
-            .child(section("Overlays", overlay_demo())),
+    page().child(
+        scroll_view().h_full().child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(16.0)
+                .p(24.0)
+                .max_w(860.0)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(4.0)
+                        .child(
+                            text("AntiWebUI")
+                                .text_size(28.0)
+                                .font_weight(FontWeight::BOLD),
+                        )
+                        .child(
+                            text("wgpu で描画する軽量ネイティブ UI フレームワーク")
+                                .dyn_style(|s| s.text_color(theme().text_muted)),
+                        ),
+                )
+                .child(section("Selectable text", selection_demo()))
+                .child(section("Counter", counter_demo()))
+                .child(section("Text input & IME", input_demo()))
+                .child(section("Controls", controls_demo()))
+                .child(section("Keyed list", todo_demo()))
+                .child(section("Scroll view", scroll_demo()))
+                .child(section("Shadows", shadow_demo()))
+                .child(section("Overlays", overlay_demo())),
+        ),
     )
 }
 

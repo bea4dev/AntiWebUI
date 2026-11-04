@@ -27,6 +27,7 @@ fn main() {
 
 ```sh
 cargo run -p anti-webui --example showcase
+cargo run -p anti-webui --example widgets
 # 開発中は Bevy と同じく動的リンクでビルドを速くできます
 cargo run -p anti-webui --example showcase --features dynamic_linking
 ```
@@ -38,7 +39,7 @@ cargo run -p anti-webui --example showcase --features dynamic_linking
 | `anti-webui` | ファサード（`dynamic_linking` feature） |
 | `anti-webui-core` | リアクティブ・ノードツリー・スタイル解決・レイアウト・テキスト・選択・編集・入力処理 |
 | `anti-webui-style` | スタイル型と `Styled` ビルダートレイト |
-| `anti-webui-widgets` | Button / Checkbox / Switch / Slider / TextField など |
+| `anti-webui-widgets` | ボタン、入力、メニュー、ダイアログ、テーブルなどの標準の部品とテーマ |
 | `anti-webui-wgpu` | レンダラ |
 | `anti-webui-wayland` | Wayland バックエンド |
 | `anti-webui-app` | 上記の結線、オフスクリーン描画 |

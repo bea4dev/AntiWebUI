@@ -19,7 +19,7 @@ Web 技術の資産そのもの（HTML/JS）の流用は目標にしない。代
 │ anti-webui-dylib      開発用 Rust dylib                         │
 ├──────────────────────────────────────────────────────────────┤
 │ anti-webui-app        プラットフォーム × レンダラ × core の結線   │
-│ anti-webui-widgets    Button / Checkbox / TextInput など        │
+│ anti-webui-widgets    標準の部品（21-widgets.md）               │
 │ anti-webui-md3e       Material 3 Expressive の部品（任意）       │
 ├──────────────────────────────────────────────────────────────┤
 │ anti-webui-core       リアクティブ・ノードツリー・スタイル解決・   │

@@ -5,12 +5,14 @@
 //! (see `docs/design/01-pixel-model.md`).
 
 mod color;
+mod sheet;
 mod style;
 mod styled;
 mod transition;
 mod types;
 
 pub use color::*;
+pub use sheet::*;
 pub use style::*;
 pub use styled::*;
 pub use transition::*;

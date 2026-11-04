@@ -11,7 +11,7 @@
 - [x] ドキュメント横断のテキスト選択（ドラッグ、ダブル/トリプルクリック、コピー、primary selection）
 - [x] TextInput / TextArea（編集、クリップボード、undo）
 - [x] IME（text-input-v3、preedit 表示）
-- [x] 基本ウィジェット: Button, Checkbox, Switch, Slider, ScrollView, TextField, Card
+- [x] 基本ウィジェット: Button, Checkbox, Switch, Slider, ScrollView, TextField, Card（[21](21-widgets.md) で一式に）
 - [x] オフスクリーン描画（`headless`）と、合成イベントによる統合テスト
 - [x] ダメージトラッキング（変更矩形の計算・部分描画・Wayland の dmabuf presenter と `damage_buffer`）
 - [x] スクロールレイヤー（上下左右のスクロールで、動いた分だけ描く）
@@ -30,6 +30,7 @@
 - [x] Material Symbols のアイコン（[18](18-icons.md)）
 - [x] MD3E のトグル、アイコンボタン、FAB、ボタングループ（[19](19-buttons.md)）
 - [x] MD3E の残りの部品、`portal`、`set_timeout`、ショーケース（[20](20-md3e-components.md)）
+- [x] 標準の部品の一式、`Sheet`、テーマ、見えている行だけ作るリストとテーブル（[21](21-widgets.md)）
 
 ### M1 の既知の制限
 

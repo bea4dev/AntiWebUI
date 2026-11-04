@@ -151,6 +151,9 @@ impl AnimatedValue {
             }
             (Self::Length(Length::Px(a)), Self::Length(Length::Px(b)))
             | (Self::Length(Length::Percent(a)), Self::Length(Length::Percent(b))) => (a - b).abs(),
+            (Self::Length(Length::Device(a)), Self::Length(Length::Device(b))) => {
+                (a - b).abs() as f32
+            }
             (Self::Shadows(a), Self::Shadows(b)) => a
                 .iter()
                 .zip(b)
@@ -173,6 +176,9 @@ impl AnimatedValue {
             }
             (Self::Length(Length::Percent(a)), Self::Length(Length::Percent(b))) => {
                 Self::Length(Length::Percent(number(*a, *b)))
+            }
+            (Self::Length(Length::Device(a)), Self::Length(Length::Device(b))) => {
+                Self::Length(Length::Device(number(*a as f32, *b as f32).round() as i32))
             }
             (Self::Shadows(a), Self::Shadows(b)) => {
                 let longest = a.len().max(b.len());

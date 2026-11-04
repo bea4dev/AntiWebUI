@@ -25,6 +25,7 @@ AntiWebUI は WebView に頼らず、wgpu による自前描画とネイティ�
 | 18 | [icons](18-icons.md) | Material Symbols のアイコンと、その同梱方法 |
 | 19 | [buttons](19-buttons.md) | トグル、アイコンボタン、FAB、ボタングループ |
 | 20 | [md3e-components](20-md3e-components.md) | MD3E の残りの部品、`portal`、タイマー、ショーケース |
+| 21 | [widgets](21-widgets.md) | 標準の部品の一式、`Sheet`、テーマ、CSS との対応、見えている行だけ作るリスト |
 
 ## 用語
 

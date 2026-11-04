@@ -10,7 +10,7 @@ use crate::text::TextLayout;
 use crate::text::edit::EditData;
 use crate::text::selection::DocSelection;
 use crate::view::NodeRef;
-use anti_webui_style::{ComputedStyle, Display, Style};
+use anti_webui_style::{ComputedStyle, Display, Sheet, Style};
 use slotmap::{Key, KeyData, SlotMap, new_key_type};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -41,14 +41,27 @@ pub struct Listeners {
     pub resized: Option<Rc<dyn Fn(f32, f32)>>,
 }
 
-/// Style layers, applied in order: base → dynamic → hover → focus → active.
+/// Style layers, applied in order: sheet → base → dynamic → hover → focus → active → disabled. The
+/// sheet has its part in each of them, below what the node has itself.
 #[derive(Default)]
 pub struct NodeStyle {
+    pub sheet: Option<Rc<Sheet>>,
     pub base: Style,
     pub dynamic: Vec<Style>,
     pub hover: Option<Style>,
     pub focus: Option<Style>,
     pub active: Option<Style>,
+}
+
+impl NodeStyle {
+    /// Whether going in and out of the state makes a difference.
+    pub fn depends_on_hover(&self) -> bool {
+        self.hover.is_some() || self.sheet.as_ref().is_some_and(|s| s.hover.is_some())
+    }
+
+    pub fn depends_on_active(&self) -> bool {
+        self.active.is_some() || self.sheet.as_ref().is_some_and(|s| s.active.is_some())
+    }
 }
 
 pub struct TextData {
@@ -201,6 +214,11 @@ pub struct Node {
 }
 
 impl Node {
+    /// Whether it doesn't react, because of itself or of something around it.
+    pub fn is_disabled(&self) -> bool {
+        self.disabled || self.computed.disabled
+    }
+
     pub fn new(kind: NodeKind) -> Self {
         Self {
             parent: None,
@@ -392,6 +410,8 @@ pub struct WindowState {
     /// The pressed node and its ancestors while the primary button is down.
     pub active: Vec<NodeId>,
     pub focused: Option<NodeId>,
+    /// The focus should be shown: it came from the keyboard.
+    pub focus_visible: bool,
     pub selection: Option<DocSelection>,
     pub window_focused: bool,
 }

@@ -8,6 +8,9 @@ pub enum Length {
     Px(f32),
     /// Percentage (`0.0..=100.0`) of the containing block's corresponding axis.
     Percent(f32),
+    /// Physical pixels, exactly: for what adds up many rounded lengths, like the rows of a long
+    /// list, where logical pixels would drift.
+    Device(i32),
     #[default]
     Auto,
 }

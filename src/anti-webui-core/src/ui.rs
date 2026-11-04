@@ -548,6 +548,7 @@ impl Ui {
                 d.mark_layout();
             }
         });
+        crate::view::tell_window_scale(scale);
     }
 
     fn ensure_layout(&mut self) {
@@ -590,12 +591,12 @@ impl Ui {
             }
             let old = std::mem::replace(&mut d.state.hovered, chain.clone());
             for &id in old.iter().filter(|i| !chain.contains(i)) {
-                if d.get(id).is_some_and(|n| n.style.hover.is_some()) {
+                if d.get(id).is_some_and(|n| n.style.depends_on_hover()) {
                     d.mark_style_of(id);
                 }
             }
             for &id in chain.iter().filter(|i| !old.contains(i)) {
-                if d.get(id).is_some_and(|n| n.style.hover.is_some()) {
+                if d.get(id).is_some_and(|n| n.style.depends_on_hover()) {
                     d.mark_style_of(id);
                 }
             }
@@ -632,7 +633,7 @@ impl Ui {
         for id in chain {
             let found: Option<(Handler<PointerEvent>, RectI)> = with_doc(|d| {
                 let n = d.get(id)?;
-                if n.disabled {
+                if n.is_disabled() {
                     return None;
                 }
                 let l = &n.listeners;
@@ -730,7 +731,7 @@ impl Ui {
                 d.ancestors(t)
                     .into_iter()
                     .take_while(|id| Some(*id) != popup.and_then(|p| d.get(p)?.parent))
-                    .find(|id| d.get(*id).is_some_and(|n| n.focusable && !n.disabled))
+                    .find(|id| d.get(*id).is_some_and(|n| n.focusable && !n.is_disabled()))
             })
         });
         if button != PointerButton::Secondary && (focus_target.is_some() || popup.is_none()) {
@@ -1034,7 +1035,7 @@ impl Ui {
         for &id in &g.chain {
             let handler = with_doc(|d| {
                 d.get(id)
-                    .filter(|n| !n.disabled)
+                    .filter(|n| !n.is_disabled())
                     .and_then(|n| n.listeners.scroll.clone())
             });
             if let Some(h) = handler {
@@ -1113,6 +1114,7 @@ impl Ui {
                 return (prev, Vec::new());
             }
             d.state.focused = next;
+            d.state.focus_visible = keyboard;
             let mut handlers = Vec::new();
             for (id, focused) in [(prev, false), (next, true)] {
                 let Some(n) = id.and_then(|id| d.get(id)) else {
@@ -1167,7 +1169,7 @@ impl Ui {
                 .into_iter()
                 .filter(|id| {
                     d.get(*id)
-                        .is_some_and(|n| n.focusable && n.visible && !n.disabled)
+                        .is_some_and(|n| n.focusable && n.visible && !n.is_disabled())
                         && modal.is_none_or(|m| d.is_ancestor(m, *id))
                 })
                 .collect();
@@ -1214,7 +1216,7 @@ impl Ui {
             let chain = with_doc(|d| d.ancestors(t));
             for id in chain {
                 let h = with_doc(|d| {
-                    d.get(id).filter(|n| !n.disabled).and_then(|n| {
+                    d.get(id).filter(|n| !n.is_disabled()).and_then(|n| {
                         if key.pressed {
                             n.listeners.key_down.clone()
                         } else {
@@ -1605,8 +1607,8 @@ impl Document {
             let Some(n) = self.get(id) else {
                 continue;
             };
-            let has_style = n.style.active.is_some();
-            if let Some(f) = n.listeners.active.clone().filter(|_| !n.disabled) {
+            let has_style = n.style.depends_on_active();
+            if let Some(f) = n.listeners.active.clone().filter(|_| !n.is_disabled()) {
                 listeners.push((f, active));
             }
             if has_style {

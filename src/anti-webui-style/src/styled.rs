@@ -122,6 +122,7 @@ pub trait Styled: Sized {
         text_align => text_align: TextAlign;
         selection_color => selection_color: Color;
         caret_color => caret_color: Color;
+        scrollbar_color => scrollbar_color: Color;
     }
 
     flag! {
@@ -163,6 +164,13 @@ pub trait Styled: Sized {
         select_text => user_select = UserSelect::Text;
         pointer_events_none => pointer_events = false;
         pointer_events_auto => pointer_events = true;
+    }
+
+    /// The color of the parts of controls here and below that show the accent: the box of a
+    /// checkbox that is on, the track of a slider (CSS `accent-color`).
+    fn accent_color(mut self, color: impl Into<Color>) -> Self {
+        self.style_mut().accent_color = Some(Some(color.into()));
+        self
     }
 
     fn cursor(mut self, icon: CursorIcon) -> Self {

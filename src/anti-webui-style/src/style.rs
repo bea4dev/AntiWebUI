@@ -166,6 +166,11 @@ define_style! {
     user_select: UserSelect = UserSelect::Text, inherited;
     selection_color: Color = Color::from_rgba(0x338fff59), inherited;
     caret_color: Color = Color::from_rgb(0x1f2328), inherited;
+    scrollbar_color: Color = Color::from_rgba(0x00000055), inherited;
+    /// What parts of controls that a sheet marks take instead of their color (CSS `accent-color`).
+    accent_color: Option<Color> = None, inherited;
+    /// The node or something around it is disabled. Set by the core and not by styles.
+    disabled: bool = false, inherited;
 }
 
 impl ComputedStyle {

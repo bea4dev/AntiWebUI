@@ -10,7 +10,7 @@ use crate::text::{ShapeStyle, TextSystem};
 use crate::tree::{Document, Node, NodeId, NodeKind, PopupSurface};
 use anti_webui_style::{
     ANIMATED_FIELDS, AlignItems, ComputedStyle, Display, Edges, JustifyContent, Length, Overflow,
-    Position, WhiteSpace,
+    Position, Sheet, WhiteSpace,
 };
 use std::collections::BinaryHeap;
 use std::time::Instant;
@@ -30,6 +30,7 @@ impl RLen {
         match l {
             Length::Px(v) => RLen::Px(scale.px(v)),
             Length::Percent(p) => RLen::Percent(p),
+            Length::Device(v) => RLen::Px(v),
             Length::Auto => RLen::Auto,
         }
     }
@@ -324,6 +325,67 @@ struct Resolution {
     spaces: Vec<NodeId>,
 }
 
+/// Everything of a sheet goes below everything the node has itself, in every state, like the
+/// stylesheet of a browser below those of a page.
+fn apply_sheet(
+    sheet: &Sheet,
+    doc: &Document,
+    id: NodeId,
+    node: &Node,
+    computed: &mut ComputedStyle,
+) {
+    let disabled = computed.disabled;
+    sheet.base.apply_to(computed);
+    if let Some(s) = sheet.hover.as_ref().filter(|_| !disabled)
+        && doc.state.hovered.contains(&id)
+    {
+        s.apply_to(computed);
+    }
+    if doc.state.focused == Some(id) {
+        if let Some(s) = &sheet.focus {
+            s.apply_to(computed);
+        }
+        if let Some(s) = sheet
+            .focus_visible
+            .as_ref()
+            .filter(|_| doc.state.focus_visible)
+        {
+            s.apply_to(computed);
+        }
+    }
+    if let Some(s) = sheet.active.as_ref().filter(|_| !disabled)
+        && doc.state.active.contains(&id)
+    {
+        s.apply_to(computed);
+    }
+    if let Some(s) = sheet.disabled.as_ref().filter(|_| disabled) {
+        s.apply_to(computed);
+    }
+    if disabled {
+        return;
+    }
+    // Its own wins over what it inherits, whichever layer says so.
+    let accent = node
+        .style
+        .dynamic
+        .iter()
+        .rev()
+        .chain([&node.style.base])
+        .find_map(|s| s.accent_color)
+        .unwrap_or(computed.accent_color);
+    if let Some(color) = accent {
+        if sheet.accent.background {
+            computed.background = color;
+        }
+        if sheet.accent.border {
+            computed.border_color = color;
+        }
+        if sheet.accent.text {
+            computed.color = color;
+        }
+    }
+}
+
 fn resolve_node(
     doc: &mut Document,
     id: NodeId,
@@ -335,6 +397,10 @@ fn resolve_node(
         return;
     };
     let mut computed = ComputedStyle::inherit_from(parent);
+    computed.disabled |= node.disabled;
+    if let Some(sheet) = node.style.sheet.as_deref() {
+        apply_sheet(sheet, doc, id, node, &mut computed);
+    }
     node.style.base.apply_to(&mut computed);
     for layer in &node.style.dynamic {
         layer.apply_to(&mut computed);

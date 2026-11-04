@@ -849,7 +849,7 @@ impl Painter<'_> {
         let pad = node.padding_abs();
         let thickness = scale.px_min1(SCROLLBAR_WIDTH);
         let inset = scale.px(2.0);
-        let color = fade(Color::from_rgba(0x00000055), opacity);
+        let color = fade(c.scrollbar_color, opacity);
         if c.overflow_y == Overflow::Scroll
             && node.content_size.height > pad.height
             && pad.height > 0
