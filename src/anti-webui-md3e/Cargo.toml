@@ -12,4 +12,5 @@ bundled-fonts = []
 
 [dependencies]
 anti-webui.workspace = true
+anti-webui-symbols-outlined.workspace = true
 # Everything goes through the public API on purpose: see docs/design/15-md3e.md.

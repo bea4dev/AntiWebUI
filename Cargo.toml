@@ -10,6 +10,7 @@ members = [
     "src/anti-webui-macros",
     "src/anti-webui-widgets",
     "src/anti-webui-md3e",
+    "src/anti-webui-symbols-outlined",
     "src/anti-webui-app",
     "src/anti-webui-wgpu",
     "src/anti-webui-wayland",
@@ -35,6 +36,7 @@ anti-webui-macros = { path = "src/anti-webui-macros", version = "0.1.0" }
 anti-webui-app = { path = "src/anti-webui-app", version = "0.1.0" }
 anti-webui-wgpu = { path = "src/anti-webui-wgpu", version = "0.1.0" }
 anti-webui-wayland = { path = "src/anti-webui-wayland", version = "0.1.0" }
+anti-webui-symbols-outlined = { path = "src/anti-webui-symbols-outlined", version = "0.1.0" }
 
 wgpu = "30"
 naga = { version = "30", features = ["wgsl-in"] }

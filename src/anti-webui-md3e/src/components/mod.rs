@@ -1,6 +1,7 @@
 //! The components. Each returns an ordinary builder that can be styled further.
 
 mod button;
+mod icon;
 mod loading;
 mod progress;
 
@@ -8,6 +9,7 @@ pub use button::{
     ButtonKind, ButtonSize, ButtonStyle, button, elevated_button, outlined_button, styled_button,
     text_button, tonal_button,
 };
+pub use icon::{icon, sized_icon};
 pub use loading::loading_indicator;
 pub use progress::wavy_progress;
 

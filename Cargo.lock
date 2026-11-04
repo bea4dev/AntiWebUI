@@ -90,11 +90,19 @@ name = "anti-webui-md3e"
 version = "0.1.0"
 dependencies = [
  "anti-webui",
+ "anti-webui-symbols-outlined",
 ]
 
 [[package]]
 name = "anti-webui-style"
 version = "0.1.0"
+
+[[package]]
+name = "anti-webui-symbols-outlined"
+version = "0.1.0"
+dependencies = [
+ "read-fonts",
+]
 
 [[package]]
 name = "anti-webui-wayland"

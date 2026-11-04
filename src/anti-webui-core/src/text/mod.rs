@@ -19,6 +19,7 @@ use parley::{
     Layout, LayoutContext, StyleProperty, TextWrapMode,
 };
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 pub use parley::{Affinity, Cursor, Selection as LayoutSelection};
@@ -35,6 +36,10 @@ pub struct TextSystem {
     prepared: Vec<IcuScript>,
     /// How many times fonts were added: what was shaped before may look different now.
     fonts_generation: u64,
+    /// The `font-family` lists text has been shaped with.
+    asked_lists: HashSet<FontFamily>,
+    /// The names in those lists, in lower case, as fontique compares them.
+    asked_names: HashSet<String>,
 }
 
 impl TextSystem {
@@ -54,7 +59,28 @@ impl TextSystem {
             locale,
             prepared: Vec::new(),
             fonts_generation: 0,
+            asked_lists: HashSet::new(),
+            asked_names: HashSet::new(),
         }
+    }
+
+    fn note_asked(&mut self, family: &FontFamily) {
+        if self.asked_lists.contains(family) {
+            return;
+        }
+        self.asked_lists.insert(family.clone());
+        for name in FontFamilyName::parse_css_list(&family.0).map_while(Result::ok) {
+            if let FontFamilyName::Named(name) = name {
+                self.asked_names.insert(name.to_lowercase());
+            }
+        }
+    }
+
+    /// Whether a font of this family can't change what was shaped so far: no text asked for it,
+    /// and it adds nothing to a family that text could have got to some other way.
+    fn is_unseen_family(&mut self, name: &str) -> bool {
+        !self.asked_names.contains(&name.to_lowercase())
+            && self.fcx.collection.family_id(name).is_none()
     }
 
     /// fontique doesn't keep what fontconfig says for a script and a locale it doesn't track, such
@@ -196,7 +222,8 @@ fn register(
     data: impl AsRef<[u8]> + Send + Sync + 'static,
     family: Option<&str>,
 ) -> Result<Vec<String>, NotAFont> {
-    let names = with_text(|ts| {
+    let (names, unseen) = with_text(|ts| {
+        let unseen = family.is_some_and(|name| ts.is_unseen_family(name));
         let info = family.map(|name| FontInfoOverride {
             family_name: Some(name),
             ..Default::default()
@@ -205,19 +232,23 @@ fn register(
             .fcx
             .collection
             .register_fonts(Blob::new(Arc::new(data)), info);
-        ts.fonts_generation += 1;
+        if !unseen {
+            ts.fonts_generation += 1;
+        }
         let mut names: Vec<String> = found
             .iter()
             .filter_map(|(id, _)| ts.fcx.collection.family_name(*id).map(str::to_owned))
             .collect();
         names.dedup();
-        names
+        (names, unseen)
     });
     if names.is_empty() {
         return Err(NotAFont);
     }
     // What fell back because the font wasn't there can use it now.
-    with_doc(Document::invalidate_all_layout);
+    if !unseen {
+        with_doc(Document::invalidate_all_layout);
+    }
     Ok(names)
 }
 
@@ -298,6 +329,7 @@ impl TextLayout {
         if self.key.as_ref() == Some(&key) {
             return false;
         }
+        ts.note_asked(&style.family);
         ts.prepare_fallbacks(text);
         let variations = ts.variations(style);
         let locale = ts.locale;

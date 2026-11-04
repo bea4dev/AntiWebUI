@@ -1,0 +1,9 @@
+Material Symbols Outlined
+Copyright 2026 Google LLC. All Rights Reserved.
+Licensed under the Apache License, Version 2.0: see LICENSE in this directory.
+
+The files here are made from MaterialSymbolsOutlined[FILL,GRAD,opsz,wght].ttf of
+https://github.com/google/material-design-icons, commit
+10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7, version 2.978 of the font, by
+tools/generate.py: each holds one icon of the font, without the ligatures and
+without most of the names.

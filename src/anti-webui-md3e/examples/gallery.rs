@@ -4,10 +4,10 @@
 
 use anti_webui::prelude::*;
 use anti_webui_md3e::components::{
-    ButtonSize, ButtonStyle, button, elevated_button, loading_indicator, outlined_button,
+    ButtonSize, ButtonStyle, button, elevated_button, icon, loading_indicator, outlined_button,
     styled_button, text_button, tonal_button, wavy_progress,
 };
-use anti_webui_md3e::{ColorScheme, color_scheme, set_color_scheme};
+use anti_webui_md3e::{ColorScheme, color_scheme, icons, set_color_scheme};
 
 fn row() -> Div {
     div().flex().flex_row().items_center().gap(12.0)
@@ -81,6 +81,13 @@ fn main() {
                         })),
                 )
                 .child(row().child(loading_indicator()))
+                .child(
+                    row()
+                        .child(icon(icons::HOME))
+                        .child(icon(icons::SEARCH))
+                        .child(icon(icons::SETTINGS))
+                        .child(icon(icons::FAVORITE).font_axis(b"FILL", 1.0)),
+                )
         })
         .unwrap();
 }

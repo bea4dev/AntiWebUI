@@ -18,6 +18,7 @@ pub mod motion;
 mod shapes;
 pub mod typography;
 
+pub use anti_webui_symbols_outlined as icons;
 pub use color::{ColorScheme, color_scheme, set_color_scheme};
 
 use std::cell::Cell;

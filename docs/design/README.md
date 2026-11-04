@@ -22,6 +22,7 @@ AntiWebUI は WebView に頼らず、wgpu による自前描画とネイティ�
 | 15 | [md3e](15-md3e.md) | Material 3 Expressive の部品（`anti_webui_md3e`） |
 | 16 | [filters](16-filters.md) | `filter`、ブラー、backdrop、入力を読むシェーダー |
 | 17 | [font-axes](17-font-axes.md) | 可変フォントの軸の指定とアニメーション |
+| 18 | [icons](18-icons.md) | Material Symbols のアイコンと、その同梱方法 |
 
 ## 用語
 
