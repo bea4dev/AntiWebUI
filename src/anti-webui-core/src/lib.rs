@@ -33,7 +33,7 @@ pub mod prelude {
         Memo, Owner, Signal, batch, create_root, effect, memo, on_cleanup, signal, untrack,
     };
     pub use crate::settings::{FrameAdvance, Settings, settings, update_settings};
-    pub use crate::shader::{Shader, ShaderPaint, ShaderParams};
+    pub use crate::shader::{Image, IntoImage, IntoPaint, Shader, ShaderPaint, ShaderParams};
     pub use crate::text::{NotAFont, register_font, register_font_as};
     pub use crate::view::{
         Div, ForEach, IntoTextSource, IntoView, NodeRef, Popup, Show, Text, TextInput, View, div,

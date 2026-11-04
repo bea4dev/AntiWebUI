@@ -109,10 +109,14 @@ pub enum Prop {
     Scale,
     Rotate,
     Opacity,
+    Blur,
+    BackdropBlur,
     Background,
     BorderColor,
     OutlineColor,
     TextColor,
+    FontWeight,
+    FontAxes,
     Radius,
     Shadow,
     Width,
@@ -131,6 +135,8 @@ pub enum AnimatedValue {
     Color(Color),
     Length(Length),
     Shadows(Vec<BoxShadow>),
+    Weight(FontWeight),
+    Axes(FontAxes),
 }
 
 impl AnimatedValue {
@@ -150,6 +156,8 @@ impl AnimatedValue {
                 .zip(b)
                 .map(|(a, b)| (a.offset_x - b.offset_x).abs() + (a.offset_y - b.offset_y).abs())
                 .sum(),
+            (Self::Weight(a), Self::Weight(b)) => (a.0 as f32 - b.0 as f32).abs(),
+            (Self::Axes(a), Self::Axes(b)) => a.distance(b),
             _ => 0.0,
         }
     }
@@ -195,6 +203,10 @@ impl AnimatedValue {
                 }
                 Self::Shadows(out)
             }
+            (Self::Weight(a), Self::Weight(b)) => {
+                Self::Weight(FontWeight(number(a.0 as f32, b.0 as f32).round() as u16))
+            }
+            (Self::Axes(a), Self::Axes(b)) => Self::Axes(a.interpolate(b, t)),
             _ => return None,
         })
     }
@@ -242,10 +254,14 @@ animated_fields! {
     Scale: scale_x as Number, scale_y as Number;
     Rotate: rotate as Number;
     Opacity: opacity as Number;
+    Blur: blur as Number;
+    BackdropBlur: backdrop_blur as Number;
     Background: background as Color;
     BorderColor: border_color as Color;
     OutlineColor: outline_color as Color;
     TextColor: color as Color;
+    FontWeight: font_weight as Weight;
+    FontAxes: font_axes as Axes;
     Radius: radius_top_left as Number, radius_top_right as Number,
         radius_bottom_right as Number, radius_bottom_left as Number;
     Shadow: shadows as Shadows;
@@ -276,6 +292,19 @@ impl ComputedStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_weight_is_a_whole_number_on_the_way() {
+        let (a, b) = (
+            AnimatedValue::Weight(FontWeight(400)),
+            AnimatedValue::Weight(FontWeight(700)),
+        );
+        assert_eq!(
+            a.interpolate(&b, 0.509),
+            Some(AnimatedValue::Weight(FontWeight(553)))
+        );
+        assert_eq!(a.distance(&b), 300.0);
+    }
 
     #[test]
     fn easings_start_and_end_where_they_should() {

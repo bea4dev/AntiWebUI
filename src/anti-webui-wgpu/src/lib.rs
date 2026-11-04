@@ -3,6 +3,7 @@
 mod custom_shader;
 #[cfg(target_os = "linux")]
 pub mod dmabuf;
+mod effects;
 mod glyph_cache;
 #[cfg(target_os = "linux")]
 pub mod linux_sync;

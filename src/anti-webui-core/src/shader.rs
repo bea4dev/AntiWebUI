@@ -210,6 +210,8 @@ impl<P: ShaderParams> Shader<P> {
         ShaderPaint {
             source: &self.source,
             params: out.finish().into(),
+            inputs: Vec::new(),
+            reach: 0.0,
         }
     }
 
@@ -236,6 +238,8 @@ pub fn preloads_from(start: usize) -> Vec<&'static ShaderSource> {
 pub struct ShaderPaint {
     source: &'static ShaderSource,
     params: Arc<[u8]>,
+    inputs: Vec<Image>,
+    reach: f32,
 }
 
 impl ShaderPaint {
@@ -246,18 +250,304 @@ impl ShaderPaint {
     pub fn params(&self) -> &[u8] {
         &self.params
     }
+
+    /// What the shader reads as `read0` to `read3`. More than four are ignored.
+    pub fn inputs(mut self, inputs: impl IntoIterator<Item = Image>) -> Self {
+        self.inputs = inputs.into_iter().take(MAX_INPUTS).collect();
+        self
+    }
+
+    /// How far from a pixel the shader reads its inputs, in logical pixels. What it reads further
+    /// away gives the color at the edge of that range. In a `filter`, it is also how far the
+    /// result goes past what it is made from.
+    pub fn reach(mut self, logical: f32) -> Self {
+        self.reach = logical.max(0.0);
+        self
+    }
+
+    pub fn input_images(&self) -> &[Image] {
+        &self.inputs
+    }
+
+    /// [`ShaderPaint::reach`] in physical pixels.
+    pub fn reach_px(&self, scale: f32) -> i32 {
+        (self.reach * scale).ceil() as i32
+    }
 }
 
 impl PartialEq for ShaderPaint {
     fn eq(&self, other: &Self) -> bool {
         std::ptr::eq(self.source, other.source)
             && (Arc::ptr_eq(&self.params, &other.params) || self.params == other.params)
+            && self.reach == other.reach
+            && self.inputs == other.inputs
+    }
+}
+
+/// How many inputs a shader can read.
+pub const MAX_INPUTS: usize = 4;
+
+/// The standard deviation, in texels, of a blur that goes down this many times and back.
+const BLUR_SIGMAS: [f32; 8] = [1.68, 3.76, 7.71, 15.52, 31.08, 62.19, 124.4, 248.8];
+
+/// How a blur of standard deviation `sigma` in texels is done: how many times to go down, and how
+/// much of the last step to use. Zero times means computing the gaussian: going down blurs more
+/// than that already. See `docs/design/16-filters.md`.
+pub fn blur_levels(sigma: f32) -> (u32, f32) {
+    if sigma <= BLUR_SIGMAS[0] {
+        return (0, 1.0);
+    }
+    let sigma = sigma.min(BLUR_SIGMAS[BLUR_SIGMAS.len() - 1]);
+    for i in 1..BLUR_SIGMAS.len() {
+        let (below, above) = (BLUR_SIGMAS[i - 1], BLUR_SIGMAS[i]);
+        if sigma <= above {
+            let mix = (sigma * sigma - below * below) / (above * above - below * below);
+            return (i as u32 + 1, mix);
+        }
+    }
+    (BLUR_SIGMAS.len() as u32, 1.0)
+}
+
+/// How far a blur reads: what lies further away has too little weight to see.
+pub fn blur_reach(sigma: f32) -> i32 {
+    (sigma.min(BLUR_SIGMAS[BLUR_SIGMAS.len() - 1]) * 3.0).ceil() as i32
+}
+
+/// How much more than [`blur_reach`] is read to keep to the grid the blur goes down on. Holds at
+/// any number of texels per pixel, unlike the grid itself.
+fn blur_grid_margin(sigma: f32) -> i32 {
+    (sigma * 2.2).ceil() as i32 + 2
+}
+
+/// A picture made of what a node paints or has behind it, blurs and shaders. See
+/// `docs/design/16-filters.md`.
+#[derive(Clone, Debug)]
+pub struct Image(Arc<ImageNode>);
+
+#[derive(Debug, PartialEq)]
+pub enum ImageNode {
+    /// What the node and its children paint.
+    Content,
+    /// What is behind the node.
+    Backdrop,
+    /// `radius` is the standard deviation in logical pixels.
+    Blur {
+        input: Image,
+        radius: f32,
+    },
+    Shader(ShaderPaint),
+}
+
+impl PartialEq for Image {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
+impl Image {
+    /// What the node and its children paint, for [`filter`](crate::view::Div::filter).
+    pub fn content() -> Image {
+        Image(Arc::new(ImageNode::Content))
+    }
+
+    /// What is behind the node, for [`fill`](crate::view::Div::fill) and
+    /// [`overlay`](crate::view::Div::overlay).
+    pub fn backdrop() -> Image {
+        Image(Arc::new(ImageNode::Backdrop))
+    }
+
+    /// Blurs it. `radius` is the standard deviation in logical pixels, like CSS `blur()`.
+    pub fn blur(self, radius: f32) -> Image {
+        if radius <= 0.0 {
+            return self;
+        }
+        Image(Arc::new(ImageNode::Blur {
+            input: self,
+            radius,
+        }))
+    }
+
+    /// Passes it through a shader, which reads it as `read0`.
+    pub fn through<P: ShaderParams>(self, shader: &'static Shader<P>, params: P) -> Image {
+        shader.params(params).inputs([self]).into()
+    }
+
+    /// See [`ShaderPaint::reach`]. Only means something right after a shader.
+    pub fn reach(self, logical: f32) -> Image {
+        match &*self.0 {
+            ImageNode::Shader(paint) => paint.clone().reach(logical).into(),
+            _ => self,
+        }
+    }
+
+    pub fn node(&self) -> &ImageNode {
+        &self.0
+    }
+
+    /// The same for what shares the result, and so is computed once.
+    pub fn id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
+    /// Whether what is behind the node decides how it looks.
+    pub fn reads_backdrop(&self) -> bool {
+        match &*self.0 {
+            ImageNode::Content => false,
+            ImageNode::Backdrop => true,
+            ImageNode::Blur { input, .. } => input.reads_backdrop(),
+            ImageNode::Shader(paint) => paint.inputs.iter().any(Image::reads_backdrop),
+        }
+    }
+
+    /// How far from a pixel its value depends on what it is made from, in physical pixels.
+    pub fn reach_px(&self, scale: f32) -> i32 {
+        match &*self.0 {
+            ImageNode::Content | ImageNode::Backdrop => 0,
+            ImageNode::Blur { input, radius } => input.reach_px(scale) + blur_reach(radius * scale),
+            ImageNode::Shader(paint) => paint.reach_px(scale) + paint.inputs_reach_px(scale),
+        }
+    }
+
+    /// How far around a pixel it reads, which is more than what it depends on: everything up to
+    /// here is drawn again when it changes.
+    pub fn read_px(&self, scale: f32) -> i32 {
+        match &*self.0 {
+            ImageNode::Content | ImageNode::Backdrop => 0,
+            ImageNode::Blur { input, radius } => {
+                let sigma = radius * scale;
+                input.read_px(scale) + blur_reach(sigma) + blur_grid_margin(sigma)
+            }
+            ImageNode::Shader(paint) => paint.reach_px(scale) + paint.inputs_read_px(scale),
+        }
+    }
+}
+
+impl ShaderPaint {
+    pub fn reads_backdrop(&self) -> bool {
+        self.inputs.iter().any(Image::reads_backdrop)
+    }
+
+    /// The furthest any input depends on what it is made from.
+    pub fn inputs_reach_px(&self, scale: f32) -> i32 {
+        self.inputs
+            .iter()
+            .map(|i| i.reach_px(scale))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The furthest any input reads.
+    pub fn inputs_read_px(&self, scale: f32) -> i32 {
+        self.inputs
+            .iter()
+            .map(|i| i.read_px(scale))
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+impl From<ShaderPaint> for Image {
+    fn from(paint: ShaderPaint) -> Image {
+        Image(Arc::new(ImageNode::Shader(paint)))
+    }
+}
+
+/// Shows an image as it is, for one that doesn't end in a shader.
+static SHOW: Shader<()> = Shader::new(
+    "aw_show",
+    "fn paint(f: Frag) -> vec4<f32> { return read0(f.px); }",
+);
+
+/// What [`fill`](crate::view::Div::fill) and [`overlay`](crate::view::Div::overlay) can paint with.
+pub trait IntoPaint {
+    fn into_paint(self) -> Option<ShaderPaint>;
+}
+
+impl IntoPaint for ShaderPaint {
+    fn into_paint(self) -> Option<ShaderPaint> {
+        Some(self)
+    }
+}
+
+impl IntoPaint for Image {
+    fn into_paint(self) -> Option<ShaderPaint> {
+        Some(match &*self.0 {
+            ImageNode::Shader(paint) => paint.clone(),
+            _ => SHOW.params(()).inputs([self]),
+        })
+    }
+}
+
+impl<T: IntoPaint> IntoPaint for Option<T> {
+    fn into_paint(self) -> Option<ShaderPaint> {
+        self.and_then(IntoPaint::into_paint)
+    }
+}
+
+/// What [`filter`](crate::view::Div::filter) can apply.
+pub trait IntoImage {
+    fn into_image(self) -> Option<Image>;
+}
+
+impl IntoImage for Image {
+    fn into_image(self) -> Option<Image> {
+        Some(self)
+    }
+}
+
+impl IntoImage for ShaderPaint {
+    fn into_image(self) -> Option<Image> {
+        Some(self.into())
+    }
+}
+
+impl<T: IntoImage> IntoImage for Option<T> {
+    fn into_image(self) -> Option<Image> {
+        self.and_then(IntoImage::into_image)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blur_changes_continuously_with_its_radius() {
+        let at = |sigma: f32| {
+            let (levels, mix) = blur_levels(sigma);
+            assert!((0..=8).contains(&levels));
+            assert!((0.0..=1.0).contains(&mix), "{sigma}: {mix}");
+            (levels, mix)
+        };
+        for &edge in &BLUR_SIGMAS[1..7] {
+            let (a, mix_a) = at(edge - 0.001);
+            let (b, mix_b) = at(edge + 0.001);
+            assert_eq!(a + 1, b, "{edge}");
+            assert!(mix_a > 0.999 && mix_b < 0.001, "{edge}: {mix_a} {mix_b}");
+        }
+        assert_eq!(at(1.0), (0, 1.0));
+        assert_eq!(at(BLUR_SIGMAS[0] + 0.001).0, 2);
+        assert!(at(BLUR_SIGMAS[0] + 0.001).1 < 0.001);
+        assert_eq!(at(10_000.0), (8, 1.0));
+    }
+
+    #[test]
+    fn what_is_read_covers_the_grid_at_any_resolution() {
+        for tenths in 1..4000 {
+            let sigma = tenths as f32 * 0.1;
+            for k in 1..=4 {
+                let (levels, _) = blur_levels(sigma * k as f32);
+                // Up to one whole cell of the grid more, in pixels of the scene.
+                let grid = (1_i32 << levels) as f32 / k as f32;
+                let reach = blur_reach(sigma * k as f32) as f32 / k as f32;
+                let read = (blur_reach(sigma) + blur_grid_margin(sigma)) as f32;
+                assert!(
+                    reach + grid <= read + 1.0,
+                    "{sigma} {k}: {reach} {grid} {read}"
+                );
+            }
+        }
+    }
 
     struct Mixed {
         time: f32,

@@ -192,9 +192,10 @@ pub(crate) fn compile(
     format: wgpu::TextureFormat,
     globals: &wgpu::BindGroupLayout,
     params: &wgpu::BindGroupLayout,
+    inputs: &wgpu::BindGroupLayout,
 ) -> CompiledShader {
     let pipeline = match validate(source) {
-        Ok(code) => create_pipeline(device, source, &code, format, globals, params),
+        Ok(code) => create_pipeline(device, source, &code, format, globals, params, inputs),
         Err(e) => {
             eprintln!("[anti-webui] {e}");
             None
@@ -217,6 +218,7 @@ fn create_pipeline(
     format: wgpu::TextureFormat,
     globals: &wgpu::BindGroupLayout,
     params: &wgpu::BindGroupLayout,
+    inputs: &wgpu::BindGroupLayout,
 ) -> Option<wgpu::RenderPipeline> {
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -225,7 +227,7 @@ fn create_pipeline(
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(source.name),
-        bind_group_layouts: &[Some(globals), Some(params)],
+        bind_group_layouts: &[Some(globals), Some(params), Some(inputs)],
         immediate_size: 0,
     });
     let attributes = wgpu::vertex_attr_array![

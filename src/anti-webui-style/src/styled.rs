@@ -39,6 +39,16 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets an axis of a variable font, in the units of the font: `.font_axis(b"GRAD", 50.0)`. A
+    /// font without it ignores it. The other axes stay as they are.
+    fn font_axis(mut self, axis: impl Into<FontAxis>, value: f32) -> Self {
+        self.style_mut()
+            .font_axes
+            .get_or_insert_default()
+            .set(axis.into(), value);
+        self
+    }
+
     setter! {
         w => width: Length;
         h => height: Length;
@@ -92,6 +102,8 @@ pub trait Styled: Sized {
 
         bg => background: Color;
         opacity => opacity: f32;
+        blur => blur: f32;
+        backdrop_blur => backdrop_blur: f32;
 
         translate_x => translate_x: f32;
         translate_y => translate_y: f32;

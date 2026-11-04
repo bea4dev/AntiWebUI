@@ -23,6 +23,43 @@ struct AwBox {
 
 var<private> aw_box: AwBox;
 
+struct AwInput {
+    origin: vec2<f32>,   // the position of the box in the texture, in texels
+    texel: vec2<f32>,    // the size of a texel in the coordinates of the texture
+    limit: vec2<f32>,    // the size in texels of what the texture holds
+    k: f32,              // texels per pixel
+}
+
+@group(2) @binding(0) var aw_input0: texture_2d<f32>;
+@group(2) @binding(1) var aw_input1: texture_2d<f32>;
+@group(2) @binding(2) var aw_input2: texture_2d<f32>;
+@group(2) @binding(3) var aw_input3: texture_2d<f32>;
+@group(2) @binding(4) var aw_input_sampler: sampler;
+@group(2) @binding(5) var<uniform> aw_inputs: array<AwInput, 4>;
+
+// Where to read an input for a position in the box. Past what it holds is the color at its edge.
+fn aw_input_at(px: vec2<f32>, input: AwInput) -> vec2<f32> {
+    let t = clamp(px * input.k + input.origin, vec2<f32>(0.5), input.limit - vec2<f32>(0.5));
+    return t * input.texel;
+}
+
+// The inputs, at a position in the box in physical pixels. Transparent if there is none.
+fn read0(px: vec2<f32>) -> vec4<f32> {
+    return textureSampleLevel(aw_input0, aw_input_sampler, aw_input_at(px, aw_inputs[0]), 0.0);
+}
+
+fn read1(px: vec2<f32>) -> vec4<f32> {
+    return textureSampleLevel(aw_input1, aw_input_sampler, aw_input_at(px, aw_inputs[1]), 0.0);
+}
+
+fn read2(px: vec2<f32>) -> vec4<f32> {
+    return textureSampleLevel(aw_input2, aw_input_sampler, aw_input_at(px, aw_inputs[2]), 0.0);
+}
+
+fn read3(px: vec2<f32>) -> vec4<f32> {
+    return textureSampleLevel(aw_input3, aw_input_sampler, aw_input_at(px, aw_inputs[3]), 0.0);
+}
+
 // The signed distance to a rounded box centered at the origin; negative inside.
 fn aw_sd_rounded_box(p: vec2<f32>, half: vec2<f32>, radii: vec4<f32>) -> f32 {
     var r: f32;

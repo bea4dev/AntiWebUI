@@ -6,9 +6,10 @@ use crate::geometry::{PointI, RectI};
 use crate::layout::{child_clip, mark_outer_layers_stale};
 use crate::platform::PopupId;
 use crate::scene::{
-    ChunkKey, Clip, Glyph, GlyphRun, Layer, Primitive, Quad, Scene, ShaderDraw, Shadow,
+    BackdropDraw, ChunkKey, Clip, Glyph, GlyphRun, Layer, LayerFilter, Primitive, Quad, Scene,
+    ShaderDraw, Shadow,
 };
-use crate::shader::ShaderPaint;
+use crate::shader::{Image, ShaderPaint};
 use crate::text::selection::node_range;
 use crate::text::{Brush, TextLayout};
 use crate::tree::{Document, LayerMemo, Node, NodeId, NodeKind, popup_id};
@@ -151,6 +152,7 @@ fn paints_overlapping(doc: &Document, id: NodeId) -> bool {
                 *things += u32::from(!c.background.is_transparent() || border);
                 *things += c.shadows.len() as u32;
                 *things += u32::from(node.fill.is_some()) + u32::from(node.overlay.is_some());
+                *things += u32::from(c.backdrop_blur > 0.0);
                 *things += u32::from(c.outline_width > 0.0);
                 if c.overflow_x == Overflow::Scroll || c.overflow_y == Overflow::Scroll {
                     *things += 2;
@@ -167,6 +169,14 @@ fn paints_overlapping(doc: &Document, id: NodeId) -> bool {
     let mut things = 0;
     count(doc, id, &mut things);
     things > 1
+}
+
+/// Whether a node is painted through a layer of its own, not counting scrolling.
+fn is_layer(doc: &Document, id: NodeId) -> bool {
+    let node = &doc.nodes[id];
+    node.transformed
+        || node.is_filtered()
+        || (node.computed.opacity < 1.0 && paints_overlapping(doc, id))
 }
 
 /// What a layer's content can touch. A node's bounds may be too big, which would only cost
@@ -188,6 +198,22 @@ fn nested_layers(scene: &Scene) -> Vec<NodeId> {
             _ => None,
         })
         .collect()
+}
+
+fn physical_radii(node: &Node, scale: crate::geometry::Scale) -> [f32; 4] {
+    let r = node.computed.radii().map(|r| scale.pxf(r));
+    [r.top_left, r.top_right, r.bottom_right, r.bottom_left]
+}
+
+/// The coordinates of a variable font on steps of 1/64, so that what moves along an axis doesn't
+/// fill the glyph atlas. All at the default is none at all (see `docs/design/17-font-axes.md`).
+fn rounded_coords(coords: impl Iterator<Item = i16> + Clone) -> Vec<i16> {
+    const STEP: i32 = 1 << 8;
+    let round = |c: i16| ((c as i32 + STEP / 2) & !(STEP - 1)) as i16;
+    if coords.clone().all(|c| round(c) == 0) {
+        return Vec::new();
+    }
+    coords.map(round).collect()
 }
 
 fn fade(c: Color, opacity: f32) -> Color {
@@ -259,6 +285,8 @@ mod part {
     pub const LAYER: u32 = 5;
     /// A shader above the box. On its own so that one coming and going doesn't damage the shadow.
     pub const OVERLAY: u32 = 6;
+    /// What is behind a node that is a layer, which goes before the layer.
+    pub const BACKDROP: u32 = 7;
 }
 
 struct Painter<'a> {
@@ -333,6 +361,7 @@ impl Painter<'_> {
             bounds: RectI::INFINITE,
             opacity: 1.0,
             content,
+            filter: None,
         }));
     }
 
@@ -347,9 +376,11 @@ impl Painter<'_> {
         };
         let clip = node.layer_clip;
         let bounds = node.subtree_bounds;
+        let reach = node.filter_reach(doc.scale);
         let view = if self.cull {
             inverse
                 .bounds_of(cull.intersect(&clip.rect))
+                .outset(reach)
                 .intersect(&bounds)
         } else {
             bounds
@@ -394,15 +425,18 @@ impl Painter<'_> {
                 transform: raw,
             },
         );
+        self.backdrop_of_layer(id, opacity, transform, clip);
         self.chunk(id, part::LAYER);
+        let (filter, bounds) = self.layer_filter(node, touched);
         self.scene.primitives.push(Primitive::Layer(Layer {
             key: id.data().as_ffi(),
             clip,
             origin: PointI::default(),
             transform,
-            bounds: touched,
+            bounds,
             opacity: snapped_opacity(opacity),
             content,
+            filter,
         }));
     }
 
@@ -471,7 +505,7 @@ impl Painter<'_> {
         }
         if node.transformed {
             self.transformed_layer(id, opacity, cull);
-        } else if node.computed.opacity < 1.0 && paints_overlapping(doc, id) {
+        } else if is_layer(doc, id) {
             self.faded_layer(id, opacity, cull);
         } else {
             self.node_body(id, opacity, cull);
@@ -486,8 +520,9 @@ impl Painter<'_> {
         // What is inside keeps the clips that apply to it, rounded ones too.
         let clip = Clip::from(node.clip);
         let bounds = node.subtree_bounds;
+        let reach = node.filter_reach(doc.scale);
         let view = if self.cull {
-            cull.intersect(&clip.rect).intersect(&bounds)
+            cull.intersect(&clip.rect).outset(reach).intersect(&bounds)
         } else {
             bounds
         };
@@ -520,16 +555,69 @@ impl Painter<'_> {
                 transform: Affine::IDENTITY,
             },
         );
+        self.backdrop_of_layer(id, opacity, Affine::IDENTITY, node.clip_shape());
         self.chunk(id, part::LAYER);
+        let (filter, bounds) = self.layer_filter(node, touched);
         self.scene.primitives.push(Primitive::Layer(Layer {
             key: id.data().as_ffi(),
             clip,
             origin: PointI::default(),
             transform: Affine::IDENTITY,
-            bounds: touched,
+            bounds,
             opacity: snapped_opacity(opacity),
             content,
+            filter,
         }));
+    }
+
+    /// The filter of a node's layer, and how far the layer can touch with it.
+    fn layer_filter(&self, node: &Node, touched: RectI) -> (Option<Box<LayerFilter>>, RectI) {
+        let Some(image) = node.filter_image() else {
+            return (None, touched);
+        };
+        let scale = self.doc.scale;
+        let reach = image.reach_px(scale.as_f32());
+        let b = &node.resolved.border;
+        let p = &node.resolved.padding;
+        let bounds = if touched.is_empty() {
+            touched
+        } else {
+            touched.outset(reach)
+        };
+        let filter = LayerFilter {
+            image,
+            rect: node.abs,
+            border: [b.top, b.right, b.bottom, b.left],
+            padding: [p.top, p.right, p.bottom, p.left],
+            radii: physical_radii(node, scale),
+            scale: scale.as_f32(),
+            reach,
+        };
+        (Some(Box::new(filter)), bounds)
+    }
+
+    /// What is behind a node that is a layer: outside of the layer, or it wouldn't see it.
+    fn backdrop_of_layer(&mut self, id: NodeId, opacity: f32, transform: Affine, clip: Clip) {
+        if self.doc.nodes[id].computed.backdrop_blur > 0.0 {
+            self.chunk(id, part::BACKDROP);
+            self.backdrop(id, opacity, transform, clip);
+        }
+    }
+
+    fn backdrop(&mut self, id: NodeId, opacity: f32, transform: Affine, clip: Clip) {
+        let node = &self.doc.nodes[id];
+        let scale = self.doc.scale;
+        self.scene
+            .primitives
+            .push(Primitive::Backdrop(BackdropDraw {
+                image: Image::backdrop().blur(node.computed.backdrop_blur),
+                rect: node.abs,
+                radii: physical_radii(node, scale),
+                transform,
+                scale: scale.as_f32(),
+                opacity: snapped_opacity(opacity),
+                clip,
+            }));
     }
 
     /// What the node paints in its own coordinates. `opacity` is what to apply to it.
@@ -591,13 +679,13 @@ impl Painter<'_> {
         let clip = node.clip_shape();
         let c = &node.computed;
         let scale = self.doc.scale;
-        let radii = c.radii().map(|r| scale.pxf(r));
-        let radii = [
-            radii.top_left,
-            radii.top_right,
-            radii.bottom_right,
-            radii.bottom_left,
-        ];
+        let radii = physical_radii(node, scale);
+        // Before the node's own shadows: they aren't behind it. A layer has it outside.
+        if c.backdrop_blur > 0.0 && !is_layer(self.doc, id) {
+            self.backdrop(id, opacity, Affine::IDENTITY, clip);
+        }
+        let node = &self.doc.nodes[id];
+        let c = &node.computed;
         let b = &node.resolved.border;
         let has_border =
             (b.top | b.right | b.bottom | b.left) != 0 && !c.border_color.is_transparent();
@@ -938,11 +1026,7 @@ impl Painter<'_> {
         self.scene.primitives.push(Primitive::Glyphs(GlyphRun {
             font: run.font().clone(),
             size: run.font_size(),
-            normalized_coords: run
-                .normalized_coords()
-                .iter()
-                .map(|c| c.to_bits())
-                .collect(),
+            normalized_coords: rounded_coords(run.normalized_coords().iter().map(|c| c.to_bits())),
             embolden: synthesis.embolden(),
             skew: synthesis.skew(),
             color,

@@ -8,13 +8,15 @@ pub mod selection;
 use crate::geometry::{RectI, Scale, SizeI};
 use crate::tree::{Document, with_doc};
 use anti_webui_style::{
-    ComputedStyle, FontFamily, FontStyle, FontWeight, LineHeight, TextAlign, WhiteSpace,
+    ComputedStyle, FontAxes, FontAxis, FontFamily, FontStyle, FontWeight, LineHeight, TextAlign,
+    WhiteSpace,
 };
 use icu_properties::props::Script as IcuScript;
 use icu_properties::{CodePointMapData, PropertyNamesShort};
 use parley::fontique::{Blob, FallbackKey, FontInfoOverride, Script};
 use parley::{
-    Alignment, AlignmentOptions, FontContext, Layout, LayoutContext, StyleProperty, TextWrapMode,
+    Alignment, AlignmentOptions, FontContext, FontFamilyName, FontVariation, FontVariations,
+    Layout, LayoutContext, StyleProperty, TextWrapMode,
 };
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -89,6 +91,64 @@ impl TextSystem {
         if !FallbackKey::new(script, self.locale.as_ref()).is_tracked() {
             let _ = self.fcx.collection.fallback_families(script);
         }
+    }
+
+    /// What the first font of the list that has the axis has it at by default.
+    fn axis_default(&mut self, family: &FontFamily, axis: FontAxis) -> Option<f32> {
+        for name in FontFamilyName::parse_css_list(&family.0).map_while(Result::ok) {
+            let ids: Vec<_> = match name {
+                FontFamilyName::Named(name) => {
+                    self.fcx.collection.family_id(&name).into_iter().collect()
+                }
+                FontFamilyName::Generic(generic) => {
+                    self.fcx.collection.generic_families(generic).collect()
+                }
+            };
+            for id in ids {
+                let Some(family) = self.fcx.collection.family(id) else {
+                    continue;
+                };
+                let found = family
+                    .fonts()
+                    .iter()
+                    .flat_map(|f| f.axes())
+                    .find(|a| a.tag.to_be_bytes() == axis.0);
+                if let Some(a) = found {
+                    return Some(a.default);
+                }
+            }
+        }
+        None
+    }
+
+    /// The axes to shape with: what is set, and what follows from the rest of the style.
+    fn variations(&mut self, style: &ShapeStyle) -> Vec<FontVariation> {
+        const WEIGHT: FontAxis = FontAxis(*b"wght");
+        const OPTICAL_SIZE: FontAxis = FontAxis(*b"opsz");
+        let mut out = Vec::with_capacity(style.axes.iter().count() + 1);
+        for v in style.axes.iter() {
+            let value = if v.amount >= 1.0 {
+                v.value
+            } else {
+                let unset = match v.axis {
+                    WEIGHT => Some(style.weight.0 as f32),
+                    OPTICAL_SIZE => Some(style.optical_size),
+                    axis => self.axis_default(&style.family, axis),
+                };
+                unset.map_or(v.value, |u| u + (v.value - u) * v.amount)
+            };
+            out.push(FontVariation {
+                tag: parley::setting::Tag::new(&v.axis.0),
+                value,
+            });
+        }
+        if style.axes.get(OPTICAL_SIZE).is_none() {
+            out.push(FontVariation {
+                tag: parley::setting::Tag::new(&OPTICAL_SIZE.0),
+                value: style.optical_size,
+            });
+        }
+        out
     }
 }
 
@@ -172,6 +232,9 @@ pub struct ShapeStyle {
     pub size: f32,
     pub weight: FontWeight,
     pub style: FontStyle,
+    pub axes: FontAxes,
+    /// The logical font size, which `opsz` follows unless it is set.
+    pub optical_size: f32,
     /// Whole physical pixels, or `None` for the font's own metrics.
     pub line_height: Option<i32>,
     pub letter_spacing: f32,
@@ -191,6 +254,8 @@ impl ShapeStyle {
             size,
             weight: style.font_weight,
             style: style.font_style,
+            axes: style.font_axes.clone(),
+            optical_size: style.font_size,
             line_height,
             letter_spacing: scale.pxf(style.letter_spacing),
             wrap: style.white_space == WhiteSpace::PreWrap,
@@ -234,6 +299,7 @@ impl TextLayout {
             return false;
         }
         ts.prepare_fallbacks(text);
+        let variations = ts.variations(style);
         let locale = ts.locale;
         let mut builder = ts.lcx.ranged_builder(&mut ts.fcx, text, 1.0, true);
         builder.push_default(StyleProperty::FontFamily(parley::FontFamily::Source(
@@ -247,6 +313,9 @@ impl TextLayout {
             FontStyle::Normal => parley::FontStyle::Normal,
             FontStyle::Italic => parley::FontStyle::Italic,
         }));
+        builder.push_default(StyleProperty::FontVariations(FontVariations::List(
+            variations.as_slice().into(),
+        )));
         builder.push_default(StyleProperty::LineHeight(match style.line_height {
             Some(px) => parley::LineHeight::Absolute(px as f32),
             None => parley::LineHeight::MetricsRelative(1.0),
@@ -444,6 +513,8 @@ mod tests {
             size: 14.0,
             weight: FontWeight::NORMAL,
             style: FontStyle::Normal,
+            axes: FontAxes::default(),
+            optical_size: 14.0,
             line_height: None,
             letter_spacing: 0.0,
             wrap: true,

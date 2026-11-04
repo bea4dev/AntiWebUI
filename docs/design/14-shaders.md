@@ -2,7 +2,7 @@
 
 WGSL で書いたシェーダーで、要素の箱の中を塗る。箱の値（サイズ、枠線、パディング、角丸）はレイアウト後の物理整数ピクセルのまま渡る。
 
-今回の範囲は**箱の中を塗る段（`fill`、`overlay`）**までで、描いた内容や背後を入力にする段（`filter`、ブラー、backdrop）は次の段階で足す。
+ここでは**箱の中を塗る段（`fill`、`overlay`）**を扱う。描いた内容や背後を入力にする段（`filter`、ブラー、backdrop）は [16](16-filters.md)。
 
 ## API
 
@@ -69,7 +69,7 @@ struct Frag {
 
 レイヤーの倍率 `k`（[12](12-transform.md)）が 1 より大きいとき、テクスチャは `k` 倍で描くが、`aw_box` と `f.px` の単位は変わらない。代わりに `f.pixel` が `1 / k` になり、`f.px` は整数間隔ではなくなる。
 
-用意する関数:
+用意する関数（入力の `read0` 〜 `read3` は [16](16-filters.md)）:
 
 | 関数 | 内容 |
 |---|---|
@@ -174,7 +174,7 @@ custom_entry.wgsl     頂点シェーダーと、paint を呼ぶフラグメン�
 
 ## 次の段階に向けて決めてあること
 
-- 入力を取る形は `AURORA.params(...)` が返す `ShaderPaint` に `.inputs([...])` を足す。`Image::content()` や `Image::backdrop()` もこの型へ合流させる。
+- 入力を取る形（`.inputs([...])`、`Image::content()`、`Image::backdrop()`）は [16](16-filters.md) で実装した。
 - シェーダーからの形の参照は `aw_shape_distance` に統一してあるので、角丸以外の形を入れてもシェーダーは変わらない。
 - カスタム影は `Primitive::Shader` に切り抜き（`cut`）と描く範囲（`extent`）を足す形で載る。今回は入れない。
 
@@ -236,7 +236,7 @@ custom_entry.wgsl     頂点シェーダーと、paint を呼ぶフラグメン�
 
 ## やっていないこと
 
-- `filter`、`Image`、ブラー、backdrop、カスタム影。
+- カスタム影。
 - 前フレームの結果を入力にすること（`Image::previous()`）。
 - パイプラインキャッシュのディスク保存。
 - コンピュートシェーダー、WebGPU を直接触る `canvas`。

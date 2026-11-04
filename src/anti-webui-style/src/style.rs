@@ -4,7 +4,8 @@ use crate::*;
 /// (every property resolved) from a single property list.
 ///
 /// `inherited` properties are copied from the parent's computed style before the node's own
-/// refinements are applied, like inherited properties in CSS.
+/// refinements are applied, like inherited properties in CSS. `merged` properties are inherited
+/// too, and refinements add to them instead of replacing them.
 macro_rules! define_style {
     ( $( $(#[$m:meta])* $name:ident : $ty:ty = $default:expr , $inherit:ident ; )* ) => {
         /// A style refinement. Only the properties that are `Some` are applied.
@@ -28,12 +29,12 @@ macro_rules! define_style {
         impl Style {
             /// Overrides properties of `self` with the properties set in `other`.
             pub fn refine(&mut self, other: &Style) {
-                $( if let Some(v) = &other.$name { self.$name = Some(v.clone()); } )*
+                $( define_style!(@refine $inherit, self, other, $name); )*
             }
 
             /// Writes the properties set in `self` into `computed`.
             pub fn apply_to(&self, computed: &mut ComputedStyle) {
-                $( if let Some(v) = &self.$name { computed.$name = v.clone(); } )*
+                $( define_style!(@apply $inherit, self, computed, $name); )*
             }
 
             pub fn is_empty(&self) -> bool {
@@ -51,8 +52,22 @@ macro_rules! define_style {
             }
         }
     };
-    (@inherit inherited, $s:ident, $p:ident, $name:ident) => { $s.$name = $p.$name.clone(); };
     (@inherit local, $s:ident, $p:ident, $name:ident) => {};
+    (@inherit $any:ident, $s:ident, $p:ident, $name:ident) => { $s.$name = $p.$name.clone(); };
+    (@refine merged, $s:ident, $o:ident, $name:ident) => {
+        if let Some(v) = &$o.$name {
+            $s.$name.get_or_insert_default().merge(v);
+        }
+    };
+    (@refine $any:ident, $s:ident, $o:ident, $name:ident) => {
+        if let Some(v) = &$o.$name { $s.$name = Some(v.clone()); }
+    };
+    (@apply merged, $s:ident, $c:ident, $name:ident) => {
+        if let Some(v) = &$s.$name { $c.$name.merge(v); }
+    };
+    (@apply $any:ident, $s:ident, $c:ident, $name:ident) => {
+        if let Some(v) = &$s.$name { $c.$name = v.clone(); }
+    };
 }
 
 define_style! {
@@ -106,6 +121,11 @@ define_style! {
     background: Color = Color::TRANSPARENT, local;
     shadows: Vec<BoxShadow> = Vec::new(), local;
     opacity: f32 = 1.0, local;
+    /// Logical pixels: the standard deviation, like CSS. Applies to what the node and its children
+    /// paint. See `docs/design/16-filters.md`.
+    blur: f32 = 0.0, local;
+    /// The same for what is behind the node's box.
+    backdrop_blur: f32 = 0.0, local;
     /// Logical pixels. Moves what is painted without affecting layout, like the other transforms.
     translate_x: f32 = 0.0, local;
     translate_y: f32 = 0.0, local;
@@ -136,6 +156,7 @@ define_style! {
     font_size: f32 = 14.0, inherited;
     font_weight: FontWeight = FontWeight::NORMAL, inherited;
     font_style: FontStyle = FontStyle::Normal, inherited;
+    font_axes: FontAxes = FontAxes::default(), merged;
     line_height: LineHeight = LineHeight::default(), inherited;
     letter_spacing: f32 = 0.0, inherited;
     text_align: TextAlign = TextAlign::Start, inherited;

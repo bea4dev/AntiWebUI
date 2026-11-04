@@ -202,6 +202,7 @@ fn same_layout(a: &ComputedStyle, b: &ComputedStyle) -> bool {
         && a.font_size == b.font_size
         && a.font_weight == b.font_weight
         && a.font_style == b.font_style
+        && a.font_axes == b.font_axes
         && a.line_height == b.line_height
         && a.letter_spacing == b.letter_spacing
         && a.text_align == b.text_align
@@ -299,6 +300,8 @@ fn same_content(a: &ComputedStyle, b: &ComputedStyle) -> bool {
     b.transform_origin_x = a.transform_origin_x;
     b.transform_origin_y = a.transform_origin_y;
     b.opacity = a.opacity;
+    b.blur = a.blur;
+    b.backdrop_blur = a.backdrop_blur;
     b.transitions.clone_from(&a.transitions);
     *a == b
 }
@@ -370,12 +373,14 @@ fn resolve_node(
     if node.resolved != resolved || !same_layout(&node.computed, &computed) {
         out.layout.push(id);
     }
-    let (stacked, context) = stacking_role(&node.kind, &computed, doc.root == Some(id));
+    let filtered = node.filter.is_some();
+    let (stacked, context) = stacking_role(&node.kind, &computed, filtered, doc.root == Some(id));
     let stacking_changed = stacked != node.stacked
         || context != node.stacking_context
         || (stacked && node.computed.z_index != computed.z_index);
     let old = &node.computed;
     if old.shadows != computed.shadows
+        || old.blur != computed.blur
         || old.outline_width != computed.outline_width
         || old.outline_offset != computed.outline_offset
     {
@@ -389,8 +394,8 @@ fn resolve_node(
         let transformed = node.transformed && computed.has_transform();
         let faded = !node.transformed
             && !computed.has_transform()
-            && old.opacity < 1.0
-            && computed.opacity < 1.0
+            && (old.opacity < 1.0 || old.blur > 0.0 || filtered)
+            && (computed.opacity < 1.0 || computed.blur > 0.0 || filtered)
             && doc.layer_contents.contains_key(&id);
         if transformed {
             out.moved.push(id);
@@ -514,7 +519,7 @@ fn apply_move(doc: &mut Document, id: NodeId, computed: &mut ComputedStyle) {
 
 /// Whether a node is painted from a stacking context's list, and whether it is a stacking context.
 /// See `docs/design/09-shadows-stacking-popups.md`.
-fn stacking_role(kind: &NodeKind, c: &ComputedStyle, root: bool) -> (bool, bool) {
+fn stacking_role(kind: &NodeKind, c: &ComputedStyle, filtered: bool, root: bool) -> (bool, bool) {
     if matches!(kind, NodeKind::Fragment) || c.display == Display::Contents {
         return (false, root);
     }
@@ -523,6 +528,9 @@ fn stacking_role(kind: &NodeKind, c: &ComputedStyle, root: bool) -> (bool, bool)
         || matches!(kind, NodeKind::Popup(_))
         || c.z_index.is_some()
         || c.opacity < 1.0
+        || c.blur > 0.0
+        || c.backdrop_blur > 0.0
+        || filtered
         || c.has_transform()
         || c.overflow_x == Overflow::Scroll
         || c.overflow_y == Overflow::Scroll;
@@ -570,12 +578,12 @@ pub fn build_stacking(doc: &mut Document) {
 
 /// Makes sure the bounds of `id` and its ancestors contain what `id` paints now. They only grow:
 /// too big is harmless, and the next positioning pass tightens them.
-fn grow_bounds(doc: &mut Document, id: NodeId) {
+pub(crate) fn grow_bounds(doc: &mut Document, id: NodeId) {
     let Some(n) = doc.nodes.get_mut(id) else {
         return;
     };
     let own = own_bounds(n, doc.scale);
-    n.subtree_bounds = n.subtree_bounds.union(&own);
+    n.subtree_bounds = grown_by_filter(n.subtree_bounds.union(&own), n, doc.scale);
     let mut bounds = n.bounds_in_parent(doc.scale);
     let mut child = id;
     let mut parent = n.parent;
@@ -601,6 +609,15 @@ fn grow_bounds(doc: &mut Document, id: NodeId) {
         bounds = n.bounds_in_parent(scale);
         child = p;
         parent = n.parent;
+    }
+}
+
+/// What is around what a node paints, once a filter is done with it. Nothing stays nothing.
+fn grown_by_filter(bounds: RectI, node: &Node, scale: Scale) -> RectI {
+    if bounds.is_empty() {
+        bounds
+    } else {
+        bounds.outset(node.filter_reach(scale))
     }
 }
 
@@ -890,11 +907,12 @@ fn position_children(doc: &mut Document, id: NodeId, order: &mut u32) {
     node.child_bounds = bounds;
     let own = own_bounds(node, scale);
     // A scroll root's descendants are in other coordinates, and within its box anyway.
-    node.subtree_bounds = if node.scroll_root {
+    let bounds = if node.scroll_root {
         own
     } else {
         own.union(&union.intersect(&inner.rect))
     };
+    node.subtree_bounds = grown_by_filter(bounds, node, scale);
 }
 
 /// Positions the descendants of `id` again after it scrolled (it is not a scroll root).

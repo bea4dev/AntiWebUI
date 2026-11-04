@@ -10,7 +10,7 @@ use crate::platform::{ImePurpose, Placement, PopupKind};
 use crate::reactive::{
     Owner, Signal, create_child_owner, create_root, effect, memo, on_cleanup, signal, untrack,
 };
-use crate::shader::ShaderPaint;
+use crate::shader::{Image, IntoImage, IntoPaint, ShaderPaint};
 use crate::text::TextLayout;
 use crate::text::edit::{EditData, TextCallback};
 use crate::tree::{
@@ -115,6 +115,7 @@ fn bind_dynamic_styles(id: NodeId, layers: Vec<StyleFn>) {
 }
 
 type PaintFn = Box<dyn Fn() -> Option<ShaderPaint>>;
+type ImageFn = Box<dyn Fn() -> Option<Image>>;
 
 /// Keeps what a node's shader paints in sync with its closure. `slot` says which one it is.
 fn bind_paint(id: NodeId, f: PaintFn, slot: fn(&mut Node) -> &mut Option<ShaderPaint>) {
@@ -127,6 +128,28 @@ fn bind_paint(id: NodeId, f: PaintFn, slot: fn(&mut Node) -> &mut Option<ShaderP
                 *slot(n) = paint;
                 d.mark_shader_of(id);
             }
+        });
+    });
+}
+
+fn bind_filter(id: NodeId, f: ImageFn) {
+    effect(move || {
+        let image = f();
+        with_doc(|d| {
+            let Some(n) = d.get_mut(id) else {
+                return;
+            };
+            if n.filter == image {
+                return;
+            }
+            let layer_changes = n.filter.is_some() != image.is_some();
+            n.filter = image;
+            if layer_changes {
+                // It starts or stops being a layer, and a stacking context.
+                d.mark_style_of(id);
+                d.dirty.content = true;
+            }
+            d.mark_filter_of(id);
         });
     });
 }
@@ -167,6 +190,7 @@ struct ElementConfig {
     dynamic: Vec<StyleFn>,
     fill: Option<PaintFn>,
     overlay: Option<PaintFn>,
+    filter: Option<ImageFn>,
     listeners: Listeners,
     focusable: bool,
     disabled: Option<Box<dyn Fn() -> bool>>,
@@ -188,6 +212,9 @@ impl ElementConfig {
         }
         if let Some(f) = self.overlay {
             bind_paint(id, f, |n| &mut n.overlay);
+        }
+        if let Some(f) = self.filter {
+            bind_filter(id, f);
         }
         if let Some(disabled) = self.disabled {
             effect(move || {
@@ -296,18 +323,23 @@ macro_rules! element_methods {
         /// Paints the box with a shader, above its outer shadows and below its background, cut to
         /// its rounded shape. `f` runs again whenever the signals it reads change. See
         /// `docs/design/14-shaders.md`.
-        pub fn fill<P: Into<Option<ShaderPaint>>>(mut self, f: impl Fn() -> P + 'static) -> Self {
-            self.cfg.fill = Some(Box::new(move || f().into()));
+        pub fn fill<P: IntoPaint>(mut self, f: impl Fn() -> P + 'static) -> Self {
+            self.cfg.fill = Some(Box::new(move || f().into_paint()));
             self
         }
 
         /// Paints the box with a shader, above its background and border and below its children,
         /// cut to its rounded shape. Returning `None` paints nothing and costs nothing.
-        pub fn overlay<P: Into<Option<ShaderPaint>>>(
-            mut self,
-            f: impl Fn() -> P + 'static,
-        ) -> Self {
-            self.cfg.overlay = Some(Box::new(move || f().into()));
+        pub fn overlay<P: IntoPaint>(mut self, f: impl Fn() -> P + 'static) -> Self {
+            self.cfg.overlay = Some(Box::new(move || f().into_paint()));
+            self
+        }
+
+        /// Shows a picture made of what the node and its children paint instead of that as it is.
+        /// `f` runs again whenever the signals it reads change, without painting them again. See
+        /// `docs/design/16-filters.md`.
+        pub fn filter<I: IntoImage>(mut self, f: impl Fn() -> I + 'static) -> Self {
+            self.cfg.filter = Some(Box::new(move || f().into_image()));
             self
         }
 
@@ -342,7 +374,7 @@ pub fn div() -> Div {
 }
 
 /// A box painted by a shader: `div().fill(f)`.
-pub fn shader<P: Into<Option<ShaderPaint>>>(f: impl Fn() -> P + 'static) -> Div {
+pub fn shader<P: IntoPaint>(f: impl Fn() -> P + 'static) -> Div {
     div().fill(f)
 }
 

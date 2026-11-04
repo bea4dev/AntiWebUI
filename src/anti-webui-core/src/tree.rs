@@ -5,7 +5,7 @@ use crate::geometry::{Affine, PointF, PointI, RectI, Scale, SizeI};
 use crate::layout::{MeasureCache, MeasureKey, Resolved, child_clip};
 use crate::platform::{Placement, PlatformRequest, PopupId, PopupKind, PopupParams};
 use crate::scene::Scene;
-use crate::shader::ShaderPaint;
+use crate::shader::{Image, ShaderPaint};
 use crate::text::TextLayout;
 use crate::text::edit::EditData;
 use crate::text::selection::DocSelection;
@@ -133,6 +133,8 @@ pub struct Node {
     pub fill: Option<ShaderPaint>,
     /// Paints the box above its background and border, below its children.
     pub overlay: Option<ShaderPaint>,
+    /// What to make of what the node and its children paint. See `docs/design/16-filters.md`.
+    pub filter: Option<Image>,
 
     pub computed: ComputedStyle,
     pub resolved: Resolved,
@@ -204,6 +206,7 @@ impl Node {
             disabled: false,
             fill: None,
             overlay: None,
+            filter: None,
             computed: ComputedStyle::default(),
             resolved: Resolved::default(),
             rect: RectI::default(),
@@ -298,6 +301,27 @@ impl Node {
     pub fn padding_abs(&self) -> RectI {
         let b = &self.resolved.border;
         self.abs.inset(b.top, b.right, b.bottom, b.left)
+    }
+
+    /// What to show of what the node and its children paint, when it isn't that as it is.
+    pub fn filter_image(&self) -> Option<Image> {
+        let blur = self.computed.blur;
+        match &self.filter {
+            Some(image) => Some(image.clone().blur(blur)),
+            None if blur > 0.0 => Some(Image::content().blur(blur)),
+            None => None,
+        }
+    }
+
+    /// Whether what the node and its children paint goes through a filter.
+    pub fn is_filtered(&self) -> bool {
+        self.filter.is_some() || self.computed.blur > 0.0
+    }
+
+    /// How far past what the node and its children paint a filter can touch.
+    pub fn filter_reach(&self, scale: Scale) -> i32 {
+        self.filter_image()
+            .map_or(0, |image| image.reach_px(scale.as_f32()))
     }
 
     /// From the coordinates of a transformed node to its parent's.
@@ -704,6 +728,14 @@ impl Document {
             self.stale_layers.insert(i);
             cur = if n.is_popup() { None } else { n.parent };
         }
+    }
+
+    /// Only what a filter makes of the node's content changed: the content stays as it is, while
+    /// the layers around it hold how it shows.
+    pub fn mark_filter_of(&mut self, id: NodeId) {
+        self.dirty.paint = true;
+        crate::layout::mark_outer_layers_stale(self, id);
+        crate::layout::grow_bounds(self, id);
     }
 
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {

@@ -25,6 +25,8 @@
 - [x] カスタムシェーダーの `fill` / `overlay`（[14](14-shaders.md)）
 - [x] アプリに同梱したフォントの登録（[04](04-text.md)）
 - [x] Material 3 Expressive の部品の最小版（[15](15-md3e.md)）
+- [x] `filter`、`blur`、`backdrop_blur`、入力を読むシェーダー（[16](16-filters.md)）
+- [x] 可変フォントの軸の指定とアニメーション（[17](17-font-axes.md)）
 
 ### M1 の既知の制限
 
@@ -33,11 +35,11 @@
 - 選択ドラッグがウィンドウ端に達したときの自動スクロールは未実装
 - パスワード入力のマスク表示は未実装（`ImePurpose::Password` は IME へのヒントのみ）
 - サーバ側装飾が無いコンポジタではタイトルバーが出ない（CSD は M2）
-- カスタムシェーダーと MD3E の部品は、内蔵 GPU をコンポジタの出力にした状態と 60 Hz での性能が未計測
+- カスタムシェーダー、MD3E の部品、`filter` と backdrop は、内蔵 GPU をコンポジタの出力にした状態と 60 Hz での性能が未計測
 
 ## M2: 実用性
 
-- `filter`、ブラー（Dual Kawase）、backdrop、カスタム影（[14](14-shaders.md)）
+- カスタム影（[14](14-shaders.md)）、ウィンドウの後ろのぼかし（`ext-background-effect-v1`）
 - MD3E の残りの部品（[15](15-md3e.md)）
 - CSS サブセット（スタイルシート・クラス・ホットリロード）
 - `flex-wrap`、Grid

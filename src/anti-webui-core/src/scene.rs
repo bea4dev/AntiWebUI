@@ -1,7 +1,7 @@
 //! The renderer-independent display list produced each frame. Coordinates are physical pixels.
 
 use crate::geometry::{Affine, PointI, RectI};
-use crate::shader::ShaderPaint;
+use crate::shader::{Image, ShaderPaint};
 use anti_webui_style::Color;
 pub use parley::FontData;
 use std::sync::Arc;
@@ -190,6 +190,26 @@ pub struct Layer {
     /// What to draw, in content coordinates and without this layer's clip. Sharing the allocation
     /// means the content is unchanged.
     pub content: Arc<Scene>,
+    /// What to show instead of the content as it is.
+    pub filter: Option<Box<LayerFilter>>,
+}
+
+/// A picture made of a layer's content. See `docs/design/16-filters.md`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerFilter {
+    pub image: Image,
+    /// The box of the node, for shaders. In content coordinates.
+    pub rect: RectI,
+    /// Top, right, bottom, left.
+    pub border: [i32; 4],
+    /// Top, right, bottom, left.
+    pub padding: [i32; 4],
+    /// Top-left, top-right, bottom-right, bottom-left, in physical pixels.
+    pub radii: [f32; 4],
+    /// Physical pixels per logical pixel.
+    pub scale: f32,
+    /// How far a pixel of the result depends on the content.
+    pub reach: i32,
 }
 
 impl Layer {
@@ -233,6 +253,7 @@ impl Layer {
             && self.origin == other.origin
             && self.transform == other.transform
             && self.opacity == other.opacity
+            && self.filter == other.filter
     }
 }
 
@@ -263,6 +284,35 @@ pub struct ShaderDraw {
     pub clip: Clip,
 }
 
+/// What is behind a box made into a picture and shown in the box, which can be transformed: this
+/// is how it goes with a layer of the same node. See `docs/design/16-filters.md`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackdropDraw {
+    pub image: Image,
+    pub rect: RectI,
+    /// Top-left, top-right, bottom-right, bottom-left, in physical pixels.
+    pub radii: [f32; 4],
+    pub transform: Affine,
+    /// Physical pixels per logical pixel.
+    pub scale: f32,
+    pub opacity: f32,
+    pub clip: Clip,
+}
+
+impl BackdropDraw {
+    /// What it can touch, before clipping.
+    pub fn outer_rect(&self) -> RectI {
+        if self.transform.is_whole_translation() {
+            self.rect.translate(
+                self.transform.e.round() as i32,
+                self.transform.f.round() as i32,
+            )
+        } else {
+            self.transform.bounds_of(self.rect.outset(1))
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Primitive {
     Shadow(Shadow),
@@ -270,6 +320,7 @@ pub enum Primitive {
     Glyphs(GlyphRun),
     Layer(Layer),
     Shader(ShaderDraw),
+    Backdrop(BackdropDraw),
 }
 
 /// Identifies a run of primitives across frames: one part of what a node paints.

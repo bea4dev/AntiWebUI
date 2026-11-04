@@ -193,7 +193,42 @@ pub fn diff_content(old: &Scene, new: &Scene) -> Damage {
             add_run(&old.primitives[old.chunk_range(i)], &mut damage);
         }
     }
+    expand_for_backdrops(new, &mut damage);
     damage
+}
+
+/// What a primitive reads of what is drawn before it, where that decides how it looks.
+pub fn backdrop_read(p: &Primitive) -> Option<RectI> {
+    match p {
+        Primitive::Backdrop(b) => Some(primitive_bounds(p).outset(b.image.read_px(b.scale))),
+        Primitive::Shader(s) if s.paint.reads_backdrop() => Some(
+            primitive_bounds(p).outset(s.paint.reach_px(s.scale) + s.paint.inputs_read_px(s.scale)),
+        ),
+        _ => None,
+    }
+}
+
+/// Adds everything a backdrop reads when a change touches it: it looks different now, and to read
+/// it, it has to be drawn again without what was on top of it. That can touch another one, so this
+/// goes on until nothing more is added. See `docs/design/16-filters.md`.
+pub fn expand_for_backdrops(scene: &Scene, damage: &mut Damage) {
+    if damage.is_empty() {
+        return;
+    }
+    let mut reads: Vec<RectI> = scene.primitives.iter().filter_map(backdrop_read).collect();
+    loop {
+        let before = reads.len();
+        reads.retain(|read| {
+            let touched = damage.rects().iter().any(|r| r.intersects(read));
+            if touched {
+                damage.add(*read);
+            }
+            !touched
+        });
+        if reads.len() == before || reads.is_empty() {
+            return;
+        }
+    }
 }
 
 fn diff_runs(old: &[Primitive], new: &[Primitive], damage: &mut Damage) {
@@ -219,8 +254,9 @@ fn diff_layers(old: &Layer, new: &Layer, damage: &mut Damage) {
         damage.add(new.bounds_on_parent());
     } else if !Arc::ptr_eq(&old.content, &new.content) {
         let changed = diff_content(&old.content, &new.content);
+        let reach = new.filter.as_ref().map_or(0, |f| f.reach);
         for r in changed.rects() {
-            damage.add(new.parent_rect(*r).intersect(&new.clip.rect));
+            damage.add(new.parent_rect(r.outset(reach)).intersect(&new.clip.rect));
         }
     }
 }
@@ -241,6 +277,7 @@ pub fn primitive_bounds(p: &Primitive) -> RectI {
         Primitive::Glyphs(run) => glyph_run_bounds(run).intersect(&run.clip.rect),
         Primitive::Layer(l) => l.bounds_on_parent(),
         Primitive::Shader(s) => s.rect.intersect(&s.clip.rect),
+        Primitive::Backdrop(b) => b.outer_rect().intersect(&b.clip.rect),
     }
 }
 

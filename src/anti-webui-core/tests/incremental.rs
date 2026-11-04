@@ -471,7 +471,18 @@ fn view(s: &Doc) -> impl IntoView + use<> {
                                                 && !painted.get().is_multiple_of(3);
                                             on.then(|| PAINT.params(Painted(painted.get() as f32)))
                                         })
+                                        .filter(move || {
+                                            let v = painted.get();
+                                            (i.is_multiple_of(5) && v % 3 == 1)
+                                                .then(|| Image::content().blur(1.0 + v as f32))
+                                        })
                                         .dyn_style(move |st| {
+                                            let v = painted.get();
+                                            let st = if i % 7 == 1 && v.is_multiple_of(2) {
+                                                st.blur(v as f32).backdrop_blur(2.0 + v as f32)
+                                            } else {
+                                                st
+                                            };
                                             if glow.get() && i % 3 == 0 {
                                                 st.shadow_md()
                                             } else {

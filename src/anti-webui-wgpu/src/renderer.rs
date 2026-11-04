@@ -1,10 +1,16 @@
 //! Scene → GPU draw calls.
 
 use crate::custom_shader::{self, CHUNK, CompiledShader, ShaderInstance};
+use crate::effects::{
+    self, BackdropInstance, EffectPipelines, Effects, EvalContext, INPUTS_SIZE, Missing,
+    PoolContext, Slot, Source, Step, UNIFORM_STRIDE,
+};
 use crate::glyph_cache::{GlyphCache, PlacedGlyph};
-use anti_webui_core::damage::{Damage, diff_content, primitive_bounds};
+use anti_webui_core::damage::{
+    Damage, backdrop_read, diff_content, expand_for_backdrops, primitive_bounds,
+};
 use anti_webui_core::geometry::{Affine, RectI};
-use anti_webui_core::scene::{Clip, Layer, Primitive, Quad, Scene};
+use anti_webui_core::scene::{Clip, Layer, LayerFilter, Primitive, Quad, Scene};
 use anti_webui_core::shader::{ShaderSource, preloads_from};
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
@@ -86,14 +92,60 @@ enum Batch {
         key: u64,
         /// Texels don't land on pixels.
         linear: bool,
+        /// From what a filter made of it rather than the texture itself.
+        filtered: bool,
         range: Range<u32>,
     },
     /// Boxes painted by the shader with this key, whose parameters are in this chunk.
     Shader {
         key: usize,
         chunk: u32,
+        /// Which of the frame's bindings of inputs it reads.
+        inputs: Option<u32>,
         range: Range<u32>,
     },
+    /// What is behind a box, which is in this texture of the pool.
+    Backdrop {
+        tex: usize,
+        range: Range<u32>,
+    },
+}
+
+/// What a filter made of a layer, kept until that changes.
+struct FilterOutput {
+    texture: wgpu::Texture,
+    bind: wgpu::BindGroup,
+    bind_linear: wgpu::BindGroup,
+    view: wgpu::TextureView,
+    size: (i32, i32),
+    /// What it holds, in texels of the layer. Starts at its first texel.
+    rect: RectI,
+    /// The filter that made it, and whether what it holds is up to date.
+    made_by: Option<Box<LayerFilter>>,
+}
+
+/// Where a window is drawn when something reads what is drawn: the surface can't be read. See
+/// `docs/design/16-filters.md`.
+struct Canvas {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    bind: wgpu::BindGroup,
+    size: (u32, u32),
+}
+
+/// What a primitive was given by the pictures made for it.
+#[derive(Clone, Copy)]
+enum PrimEval {
+    Backdrop(Option<Slot>),
+    Inputs(u32),
+}
+
+/// The pictures to make in a target. Drawing stops before each primitive that needs some: `segment`
+/// is what comes after making them.
+#[derive(Default)]
+struct TargetEffects {
+    by_primitive: HashMap<usize, (usize, PrimEval)>,
+    steps: Vec<Vec<Step>>,
 }
 
 /// A texture holding a layer's content, `k` times bigger. A content pixel `(x, y)` lives at texel
@@ -102,6 +154,7 @@ enum Batch {
 struct LayerCache {
     /// The target it is shown on, which decides when it is no longer in use.
     owner: u64,
+    texture: wgpu::Texture,
     view: wgpu::TextureView,
     /// Binds the texture like the glyph atlas, for compositing.
     bind: wgpu::BindGroup,
@@ -120,6 +173,7 @@ struct LayerCache {
     /// The content rectangle the texture holds.
     valid: RectI,
     used: bool,
+    output: Option<FilterOutput>,
 }
 
 /// One rectangle to redraw in a layer's texture.
@@ -127,13 +181,25 @@ struct RasterOp {
     scissor: RectI,
     /// Index of the solid instance clearing `scissor`.
     clear: u32,
-    batches: Vec<Batch>,
+    /// What to draw before the first picture is made, and after each one.
+    segments: Vec<Vec<Batch>>,
+}
+
+/// What a frame draws in a layer's texture.
+struct Raster {
+    key: u64,
+    ops: Vec<RasterOp>,
+    effects: Vec<Vec<Step>>,
+    /// What a filter makes of the layer, afterwards.
+    filter: Vec<Step>,
 }
 
 /// What a frame redraws in one layer: from the plan, in content coordinates.
 struct LayerPlan {
     key: u64,
     dirty: Vec<RectI>,
+    /// What to make of it: it changed, or the filter did.
+    filter: Option<Box<LayerFilter>>,
 }
 
 #[derive(Default)]
@@ -143,6 +209,7 @@ struct Instances {
     glyphs: Vec<GlyphInstance>,
     layers: Vec<LayerInstance>,
     shaders: Vec<ShaderInstance>,
+    backdrops: Vec<BackdropInstance>,
 }
 
 /// Where content goes in the texture being drawn: `k` times bigger, then moved.
@@ -159,9 +226,11 @@ impl Placement {
 
 struct Prepared {
     instances: Instances,
-    batches: Vec<Batch>,
-    /// Redraws per layer, by key.
-    rasters: Vec<(u64, Vec<RasterOp>)>,
+    /// What to draw in the window before the first picture is made, and after each one.
+    segments: Vec<Vec<Batch>>,
+    effects: Vec<Vec<Step>>,
+    /// Redraws per layer.
+    rasters: Vec<Raster>,
 }
 
 /// Splits a content rectangle where it wraps around a layer texture of `size`, and calls `f` with
@@ -414,6 +483,7 @@ pub struct Renderer {
     glyph_buffer: InstanceBuffer,
     layer_buffer: InstanceBuffer,
     shader_buffer: InstanceBuffer,
+    backdrop_buffer: InstanceBuffer,
     /// Shaders written by users, by the address of their source.
     shaders: HashMap<usize, CompiledShader>,
     /// What the frame being prepared needs and isn't compiled yet.
@@ -421,6 +491,23 @@ pub struct Renderer {
     /// How many of the shaders asked to be compiled ahead were seen to.
     preloaded: usize,
     shader_params_layout: wgpu::BindGroupLayout,
+    /// What shaders read. Shaders without inputs read a transparent texture.
+    inputs_layout: wgpu::BindGroupLayout,
+    no_inputs: wgpu::BindGroup,
+    empty_view: wgpu::TextureView,
+    empty_source: wgpu::BindGroup,
+    /// Doesn't go past the edge of what it reads.
+    clamp_sampler: wgpu::Sampler,
+    effects: Effects,
+    effect_pipelines: Option<EffectPipelines>,
+    /// A frame being prepared needs them.
+    missing_effects: bool,
+    effect_uniform_layout: wgpu::BindGroupLayout,
+    effect_uniforms: Option<wgpu::Buffer>,
+    effect_uniform_bind: Option<wgpu::BindGroup>,
+    /// Windows that something reads, by target.
+    canvases: HashMap<u64, Canvas>,
+    filters_run: usize,
     max_texture: u32,
     layers: HashMap<u64, LayerCache>,
     /// The target being rendered to, when one renderer serves several.
@@ -702,6 +789,44 @@ impl Renderer {
             cache: None,
         });
 
+        let inputs_layout = effects::inputs_layout(device);
+        let effect_uniform_layout = effects::uniform_layout(device);
+        let clamp_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("effects"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let empty = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("nothing"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let empty_view = empty.create_view(&wgpu::TextureViewDescriptor::default());
+        let empty_source = effects::source_bind(device, &atlas_layout, &empty_view, &clamp_sampler);
+        let no_inputs_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("no inputs"),
+            size: INPUTS_SIZE,
+            usage: wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: false,
+        });
+        let no_inputs = inputs_bind(
+            device,
+            &inputs_layout,
+            [&empty_view; 4],
+            &clamp_sampler,
+            &no_inputs_uniform,
+        );
+
         Self {
             format,
             quad_pipeline,
@@ -723,10 +848,24 @@ impl Renderer {
             glyph_buffer: InstanceBuffer::new(device, "glyphs"),
             layer_buffer: InstanceBuffer::new(device, "layers"),
             shader_buffer: InstanceBuffer::new(device, "shaders"),
+            backdrop_buffer: InstanceBuffer::new(device, "backdrops"),
             shaders: HashMap::new(),
             missing_shader: None,
             preloaded: 0,
             shader_params_layout: custom_shader::params_layout(device),
+            inputs_layout,
+            no_inputs,
+            empty_view,
+            empty_source,
+            clamp_sampler,
+            effects: Effects::default(),
+            effect_pipelines: None,
+            missing_effects: false,
+            effect_uniform_layout,
+            effect_uniforms: None,
+            effect_uniform_bind: None,
+            canvases: HashMap::new(),
+            filters_run: 0,
             max_texture: device.limits().max_texture_dimension_2d,
             layers: HashMap::new(),
             target: 0,
@@ -743,12 +882,30 @@ impl Renderer {
     /// Frees what was kept for a target that is gone.
     pub fn forget_target(&mut self, target: u64) {
         self.layers.retain(|_, c| c.owner != target);
+        self.canvases.remove(&target);
     }
 
     /// Sends every box through the quad shader, which any drawing must match pixel for pixel.
     #[doc(hidden)]
     pub fn set_slice_quads(&mut self, on: bool) {
         self.slice_quads = on;
+    }
+
+    /// How many windows are drawn on a canvas, how many textures are kept for making pictures, and
+    /// how many filters have run so far, for tests.
+    #[doc(hidden)]
+    pub fn effect_counts(&self) -> (usize, usize, usize) {
+        (
+            self.canvases.len(),
+            self.effects.pool.len(),
+            self.filters_run,
+        )
+    }
+
+    /// The length of a side of the glyph atlas, for tests.
+    #[doc(hidden)]
+    pub fn atlas_size(&self) -> u32 {
+        self.glyphs.size
     }
 
     pub fn format(&self) -> wgpu::TextureFormat {
@@ -778,7 +935,10 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: self.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            // Copied from by what reads it.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -819,6 +979,7 @@ impl Renderer {
         let (bounds, nested) = index_content(&layer.content);
         LayerCache {
             owner: self.target,
+            texture,
             view,
             bind,
             bind_linear,
@@ -830,6 +991,56 @@ impl Renderer {
             nested,
             valid: RectI::default(),
             used: true,
+            output: None,
+        }
+    }
+
+    /// Makes sure a layer has where to keep what its filter makes of `rect`, in texels.
+    fn prepare_output(&self, device: &wgpu::Device, cache: &mut LayerCache, rect: RectI) {
+        let round_up = |v: i32| ((v.max(1) + 63) & !63).min(self.max_texture as i32);
+        let needed = (round_up(rect.width), round_up(rect.height));
+        let fits = cache.output.as_ref().is_some_and(|o| {
+            o.size.0 >= needed.0
+                && o.size.1 >= needed.1
+                && (o.size.0 as i64 * o.size.1 as i64) <= 4 * needed.0 as i64 * needed.1 as i64
+        });
+        if !fits {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("filter output"),
+                size: wgpu::Extent3d {
+                    width: needed.0 as u32,
+                    height: needed.1 as u32,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            cache.output = Some(FilterOutput {
+                bind: effects::source_bind(device, &self.atlas_layout, &view, &self.sampler),
+                bind_linear: effects::source_bind(
+                    device,
+                    &self.atlas_layout,
+                    &view,
+                    &self.clamp_sampler,
+                ),
+                texture,
+                view,
+                size: needed,
+                rect,
+                made_by: None,
+            });
+        }
+        let output = cache.output.as_mut().expect("just made");
+        if output.rect != rect {
+            output.rect = rect;
+            output.made_by = None;
         }
     }
 
@@ -885,6 +1096,14 @@ impl Renderer {
                 .outset(1)
                 .intersect(&layer.bounds.outset(1))
         };
+        // A filter shows `view`, made of all it reads around it.
+        let shows = view;
+        let view = match &layer.filter {
+            Some(f) => view
+                .outset(f.image.read_px(f.scale))
+                .intersect(&layer.bounds.inset(f.reach, f.reach, f.reach, f.reach)),
+            None => view,
+        };
         let wanted = (matrix.max_scale() * parent_k as f64 - 0.01).ceil() as i32;
         let wanted = if matrix.is_axis_aligned() {
             wanted
@@ -934,6 +1153,8 @@ impl Renderer {
         }
         subtract(view, kept, &mut dirty);
         cache.valid = view;
+        expand_for_backdrops(&layer.content, &mut dirty);
+        dirty.clip(view);
         let dirty = dirty.rects().to_vec();
         let nested = cache.nested.clone();
         for i in nested {
@@ -941,10 +1162,24 @@ impl Renderer {
                 self.plan_layer(device, inner, view, Some(&dirty), k, plans);
             }
         }
-        if !dirty.is_empty() {
+        let mut filter = None;
+        if layer.filter.is_some() {
+            let mut cache = self.layers.remove(&layer.key).expect("kept above");
+            self.prepare_output(device, &mut cache, shows.scaled(k));
+            let output = cache.output.as_mut().expect("just prepared");
+            if !dirty.is_empty() || output.made_by != layer.filter {
+                output.made_by = layer.filter.clone();
+                filter = layer.filter.clone();
+            }
+            self.layers.insert(layer.key, cache);
+        } else if let Some(cache) = self.layers.get_mut(&layer.key) {
+            cache.output = None;
+        }
+        if !dirty.is_empty() || filter.is_some() {
             plans.push(LayerPlan {
                 key: layer.key,
                 dirty,
+                filter,
             });
         }
     }
@@ -979,19 +1214,33 @@ impl Renderer {
             self.preloaded += 1;
             self.compile_shader(device, source);
         }
+        let mut cleared = false;
         loop {
-            match self.try_prepare(scene, damage, plans) {
+            match self.try_prepare(device, scene, damage, plans) {
                 Some(r) => return r,
                 None => {
                     if let Some(source) = self.missing_shader.take() {
                         self.compile_shader(device, source);
                         continue;
                     }
-                    let next = (self.glyphs.size * 2).min(self.max_texture);
+                    if std::mem::take(&mut self.missing_effects) {
+                        self.effect_pipelines = Some(effects::create_pipelines(
+                            device,
+                            self.format,
+                            &self.globals_layout,
+                            &self.atlas_layout,
+                            &self.effect_uniform_layout,
+                        ));
+                        continue;
+                    }
+                    let next = self.glyphs.size_when_full(cleared, self.max_texture);
+                    if next != self.glyphs.size {
+                        let (t, b) = create_atlas(device, &self.atlas_layout, &self.sampler, next);
+                        self.atlas = t;
+                        self.atlas_bind = b;
+                    }
                     self.glyphs.clear(next);
-                    let (t, b) = create_atlas(device, &self.atlas_layout, &self.sampler, next);
-                    self.atlas = t;
-                    self.atlas_bind = b;
+                    cleared = true;
                 }
             }
         }
@@ -1006,13 +1255,210 @@ impl Renderer {
                 self.format,
                 &self.globals_layout,
                 &self.shader_params_layout,
+                &self.inputs_layout,
             );
             self.shaders.insert(key, compiled);
         }
     }
 
+    /// Plans the pictures of the primitives that need some and show in `touches`, in paint order.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_effects(
+        &mut self,
+        device: &wgpu::Device,
+        primitives: &[Primitive],
+        bounds: impl Fn(usize) -> RectI,
+        touches: impl Fn(&RectI) -> bool,
+        k: i32,
+        area: RectI,
+        backdrop: Option<Source>,
+        instances: &mut Instances,
+    ) -> Option<TargetEffects> {
+        let mut out = TargetEffects::default();
+        for (i, prim) in primitives.iter().enumerate() {
+            if !needs_pictures(prim) || !touches(&bounds(i)) {
+                continue;
+            }
+            if self.effect_pipelines.is_none() {
+                self.missing_effects = true;
+                return None;
+            }
+            self.effects.release_results();
+            let pool = PoolContext {
+                source_layout: &self.atlas_layout,
+                globals_layout: &self.globals_layout,
+                sampler: &self.clamp_sampler,
+                format: self.format,
+                max_texture: self.max_texture,
+            };
+            let mut steps = Vec::new();
+            let eval = match prim {
+                Primitive::Backdrop(b) => {
+                    let cx = EvalContext {
+                        k,
+                        scale: b.scale,
+                        rect: b.rect.scaled(k),
+                        border: [0; 4],
+                        padding: [0; 4],
+                        radii: b.radii,
+                        content: None,
+                        backdrop: backdrop.clone(),
+                    };
+                    let shows = b
+                        .outer_rect()
+                        .scaled(k)
+                        .intersect(&b.clip.scaled(k).rect)
+                        .intersect(&area);
+                    let slots = self.effects.evaluate(
+                        device,
+                        &pool,
+                        &[(b.image.clone(), shows)],
+                        &cx,
+                        &mut self.shaders,
+                        &mut instances.shaders,
+                        &mut steps,
+                    );
+                    PrimEval::Backdrop(self.got_slots(slots)?[0])
+                }
+                Primitive::Shader(s) => {
+                    let cx = EvalContext {
+                        k,
+                        scale: s.scale,
+                        rect: s.rect.scaled(k),
+                        border: s.border,
+                        padding: s.padding,
+                        radii: s.radii,
+                        content: None,
+                        backdrop: backdrop.clone(),
+                    };
+                    let shows = s
+                        .rect
+                        .scaled(k)
+                        .intersect(&s.clip.scaled(k).rect)
+                        .intersect(&area)
+                        .outset(s.paint.reach_px(s.scale) * k);
+                    let roots: Vec<_> = s
+                        .paint
+                        .input_images()
+                        .iter()
+                        .map(|image| (image.clone(), shows))
+                        .collect();
+                    let slots = self.effects.evaluate(
+                        device,
+                        &pool,
+                        &roots,
+                        &cx,
+                        &mut self.shaders,
+                        &mut instances.shaders,
+                        &mut steps,
+                    );
+                    let slots = self.got_slots(slots)?;
+                    PrimEval::Inputs(self.effects.bind_inputs(&slots, &cx))
+                }
+                _ => unreachable!("only these need pictures"),
+            };
+            out.by_primitive.insert(i, (out.steps.len(), eval));
+            out.steps.push(steps);
+        }
+        Some(out)
+    }
+
+    fn got_slots(
+        &mut self,
+        slots: Result<Vec<Option<Slot>>, Missing>,
+    ) -> Option<Vec<Option<Slot>>> {
+        match slots {
+            Ok(slots) => Some(slots),
+            Err(Missing::Shader(source)) => {
+                self.missing_shader = Some(source);
+                None
+            }
+        }
+    }
+
+    /// Plans what a layer's filter makes of it.
+    fn plan_filter(
+        &mut self,
+        device: &wgpu::Device,
+        filter: &LayerFilter,
+        cache: &LayerCache,
+        instances: &mut Instances,
+    ) -> Option<Vec<Step>> {
+        if self.effect_pipelines.is_none() {
+            self.missing_effects = true;
+            return None;
+        }
+        let output = cache.output.as_ref()?;
+        self.effects.release_results();
+        let k = cache.k;
+        let cx = EvalContext {
+            k,
+            scale: filter.scale,
+            rect: filter.rect.scaled(k),
+            border: filter.border,
+            padding: filter.padding,
+            radii: filter.radii,
+            content: Some(Source {
+                texture: cache.texture.clone(),
+                wrap: Some(cache.size),
+                valid: cache.valid.scaled(k),
+            }),
+            backdrop: None,
+        };
+        let pool = PoolContext {
+            source_layout: &self.atlas_layout,
+            globals_layout: &self.globals_layout,
+            sampler: &self.clamp_sampler,
+            format: self.format,
+            max_texture: self.max_texture,
+        };
+        let mut steps = Vec::new();
+        let slots = self.effects.evaluate(
+            device,
+            &pool,
+            &[(filter.image.clone(), output.rect)],
+            &cx,
+            &mut self.shaders,
+            &mut instances.shaders,
+            &mut steps,
+        );
+        let slot = self.got_slots(slots)?[0];
+        match slot {
+            Some(slot) => {
+                let part = output.rect.intersect(&slot.rect).intersect(&RectI::new(
+                    output.rect.x,
+                    output.rect.y,
+                    output.size.0,
+                    output.size.1,
+                ));
+                if part != output.rect {
+                    steps.push(Step::ClearOutput {
+                        view: output.view.clone(),
+                    });
+                }
+                if !part.is_empty() {
+                    steps.push(Step::Output {
+                        src: slot.tex,
+                        src_at: ((part.x - slot.rect.x) as u32, (part.y - slot.rect.y) as u32),
+                        to: output.texture.clone(),
+                        at: (
+                            (part.x - output.rect.x) as u32,
+                            (part.y - output.rect.y) as u32,
+                        ),
+                        size: (part.width as u32, part.height as u32),
+                    });
+                }
+            }
+            None => steps.push(Step::ClearOutput {
+                view: output.view.clone(),
+            }),
+        }
+        Some(steps)
+    }
+
     fn try_prepare(
         &mut self,
+        device: &wgpu::Device,
         scene: &Scene,
         damage: Option<&[RectI]>,
         plans: &[LayerPlan],
@@ -1021,9 +1467,11 @@ impl Renderer {
             shader.data.clear();
             shader.count = 0;
         }
+        self.effects.begin_try();
         let mut out = Prepared {
             instances: Instances::default(),
-            batches: Vec::new(),
+            segments: Vec::new(),
+            effects: Vec::new(),
             rasters: Vec::new(),
         };
         let mut placed: Vec<PlacedGlyph> = Vec::new();
@@ -1033,18 +1481,40 @@ impl Renderer {
         }
 
         let layers = std::mem::take(&mut self.layers);
-        let rasters = plans.iter().map(|plan| {
+        let mut rasters = Vec::with_capacity(plans.len());
+        let mut failed = false;
+        for plan in plans {
             let cache = &layers[&plan.key];
             let mut ops = Vec::new();
             let target = RectI::new(0, 0, cache.size.0, cache.size.1);
             let k = cache.k;
-            let mut failed = false;
+            let content = cache.content.clone();
+            let touched_dirty = |r: &RectI| plan.dirty.iter().any(|d| d.intersects(r));
+            let Some(planned) = self.plan_effects(
+                device,
+                &content.primitives,
+                |i| cache.bounds[i],
+                touched_dirty,
+                k,
+                cache.valid.scaled(k),
+                Some(Source {
+                    texture: cache.texture.clone(),
+                    wrap: Some(cache.size),
+                    valid: cache.valid.scaled(k),
+                }),
+                &mut out.instances,
+            ) else {
+                failed = true;
+                break;
+            };
             for dirty in &plan.dirty {
+                let mut ok = true;
                 torus_parts(dirty.scaled(k), cache.size, |part, (tx, ty)| {
                     let scissor = RectI::new(tx, ty, part.width, part.height);
                     let index = out.instances.solids.len() as u32;
                     out.instances.solids.push(solid_instance(scissor, [0.0; 4]));
-                    let mut batches = Vec::new();
+                    let mut segments: Vec<Vec<Batch>> = Vec::new();
+                    segments.resize_with(planned.steps.len() + 1, Vec::new);
                     let at = Placement {
                         k,
                         dx: tx - part.x,
@@ -1056,7 +1526,14 @@ impl Renderer {
                         part.width / k + 2,
                         part.height / k + 2,
                     );
-                    for (prim, bounds) in cache.content.primitives.iter().zip(&cache.bounds) {
+                    let mut segment = 0;
+                    for (i, (prim, bounds)) in
+                        content.primitives.iter().zip(&cache.bounds).enumerate()
+                    {
+                        let eval = planned.by_primitive.get(&i);
+                        if let Some((seg, _)) = eval {
+                            segment = seg + 1;
+                        }
                         if !bounds.intersects(&touched) {
                             continue;
                         }
@@ -1066,46 +1543,92 @@ impl Renderer {
                             target,
                             &layers,
                             &mut out.instances,
-                            &mut batches,
+                            &mut segments[segment],
                             &mut placed,
+                            eval.map(|e| e.1),
                         );
-                        failed |= placed_ok.is_none();
+                        ok &= placed_ok.is_some();
                     }
                     ops.push(RasterOp {
                         scissor,
                         clear: index,
-                        batches,
+                        segments,
                     });
                 });
+                failed |= !ok;
             }
-            (!failed).then_some((plan.key, ops))
-        });
-        let rasters: Option<Vec<_>> = rasters.collect();
+            if failed {
+                break;
+            }
+            let filter = match &plan.filter {
+                Some(filter) => match self.plan_filter(device, filter, cache, &mut out.instances) {
+                    Some(steps) => steps,
+                    None => {
+                        failed = true;
+                        break;
+                    }
+                },
+                None => Vec::new(),
+            };
+            self.effects.release_results();
+            rasters.push(Raster {
+                key: plan.key,
+                ops,
+                effects: planned.steps,
+                filter,
+            });
+        }
 
         let screen = RectI::new(0, 0, scene.width as i32, scene.height as i32);
-        let window = rasters.as_ref().and_then(|_| {
-            for prim in &scene.primitives {
-                let bounds = primitive_bounds(prim).intersect(&screen);
-                if bounds.is_empty()
-                    || damage.is_some_and(|d| !d.iter().any(|r| r.intersects(&bounds)))
-                {
-                    continue;
-                }
-                self.push_primitive(
-                    prim,
-                    Placement::NONE,
-                    screen,
-                    &layers,
-                    &mut out.instances,
-                    &mut out.batches,
-                    &mut placed,
-                )?;
-            }
-            Some(())
+        let touches = |r: &RectI| damage.is_none_or(|d| d.iter().any(|x| x.intersects(r)));
+        let canvas_source = self.canvases.get(&self.target).map(|c| Source {
+            texture: c.texture.clone(),
+            wrap: None,
+            valid: screen,
         });
+        let window = if failed {
+            None
+        } else {
+            self.plan_effects(
+                device,
+                &scene.primitives,
+                |i| primitive_bounds(&scene.primitives[i]).intersect(&screen),
+                touches,
+                1,
+                screen,
+                canvas_source,
+                &mut out.instances,
+            )
+            .and_then(|planned| {
+                out.segments.resize_with(planned.steps.len() + 1, Vec::new);
+                let mut segment = 0;
+                for (i, prim) in scene.primitives.iter().enumerate() {
+                    let eval = planned.by_primitive.get(&i);
+                    if let Some((seg, _)) = eval {
+                        segment = seg + 1;
+                    }
+                    let bounds = primitive_bounds(prim).intersect(&screen);
+                    if bounds.is_empty() || !touches(&bounds) {
+                        continue;
+                    }
+                    self.push_primitive(
+                        prim,
+                        Placement::NONE,
+                        screen,
+                        &layers,
+                        &mut out.instances,
+                        &mut out.segments[segment],
+                        &mut placed,
+                        eval.map(|e| e.1),
+                    )?;
+                }
+                out.effects = planned.steps;
+                Some(())
+            })
+        };
         self.layers = layers;
         window?;
-        out.rasters = rasters?;
+        out.rasters = rasters;
         Some(out)
     }
 
@@ -1121,6 +1644,7 @@ impl Renderer {
         instances: &mut Instances,
         batches: &mut Vec<Batch>,
         placed: &mut Vec<PlacedGlyph>,
+        eval: Option<PrimEval>,
     ) -> Option<()> {
         let Placement { k, dx, dy } = at;
         let Instances {
@@ -1129,6 +1653,7 @@ impl Renderer {
             glyphs,
             layers: layer_instances,
             shaders: shader_instances,
+            backdrops,
         } = instances;
         match prim {
             Primitive::Quad(q) => {
@@ -1247,6 +1772,35 @@ impl Renderer {
                     push_layer(layer, cache, at, target, layer_instances, batches);
                 }
             }
+            Primitive::Backdrop(b) => {
+                // It didn't get its picture because it doesn't show: nothing to draw.
+                let Some(PrimEval::Backdrop(Some(slot))) = eval else {
+                    return Some(());
+                };
+                let m = Affine::translation(dx as f64, dy as f64)
+                    .then_apply(&Affine::scaling(k as f64, k as f64))
+                    .then_apply(&b.transform);
+                let (x, y) = m.apply(b.rect.x as f64, b.rect.y as f64);
+                let (clip, clip_radii) = gpu_clip(&b.clip.scaled(k).translated(dx, dy), target);
+                let size = self.effects.texture_size(slot.tex);
+                backdrops.push(BackdropInstance {
+                    matrix: [m.a as f32, m.b as f32, m.c as f32, m.d as f32],
+                    offset: [x as f32, y as f32],
+                    size: [b.rect.width as f32, b.rect.height as f32],
+                    radii: b.radii,
+                    clip,
+                    clip_radii,
+                    origin: [(slot.rect.x + dx) as f32, (slot.rect.y + dy) as f32],
+                    limit: [slot.rect.width as f32, slot.rect.height as f32],
+                    texel: [1.0 / size.0 as f32, 1.0 / size.1 as f32],
+                    opacity: b.opacity,
+                });
+                let end = backdrops.len() as u32;
+                batches.push(Batch::Backdrop {
+                    tex: slot.tex,
+                    range: end - 1..end,
+                });
+            }
             Primitive::Shader(s) => {
                 let source = s.paint.source();
                 let key = shader_key(source);
@@ -1257,6 +1811,12 @@ impl Renderer {
                 if compiled.pipeline.is_none() {
                     return Some(());
                 }
+                let inputs = match eval {
+                    Some(PrimEval::Inputs(inputs)) => Some(inputs),
+                    // It takes inputs and doesn't show now, or it would have got them.
+                    _ if !s.paint.input_images().is_empty() => return Some(()),
+                    _ => None,
+                };
                 let f = k as f32;
                 let rect = s.rect.scaled(k).translate(dx, dy);
                 let clip = s.clip.scaled(k).translated(dx, dy);
@@ -1284,11 +1844,15 @@ impl Renderer {
                     Some(Batch::Shader {
                         key: last,
                         chunk: same,
+                        inputs: same_inputs,
                         range,
-                    }) if *last == key && *same == chunk => range.end = end,
+                    }) if *last == key && *same == chunk && *same_inputs == inputs => {
+                        range.end = end
+                    }
                     _ => batches.push(Batch::Shader {
                         key,
                         chunk,
+                        inputs,
                         range: end - 1..end,
                     }),
                 }
@@ -1321,6 +1885,9 @@ impl Renderer {
         damage: &Damage,
     ) {
         let screen = RectI::new(0, 0, scene.width as i32, scene.height as i32);
+        // What is older than the last frame adds to it, and can touch what reads what is drawn.
+        let mut damage = damage.clone();
+        expand_for_backdrops(scene, &mut damage);
         let rects: Vec<RectI> = damage
             .rects()
             .iter()
@@ -1343,10 +1910,38 @@ impl Renderer {
         scene: &Scene,
         damage: Option<&[RectI]>,
     ) {
+        // Something reads what is drawn in the window: it goes where that is possible.
+        let reads = scene.primitives.iter().any(|p| backdrop_read(p).is_some());
+        let size = (scene.width.max(1), scene.height.max(1));
+        let mut damage = damage;
+        if reads {
+            if self.effect_pipelines.is_none() {
+                self.effect_pipelines = Some(effects::create_pipelines(
+                    device,
+                    self.format,
+                    &self.globals_layout,
+                    &self.atlas_layout,
+                    &self.effect_uniform_layout,
+                ));
+            }
+            if self
+                .canvases
+                .get(&self.target)
+                .is_none_or(|c| c.size != size)
+            {
+                let canvas = self.create_canvas(device, size);
+                self.canvases.insert(self.target, canvas);
+                // It holds nothing yet.
+                damage = None;
+            }
+        } else {
+            self.canvases.remove(&self.target);
+        }
         let plans = self.plan_layers(device, scene, damage);
         let Prepared {
             instances,
-            batches,
+            segments,
+            effects,
             rasters,
         } = self.prepare(device, scene, damage, &plans);
         for (g, pixels) in self.glyphs.uploads.drain(..) {
@@ -1390,6 +1985,8 @@ impl Renderer {
             .upload(device, queue, bytemuck::cast_slice(&instances.glyphs));
         self.layer_buffer
             .upload(device, queue, bytemuck::cast_slice(&instances.layers));
+        self.backdrop_buffer
+            .upload(device, queue, bytemuck::cast_slice(&instances.backdrops));
         if !instances.shaders.is_empty() {
             self.shader_buffer
                 .upload(device, queue, bytemuck::cast_slice(&instances.shaders));
@@ -1397,74 +1994,300 @@ impl Renderer {
                 shader.upload(device, queue, &self.shader_params_layout);
             }
         }
+        self.upload_effects(device, queue);
 
-        for (key, ops) in &rasters {
-            let cache = &self.layers[key];
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("layer"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &cache.view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_bind_group(0, &cache.globals_bind, &[]);
-            for op in ops {
-                let r = op.scissor;
-                pass.set_scissor_rect(r.x as u32, r.y as u32, r.width as u32, r.height as u32);
-                pass.set_pipeline(&self.opaque_pipeline);
-                pass.set_vertex_buffer(0, self.solid_buffer.buffer.slice(..));
-                pass.draw(0..4, op.clear..op.clear + 1);
-                self.draw_batches(&mut pass, &op.batches);
+        for raster in &rasters {
+            let cache = &self.layers[&raster.key];
+            if !raster.ops.is_empty() {
+                for segment in 0..=raster.effects.len() {
+                    if segment > 0 {
+                        self.run_steps(encoder, &raster.effects[segment - 1]);
+                    }
+                    let mut pass = begin_pass(encoder, "layer", &cache.view, wgpu::LoadOp::Load);
+                    pass.set_bind_group(0, &cache.globals_bind, &[]);
+                    for op in &raster.ops {
+                        let r = op.scissor;
+                        pass.set_scissor_rect(
+                            r.x as u32,
+                            r.y as u32,
+                            r.width as u32,
+                            r.height as u32,
+                        );
+                        if segment == 0 {
+                            pass.set_pipeline(&self.opaque_pipeline);
+                            pass.set_vertex_buffer(0, self.solid_buffer.buffer.slice(..));
+                            pass.draw(0..4, op.clear..op.clear + 1);
+                        }
+                        self.draw_batches(&mut pass, &op.segments[segment]);
+                    }
+                }
+            }
+            if !raster.filter.is_empty() {
+                self.filters_run += 1;
+                self.run_steps(encoder, &raster.filter);
             }
         }
 
         let c = scene.clear.premultiplied();
-        let load = match damage {
-            Some(_) => wgpu::LoadOp::Load,
-            None => wgpu::LoadOp::Clear(wgpu::Color {
-                r: c[0] as f64,
-                g: c[1] as f64,
-                b: c[2] as f64,
-                a: c[3] as f64,
-            }),
-        };
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("anti-webui"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
+        let canvas = reads.then(|| &self.canvases[&self.target]);
+        let drawn_on = canvas.map_or(view, |c| &c.view);
+        for segment in 0..segments.len() {
+            if segment > 0 {
+                self.run_steps(encoder, &effects[segment - 1]);
+            }
+            let load = match damage {
+                None if segment == 0 => wgpu::LoadOp::Clear(wgpu::Color {
+                    r: c[0] as f64,
+                    g: c[1] as f64,
+                    b: c[2] as f64,
+                    a: c[3] as f64,
+                }),
+                _ => wgpu::LoadOp::Load,
+            };
+            let mut pass = begin_pass(encoder, "anti-webui", drawn_on, load);
+            pass.set_bind_group(0, &self.globals_bind, &[]);
+            let Some(damage) = damage else {
+                self.draw_batches(&mut pass, &segments[segment]);
+                continue;
+            };
+            // Each rectangle is cleared and then repainted; overlapping rectangles just repeat work.
+            for (i, r) in damage.iter().enumerate() {
+                pass.set_scissor_rect(r.x as u32, r.y as u32, r.width as u32, r.height as u32);
+                if segment == 0 {
+                    pass.set_pipeline(&self.opaque_pipeline);
+                    pass.set_vertex_buffer(0, self.solid_buffer.buffer.slice(..));
+                    pass.draw(0..4, i as u32..i as u32 + 1);
+                }
+                self.draw_batches(&mut pass, &segments[segment]);
+            }
+        }
+        if let Some(canvas) = canvas {
+            let load = match damage {
+                Some(_) => wgpu::LoadOp::Load,
+                None => wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            };
+            let pipelines = self.effect_pipelines.as_ref();
+            if let Some(show) = pipelines.map(|p| &p.show) {
+                let mut pass = begin_pass(encoder, "show", view, load);
+                pass.set_pipeline(show);
+                pass.set_bind_group(0, &canvas.bind, &[]);
+                match damage {
+                    Some(damage) => {
+                        for r in damage {
+                            pass.set_scissor_rect(
+                                r.x as u32,
+                                r.y as u32,
+                                r.width as u32,
+                                r.height as u32,
+                            );
+                            pass.draw(0..3, 0..1);
+                        }
+                    }
+                    None => pass.draw(0..3, 0..1),
+                }
+            }
+        }
+        self.effects.end_frame();
+    }
+
+    fn create_canvas(&self, device: &wgpu::Device, size: (u32, u32)) -> Canvas {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("canvas"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
         });
-        pass.set_bind_group(0, &self.globals_bind, &[]);
-        let Some(damage) = damage else {
-            self.draw_batches(&mut pass, &batches);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Canvas {
+            bind: effects::source_bind(device, &self.atlas_layout, &view, &self.sampler),
+            texture,
+            view,
+            size,
+        }
+    }
+
+    /// Hands the frame's uniforms to the GPU, and binds what shaders read.
+    fn upload_effects(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.effects.binds.clear();
+        if self.effects.uniforms.is_empty() {
             return;
+        }
+        let needed = self.effects.uniforms.len() as u64;
+        if self
+            .effect_uniforms
+            .as_ref()
+            .is_none_or(|b| b.size() < needed)
+        {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("effect uniforms"),
+                size: needed.next_power_of_two().max(UNIFORM_STRIDE as u64 * 16),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.effect_uniform_bind = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("effect uniforms"),
+                layout: &self.effect_uniform_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &buffer,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(effects::BLUR_UNIFORM_SIZE),
+                    }),
+                }],
+            }));
+            self.effect_uniforms = Some(buffer);
+        }
+        let buffer = self.effect_uniforms.as_ref().expect("just made");
+        queue.write_buffer(buffer, 0, &self.effects.uniforms);
+        let binds = self
+            .effects
+            .inputs
+            .iter()
+            .map(|input| {
+                let views = input
+                    .textures
+                    .map(|t| t.map_or(&self.empty_view, |t| self.effects.view(t)));
+                inputs_bind(
+                    device,
+                    &self.inputs_layout,
+                    views,
+                    &self.clamp_sampler,
+                    buffer,
+                )
+            })
+            .collect();
+        self.effects.binds = binds;
+    }
+
+    /// Runs what makes pictures. No pass is open.
+    fn run_steps(&self, encoder: &mut wgpu::CommandEncoder, steps: &[Step]) {
+        let extent = |size: (u32, u32)| wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
         };
-        // Each rectangle is cleared and then repainted; overlapping rectangles just repeat work.
-        for (i, r) in damage.iter().enumerate() {
-            pass.set_scissor_rect(r.x as u32, r.y as u32, r.width as u32, r.height as u32);
-            pass.set_pipeline(&self.opaque_pipeline);
-            pass.set_vertex_buffer(0, self.solid_buffer.buffer.slice(..));
-            pass.draw(0..4, i as u32..i as u32 + 1);
-            self.draw_batches(&mut pass, &batches);
+        let copy_of = |texture, at: (u32, u32)| wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: at.0,
+                y: at.1,
+                z: 0,
+            },
+            aspect: wgpu::TextureAspect::All,
+        };
+        for step in steps {
+            match step {
+                Step::Clear { tex } => {
+                    let clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
+                    begin_pass(encoder, "clear", self.effects.view(*tex), clear);
+                }
+                Step::ClearOutput { view } => {
+                    let clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
+                    begin_pass(encoder, "clear", view, clear);
+                }
+                Step::Copy {
+                    from,
+                    src,
+                    dst,
+                    at,
+                    size,
+                } => encoder.copy_texture_to_texture(
+                    copy_of(from, *src),
+                    copy_of(self.effects.texture(*dst), *at),
+                    extent(*size),
+                ),
+                Step::Output {
+                    src,
+                    src_at,
+                    to,
+                    at,
+                    size,
+                } => encoder.copy_texture_to_texture(
+                    copy_of(self.effects.texture(*src), *src_at),
+                    copy_of(to, *at),
+                    extent(*size),
+                ),
+                Step::Gauss {
+                    src,
+                    dst,
+                    size,
+                    uniform,
+                } => {
+                    let (Some(pipelines), Some(uniforms)) =
+                        (&self.effect_pipelines, &self.effect_uniform_bind)
+                    else {
+                        continue;
+                    };
+                    let mut pass =
+                        begin_pass(encoder, "blur", self.effects.view(*dst), wgpu::LoadOp::Load);
+                    pass.set_scissor_rect(0, 0, size.0, size.1);
+                    pass.set_pipeline(&pipelines.gauss);
+                    pass.set_bind_group(0, uniforms, &[*uniform]);
+                    pass.set_bind_group(1, self.effects.source_bind(*src), &[]);
+                    pass.draw(0..3, 0..1);
+                }
+                Step::Blur {
+                    down,
+                    src,
+                    lower,
+                    dst,
+                    size,
+                    uniform,
+                } => {
+                    let (Some(pipelines), Some(uniforms)) =
+                        (&self.effect_pipelines, &self.effect_uniform_bind)
+                    else {
+                        continue;
+                    };
+                    let mut pass =
+                        begin_pass(encoder, "blur", self.effects.view(*dst), wgpu::LoadOp::Load);
+                    pass.set_scissor_rect(0, 0, size.0, size.1);
+                    pass.set_pipeline(if *down {
+                        &pipelines.down
+                    } else {
+                        &pipelines.up
+                    });
+                    pass.set_bind_group(0, uniforms, &[*uniform]);
+                    pass.set_bind_group(1, self.effects.source_bind(*src), &[]);
+                    let lower = lower.map_or(&self.empty_source, |t| self.effects.source_bind(t));
+                    pass.set_bind_group(2, lower, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+                Step::Shader {
+                    dst,
+                    size,
+                    key,
+                    chunk,
+                    instance,
+                    inputs,
+                } => {
+                    let clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
+                    let mut pass = begin_pass(encoder, "shader", self.effects.view(*dst), clear);
+                    pass.set_scissor_rect(0, 0, size.0, size.1);
+                    pass.set_bind_group(0, self.effects.globals_bind(*dst), &[]);
+                    self.draw_batches(
+                        &mut pass,
+                        &[Batch::Shader {
+                            key: *key,
+                            chunk: *chunk,
+                            inputs: Some(*inputs),
+                            range: *instance..*instance + 1,
+                        }],
+                    );
+                }
+            }
         }
     }
 
@@ -1492,21 +2315,41 @@ impl Renderer {
                     pass.set_vertex_buffer(0, self.glyph_buffer.buffer.slice(..));
                     pass.draw(0..4, r.clone());
                 }
-                Batch::Layer { key, linear, range } => {
+                Batch::Layer {
+                    key,
+                    linear,
+                    filtered,
+                    range,
+                } => {
                     let Some(cache) = self.layers.get(key) else {
                         continue;
                     };
                     pass.set_pipeline(&self.layer_pipeline);
-                    let bind = if *linear {
-                        &cache.bind_linear
-                    } else {
-                        &cache.bind
+                    let bind = match (cache.output.as_ref().filter(|_| *filtered), *linear) {
+                        (Some(output), true) => &output.bind_linear,
+                        (Some(output), false) => &output.bind,
+                        (None, true) => &cache.bind_linear,
+                        (None, false) => &cache.bind,
                     };
                     pass.set_bind_group(1, bind, &[]);
                     pass.set_vertex_buffer(0, self.layer_buffer.buffer.slice(..));
                     pass.draw(0..4, range.clone());
                 }
-                Batch::Shader { key, chunk, range } => {
+                Batch::Backdrop { tex, range } => {
+                    let Some(pipelines) = &self.effect_pipelines else {
+                        continue;
+                    };
+                    pass.set_pipeline(&pipelines.backdrop);
+                    pass.set_bind_group(1, self.effects.source_bind(*tex), &[]);
+                    pass.set_vertex_buffer(0, self.backdrop_buffer.buffer.slice(..));
+                    pass.draw(0..4, range.clone());
+                }
+                Batch::Shader {
+                    key,
+                    chunk,
+                    inputs,
+                    range,
+                } => {
                     let Some(shader) = self.shaders.get(key) else {
                         continue;
                     };
@@ -1515,6 +2358,13 @@ impl Renderer {
                     };
                     pass.set_pipeline(pipeline);
                     pass.set_bind_group(1, bind, &[*chunk * CHUNK as u32]);
+                    match inputs {
+                        Some(i) => {
+                            let uniform = self.effects.inputs[*i as usize].uniform;
+                            pass.set_bind_group(2, &self.effects.binds[*i as usize], &[uniform]);
+                        }
+                        None => pass.set_bind_group(2, &self.no_inputs, &[0]),
+                    }
                     pass.set_vertex_buffer(0, self.shader_buffer.buffer.slice(..));
                     pass.draw(0..4, range.clone());
                 }
@@ -1526,6 +2376,74 @@ impl Renderer {
 /// Identifies a shader: its source lives in a `static`.
 fn shader_key(source: &'static ShaderSource) -> usize {
     std::ptr::from_ref(source) as usize
+}
+
+/// Whether a primitive needs pictures made before it is drawn.
+fn needs_pictures(p: &Primitive) -> bool {
+    match p {
+        Primitive::Backdrop(_) => true,
+        Primitive::Shader(s) => !s.paint.input_images().is_empty(),
+        _ => false,
+    }
+}
+
+fn begin_pass<'a>(
+    encoder: &'a mut wgpu::CommandEncoder,
+    label: &str,
+    view: &wgpu::TextureView,
+    load: wgpu::LoadOp<wgpu::Color>,
+) -> wgpu::RenderPass<'a> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load,
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    })
+}
+
+fn inputs_bind(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    views: [&wgpu::TextureView; 4],
+    sampler: &wgpu::Sampler,
+    uniforms: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    let view = |binding: u32, view| wgpu::BindGroupEntry {
+        binding,
+        resource: wgpu::BindingResource::TextureView(view),
+    };
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("shader inputs"),
+        layout,
+        entries: &[
+            view(0, views[0]),
+            view(1, views[1]),
+            view(2, views[2]),
+            view(3, views[3]),
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: uniforms,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(INPUTS_SIZE),
+                }),
+            },
+        ],
+    })
 }
 
 fn solid_instance(r: RectI, color: [f32; 4]) -> SolidInstance {
@@ -1555,6 +2473,38 @@ fn push_layer(
     let start = instances.len() as u32;
     let valid = cache.valid.scaled(cache.k);
     let linear = !m.is_whole_translation();
+    if layer.filter.is_some() {
+        // What the filter made, which doesn't wrap around.
+        let Some(output) = &cache.output else {
+            return;
+        };
+        let r = output.rect;
+        let inset = if linear { 0.5 } else { 0.0 };
+        let (x, y) = m.apply(r.x as f64 + inset as f64, r.y as f64 + inset as f64);
+        let (width, height) = (r.width as f32 - inset * 2.0, r.height as f32 - inset * 2.0);
+        let (tw, th) = (output.size.0 as f32, output.size.1 as f32);
+        instances.push(LayerInstance {
+            matrix: [m.a as f32, m.b as f32, m.c as f32, m.d as f32],
+            offset: [x as f32, y as f32],
+            size: [width, height],
+            uv: [
+                inset / tw,
+                inset / th,
+                (inset + width) / tw,
+                (inset + height) / th,
+            ],
+            clip,
+            clip_radii,
+            opacity: layer.opacity,
+        });
+        batches.push(Batch::Layer {
+            key: layer.key,
+            linear,
+            filtered: true,
+            range: start..instances.len() as u32,
+        });
+        return;
+    }
     // Filtering at the very edge would read a texel further, which holds whatever was there before.
     // Half a texel in, the edge is all it reads, and it is transparent or not shown.
     let inset = if linear { 0.5 } else { 0.0 };
@@ -1590,6 +2540,7 @@ fn push_layer(
     batches.push(Batch::Layer {
         key: layer.key,
         linear,
+        filtered: false,
         range: start..instances.len() as u32,
     });
 }
