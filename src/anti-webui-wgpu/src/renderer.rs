@@ -10,12 +10,13 @@ use anti_webui_core::damage::{
     Damage, backdrop_read, diff_content, expand_for_backdrops, primitive_bounds,
 };
 use anti_webui_core::geometry::{Affine, RectI};
-use anti_webui_core::scene::{Clip, Layer, LayerFilter, Primitive, Quad, Scene};
+use anti_webui_core::images::Bitmap;
+use anti_webui_core::scene::{Clip, ImageDraw, Layer, LayerFilter, Primitive, Quad, Scene};
 use anti_webui_core::shader::{ShaderSource, preloads_from};
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use wgpu::util::DeviceExt;
 
 const ATLAS_INITIAL: u32 = 1024;
@@ -80,6 +81,30 @@ struct LayerInstance {
     opacity: f32,
 }
 
+/// A picture on its way to the screen.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PictureInstance {
+    area: [f32; 4],
+    rect: [f32; 4],
+    shape: [f32; 4],
+    shape_radii: [f32; 4],
+    clip: [f32; 4],
+    clip_radii: [f32; 4],
+    params: [f32; 2],
+}
+
+/// A picture on the GPU, for as long as anything has its pixels.
+struct GpuPicture {
+    bitmap: Weak<Bitmap>,
+    texture: wgpu::Texture,
+    bind: wgpu::BindGroup,
+    /// The first level of the bitmap in the texture: only those the GPU can take are.
+    first: u32,
+    /// The frame of an animation the texture holds.
+    frame: u32,
+}
+
 enum Batch {
     Quads(Range<u32>),
     /// Solid instances, blended.
@@ -107,6 +132,13 @@ enum Batch {
     /// What is behind a box, which is in this texture of the pool.
     Backdrop {
         tex: usize,
+        range: Range<u32>,
+    },
+    /// Instances of the picture with this id.
+    Picture {
+        id: u64,
+        sampler: u8,
+        opaque: bool,
         range: Range<u32>,
     },
 }
@@ -210,6 +242,7 @@ struct Instances {
     layers: Vec<LayerInstance>,
     shaders: Vec<ShaderInstance>,
     backdrops: Vec<BackdropInstance>,
+    pictures: Vec<PictureInstance>,
 }
 
 /// Where content goes in the texture being drawn: `k` times bigger, then moved.
@@ -468,6 +501,16 @@ pub struct Renderer {
     opaque_pipeline: wgpu::RenderPipeline,
     glyph_pipeline: wgpu::RenderPipeline,
     layer_pipeline: wgpu::RenderPipeline,
+    picture_pipeline: wgpu::RenderPipeline,
+    opaque_picture_pipeline: wgpu::RenderPipeline,
+    picture_layout: wgpu::BindGroupLayout,
+    /// For each of: square pixels, repeating across, repeating down.
+    picture_samplers: Vec<wgpu::BindGroup>,
+    pictures: HashMap<u64, GpuPicture>,
+    /// What to hand to the GPU before drawing.
+    picture_uploads: Vec<(Arc<Bitmap>, u32)>,
+    /// Let go of the pixels of a picture once it is on the GPU.
+    release_pixels: bool,
     globals: wgpu::Buffer,
     globals_bind: wgpu::BindGroup,
     globals_layout: wgpu::BindGroupLayout,
@@ -484,6 +527,7 @@ pub struct Renderer {
     layer_buffer: InstanceBuffer,
     shader_buffer: InstanceBuffer,
     backdrop_buffer: InstanceBuffer,
+    picture_buffer: InstanceBuffer,
     /// Shaders written by users, by the address of their source.
     shaders: HashMap<usize, CompiledShader>,
     /// What the frame being prepared needs and isn't compiled yet.
@@ -789,6 +833,115 @@ impl Renderer {
             cache: None,
         });
 
+        let picture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("picture"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let picture_sampler_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("picture sampler"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                }],
+            });
+        let picture_samplers = (0..8u8)
+            .map(|i| {
+                let filter = if i & 1 != 0 {
+                    wgpu::FilterMode::Nearest
+                } else {
+                    wgpu::FilterMode::Linear
+                };
+                let address = |repeats: bool| {
+                    if repeats {
+                        wgpu::AddressMode::Repeat
+                    } else {
+                        wgpu::AddressMode::ClampToEdge
+                    }
+                };
+                let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                    label: Some("picture"),
+                    address_mode_u: address(i & 2 != 0),
+                    address_mode_v: address(i & 4 != 0),
+                    mag_filter: filter,
+                    min_filter: filter,
+                    mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                    ..Default::default()
+                });
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("picture sampler"),
+                    layout: &picture_sampler_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    }],
+                })
+            })
+            .collect();
+        let picture_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("picture"),
+                bind_group_layouts: &[
+                    Some(&globals_layout),
+                    Some(&picture_layout),
+                    Some(&picture_sampler_layout),
+                ],
+                immediate_size: 0,
+            });
+        let picture_attrs = wgpu::vertex_attr_array![
+            0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4,
+            5 => Float32x4, 6 => Float32x2
+        ];
+        let picture_buffers = [Some(wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<PictureInstance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &picture_attrs,
+        })];
+        let picture_pipeline_with = |label, entry, targets: &[Option<wgpu::ColorTargetState>]| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&picture_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_picture"),
+                    compilation_options: Default::default(),
+                    buffers: &picture_buffers,
+                },
+                primitive,
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    targets,
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let picture_pipeline = picture_pipeline_with("picture", "fs_picture", &targets);
+        let opaque_picture_pipeline = picture_pipeline_with(
+            "opaque picture",
+            "fs_opaque_picture",
+            &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        );
+
         let inputs_layout = effects::inputs_layout(device);
         let effect_uniform_layout = effects::uniform_layout(device);
         let clamp_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -834,6 +987,13 @@ impl Renderer {
             opaque_pipeline,
             glyph_pipeline,
             layer_pipeline,
+            picture_pipeline,
+            opaque_picture_pipeline,
+            picture_layout,
+            picture_samplers,
+            pictures: HashMap::new(),
+            picture_uploads: Vec::new(),
+            release_pixels: false,
             globals,
             globals_bind,
             globals_layout,
@@ -849,6 +1009,7 @@ impl Renderer {
             layer_buffer: InstanceBuffer::new(device, "layers"),
             shader_buffer: InstanceBuffer::new(device, "shaders"),
             backdrop_buffer: InstanceBuffer::new(device, "backdrops"),
+            picture_buffer: InstanceBuffer::new(device, "pictures"),
             shaders: HashMap::new(),
             missing_shader: None,
             preloaded: 0,
@@ -883,6 +1044,32 @@ impl Renderer {
     pub fn forget_target(&mut self, target: u64) {
         self.layers.retain(|_, c| c.owner != target);
         self.canvases.remove(&target);
+    }
+
+    /// Lets go of the pixels of each picture once they are on the GPU, which is right when this is
+    /// the only renderer that draws them. They are decoded again if anything needs them.
+    pub fn set_release_picture_pixels(&mut self, on: bool) {
+        self.release_pixels = on;
+    }
+
+    /// How many pictures are on the GPU, and what their textures take, for tests.
+    #[doc(hidden)]
+    pub fn picture_counts(&self) -> (usize, u64) {
+        (
+            self.pictures.len(),
+            self.pictures
+                .values()
+                .map(|p| {
+                    let size = p.texture.size();
+                    let base = size.width as u64 * size.height as u64 * 4;
+                    if p.texture.mip_level_count() > 1 {
+                        base * 4 / 3
+                    } else {
+                        base
+                    }
+                })
+                .sum(),
+        )
     }
 
     /// Sends every box through the quad shader, which any drawing must match pixel for pixel.
@@ -1538,6 +1725,7 @@ impl Renderer {
                             continue;
                         }
                         let placed_ok = self.push_primitive(
+                            device,
                             prim,
                             at,
                             target,
@@ -1612,6 +1800,7 @@ impl Renderer {
                         continue;
                     }
                     self.push_primitive(
+                        device,
                         prim,
                         Placement::NONE,
                         screen,
@@ -1637,6 +1826,7 @@ impl Renderer {
     #[allow(clippy::too_many_arguments)]
     fn push_primitive(
         &mut self,
+        device: &wgpu::Device,
         prim: &Primitive,
         at: Placement,
         target: RectI,
@@ -1654,8 +1844,10 @@ impl Renderer {
             layers: layer_instances,
             shaders: shader_instances,
             backdrops,
+            pictures,
         } = instances;
         match prim {
+            Primitive::Image(d) => self.push_picture(device, d, at, target, pictures, batches),
             Primitive::Quad(q) => {
                 let scaled;
                 let q = if k == 1 {
@@ -1861,6 +2053,159 @@ impl Renderer {
         Some(())
     }
 
+    /// Adds what shows a picture, and makes sure the GPU is going to have it.
+    fn push_picture(
+        &mut self,
+        device: &wgpu::Device,
+        d: &ImageDraw,
+        at: Placement,
+        target: RectI,
+        pictures: &mut Vec<PictureInstance>,
+        batches: &mut Vec<Batch>,
+    ) {
+        let Placement { k, dx, dy } = at;
+        let rect = d.rect.scaled(k).translate(dx, dy);
+        let shape = d.shape.scaled(k).translated(dx, dy);
+        let clip = d.clip.scaled(k).translated(dx, dy);
+        let placed = ImageDraw {
+            rect,
+            shape,
+            clip,
+            ..d.clone()
+        };
+        let area = placed.area().intersect(&target);
+        if area.is_empty() || rect.is_empty() {
+            return;
+        }
+        let id = d.bitmap.id();
+        if !self.pictures.contains_key(&id) {
+            let Some(picture) = self.create_picture(device, &d.bitmap) else {
+                return;
+            };
+            self.pictures.insert(id, picture);
+            self.picture_uploads.push((d.bitmap.clone(), d.frame));
+        }
+        let picture = self.pictures.get_mut(&id).expect("just made sure");
+        if picture.frame != d.frame {
+            picture.frame = d.frame;
+            self.picture_uploads.push((d.bitmap.clone(), d.frame));
+        }
+        // As in Chrome: the smallest level that is no smaller than the box, read with bilinear
+        // filtering. See `docs/design/22-images.md` for how this was found out.
+        let tile = (d.tile.0 * k as f32, d.tile.1 * k as f32);
+        let shrink = (d.bitmap.width() as f32 / tile.0).max(d.bitmap.height() as f32 / tile.1);
+        let lod = (shrink.log2().floor() - picture.first as f32).max(0.0);
+        let sampler = u8::from(d.pixelated) | u8::from(d.repeat.0) << 1 | u8::from(d.repeat.1) << 2;
+        let opaque = d.covers_all();
+        let (clip_rect, clip_radii) = gpu_clip(&clip, target);
+        pictures.push(PictureInstance {
+            area: rect4(area),
+            rect: [rect.x as f32, rect.y as f32, tile.0, tile.1],
+            shape: rect4(shape.rect),
+            shape_radii: shape.radii,
+            clip: clip_rect,
+            clip_radii,
+            params: [lod, d.opacity],
+        });
+        let end = pictures.len() as u32;
+        match batches.last_mut() {
+            Some(Batch::Picture {
+                id: last,
+                sampler: same,
+                opaque: same_opaque,
+                range,
+            }) if *last == id && *same == sampler && *same_opaque == opaque => range.end = end,
+            _ => batches.push(Batch::Picture {
+                id,
+                sampler,
+                opaque,
+                range: end - 1..end,
+            }),
+        }
+    }
+
+    fn create_picture(&self, device: &wgpu::Device, bitmap: &Arc<Bitmap>) -> Option<GpuPicture> {
+        let (w, h) = (bitmap.width(), bitmap.height());
+        let mut first = 0;
+        while (w >> first).max(h >> first) > self.max_texture {
+            first += 1;
+        }
+        let levels = bitmap.level_count().saturating_sub(first).max(1);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("picture"),
+            size: wgpu::Extent3d {
+                width: (w >> first).max(1),
+                height: (h >> first).max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: levels,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("picture"),
+            layout: &self.picture_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            }],
+        });
+        Some(GpuPicture {
+            bitmap: Arc::downgrade(bitmap),
+            texture,
+            bind,
+            first,
+            frame: 0,
+        })
+    }
+
+    /// Hands to the GPU what the frame needs and it doesn't have.
+    fn upload_pictures(&mut self, queue: &wgpu::Queue) {
+        for (bitmap, frame) in std::mem::take(&mut self.picture_uploads) {
+            let Some(picture) = self.pictures.get(&bitmap.id()) else {
+                continue;
+            };
+            let (first, texture) = (picture.first, &picture.texture);
+            let write = |level: u32, (w, h): (u32, u32), pixels: &[u8]| {
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture,
+                        mip_level: level,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    pixels,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(w * 4),
+                        rows_per_image: Some(h),
+                    },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            };
+            if let Some(pixels) = bitmap.frame(frame) {
+                write(0, (bitmap.width(), bitmap.height()), pixels);
+                continue;
+            }
+            bitmap.with_levels(|level, size, pixels| {
+                if level >= first {
+                    write(level - first, size, pixels);
+                }
+            });
+            if self.release_pixels {
+                bitmap.release_levels();
+            }
+        }
+    }
+
     /// Records the scene into `view`, clearing it first.
     pub fn render(
         &mut self,
@@ -1937,6 +2282,7 @@ impl Renderer {
         } else {
             self.canvases.remove(&self.target);
         }
+        self.pictures.retain(|_, p| p.bitmap.strong_count() > 0);
         let plans = self.plan_layers(device, scene, damage);
         let Prepared {
             instances,
@@ -1944,6 +2290,7 @@ impl Renderer {
             effects,
             rasters,
         } = self.prepare(device, scene, damage, &plans);
+        self.upload_pictures(queue);
         for (g, pixels) in self.glyphs.uploads.drain(..) {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -1987,6 +2334,8 @@ impl Renderer {
             .upload(device, queue, bytemuck::cast_slice(&instances.layers));
         self.backdrop_buffer
             .upload(device, queue, bytemuck::cast_slice(&instances.backdrops));
+        self.picture_buffer
+            .upload(device, queue, bytemuck::cast_slice(&instances.pictures));
         if !instances.shaders.is_empty() {
             self.shader_buffer
                 .upload(device, queue, bytemuck::cast_slice(&instances.shaders));
@@ -2342,6 +2691,25 @@ impl Renderer {
                     pass.set_pipeline(&pipelines.backdrop);
                     pass.set_bind_group(1, self.effects.source_bind(*tex), &[]);
                     pass.set_vertex_buffer(0, self.backdrop_buffer.buffer.slice(..));
+                    pass.draw(0..4, range.clone());
+                }
+                Batch::Picture {
+                    id,
+                    sampler,
+                    opaque,
+                    range,
+                } => {
+                    let Some(picture) = self.pictures.get(id) else {
+                        continue;
+                    };
+                    pass.set_pipeline(if *opaque {
+                        &self.opaque_picture_pipeline
+                    } else {
+                        &self.picture_pipeline
+                    });
+                    pass.set_bind_group(1, &picture.bind, &[]);
+                    pass.set_bind_group(2, &self.picture_samplers[*sampler as usize], &[]);
+                    pass.set_vertex_buffer(0, self.picture_buffer.buffer.slice(..));
                     pass.draw(0..4, range.clone());
                 }
                 Batch::Shader {

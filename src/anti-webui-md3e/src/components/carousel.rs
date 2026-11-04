@@ -201,10 +201,21 @@ pub fn carousel<V: IntoView>(count: usize, preferred: f32, item: impl Fn(usize) 
                     s.left(left).w(width.max(0.0))
                 })
                 .child(
+                    // The middle of the item stays in the middle of what shows, as with the mask of
+                    // Compose: a picture keeps showing what it is of as it gets narrow.
                     div()
-                        .h_full()
-                        .flex_none()
-                        .dyn_style(move |s| s.w(lines.with(|l| l.large)))
+                        .absolute()
+                        .top(0.0)
+                        .bottom(0.0)
+                        .flex()
+                        .flex_col()
+                        .items_stretch()
+                        .dyn_style(move |s| {
+                            let large = lines.with(|l| l.large);
+                            let places =
+                                lines.with(|l| place_items(l, scroll.get(), count, main.get()));
+                            s.w(large).left((places[i].1 - large) * 0.5)
+                        })
                         .child(content),
                 )
         })

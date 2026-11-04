@@ -6,14 +6,16 @@ use crate::geometry::{PointI, RectI};
 use crate::layout::{child_clip, mark_outer_layers_stale};
 use crate::platform::PopupId;
 use crate::scene::{
-    BackdropDraw, ChunkKey, Clip, Glyph, GlyphRun, Layer, LayerFilter, Primitive, Quad, Scene,
-    ShaderDraw, Shadow,
+    BackdropDraw, ChunkKey, Clip, Glyph, GlyphRun, ImageDraw, Layer, LayerFilter, Primitive, Quad,
+    Scene, ShaderDraw, Shadow,
 };
 use crate::shader::{Image, ShaderPaint};
 use crate::text::selection::node_range;
 use crate::text::{Brush, TextLayout};
 use crate::tree::{Document, LayerMemo, Node, NodeId, NodeKind, popup_id};
-use anti_webui_style::{Color, Overflow};
+use anti_webui_style::{
+    BackgroundRepeat, BackgroundSize, Color, ImageRendering, Length, ObjectFit, Overflow,
+};
 use parley::PositionedLayoutItem;
 use slotmap::{Key, KeyData};
 use std::collections::HashMap;
@@ -70,6 +72,7 @@ pub fn paint_document(doc: &mut Document, now: Instant) -> Frame {
         })
         .collect();
     doc.layer_contents = new_layers;
+    doc.images.get_mut().end_frame();
     doc.stale_layers.clear();
     doc.settling = !settling.is_empty();
     for id in settling {
@@ -111,6 +114,8 @@ fn paint_root(
         reuse_layers: !doc.dirty.content,
         cull: true,
         settling: Vec::new(),
+        magnified: 1.0,
+        pictures: 0,
     };
     if doc.nodes[root].is_popup() {
         painter.contents(root, 1.0, screen);
@@ -151,11 +156,17 @@ fn paints_overlapping(doc: &Document, id: NodeId) -> bool {
             }
             NodeKind::Edit(_) => *things += 2,
             NodeKind::Fragment => {}
+            NodeKind::Image(_) => {
+                *things += 1 + u32::from(!c.background.is_transparent());
+                *things += u32::from(c.background_image.is_some());
+                *things += c.shadows.len() as u32;
+            }
             _ => {
                 let b = &node.resolved.border;
                 let border =
                     (b.top | b.right | b.bottom | b.left) != 0 && !c.border_color.is_transparent();
                 *things += u32::from(!c.background.is_transparent() || border);
+                *things += u32::from(c.background_image.is_some());
                 *things += c.shadows.len() as u32;
                 *things += u32::from(node.fill.is_some()) + u32::from(node.overlay.is_some());
                 *things += u32::from(c.backdrop_blur > 0.0);
@@ -211,6 +222,109 @@ fn physical_radii(node: &Node, scale: crate::geometry::Scale) -> [f32; 4] {
     [r.top_left, r.top_right, r.bottom_right, r.bottom_left]
 }
 
+/// Where a length along an axis puts something of size `size` in `free` room: percentages line up
+/// that point of both, like `object-position` and `background-position`.
+fn placed(at: Length, room: f32, size: f32, scale: crate::geometry::Scale) -> f32 {
+    match at {
+        Length::Px(v) => scale.pxf(v),
+        Length::Percent(p) => (room - size) * p / 100.0,
+        Length::Device(v) => v as f32,
+        Length::Auto => (room - size) * 0.5,
+    }
+}
+
+/// Where the whole picture goes for `object-fit` and `object-position`. Rounded like everything
+/// else: on the screen, parts of pixels would blur all of it.
+fn fitted_rect(
+    content: RectI,
+    natural: Option<(f32, f32)>,
+    fit: ObjectFit,
+    position: (Length, Length),
+    scale: crate::geometry::Scale,
+) -> RectI {
+    let Some((nw, nh)) = natural.filter(|n| n.0 > 0.0 && n.1 > 0.0) else {
+        return content;
+    };
+    let (cw, ch) = (content.width as f32, content.height as f32);
+    let (w, h) = match fit {
+        ObjectFit::Fill => return content,
+        ObjectFit::None => (nw, nh),
+        ObjectFit::Cover => {
+            let k = (cw / nw).max(ch / nh);
+            (nw * k, nh * k)
+        }
+        ObjectFit::Contain => {
+            let k = (cw / nw).min(ch / nh);
+            (nw * k, nh * k)
+        }
+        ObjectFit::ScaleDown => {
+            let k = (cw / nw).min(ch / nh).min(1.0);
+            (nw * k, nh * k)
+        }
+    };
+    let x = content.x as f32 + placed(position.0, cw, w, scale);
+    let y = content.y as f32 + placed(position.1, ch, h, scale);
+    let (x0, y0) = (x.round() as i32, y.round() as i32);
+    RectI::new(
+        x0,
+        y0,
+        (x + w).round() as i32 - x0,
+        (y + h).round() as i32 - y0,
+    )
+}
+
+/// Where one copy of a background goes, for `background-size` and `background-position`, and how
+/// big a copy is: copies follow each other at their exact size, as measured in Chrome, while one on
+/// its own goes on whole pixels.
+fn background_rect(
+    area: RectI,
+    natural: (f32, f32),
+    size: BackgroundSize,
+    position: (Length, Length),
+    scale: crate::geometry::Scale,
+) -> (RectI, (f32, f32)) {
+    let (aw, ah) = (area.width as f32, area.height as f32);
+    let (nw, nh) = natural;
+    if nw <= 0.0 || nh <= 0.0 {
+        return (RectI::default(), (0.0, 0.0));
+    }
+    let side = |l: Length, room: f32| match l {
+        Length::Px(v) => Some(scale.pxf(v)),
+        Length::Percent(p) => Some(room * p / 100.0),
+        Length::Device(v) => Some(v as f32),
+        Length::Auto => None,
+    };
+    let (w, h) = match size {
+        BackgroundSize::Auto => (nw, nh),
+        BackgroundSize::Cover => {
+            let k = (aw / nw).max(ah / nh);
+            (nw * k, nh * k)
+        }
+        BackgroundSize::Contain => {
+            let k = (aw / nw).min(ah / nh);
+            (nw * k, nh * k)
+        }
+        BackgroundSize::Size(w, h) => match (side(w, aw), side(h, ah)) {
+            (Some(w), Some(h)) => (w, h),
+            (Some(w), None) => (w, w * nh / nw),
+            (None, Some(h)) => (h * nw / nh, h),
+            (None, None) => (nw, nh),
+        },
+    };
+    let x = area.x as f32 + placed(position.0, aw, w, scale);
+    let y = area.y as f32 + placed(position.1, ah, h, scale);
+    let (x0, y0) = (x.round() as i32, y.round() as i32);
+    (
+        RectI::new(
+            x0,
+            y0,
+            ((x + w).round() as i32 - x0).max(1),
+            ((y + h).round() as i32 - y0).max(1),
+        ),
+        (w, h),
+    )
+}
+
 /// The coordinates of a variable font on steps of 1/64, so that what moves along an axis doesn't
 /// fill the glyph atlas. All at the default is none at all (see `docs/design/17-font-axes.md`).
 fn rounded_coords(coords: impl Iterator<Item = i16> + Clone) -> Vec<i16> {
@@ -250,6 +364,8 @@ pub fn paint_everything(doc: &Document, now: Instant) -> Scene {
         reuse_layers: false,
         cull: false,
         settling: Vec::new(),
+        magnified: 1.0,
+        pictures: 0,
     };
     if let Some(root) = doc.root {
         painter.node(root, 1.0, RectI::INFINITE);
@@ -293,6 +409,8 @@ mod part {
     pub const OVERLAY: u32 = 6;
     /// What is behind a node that is a layer, which goes before the layer.
     pub const BACKDROP: u32 = 7;
+    /// The picture of an `img`.
+    pub const PICTURE: u32 = 8;
 }
 
 struct Painter<'a> {
@@ -307,6 +425,10 @@ struct Painter<'a> {
     cull: bool,
     /// Transformed nodes shown between pixels.
     settling: Vec<NodeId>,
+    /// How much bigger what is being painted shows, by the transforms around it.
+    magnified: f64,
+    /// Counts the pictures painted, to find out whether a layer has any.
+    pictures: u32,
 }
 
 impl Painter<'_> {
@@ -332,8 +454,10 @@ impl Painter<'_> {
             .old_layers
             .remove(&id)
             .filter(|m| self.reuse_layers && !stale && m.covers.intersect(&view) == view);
+        let before = self.pictures;
         let (content, covers) = if let Some(m) = reused {
             self.keep_nested(&m.nested);
+            self.pictures += u32::from(m.pictures);
             (m.content, m.covers)
         } else {
             // A screenful around the view, so that scrolling doesn't paint on every frame.
@@ -356,6 +480,7 @@ impl Painter<'_> {
                 covers,
                 touched: RectI::INFINITE,
                 transform: Affine::IDENTITY,
+                pictures: self.pictures != before,
             },
         );
         self.chunk(id, part::LAYER);
@@ -404,10 +529,17 @@ impl Painter<'_> {
             }
         }
         let stale = doc.stale_layers.contains(&id);
-        let reused =
-            old.filter(|m| self.reuse_layers && !stale && m.covers.intersect(&view) == view);
+        let size = raw.max_scale();
+        // The pictures in it may have to be there in more detail.
+        let grew = old
+            .as_ref()
+            .is_some_and(|m| m.pictures && size > m.transform.max_scale());
+        let reused = old
+            .filter(|m| self.reuse_layers && !stale && !grew && m.covers.intersect(&view) == view);
+        let before = self.pictures;
         let (content, covers, touched) = if let Some(m) = reused {
             self.keep_nested(&m.nested);
+            self.pictures += u32::from(m.pictures);
             (m.content, m.covers, m.touched)
         } else {
             let covers = if self.cull {
@@ -416,7 +548,12 @@ impl Painter<'_> {
                 RectI::INFINITE
             };
             let outer = std::mem::take(self.scene);
+            let (around, reuse) = (self.magnified, self.reuse_layers);
+            self.magnified *= size;
+            self.reuse_layers &= !grew;
             self.node_body(id, 1.0, covers);
+            self.magnified = around;
+            self.reuse_layers = reuse;
             let content = std::mem::replace(self.scene, outer);
             let touched = what_it_touches(&content);
             (Arc::new(content), covers, touched)
@@ -429,6 +566,7 @@ impl Painter<'_> {
                 covers,
                 touched,
                 transform: raw,
+                pictures: self.pictures != before,
             },
         );
         self.backdrop_of_layer(id, opacity, transform, clip);
@@ -537,7 +675,9 @@ impl Painter<'_> {
         let reused = self.old_layers.remove(&id).filter(|m| {
             self.reuse_layers && !stale && m.nested.is_empty() && m.covers.intersect(&view) == view
         });
+        let before = self.pictures;
         let (content, covers, touched) = if let Some(m) = reused {
+            self.pictures += u32::from(m.pictures);
             (m.content, m.covers, m.touched)
         } else {
             let covers = if self.cull {
@@ -559,6 +699,7 @@ impl Painter<'_> {
                 covers,
                 touched,
                 transform: Affine::IDENTITY,
+                pictures: self.pictures != before,
             },
         );
         self.backdrop_of_layer(id, opacity, Affine::IDENTITY, node.clip_shape());
@@ -667,6 +808,10 @@ impl Painter<'_> {
         if let NodeKind::Edit(_) = &node.kind {
             self.edit(id, opacity);
         }
+        if let NodeKind::Image(_) = &node.kind {
+            self.chunk(id, part::PICTURE);
+            self.picture(id, opacity);
+        }
 
         if node.scroll_root {
             self.layer(id, opacity);
@@ -737,11 +882,17 @@ impl Painter<'_> {
             let draw = self.shader_draw(node, radii, paint, opacity);
             self.scene.primitives.push(draw);
         }
-        if !c.background.is_transparent() || has_border {
+        let picture = c
+            .background_image
+            .as_ref()
+            .and_then(|source| self.background_picture(id, source, radii, clip, opacity));
+        // A picture goes between the color and the border.
+        let together = picture.is_none();
+        if !c.background.is_transparent() || (has_border && together) {
             self.scene.primitives.push(Primitive::Quad(Quad {
                 rect: node.abs,
                 background,
-                border_widths: if has_border {
+                border_widths: if has_border && together {
                     [b.top, b.right, b.bottom, b.left]
                 } else {
                     [0; 4]
@@ -750,6 +901,19 @@ impl Painter<'_> {
                 radii,
                 clip,
             }));
+        }
+        if let Some(picture) = picture {
+            self.scene.primitives.push(Primitive::Image(picture));
+            if has_border {
+                self.scene.primitives.push(Primitive::Quad(Quad {
+                    rect: node.abs,
+                    background: Color::TRANSPARENT,
+                    border_widths: [b.top, b.right, b.bottom, b.left],
+                    border_color: fade(c.border_color, opacity),
+                    radii,
+                    clip,
+                }));
+            }
         }
         if c.shadows.iter().any(|s| s.inset) {
             let pad = node.padding_abs();
@@ -787,6 +951,133 @@ impl Painter<'_> {
             self.chunk(id, part::OVERLAY);
             self.scene.primitives.push(draw);
         }
+    }
+
+    /// The picture of an `img`, in its content box.
+    fn picture(&mut self, id: NodeId, opacity: f32) {
+        let doc = self.doc;
+        let node = &doc.nodes[id];
+        let Some(data) = node.image() else {
+            return;
+        };
+        let c = &node.computed;
+        let scale = doc.scale;
+        let content = node.content_abs();
+        if content.is_empty() {
+            return;
+        }
+        let natural = data
+            .natural
+            .map(|(w, h)| (scale.pxf(w / data.density), scale.pxf(h / data.density)));
+        let rect = fitted_rect(content, natural, c.object_fit, c.object_position, scale);
+        let pixelated = c.image_rendering == ImageRendering::Pixelated;
+        let showing = data.source.as_ref().and_then(|source| {
+            doc.images
+                .borrow_mut()
+                .want(id, source, self.wanted(rect), pixelated)
+        });
+        let (bitmap, frame) = match (showing, &data.fallback) {
+            (Some(s), _) => {
+                if !data.told.replace(true) {
+                    doc.images.borrow_mut().tell_decoded(id);
+                }
+                (s.bitmap, s.frame)
+            }
+            (None, Some(old)) => (old.clone(), 0),
+            (None, None) => return,
+        };
+        self.pictures += 1;
+        let b = &node.resolved.border;
+        let p = &node.resolved.padding;
+        let r = physical_radii(node, scale);
+        // Radii of the content edge: what the border and the padding leave of them.
+        let radii = [
+            (r[0] - (b.left + p.left).max(b.top + p.top) as f32).max(0.0),
+            (r[1] - (b.right + p.right).max(b.top + p.top) as f32).max(0.0),
+            (r[2] - (b.right + p.right).max(b.bottom + p.bottom) as f32).max(0.0),
+            (r[3] - (b.left + p.left).max(b.bottom + p.bottom) as f32).max(0.0),
+        ];
+        self.scene.primitives.push(Primitive::Image(ImageDraw {
+            bitmap,
+            frame,
+            rect,
+            tile: (rect.width as f32, rect.height as f32),
+            repeat: (false, false),
+            shape: Clip {
+                rect: content,
+                radii,
+            },
+            clip: node.clip_shape(),
+            opacity: snapped_opacity(opacity * c.image_opacity),
+            pixelated,
+        }));
+    }
+
+    /// The physical pixels a rectangle takes where it shows in the end.
+    fn wanted(&self, rect: RectI) -> (u32, u32) {
+        let k = self.magnified;
+        (
+            (rect.width.max(0) as f64 * k).ceil() as u32,
+            (rect.height.max(0) as f64 * k).ceil() as u32,
+        )
+    }
+
+    /// The picture of a node's background, if it is there to show.
+    fn background_picture(
+        &mut self,
+        id: NodeId,
+        source: &anti_webui_style::ImageSource,
+        radii: [f32; 4],
+        clip: Clip,
+        opacity: f32,
+    ) -> Option<ImageDraw> {
+        let doc = self.doc;
+        let node = &doc.nodes[id];
+        let c = &node.computed;
+        let scale = doc.scale;
+        let info = doc.images.borrow_mut().info(id, source)?;
+        let natural = (scale.pxf(info.natural.0), scale.pxf(info.natural.1));
+        let area = node.padding_abs();
+        let (rect, size) = background_rect(
+            area,
+            natural,
+            c.background_size,
+            c.background_position,
+            scale,
+        );
+        if rect.is_empty() {
+            return None;
+        }
+        let pixelated = c.image_rendering == ImageRendering::Pixelated;
+        let wanted = self.wanted(rect);
+        let showing = doc
+            .images
+            .borrow_mut()
+            .want(id, source, wanted, pixelated)?;
+        self.pictures += 1;
+        let repeat = match c.background_repeat {
+            BackgroundRepeat::Repeat => (true, true),
+            BackgroundRepeat::RepeatX => (true, false),
+            BackgroundRepeat::RepeatY => (false, true),
+            BackgroundRepeat::NoRepeat => (false, false),
+        };
+        Some(ImageDraw {
+            bitmap: showing.bitmap,
+            frame: showing.frame,
+            rect,
+            tile: (
+                if repeat.0 { size.0 } else { rect.width as f32 },
+                if repeat.1 { size.1 } else { rect.height as f32 },
+            ),
+            repeat,
+            shape: Clip {
+                rect: node.abs,
+                radii,
+            },
+            clip,
+            opacity: snapped_opacity(opacity),
+            pixelated,
+        })
     }
 
     /// What it takes to paint the box of `node` with a shader.

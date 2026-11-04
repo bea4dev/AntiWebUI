@@ -1,13 +1,14 @@
 //! Cards, lists, dialogs, sheets and the carousel.
 
-use super::{demo_is, row, section};
+use super::{demo_is, photo, row, section};
 use anti_webui::prelude::*;
 use anti_webui_md3e::color_scheme;
 use anti_webui_md3e::components::{
-    AlertDialog, ButtonStyle, CardKind, ListItemStyle, alert_dialog, bottom_sheet, button,
-    carousel, clickable_card, dialog, divider, elevated_card, filled_card, icon, list_item,
-    outlined_card, segmented_list, side_sheet, styled_button, styled_list_item, switch,
-    text_button, tonal_button, vertical_divider,
+    AlertDialog, ButtonStyle, CardKind, ListItemStyle, alert_dialog, avatar, bottom_sheet, button,
+    card_media, carousel, carousel_image, clickable_card, dialog, divider, elevated_card,
+    filled_card, icon, image, initials_avatar, list_item, outlined_card, segmented_list,
+    side_sheet, styled_button, styled_list_item, switch, text_button, tonal_button,
+    vertical_divider,
 };
 use anti_webui_md3e::icons;
 use anti_webui_md3e::typography::TextStyle;
@@ -224,24 +225,34 @@ fn modals() -> Div {
 }
 
 fn photos() -> Div {
-    let colors = [
-        rgb(0x6750a4),
-        rgb(0x7d5260),
-        rgb(0x386a20),
-        rgb(0x006a6a),
-        rgb(0x8c4a00),
-        rgb(0x3a5ba0),
-        rgb(0x984061),
-        rgb(0x4f5b62),
-    ];
-    section("Carousel").child(div().w(720.0).child(carousel(8, 240.0, move |i| {
-        div()
-            .size_full()
-            .flex()
-            .items_end()
-            .p(16.0)
-            .bg(colors[i])
-            .text_color(Color::WHITE)
-            .child(TextStyle::TITLE_MEDIUM.apply(text(format!("Photo {}", i + 1))))
-    })))
+    let pictures: Vec<ImageSource> = (0..8).map(|i| photo(i, 480, 320)).collect();
+    let at_top = photo(9, 640, 400);
+    let portrait = photo(3, 200, 200);
+    section("Pictures")
+        .child(
+            row()
+                .child(
+                    elevated_card()
+                        .w(280.0)
+                        .child(card_media(at_top.clone()))
+                        .child(div().p(16.0).child(
+                            TextStyle::TITLE_MEDIUM.apply(text("A picture across the top")),
+                        )),
+                )
+                .child(image(at_top).size(120.0).rounded(28.0))
+                .child(image("/no/such/file.png").size(120.0).rounded(28.0))
+                .child(avatar(portrait, "Ada Lovelace"))
+                .child(avatar("/no/such/file.png", "Grace Hopper"))
+                .child(initials_avatar("Alan Turing")),
+        )
+        .child(div().w(720.0).child(carousel(8, 240.0, move |i| {
+            carousel_image(pictures[i].clone()).child(
+                div()
+                    .absolute()
+                    .left(16.0)
+                    .bottom(16.0)
+                    .text_color(Color::WHITE)
+                    .child(TextStyle::TITLE_MEDIUM.apply(text(format!("Photo {}", i + 1)))),
+            )
+        })))
 }

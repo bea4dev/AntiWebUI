@@ -9,5 +9,10 @@ anti-webui-core.workspace = true
 anti-webui-wgpu.workspace = true
 png.workspace = true
 
+[dev-dependencies]
+anti-webui-core = { workspace = true, features = ["svg", "svg-text"] }
+image.workspace = true
+moxcms.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 anti-webui-wayland.workspace = true

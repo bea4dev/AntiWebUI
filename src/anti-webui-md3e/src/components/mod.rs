@@ -13,6 +13,7 @@ mod fab;
 mod fab_menu;
 mod icon;
 mod icon_button;
+mod image;
 mod list;
 mod loading;
 mod menu;
@@ -62,6 +63,7 @@ pub use icon_button::{
     IconButtonKind, IconButtonStyle, IconButtonWidth, filled_icon_button, icon_button,
     icon_toggle_button, outlined_icon_button, styled_icon_button, tonal_icon_button,
 };
+pub use image::{avatar, card_media, carousel_image, image, initials_avatar};
 pub use list::{ListItemStyle, list_item, segmented_list, styled_list_item};
 pub use loading::loading_indicator;
 pub use menu::{MenuItem, MenuStyle, menu, menu_item, styled_menu};

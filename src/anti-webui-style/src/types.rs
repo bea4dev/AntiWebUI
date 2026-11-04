@@ -1,4 +1,6 @@
 use crate::Color;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// A logical length.
@@ -99,6 +101,167 @@ impl<T: Copy> Corners<T> {
             bottom_left: f(self.bottom_left),
         }
     }
+}
+
+/// Pixels to show as they are: straight alpha, four bytes each, row by row.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RgbaPixels {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}
+
+/// Where a picture comes from. Two sources are the same picture when they name the same file or
+/// share the same memory. See `docs/design/22-images.md`.
+#[derive(Clone, Debug)]
+pub enum ImageSource {
+    Path(Arc<Path>),
+    /// An encoded file in the program: `include_bytes!("logo.png")`.
+    Static(&'static [u8]),
+    /// An encoded file in memory.
+    Bytes(Arc<[u8]>),
+    Pixels(Arc<RgbaPixels>),
+}
+
+impl ImageSource {
+    /// Pixels with straight alpha, four bytes each, row by row.
+    ///
+    /// # Panics
+    ///
+    /// If `data` doesn't hold exactly `width * height` pixels.
+    pub fn rgba(width: u32, height: u32, data: Vec<u8>) -> Self {
+        assert_eq!(
+            data.len() as u64,
+            width as u64 * height as u64 * 4,
+            "{width}x{height} pixels take four bytes each"
+        );
+        ImageSource::Pixels(Arc::new(RgbaPixels {
+            width,
+            height,
+            data,
+        }))
+    }
+}
+
+impl PartialEq for ImageSource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ImageSource::Path(a), ImageSource::Path(b)) => a == b,
+            (ImageSource::Static(a), ImageSource::Static(b)) => std::ptr::eq(*a, *b),
+            (ImageSource::Bytes(a), ImageSource::Bytes(b)) => Arc::ptr_eq(a, b),
+            (ImageSource::Pixels(a), ImageSource::Pixels(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ImageSource {}
+
+impl Hash for ImageSource {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            ImageSource::Path(p) => p.hash(state),
+            ImageSource::Static(b) => std::ptr::from_ref(*b).hash(state),
+            ImageSource::Bytes(b) => Arc::as_ptr(b).hash(state),
+            ImageSource::Pixels(p) => Arc::as_ptr(p).hash(state),
+        }
+    }
+}
+
+impl From<&str> for ImageSource {
+    fn from(path: &str) -> Self {
+        ImageSource::Path(Arc::from(Path::new(path)))
+    }
+}
+
+impl From<String> for ImageSource {
+    fn from(path: String) -> Self {
+        ImageSource::from(path.as_str())
+    }
+}
+
+impl From<&Path> for ImageSource {
+    fn from(path: &Path) -> Self {
+        ImageSource::Path(Arc::from(path))
+    }
+}
+
+impl From<PathBuf> for ImageSource {
+    fn from(path: PathBuf) -> Self {
+        ImageSource::Path(Arc::from(path))
+    }
+}
+
+impl From<&'static [u8]> for ImageSource {
+    fn from(bytes: &'static [u8]) -> Self {
+        ImageSource::Static(bytes)
+    }
+}
+
+impl<const N: usize> From<&'static [u8; N]> for ImageSource {
+    fn from(bytes: &'static [u8; N]) -> Self {
+        ImageSource::Static(bytes)
+    }
+}
+
+impl From<Vec<u8>> for ImageSource {
+    fn from(bytes: Vec<u8>) -> Self {
+        ImageSource::Bytes(Arc::from(bytes))
+    }
+}
+
+impl From<Arc<[u8]>> for ImageSource {
+    fn from(bytes: Arc<[u8]>) -> Self {
+        ImageSource::Bytes(bytes)
+    }
+}
+
+/// CSS `object-fit`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ObjectFit {
+    /// As big as the box, whatever that does to its proportions.
+    #[default]
+    Fill,
+    /// All of it in the box, in proportion.
+    Contain,
+    /// All of the box covered, in proportion.
+    Cover,
+    /// As big as it is.
+    None,
+    /// `None` or `Contain`, whichever comes out smaller.
+    ScaleDown,
+}
+
+/// CSS `image-rendering`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ImageRendering {
+    #[default]
+    Auto,
+    /// Pixels stay squares when they get bigger.
+    Pixelated,
+}
+
+/// CSS `background-size`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum BackgroundSize {
+    /// As big as the picture is.
+    #[default]
+    Auto,
+    Cover,
+    Contain,
+    /// Width and height. One that is `auto` keeps the proportions, percentages are of the padding
+    /// box.
+    Size(Length, Length),
+}
+
+/// CSS `background-repeat`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BackgroundRepeat {
+    #[default]
+    Repeat,
+    RepeatX,
+    RepeatY,
+    NoRepeat,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

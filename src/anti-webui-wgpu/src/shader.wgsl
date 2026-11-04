@@ -317,3 +317,61 @@ fn fs_layer(in: LayerOut) -> @location(0) vec4<f32> {
     }
     return textureSampleLevel(atlas, atlas_sampler, in.uv, 0.0) * (in.opacity * clip_cov);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Pictures. See docs/design/22-images.md.
+
+@group(1) @binding(0) var picture: texture_2d<f32>;
+@group(2) @binding(0) var picture_sampler: sampler;
+
+struct PictureInstance {
+    @location(0) area: vec4<f32>,  // what this instance draws
+    @location(1) rect: vec4<f32>,  // where all of the picture goes
+    @location(2) shape: vec4<f32>,
+    @location(3) shape_radii: vec4<f32>,
+    @location(4) clip: vec4<f32>,
+    @location(5) clip_radii: vec4<f32>,
+    @location(6) params: vec2<f32>, // x: level to read, y: opacity
+}
+
+struct PictureOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) shape: vec4<f32>,
+    @location(2) @interpolate(flat) shape_radii: vec4<f32>,
+    @location(3) @interpolate(flat) clip: vec4<f32>,
+    @location(4) @interpolate(flat) clip_radii: vec4<f32>,
+    @location(5) @interpolate(flat) params: vec2<f32>,
+}
+
+@vertex
+fn vs_picture(@builtin(vertex_index) vi: u32, inst: PictureInstance) -> PictureOut {
+    var out: PictureOut;
+    let p = inst.area.xy + corner(vi) * inst.area.zw;
+    out.position = to_clip(p);
+    out.uv = (p - inst.rect.xy) / inst.rect.zw;
+    out.shape = inst.shape;
+    out.shape_radii = inst.shape_radii;
+    out.clip = inst.clip;
+    out.clip_radii = inst.clip_radii;
+    out.params = inst.params;
+    return out;
+}
+
+@fragment
+fn fs_picture(in: PictureOut) -> @location(0) vec4<f32> {
+    var coverage = clip_coverage(in.position.xy, in.clip, in.clip_radii);
+    if (max(max(in.shape_radii.x, in.shape_radii.y), max(in.shape_radii.z, in.shape_radii.w)) > 0.0) {
+        coverage *= rrect_coverage(in.position.xy, in.shape, in.shape_radii);
+    }
+    if (coverage <= 0.0) {
+        discard;
+    }
+    return textureSampleLevel(picture, picture_sampler, in.uv, in.params.x) * (in.params.y * coverage);
+}
+
+// Nothing shows through it and nothing cuts it: most of a page of photos.
+@fragment
+fn fs_opaque_picture(in: PictureOut) -> @location(0) vec4<f32> {
+    return textureSampleLevel(picture, picture_sampler, in.uv, in.params.x);
+}

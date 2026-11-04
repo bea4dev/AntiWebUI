@@ -4,7 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["svg", "svg-text"]
+## Pictures in SVG.
+svg = ["dep:resvg"]
+## Text in SVG, which reads the fonts of the system when it comes up and adds 1.6 MiB.
+svg-text = ["svg", "resvg/text", "resvg/system-fonts"]
+
 [dependencies]
+image.workspace = true
+moxcms.workspace = true
+resvg = { workspace = true, optional = true }
 anti-webui-style.workspace = true
 parley.workspace = true
 icu_properties.workspace = true

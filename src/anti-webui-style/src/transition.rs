@@ -109,6 +109,7 @@ pub enum Prop {
     Scale,
     Rotate,
     Opacity,
+    ImageOpacity,
     Blur,
     BackdropBlur,
     Background,
@@ -260,6 +261,7 @@ animated_fields! {
     Scale: scale_x as Number, scale_y as Number;
     Rotate: rotate as Number;
     Opacity: opacity as Number;
+    ImageOpacity: image_opacity as Number;
     Blur: blur as Number;
     BackdropBlur: backdrop_blur as Number;
     Background: background as Color;

@@ -17,7 +17,8 @@ use crate::tree::{
     Document, Handler, Listeners, Node, NodeId, NodeKind, PopupData, TextData, with_doc,
 };
 use anti_webui_style::{
-    AlignItems, Display as Layout, FlexDirection, Sheet, Style, Styled, Transition, UserSelect,
+    AlignItems, Display as Layout, FlexDirection, ImageSource, Sheet, Style, Styled, Transition,
+    UserSelect,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -513,6 +514,135 @@ impl IntoView for Div {
         let id = self.cfg.build(Node::new(NodeKind::Element));
         let children: Vec<NodeId> = self.children.into_iter().map(|v| v.0).collect();
         with_doc(|d| d.set_children(id, children));
+        View(id)
+    }
+}
+
+/// Where an `img` takes its picture from: something that makes an [`ImageSource`], or a closure that
+/// returns one.
+pub trait IntoImageSource {
+    fn into_image_source(self) -> Box<dyn Fn() -> ImageSource>;
+}
+
+impl<F, S> IntoImageSource for F
+where
+    F: Fn() -> S + 'static,
+    S: Into<ImageSource>,
+{
+    fn into_image_source(self) -> Box<dyn Fn() -> ImageSource> {
+        Box::new(move || self().into())
+    }
+}
+
+macro_rules! image_sources {
+    ($($ty:ty),* $(,)?) => {$(
+        impl IntoImageSource for $ty {
+            fn into_image_source(self) -> Box<dyn Fn() -> ImageSource> {
+                let source: ImageSource = self.into();
+                Box::new(move || source.clone())
+            }
+        }
+    )*};
+}
+
+image_sources!(
+    ImageSource,
+    &str,
+    String,
+    &std::path::Path,
+    std::path::PathBuf,
+    &'static [u8],
+    Vec<u8>,
+    std::sync::Arc<[u8]>,
+);
+
+impl<const N: usize> IntoImageSource for &'static [u8; N] {
+    fn into_image_source(self) -> Box<dyn Fn() -> ImageSource> {
+        Box::new(move || self.into())
+    }
+}
+
+/// A picture in a box, like `<img>`. See `docs/design/22-images.md`.
+pub struct Img {
+    cfg: ElementConfig,
+    source: Box<dyn Fn() -> ImageSource>,
+    data: crate::tree::ImageData,
+    children: Vec<View>,
+}
+
+/// A picture from a file, or from something in memory. When a closure says something else, what
+/// shows stays until that is there to show.
+pub fn img(source: impl IntoImageSource) -> Img {
+    Img {
+        cfg: ElementConfig::default(),
+        source: source.into_image_source(),
+        data: crate::tree::ImageData {
+            density: 1.0,
+            ..Default::default()
+        },
+        children: Vec::new(),
+    }
+}
+
+impl Styled for Img {
+    fn style_mut(&mut self) -> &mut Style {
+        &mut self.cfg.style
+    }
+}
+
+impl Img {
+    element_methods!();
+
+    /// How many pixels of the picture make a logical pixel, for a picture made for screens with
+    /// more pixels (`srcset="a.png 2x"`). The box gets smaller, and the picture sharper.
+    pub fn density(mut self, density: f32) -> Self {
+        self.data.density = density.max(f32::EPSILON);
+        self
+    }
+
+    /// Called when the size of the picture is known, in logical pixels.
+    pub fn on_load(mut self, f: impl Fn(f32, f32) + 'static) -> Self {
+        self.data.on_load = Some(Rc::new(f));
+        self
+    }
+
+    /// Called when there are pixels to show. This waits until the picture comes near the screen.
+    pub fn on_decoded(mut self, f: impl Fn() + 'static) -> Self {
+        self.data.on_decoded = Some(Rc::new(f));
+        self
+    }
+
+    /// Called when the picture can't be shown, and with why.
+    pub fn on_error(mut self, f: impl Fn(&str) + 'static) -> Self {
+        self.data.on_error = Some(Rc::new(f));
+        self
+    }
+
+    /// Lays something over the picture, in its content box. It has no say in the size of the box.
+    pub fn child(mut self, child: impl IntoView) -> Self {
+        self.children.push(child.into_view());
+        self
+    }
+
+    pub fn children<V: IntoView>(mut self, children: impl IntoIterator<Item = V>) -> Self {
+        self.children
+            .extend(children.into_iter().map(IntoView::into_view));
+        self
+    }
+}
+
+impl IntoView for Img {
+    fn into_view(self) -> View {
+        let id = self
+            .cfg
+            .build(Node::new(NodeKind::Image(Box::new(self.data))));
+        let children: Vec<NodeId> = self.children.into_iter().map(|v| v.0).collect();
+        with_doc(|d| d.set_children(id, children));
+        let source = self.source;
+        effect(move || {
+            let source = source();
+            with_doc(|d| d.set_image_source(id, source));
+        });
         View(id)
     }
 }

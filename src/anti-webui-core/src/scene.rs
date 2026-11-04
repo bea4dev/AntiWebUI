@@ -1,6 +1,7 @@
 //! The renderer-independent display list produced each frame. Coordinates are physical pixels.
 
 use crate::geometry::{Affine, PointI, RectI};
+use crate::images::Bitmap;
 use crate::shader::{Image, ShaderPaint};
 use anti_webui_style::Color;
 pub use parley::FontData;
@@ -313,8 +314,70 @@ impl BackdropDraw {
     }
 }
 
+/// A picture. See `docs/design/22-images.md`.
+#[derive(Clone, Debug)]
+pub struct ImageDraw {
+    pub bitmap: Arc<Bitmap>,
+    /// Which one, of an animation.
+    pub frame: u32,
+    /// Where all of the picture goes: the first of them, if it repeats.
+    pub rect: RectI,
+    /// How far apart its copies are, which need not be whole pixels.
+    pub tile: (f32, f32),
+    /// Whether it goes on past `rect`, horizontally and vertically.
+    pub repeat: (bool, bool),
+    /// What it is cut to, which can be rounded.
+    pub shape: Clip,
+    pub clip: Clip,
+    pub opacity: f32,
+    /// Pixels stay squares when they get bigger.
+    pub pixelated: bool,
+}
+
+impl ImageDraw {
+    /// What it can touch.
+    pub fn area(&self) -> RectI {
+        let mut area = self.shape.rect.intersect(&self.clip.rect);
+        let (r, a) = (self.rect, area);
+        if !self.repeat.0 {
+            let (x, right) = (a.x.max(r.x), a.right().min(r.right()));
+            area.x = x;
+            area.width = (right - x).max(0);
+        }
+        if !self.repeat.1 {
+            let (y, bottom) = (a.y.max(r.y), a.bottom().min(r.bottom()));
+            area.y = y;
+            area.height = (bottom - y).max(0);
+        }
+        area
+    }
+
+    /// Whether nothing shows through it and it doesn't need cutting in the shader.
+    pub fn covers_all(&self) -> bool {
+        self.bitmap.is_opaque()
+            && self.opacity >= 1.0
+            && !self.shape.is_rounded()
+            && !self.clip.is_rounded()
+    }
+}
+
+impl PartialEq for ImageDraw {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.bitmap, &other.bitmap)
+            && self.frame == other.frame
+            && self.rect == other.rect
+            && self.tile == other.tile
+            && self.repeat == other.repeat
+            && self.shape == other.shape
+            && self.clip == other.clip
+            && self.opacity == other.opacity
+            && self.pixelated == other.pixelated
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Primitive {
+    Image(ImageDraw),
     Shadow(Shadow),
     Quad(Quad),
     Glyphs(GlyphRun),

@@ -12,7 +12,8 @@ cargo run --release -p anti-webui-md3e --example showcase [actions|selection|com
 |---|---|
 | 選択 | `switch`、`checkbox`、`tri_state_checkbox`、`radio_button`、`slider`、`range_slider`、`assist_chip`、`suggestion_chip`、`filter_chip`、`input_chip` |
 | 通知 | `linear_progress`、`circular_progress`、`circular_wavy_progress`、`indeterminate_*` 4 種、`badge`、`text_badge`、`badged`、`tooltip`、`rich_tooltip`、`snackbars` |
-| 容器 | `filled_card`、`elevated_card`、`outlined_card`、`clickable_card`、`divider`、`vertical_divider`、`list_item`、`segmented_list`、`dialog`、`alert_dialog`、`bottom_sheet`、`side_sheet`、`navigation_drawer`、`carousel` |
+| 容器 | `filled_card`、`elevated_card`、`outlined_card`、`clickable_card`、`divider`、`vertical_divider`、`list_item`、`segmented_list`、`dialog`、`alert_dialog`、`bottom_sheet`、`side_sheet`、`navigation_drawer`、`carousel`、`card_media`、`carousel_image` |
+| 画像 | `image`、`avatar`、`initials_avatar`（[22](22-images.md)） |
 | 移動 | `navigation_bar`、`short_navigation_bar`、`navigation_rail`、`wide_navigation_rail`、`drawer_item`、`tabs`、`styled_tabs`、`top_app_bar`、`top_app_bar_over`、`bottom_app_bar`、`flexible_bottom_app_bar`、`floating_toolbar`、`floating_toolbar_with_fab` |
 | 入力 | `text_field`、`outlined_text_field`、`dropdown_field`、`search_bar`、`menu`、`fab_menu`、`split_button`、`date_picker`、`date_picker_dialog`、`time_picker`、`time_picker_dialog` |
 
@@ -287,7 +288,7 @@ bars.show(Snackbar::new("保存しました").action("元に戻す", || undo()).
 
 ### カルーセル
 
-`multi_browse_keylines` は Compose の式で、与えられた幅と希望の大きさから、大・中・小の場所を決める。項目は常に大の幅で作り、場所の幅で切り抜いて見せる。
+`multi_browse_keylines` は Compose の式で、与えられた幅と希望の大きさから、大・中・小の場所を決める。項目は常に大の幅で作り、場所の幅で切り抜いて見せる。Compose の `maskClip` と同じく、切り抜きの中央に項目の中央を合わせる（パララックス）。
 
 **Compose との違い。** 端での切り替えは Compose の段階的な計算ではなく、並びを逆順にしたものへ 1 回で補間する。角丸は 28、間は 8（Compose は呼び出し側が決め、既定の間は 0）。ドラッグとスクロールのあと、次の項目へばね（400、1.0）で止まる。
 
@@ -487,7 +488,6 @@ fab_menu(icons::ADD, move || open.get(), move || open.update(|o| *o = !*o), item
 ## やっていないこと
 
 - `flex-wrap`。チップの列やボタンの列は折り返さない（[07](07-roadmap.md) の M2）。
-- 画像。カルーセルとカードは色や `fill` で埋める。
 - HCT による配色の生成。
 - テキストの選択と IME の、フィールド固有の見た目（コアの標準のまま）。
 - 上記の各節の「Compose との違い」に挙げたもの。

@@ -9,6 +9,7 @@ mod choice;
 mod dialog;
 mod display;
 mod field;
+mod image;
 mod layout;
 mod long;
 mod menu;
@@ -25,6 +26,7 @@ pub use choice::*;
 pub use dialog::*;
 pub use display::*;
 pub use field::*;
+pub use image::*;
 pub use layout::*;
 pub use long::*;
 pub use menu::{

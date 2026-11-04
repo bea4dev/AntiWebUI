@@ -119,6 +119,22 @@ define_style! {
     outline_color: Color = Color::from_rgb(0x2f81f7), local;
 
     background: Color = Color::TRANSPARENT, local;
+    /// Above the background color and below the border. See `docs/design/22-images.md`.
+    background_image: Option<ImageSource> = None, local;
+    background_size: BackgroundSize = BackgroundSize::Auto, local;
+    /// Where the picture goes in the padding box. A percentage lines up that point of both.
+    background_position: (Length, Length) = (Length::Percent(0.0), Length::Percent(0.0)), local;
+    background_repeat: BackgroundRepeat = BackgroundRepeat::Repeat, local;
+    /// How a picture fills the content box of `img`.
+    object_fit: ObjectFit = ObjectFit::Fill, local;
+    object_position: (Length, Length) = (Length::Percent(50.0), Length::Percent(50.0)), local;
+    /// How opaque the picture of `img` is, on its own: what is behind it in the box stays. For
+    /// fading a picture in over what shows while it loads.
+    image_opacity: f32 = 1.0, local;
+    image_rendering: ImageRendering = ImageRendering::Auto, inherited;
+    /// Width over height. The side that is `auto` follows the other; other than for pictures, the
+    /// box still grows to fit its content.
+    aspect_ratio: Option<f32> = None, local;
     shadows: Vec<BoxShadow> = Vec::new(), local;
     opacity: f32 = 1.0, local;
     /// Logical pixels: the standard deviation, like CSS. Applies to what the node and its children

@@ -129,10 +129,35 @@ pub fn popup_node(id: PopupId) -> NodeId {
     clippy::large_enum_variant,
     reason = "text nodes are the common case; boxing them would add an indirection per paint"
 )]
+/// What an `img` shows.
+#[derive(Default)]
+pub struct ImageData {
+    pub source: Option<anti_webui_style::ImageSource>,
+    /// In logical pixels when one pixel of the picture is one of them, or `None` while it isn't
+    /// known. It stays from the last picture until the next one is known.
+    pub natural: Option<(f32, f32)>,
+    /// How many pixels of the picture make a logical pixel.
+    pub density: f32,
+    /// What to show until the source shows, when the source changed.
+    pub fallback: Option<Arc<crate::images::Bitmap>>,
+    /// `on_decoded` has been called for this source.
+    pub told: std::cell::Cell<bool>,
+    pub on_load: Option<Rc<dyn Fn(f32, f32)>>,
+    pub on_decoded: Option<Rc<dyn Fn()>>,
+    pub on_error: Option<ErrorListener>,
+}
+
+/// Told why a picture can't be shown.
+pub type ErrorListener = Rc<dyn Fn(&str)>;
+
+// Text is what there is the most of, so it is worth the room over going through a pointer.
+#[allow(clippy::large_enum_variant)]
 pub enum NodeKind {
     Element,
     Text(TextData),
     Edit(Box<EditData>),
+    /// A picture in its box: `img`. See `docs/design/22-images.md`.
+    Image(Box<ImageData>),
     /// Generates no box; children take part in the parent's layout.
     Fragment,
     /// The root of what is shown in a surface of its own. It stays in the tree for its lifetime,
@@ -262,6 +287,13 @@ impl Node {
         }
     }
 
+    pub fn image(&self) -> Option<&ImageData> {
+        match &self.kind {
+            NodeKind::Image(d) => Some(d),
+            _ => None,
+        }
+    }
+
     pub fn is_text(&self) -> bool {
         matches!(self.kind, NodeKind::Text(_))
     }
@@ -387,6 +419,8 @@ pub struct LayerMemo {
     pub transform: Affine,
     /// The layers directly in `content`.
     pub nested: Vec<NodeId>,
+    /// There are pictures somewhere in `content`.
+    pub pictures: bool,
 }
 
 /// What needs recomputing before the next frame.
@@ -462,6 +496,8 @@ pub struct Document {
     pub scrolled: Vec<NodeId>,
     /// Nodes that got another size and have someone waiting to hear about it.
     pub resized: Vec<NodeId>,
+    /// Painting asks for pictures while the rest of the document stays as it is.
+    pub images: RefCell<crate::images::ImageStore>,
 }
 
 /// What a stacking context paints above its own background, besides its children in tree order.
@@ -499,6 +535,7 @@ thread_local! {
         pending_scroll: Vec::new(),
         scrolled: Vec::new(),
         resized: Vec::new(),
+        images: RefCell::default(),
     });
 }
 
@@ -712,6 +749,42 @@ impl Document {
         self.dirty.content = true;
     }
 
+    /// An `img` is to show `source` now. What it showed stays until this shows.
+    pub(crate) fn set_image_source(&mut self, id: NodeId, source: anti_webui_style::ImageSource) {
+        let Some(old) = self
+            .nodes
+            .get(id)
+            .and_then(|n| n.image())
+            .map(|d| d.source.clone())
+        else {
+            return;
+        };
+        if old.as_ref() == Some(&source) {
+            return;
+        }
+        let images = self.images.get_mut();
+        let fallback = old.as_ref().and_then(|old| {
+            let best = images.best(old);
+            images.release(id, old);
+            best
+        });
+        let info = images.acquire(id, &source);
+        let ready = images.best(&source).is_some();
+        if info.is_some() {
+            crate::images::tell_loaded(images, id);
+        }
+        if let Some(NodeKind::Image(d)) = self.nodes.get_mut(id).map(|n| &mut n.kind) {
+            d.source = Some(source);
+            d.fallback = fallback.filter(|_| !ready);
+            d.told.set(false);
+            if let Some(info) = info {
+                d.natural = Some(info.natural);
+            }
+        }
+        self.invalidate_layout(id);
+        self.mark_shader_of(id);
+    }
+
     /// Marks `id` and its ancestors for re-layout; clean subtrees keep their cached layout.
     pub fn invalidate_layout(&mut self, id: NodeId) {
         let mut cur = Some(id);
@@ -835,6 +908,9 @@ impl Document {
         }
         self.detach(id);
         if let Some(node) = self.nodes.remove(id) {
+            if let Some(source) = node.image().and_then(|d| d.source.as_ref()) {
+                self.images.get_mut().release(id, source);
+            }
             if let Some(popup) = node.popup() {
                 self.popups.retain(|p| *p != id);
                 if popup.sent.is_some() {

@@ -623,3 +623,231 @@ pub fn layout() -> Div {
                 .child(pagination(few, || 5)),
         ))
 }
+
+/// A made-up photo: hills under a sky, in what shades `seed` says. No files to carry around.
+fn photo(seed: u32, width: u32, height: u32) -> ImageSource {
+    let hue = seed as f32 * 0.7;
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let (u, v) = (x as f32 / width as f32, y as f32 / height as f32);
+            let wave = |freq: f32, shift: f32| (u * freq + shift + hue).sin() * 0.5 + 0.5;
+            let far = 0.45 + 0.12 * wave(6.0, 1.0);
+            let near = 0.68 + 0.1 * wave(9.0, 4.0);
+            let aspect = width as f32 / height as f32;
+            let sun = (((u - 0.72) * aspect).powi(2) + (v - 0.25).powi(2)).sqrt();
+            let (r, g, b) = if v > near {
+                (0.16 + 0.1 * hue.sin().abs(), 0.42 - 0.2 * (v - near), 0.3)
+            } else if v > far {
+                (0.3 + 0.1 * wave(3.0, 0.0), 0.5, 0.45 + 0.1 * hue.cos())
+            } else if sun < 0.08 {
+                (1.0, 0.92, 0.6)
+            } else {
+                (
+                    0.45 + 0.4 * v + 0.1 * hue.sin(),
+                    0.6 + 0.25 * v,
+                    0.95 - 0.1 * v,
+                )
+            };
+            pixels.extend([
+                (r.clamp(0.0, 1.0) * 255.0) as u8,
+                (g.clamp(0.0, 1.0) * 255.0) as u8,
+                (b.clamp(0.0, 1.0) * 255.0) as u8,
+                255,
+            ]);
+        }
+    }
+    ImageSource::rgba(width, height, pixels)
+}
+
+/// An animation made here: a ball going around.
+fn animation() -> Vec<u8> {
+    use image::codecs::gif::{GifEncoder, Repeat};
+    use image::{Delay, Frame, Rgba, RgbaImage};
+    let mut out = Vec::new();
+    {
+        let mut encoder = GifEncoder::new_with_speed(&mut out, 30);
+        encoder.set_repeat(Repeat::Infinite).expect("in memory");
+        for i in 0..24 {
+            let at = i as f32 / 24.0 * std::f32::consts::TAU;
+            let (cx, cy) = (48.0 + at.cos() * 28.0, 48.0 + at.sin() * 28.0);
+            let picture = RgbaImage::from_fn(96, 96, |x, y| {
+                let d = ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt();
+                if d < 10.0 {
+                    Rgba([47, 129, 247, 255])
+                } else {
+                    Rgba([230, 235, 240, 255])
+                }
+            });
+            encoder
+                .encode_frame(Frame::from_parts(
+                    picture,
+                    0,
+                    0,
+                    Delay::from_numer_denom_ms(40, 1),
+                ))
+                .expect("in memory");
+        }
+    }
+    out
+}
+
+const LOGO: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+<circle cx="24" cy="24" r="22" fill="#2f81f7"/>
+<path d="M12 34 L24 12 L36 34 Z" fill="none" stroke="#fff" stroke-width="3" stroke-linejoin="round"/>
+</svg>"##;
+
+pub fn images() -> Div {
+    let sample = photo(1, 640, 400);
+    let portrait = photo(3, 300, 400);
+    let swapped = signal(false);
+    let (first, second) = (photo(2, 480, 320), photo(5, 480, 320));
+    let fits = [
+        ("fill", ObjectFit::Fill),
+        ("contain", ObjectFit::Contain),
+        ("cover", ObjectFit::Cover),
+        ("none", ObjectFit::None),
+        ("scale-down", ObjectFit::ScaleDown),
+    ];
+    sections()
+        .child(section(
+            "image_view",
+            row()
+                .child(
+                    image_view(sample.clone(), "Hills")
+                        .w(200.0)
+                        .h(130.0)
+                        .rounded(8.0),
+                )
+                .child(
+                    image_view(sample.clone(), "Hills")
+                        .w(130.0)
+                        .h(130.0)
+                        .rounded(65.0),
+                )
+                .child(
+                    image_view("/no/such/file.png", "A picture that isn't there")
+                        .w(200.0)
+                        .h(130.0)
+                        .rounded(8.0),
+                ),
+        ))
+        .child(section(
+            "object-fit",
+            row().children(fits.map(|(name, fit)| {
+                col().gap(4.0).child(label(name)).child(
+                    img(sample.clone())
+                        .w(150.0)
+                        .h(90.0)
+                        .object_fit(fit)
+                        .bg(rgb(0x808080))
+                        .rounded(4.0),
+                )
+            })),
+        ))
+        .child(section(
+            "avatar",
+            row()
+                .child(avatar("Ada Lovelace"))
+                .child(image_avatar(portrait.clone(), "Grace Hopper"))
+                .child(image_avatar(portrait.clone(), "Grace Hopper").size(64.0))
+                .child(image_avatar("/no/such/file.png", "Alan Turing")),
+        ))
+        .child(section(
+            "media_card",
+            row().child(
+                media_card(sample.clone(), "Hills").w(280.0).child(
+                    card_body()
+                        .child(heading("Hills").text_size(16.0))
+                        .child(label("The picture goes to the corners of the card.")),
+                ),
+            ),
+        ))
+        .child(section(
+            "Background",
+            row()
+                .child(
+                    div()
+                        .w(240.0)
+                        .h(130.0)
+                        .rounded(8.0)
+                        .bg_image(sample.clone())
+                        .bg_size(BackgroundSize::Cover)
+                        .bg_position(pct(50.0), pct(50.0))
+                        .flex()
+                        .items_end()
+                        .p(12.0)
+                        .text_color(Color::WHITE)
+                        .child(text("On top of a picture")),
+                )
+                .child(
+                    div()
+                        .w(240.0)
+                        .h(130.0)
+                        .rounded(8.0)
+                        .border(1.0)
+                        .bg_image(LOGO)
+                        .bg_size(BackgroundSize::Size(px(32.0), px(32.0))),
+                ),
+        ))
+        .child(section(
+            "SVG, and changing the source",
+            row()
+                .child(img(LOGO).size(24.0))
+                .child(img(LOGO).size(48.0))
+                .child(img(LOGO).size(96.0))
+                .child(
+                    img(move || {
+                        if swapped.get() {
+                            second.clone()
+                        } else {
+                            first.clone()
+                        }
+                    })
+                    .w(150.0)
+                    .h(100.0)
+                    .object_fit(ObjectFit::Cover)
+                    .rounded(8.0),
+                )
+                .child(button("Change").on_click(move |_| swapped.update(|s| *s = !*s))),
+        ))
+        .child(section(
+            "An animation runs on timers alone, and only while it is in view",
+            row().child(img(animation()).size(96.0).rounded(8.0)),
+        ))
+        .child(section(
+            "Goes with everything else",
+            row()
+                .child(
+                    img(sample.clone())
+                        .w(150.0)
+                        .h(100.0)
+                        .object_fit(ObjectFit::Cover)
+                        .opacity(0.5),
+                )
+                .child(
+                    img(sample.clone())
+                        .w(150.0)
+                        .h(100.0)
+                        .object_fit(ObjectFit::Cover)
+                        .blur(3.0),
+                )
+                .child(
+                    img(sample.clone())
+                        .w(150.0)
+                        .h(100.0)
+                        .object_fit(ObjectFit::Cover)
+                        .rounded(12.0)
+                        .transition(Transition::ms(200).ease_out())
+                        .hover(|s| s.scale(1.1).rotate(3.0)),
+                )
+                .child(
+                    img(sample)
+                        .w(150.0)
+                        .h(100.0)
+                        .object_fit(ObjectFit::Cover)
+                        .rounded(12.0)
+                        .shadow_md(),
+                ),
+        ))
+}

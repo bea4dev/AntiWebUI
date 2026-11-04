@@ -154,6 +154,8 @@ GPU の時間、実ウィンドウでの CPU と消費電力、Chrome との比�
 
 重なる処理（ツールチップの待ち時間、モーダルの枠組み）は共通化しない。必要な量が少なく、動きが違うからである。MD3E が必要とする共通部分は `portal`、`modal`、`set_timeout` としてすでに core にある。
 
+画像を持つ部品（`image_view`、`avatar`、`image_avatar`、`media_card`）は [22](22-images.md) にある。
+
 ## 今回やらないこと
 
 - 文字を打って項目へ飛ぶ操作（`select`、`menu`、`list_box`）

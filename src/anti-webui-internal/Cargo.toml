@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["svg", "svg-text"]
+svg = ["anti-webui-core/svg"]
+svg-text = ["anti-webui-core/svg-text"]
+
 [dependencies]
 anti-webui-core.workspace = true
 anti-webui-style.workspace = true

@@ -80,6 +80,8 @@ pub trait WaylandHandler {
     fn may_render_ahead(&mut self, _ctx: &mut Ctx<'_>) -> bool {
         false
     }
+    /// Another thread called the function from [`Ctx::waker`].
+    fn woken(&mut self, _ctx: &mut Ctx<'_>) {}
 }
 
 impl<H: WaylandHandler> WaylandHandler for &mut H {
@@ -139,6 +141,15 @@ impl Ctx<'_> {
 
     pub fn request_paste(&mut self, kind: ClipboardKind) {
         self.state.request_paste(self.conn, kind);
+    }
+
+    /// Something another thread can call to wake up the event loop, which then calls
+    /// [`WaylandHandler::woken`].
+    pub fn waker(&self) -> Option<impl Fn() + Send + Sync + use<>> {
+        let wake = self.state.wake.try_clone().ok()?;
+        Some(move || {
+            let _ = rustix::io::write(&wake, &[1]);
+        })
     }
 
     pub fn set_title(&mut self, title: &str) {
@@ -418,6 +429,7 @@ impl Loop<'_> {
         let (conn, paste_rx, wl_fd, wake_read) = (*conn, *paste_rx, *wl_fd, *wake_read);
         let mut exit = false;
         let mut timer_deadline: Option<Instant> = None;
+        let mut woken = false;
         loop {
             queue.dispatch_pending(*state).map_err(err)?;
 
@@ -455,6 +467,14 @@ impl Loop<'_> {
                     exit: &mut exit,
                 };
                 handler.event(&mut ctx, ev);
+            }
+            if std::mem::take(&mut woken) {
+                let mut ctx = Ctx {
+                    state,
+                    conn,
+                    exit: &mut exit,
+                };
+                handler.woken(&mut ctx);
             }
             // The deadline we slept until; asking again now would give the one after it.
             if timer_deadline.is_some_and(|d| d <= Instant::now()) {
@@ -552,6 +572,7 @@ impl Loop<'_> {
             if wake_ready {
                 let mut buf = [0u8; 64];
                 while matches!(rustix::io::read(wake_read, &mut buf), Ok(n) if n > 0) {}
+                woken = true;
             }
         }
         Ok(())

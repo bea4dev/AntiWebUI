@@ -40,7 +40,18 @@ pub fn render_driven_rgba<V: IntoView>(
     ui.update();
     drive(&mut ui);
     ui.update();
-    let scene = ui.paint(Instant::now());
+    let mut now = Instant::now();
+    if ui.wait_for_images(std::time::Duration::from_secs(30)) {
+        // What pictures bring along when they arrive, like fading in, is part of how they look.
+        for _ in 0..60 {
+            now += std::time::Duration::from_millis(16);
+            ui.animate(now);
+            ui.update();
+            ui.paint(now);
+        }
+    }
+    ui.update();
+    let scene = ui.paint(now);
     Ok(gpu.render_to_rgba(&mut renderer, &scene))
 }
 

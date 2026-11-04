@@ -7,6 +7,15 @@ use crate::reactive::{Signal, create_root, signal};
 pub struct Settings {
     pub scroll: ScrollSettings,
     pub rendering: RenderingSettings,
+    pub images: ImageSettings,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct ImageSettings {
+    /// How much of what pictures take to keep when nothing on the screen uses it, in bytes. What
+    /// is on the screen stays whatever this says.
+    pub cache_bytes: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -76,6 +85,9 @@ impl Default for Settings {
             },
             rendering: RenderingSettings {
                 frame_advance: FrameAdvance::Auto,
+            },
+            images: ImageSettings {
+                cache_bytes: 256 << 20,
             },
         }
     }

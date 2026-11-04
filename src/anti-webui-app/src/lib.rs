@@ -136,10 +136,21 @@ mod wayland {
         /// `ANTIWEBUI_FRAME_STATS=path.csv` records what every frame took (see `frame_stats`).
         stats: Option<FrameStats>,
         pacing: Pacing,
+        /// Decoded pictures say so through the event loop.
+        waker_set: bool,
     }
 
     impl Runner {
+        fn set_waker(&mut self, ctx: &mut Ctx<'_>) {
+            if !std::mem::replace(&mut self.waker_set, true)
+                && let Some(waker) = ctx.waker()
+            {
+                self.ui.set_image_waker(std::sync::Arc::new(waker));
+            }
+        }
+
         fn process(&mut self, ctx: &mut Ctx<'_>) {
+            self.set_waker(ctx);
             self.handle_requests(ctx);
             if self.ui.needs_redraw() {
                 ctx.request_redraw();
@@ -219,10 +230,20 @@ mod wayland {
             self.process(ctx);
         }
 
+        fn woken(&mut self, ctx: &mut Ctx<'_>) {
+            self.ui.poll_images();
+            self.process(ctx);
+        }
+
         fn frame(&mut self, ctx: &mut Ctx<'_>) {
+            self.set_waker(ctx);
             if self.presenter.is_none() {
                 match Presenter::new(ctx) {
-                    Ok(p) => self.presenter = Some(p),
+                    Ok(mut p) => {
+                        // What writes frames to files draws them again, with its own renderer.
+                        p.keep_picture_pixels(std::env::var_os("ANTIWEBUI_DUMP_FRAME").is_some());
+                        self.presenter = Some(p);
+                    }
                     Err(e) => {
                         self.error = Some(Box::new(e));
                         ctx.exit();
@@ -334,6 +355,7 @@ mod wayland {
             dump: None,
             stats: FrameStats::from_env(),
             pacing: Pacing::new(),
+            waker_set: false,
         };
         let options = WindowOptions {
             title: app.title,

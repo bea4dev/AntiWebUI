@@ -5,6 +5,7 @@ pub mod animation;
 pub mod damage;
 pub mod event;
 pub mod geometry;
+pub mod images;
 pub mod layout;
 pub mod paint;
 pub mod platform;
@@ -34,13 +35,13 @@ pub mod prelude {
     pub use crate::reactive::{
         Memo, Owner, Signal, batch, create_root, effect, memo, on_cleanup, signal, untrack,
     };
-    pub use crate::settings::{FrameAdvance, Settings, settings, update_settings};
+    pub use crate::settings::{FrameAdvance, ImageSettings, Settings, settings, update_settings};
     pub use crate::shader::{Image, IntoImage, IntoPaint, Shader, ShaderPaint, ShaderParams};
     pub use crate::text::{NotAFont, register_font, register_font_as};
     pub use crate::view::{
-        Div, ForEach, IntoTextSource, IntoView, NodeRef, Popup, Show, Text, TextInput, View, div,
-        dyn_view, for_each, fragment, node_ref, popup, portal, shader, show, text, text_area,
-        text_input, window_scale,
+        Div, ForEach, Img, IntoImageSource, IntoTextSource, IntoView, NodeRef, Popup, Show, Text,
+        TextInput, View, div, dyn_view, for_each, fragment, img, node_ref, popup, portal, shader,
+        show, text, text_area, text_input, window_scale,
     };
     pub use anti_webui_style::*;
 }

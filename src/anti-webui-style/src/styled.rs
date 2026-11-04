@@ -49,6 +49,37 @@ pub trait Styled: Sized {
         self
     }
 
+    /// The picture of the background (CSS `background-image`), which can be a file or something in
+    /// memory like `img`. It can change in `.hover()` and in sheets like any other style.
+    fn bg_image(mut self, source: impl Into<ImageSource>) -> Self {
+        self.style_mut().background_image = Some(Some(source.into()));
+        self
+    }
+
+    /// Takes away a picture of the background that comes from elsewhere.
+    fn no_bg_image(mut self) -> Self {
+        self.style_mut().background_image = Some(None);
+        self
+    }
+
+    /// CSS `background-position`.
+    fn bg_position(mut self, x: impl Into<Length>, y: impl Into<Length>) -> Self {
+        self.style_mut().background_position = Some((x.into(), y.into()));
+        self
+    }
+
+    /// CSS `object-position`.
+    fn object_position(mut self, x: impl Into<Length>, y: impl Into<Length>) -> Self {
+        self.style_mut().object_position = Some((x.into(), y.into()));
+        self
+    }
+
+    /// CSS `aspect-ratio`: width over height.
+    fn aspect_ratio(mut self, ratio: f32) -> Self {
+        self.style_mut().aspect_ratio = Some(Some(ratio));
+        self
+    }
+
     setter! {
         w => width: Length;
         h => height: Length;
@@ -101,6 +132,11 @@ pub trait Styled: Sized {
         outline_color => outline_color: Color;
 
         bg => background: Color;
+        bg_size => background_size: BackgroundSize;
+        bg_repeat => background_repeat: BackgroundRepeat;
+        object_fit => object_fit: ObjectFit;
+        image_rendering => image_rendering: ImageRendering;
+        image_opacity => image_opacity: f32;
         opacity => opacity: f32;
         blur => blur: f32;
         backdrop_blur => backdrop_blur: f32;

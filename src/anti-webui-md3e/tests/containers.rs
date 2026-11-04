@@ -382,7 +382,9 @@ fn a_carousel_lays_out_its_items_and_scrolls_by_dragging() {
     });
     let scene = settle(&mut ui);
     let first = colored(&scene, colors[0]).pop().expect("the first item");
-    assert_eq!(first.rect.x, 0);
+    // What it shows is cut to its place, with the middle of the item in the middle.
+    assert_eq!(first.clip.rect.x, 0);
+    assert!(first.rect.width >= first.clip.rect.width);
     pointer_at(&mut ui, 400.0, 100.0);
     pointer(&mut ui, 400.0, 100.0, true);
     pointer_at(&mut ui, 300.0, 100.0);

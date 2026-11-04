@@ -64,6 +64,7 @@ pub struct Resolved {
     pub border: Edges<i32>,
     pub row_gap: i32,
     pub column_gap: i32,
+    pub aspect_ratio: Option<f32>,
 }
 
 impl Resolved {
@@ -83,6 +84,80 @@ impl Resolved {
             border: c.border_widths().map(|v| scale.px_min1(v)),
             row_gap: scale.px(c.row_gap),
             column_gap: scale.px(c.column_gap),
+            aspect_ratio: c.aspect_ratio.filter(|r| *r > 0.0),
+        }
+    }
+}
+
+/// The border box of a picture, from what is known about its sides, following CSS 2.1 10.3.2, 10.6.2
+/// and the table in 10.4. Without a size of its own and nothing else to go by, it takes up no room.
+fn replaced_size(
+    natural: Option<(i32, i32)>,
+    ratio: Option<f32>,
+    known: (Option<i32>, Option<i32>),
+    (min_w, max_w, min_h, max_h): (Option<i32>, Option<i32>, Option<i32>, Option<i32>),
+    (pb_h, pb_v): (i32, i32),
+) -> (i32, i32) {
+    let ratio = ratio.or_else(|| {
+        natural
+            .filter(|n| n.0 > 0 && n.1 > 0)
+            .map(|n| n.0 as f32 / n.1 as f32)
+    });
+    let high = |w: i32| ratio.map(|r| ((w - pb_h).max(0) as f32 / r).round() as i32 + pb_v);
+    let wide = |h: i32| ratio.map(|r| ((h - pb_v).max(0) as f32 * r).round() as i32 + pb_h);
+    match known {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => {
+            let h = high(w).unwrap_or_else(|| natural.map_or(0, |n| n.1) + pb_v);
+            (w, clamp_opt(h, min_h, max_h))
+        }
+        (None, Some(h)) => {
+            let w = wide(h).unwrap_or_else(|| natural.map_or(0, |n| n.0) + pb_h);
+            (clamp_opt(w, min_w, max_w), h)
+        }
+        (None, None) => {
+            let (nw, nh) = natural.unwrap_or_default();
+            let (w, h) = (nw + pb_h, nh + pb_v);
+            let (lo_w, hi_w) = (
+                min_w.unwrap_or(0),
+                max_w.unwrap_or(i32::MAX).max(min_w.unwrap_or(0)),
+            );
+            let (lo_h, hi_h) = (
+                min_h.unwrap_or(0),
+                max_h.unwrap_or(i32::MAX).max(min_h.unwrap_or(0)),
+            );
+            if ratio.is_none() || nw <= 0 || nh <= 0 {
+                return (w.clamp(lo_w, hi_w), h.clamp(lo_h, hi_h));
+            }
+            let (fw, fh) = (w as f64, h as f64);
+            let at = |v: f64| v.round() as i32;
+            let by_w = |to: i32| at(to as f64 * fh / fw);
+            let by_h = |to: i32| at(to as f64 * fw / fh);
+            let (over_w, under_w) = (w > hi_w, w < lo_w);
+            let (over_h, under_h) = (h > hi_h, h < lo_h);
+            match (over_w, under_w, over_h, under_h) {
+                (true, _, true, _) => {
+                    if hi_w as f64 / fw <= hi_h as f64 / fh {
+                        (hi_w, by_w(hi_w).max(lo_h))
+                    } else {
+                        (by_h(hi_h).max(lo_w), hi_h)
+                    }
+                }
+                (_, true, _, true) => {
+                    if lo_w as f64 / fw <= lo_h as f64 / fh {
+                        (by_h(lo_h).min(hi_w), lo_h)
+                    } else {
+                        (lo_w, by_w(lo_w).min(hi_h))
+                    }
+                }
+                (_, true, true, _) => (lo_w, hi_h),
+                (true, _, _, true) => (hi_w, lo_h),
+                (true, ..) => (hi_w, by_w(hi_w).max(lo_h)),
+                (_, true, ..) => (lo_w, by_w(lo_w).min(hi_h)),
+                (_, _, true, _) => (by_h(hi_h).max(lo_w), hi_h),
+                (_, _, _, true) => (by_h(lo_h).min(hi_w), lo_h),
+                _ => (w, h),
+            }
         }
     }
 }
@@ -456,6 +531,11 @@ fn resolve_node(
         out.clips.push(id);
     }
     let changed = *old != computed;
+    let picture = computed
+        .background_image
+        .as_ref()
+        .filter(|source| old.background_image.as_ref() != Some(*source))
+        .cloned();
     if changed {
         let transformed = node.transformed && computed.has_transform();
         let faded = !node.transformed
@@ -476,6 +556,10 @@ fn resolve_node(
         }
     }
     let children = (all || changed).then(|| node.children.clone());
+    // Like the picture of an `img`, its size is found out as soon as it is known to be wanted.
+    if let Some(source) = picture {
+        doc.images.get_mut().info(id, &source);
+    }
     let node = doc.nodes.get_mut(id).unwrap();
     node.style_dirty = false;
     node.resolved = resolved;
@@ -1181,6 +1265,32 @@ impl Engine<'_> {
             return self.compute_text(id, w, avail_w, perform);
         }
 
+        if let NodeKind::Image(data) = &node.kind {
+            let natural = data.natural.map(|(nw, nh)| {
+                let d = data.density;
+                (self.scale.px(nw / d), self.scale.px(nh / d))
+            });
+            let (w, h) = replaced_size(
+                natural,
+                r.aspect_ratio,
+                (w, h),
+                (min_w, max_w, min_h, max_h),
+                (pb_h, pb_v),
+            );
+            if perform {
+                self.doc.nodes[id].rect.width = w;
+                self.doc.nodes[id].rect.height = h;
+                let inner = ((w - pb_h).max(0), (h - pb_v).max(0));
+                // What is laid over the picture has no say in the size of the box.
+                self.block(id, Some(inner.0), Some(inner.1), Some(inner.0), true);
+                let size = SizeI::new(w, h);
+                self.place_fragments(id, size);
+                self.layout_absolute(id, size);
+                self.update_content_size(id);
+            }
+            return SizeI::new(w, h);
+        }
+
         if let (Some(w), Some(h)) = (w, h)
             && !perform
         {
@@ -1209,8 +1319,17 @@ impl Engine<'_> {
             }
         };
 
-        let w = w.unwrap_or_else(|| clamp_opt(content.width + pb_h, min_w, max_w));
-        let h = h.unwrap_or_else(|| clamp_opt(content.height + pb_v, min_h, max_h));
+        // The other side of what is known, unless the content needs more.
+        let by_ratio = r.aspect_ratio.map_or((0, 0), |ratio| {
+            (
+                h.map_or(0, |h| (h as f32 * ratio).round() as i32),
+                w.map_or(0, |w| (w as f32 / ratio).round() as i32),
+            )
+        });
+        let w =
+            w.unwrap_or_else(|| clamp_opt((content.width + pb_h).max(by_ratio.0), min_w, max_w));
+        let h =
+            h.unwrap_or_else(|| clamp_opt((content.height + pb_v).max(by_ratio.1), min_h, max_h));
         let size = SizeI::new(w, h);
 
         if perform {
@@ -1334,8 +1453,10 @@ impl Engine<'_> {
                 y += gap;
             }
             let explicit_w = cr.width.resolve(inner_w);
+            // A picture is as wide as it is rather than as wide as there is room.
             let child_w = match (explicit_w, inner_w) {
                 (Some(_), _) => None,
+                (None, _) if self.doc.nodes[c].image().is_some() => None,
                 (None, Some(iw)) => Some((iw - mx).max(0)),
                 (None, None) => None,
             };
@@ -1848,6 +1969,84 @@ impl Engine<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fitted(
+        natural: (i32, i32),
+        known: (Option<i32>, Option<i32>),
+        limits: (Option<i32>, Option<i32>, Option<i32>, Option<i32>),
+    ) -> (i32, i32) {
+        replaced_size(Some(natural), None, known, limits, (0, 0))
+    }
+
+    /// Every row of the table in CSS 2.1 10.4, with a picture of 400x200.
+    #[test]
+    fn a_pictures_limits_keep_its_proportions() {
+        let at = |limits| fitted((400, 200), (None, None), limits);
+        assert_eq!(at((None, None, None, None)), (400, 200));
+        assert_eq!(at((None, Some(100), None, None)), (100, 50));
+        assert_eq!(at((Some(800), None, None, None)), (800, 400));
+        assert_eq!(at((None, None, None, Some(50))), (100, 50));
+        assert_eq!(at((None, None, Some(400), None)), (800, 400));
+        assert_eq!(at((None, Some(200), None, Some(50))), (100, 50));
+        assert_eq!(at((None, Some(100), None, Some(150))), (100, 50));
+        assert_eq!(at((Some(800), None, Some(300), None)), (800, 400));
+        assert_eq!(at((Some(500), None, Some(400), None)), (800, 400));
+        assert_eq!(at((Some(500), None, None, Some(100))), (500, 100));
+        assert_eq!(at((None, Some(100), Some(300), None)), (100, 300));
+        // The smaller limit stands when the other side would break it.
+        assert_eq!(at((None, Some(100), Some(80), None)), (100, 80));
+    }
+
+    #[test]
+    fn a_side_of_a_picture_follows_the_other() {
+        let none = (None, None, None, None);
+        assert_eq!(fitted((400, 200), (Some(100), None), none), (100, 50));
+        assert_eq!(fitted((400, 200), (None, Some(100)), none), (200, 100));
+        assert_eq!(fitted((400, 200), (Some(10), Some(10)), none), (10, 10));
+        assert_eq!(
+            fitted((400, 200), (Some(100), None), (None, None, Some(70), None)),
+            (100, 70)
+        );
+    }
+
+    #[test]
+    fn a_ratio_goes_above_that_of_the_picture() {
+        let none = (None, None, None, None);
+        assert_eq!(
+            replaced_size(Some((400, 200)), Some(1.0), (Some(100), None), none, (0, 0)),
+            (100, 100)
+        );
+    }
+
+    #[test]
+    fn padding_and_border_arent_part_of_the_proportions() {
+        let none = (None, None, None, None);
+        assert_eq!(
+            replaced_size(Some((400, 200)), None, (Some(120), None), none, (20, 10)),
+            (120, 60)
+        );
+        assert_eq!(
+            replaced_size(Some((400, 200)), None, (None, None), none, (20, 10)),
+            (420, 210)
+        );
+    }
+
+    #[test]
+    fn a_picture_not_known_yet_takes_up_no_room() {
+        let none = (None, None, None, None);
+        assert_eq!(
+            replaced_size(None, None, (None, None), none, (0, 0)),
+            (0, 0)
+        );
+        assert_eq!(
+            replaced_size(None, None, (Some(50), None), none, (0, 0)),
+            (50, 0)
+        );
+        assert_eq!(
+            replaced_size(None, Some(2.0), (Some(50), None), none, (0, 0)),
+            (50, 25)
+        );
+    }
 
     #[test]
     fn distribute_equal_monotone() {

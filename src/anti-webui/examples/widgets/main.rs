@@ -12,7 +12,7 @@ mod pages;
 use anti_webui::app::headless;
 use anti_webui::prelude::*;
 
-const PAGES: [(&str, &str); 8] = [
+const PAGES: [(&str, &str); 9] = [
     ("buttons", "Buttons"),
     ("selection", "Selection"),
     ("inputs", "Inputs"),
@@ -21,6 +21,7 @@ const PAGES: [(&str, &str); 8] = [
     ("menus", "Menus"),
     ("data", "Data"),
     ("layout", "Layout"),
+    ("images", "Images"),
 ];
 
 fn page_view(name: &str) -> Div {
@@ -33,6 +34,7 @@ fn page_view(name: &str) -> Div {
         "menus" => pages::menus(),
         "data" => pages::data(),
         "layout" => pages::layout(),
+        "images" => pages::images(),
         _ => div(),
     }
 }
@@ -181,6 +183,7 @@ fn shot(first: usize, dark: bool, file: &str) {
         scale: Scale::from_f64(1.8),
     });
     ui.handle_event(WindowEvent::Focused(true));
+    ui.wait_for_images(Duration::from_secs(30));
     let start = Instant::now();
     let mut frame = None;
     for i in 0..40 {

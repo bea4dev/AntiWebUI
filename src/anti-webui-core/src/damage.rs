@@ -273,6 +273,7 @@ fn add_run(prims: &[Primitive], damage: &mut Damage) {
 pub fn primitive_bounds(p: &Primitive) -> RectI {
     match p {
         Primitive::Quad(q) => q.rect.intersect(&q.clip.rect),
+        Primitive::Image(i) => i.area(),
         Primitive::Shadow(s) => s.bounds().intersect(&s.clip.rect),
         Primitive::Glyphs(run) => glyph_run_bounds(run).intersect(&run.clip.rect),
         Primitive::Layer(l) => l.bounds_on_parent(),

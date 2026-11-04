@@ -142,6 +142,13 @@ impl Presenter {
         self.trace.take()
     }
 
+    /// Whether the pixels of pictures are needed after this renderer has handed them to the GPU.
+    pub fn keep_picture_pixels(&mut self, keep: bool) {
+        if let Some(d) = &mut self.dmabuf {
+            d.renderer.set_release_picture_pixels(!keep);
+        }
+    }
+
     pub fn gpu(&self) -> &Gpu {
         &self.gpu
     }

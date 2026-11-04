@@ -288,11 +288,60 @@ impl Ui {
     pub fn animating(&self) -> bool {
         self.fling.is_some()
             || animation::frame_requested()
-            || with_doc(|d| d.settling || !d.transitioning.is_empty())
+            || with_doc(|d| {
+                d.settling || !d.transitioning.is_empty() || d.images.get_mut().has_news()
+            })
+    }
+
+    /// Takes in the pictures that have been decoded. Call on the UI thread when the waker says so;
+    /// frames do it anyway. See `docs/design/22-images.md`.
+    pub fn poll_images(&mut self) {
+        let tells = with_doc(crate::images::poll);
+        if !tells.is_empty() {
+            batch(|| {
+                for tell in tells {
+                    tell.run();
+                }
+            });
+        }
+    }
+
+    /// Called from another thread when there are pictures for [`Ui::poll_images`].
+    pub fn set_image_waker(&mut self, waker: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        with_doc(|d| d.images.get_mut().set_waker(waker));
+    }
+
+    /// Waits for all the pictures that are wanted to arrive, for tests and screenshots: a window
+    /// never waits for them. Returns whether there are any.
+    pub fn wait_for_images(&mut self, timeout: std::time::Duration) -> bool {
+        let end = Instant::now() + timeout;
+        loop {
+            self.poll_images();
+            self.update();
+            if with_doc(|d| d.images.get_mut().is_empty()) {
+                return false;
+            }
+            // Painting is what asks for the pixels.
+            self.paint_frame(Instant::now());
+            self.poll_images();
+            let waiting = with_doc(|d| d.images.get_mut().busy());
+            if !waiting && !with_doc(|d| d.dirty.paint || Self::needs_update(d)) {
+                self.update();
+                return true;
+            }
+            if waiting {
+                let left = end.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return true;
+                }
+                with_doc(|d| d.images.get_mut().wait(left));
+            }
+        }
     }
 
     /// Advances animations to `now`. Call before [`Ui::update`] when producing a frame.
     pub fn animate(&mut self, now: Instant) {
+        self.poll_images();
         animation::run_frame_callbacks(now);
         with_doc(|d| animation::advance_transitions(d, now));
         let Some(fling) = &mut self.fling else {
@@ -319,6 +368,7 @@ impl Ui {
             let frame = paint_document(d, now);
             d.dirty.paint = false;
             d.dirty.content = false;
+            crate::images::advance(d, now, false);
             frame
         })
     }
@@ -428,16 +478,18 @@ impl Ui {
             let periods = elapsed.as_millis() / CARET_BLINK.as_millis() + 1;
             Some(edit.caret_epoch + CARET_BLINK * periods as u32)
         });
-        match (caret, animation::next_timer()) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        let picture = with_doc(|d| d.images.get_mut().next_frame());
+        [caret, animation::next_timer(), picture]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Call when a deadline from [`Ui::next_deadline`] passes.
     pub fn tick(&mut self, now: Instant) {
         animation::run_timers(now);
         with_doc(|d| {
+            crate::images::advance(d, now, true);
             if d.state
                 .focused
                 .and_then(|id| d.get(id))

@@ -6,10 +6,17 @@ license.workspace = true
 description = "A lightweight native UI framework rendered with wgpu"
 
 [features]
-default = []
+default = ["svg", "svg-text"]
+## Pictures in SVG.
+svg = ["anti-webui-internal/svg"]
+## Text in pictures in SVG, which adds 1.6 MiB.
+svg-text = ["anti-webui-internal/svg-text"]
 ## Link AntiWebUI dynamically for faster incremental builds (development only).
 dynamic_linking = ["dep:anti-webui-dylib"]
 
 [dependencies]
 anti-webui-internal.workspace = true
 anti-webui-dylib = { workspace = true, optional = true }
+
+[dev-dependencies]
+image.workspace = true
