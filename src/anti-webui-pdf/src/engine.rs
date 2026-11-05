@@ -1,11 +1,14 @@
-//! The threads that draw. The UI thread says what it wants, most urgent first, and gets pictures
-//! back over a channel. Saying it again replaces what hasn't started, which is how old requests
+//! The threads that draw and read the text of pages. The UI thread says what it wants, most urgent
+//! first, and gets it back over a channel. Saying it again replaces what hasn't started, which is how old requests
 //! are dropped: nothing can stop a page that is being drawn. See `docs/design/26-pdf.md`.
 
 use crate::PdfError;
+use crate::links::PdfOutlineItem;
 use crate::plan::Job;
+use crate::text::PageText;
 use anti_webui_core::channel::{UiSender, UiWork};
 use anti_webui_core::images::Bitmap;
+use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -22,10 +25,17 @@ const MAX_STUCK_WORKERS: usize = 8;
 pub(crate) trait Document: Send + Sync + 'static {
     /// What a worker draws with, which holds its caches. It is thrown away after a panic.
     fn session(&self) -> Box<dyn Session + '_>;
+
+    /// What it has for a table of contents. It is read once, after opening.
+    fn outline(&self) -> Vec<PdfOutlineItem> {
+        Vec::new()
+    }
 }
 
 pub(crate) trait Session {
     fn draw(&mut self, job: Job) -> Bitmap;
+
+    fn text(&mut self, page: usize) -> PageText;
 }
 
 /// An open document and the size of each page, in points.
@@ -38,18 +48,34 @@ pub(crate) enum Event {
     Drawn(Job, Arc<Bitmap>),
     /// It panicked. The page won't be asked for again.
     NotDrawn(Job),
+    /// The text of a page, which there is none of if reading it panicked.
+    Text(usize, Arc<PageText>),
+    Outline(Vec<PdfOutlineItem>),
 }
 
-/// A job a worker is on.
+/// What a worker does.
+#[derive(Clone, Copy, PartialEq)]
+enum Work {
+    Draw(Job),
+    Text(usize),
+}
+
+/// What a worker is on.
 struct Running {
-    job: Job,
-    /// Since when it hasn't been wanted.
+    work: Work,
+    /// Since when it hasn't been wanted. Text doesn't take long enough for this to matter.
     unwanted: Option<Instant>,
 }
 
 struct State {
     doc: Option<Arc<dyn Document>>,
     wanted: Vec<Job>,
+    /// The text someone is waiting for, which comes before all pictures.
+    text_now: Vec<usize>,
+    /// The text searching goes through, which comes after them.
+    text_later: Vec<usize>,
+    /// The text that is on its way to the UI thread, which doesn't know yet and may ask again.
+    text_sent: HashSet<usize>,
     running: Vec<Running>,
     workers: usize,
     idle: usize,
@@ -58,6 +84,25 @@ struct State {
     stopped: bool,
     /// Tells those who wait for pictures that some are coming.
     work: Option<UiWork>,
+}
+
+impl State {
+    fn nothing_wanted(&self) -> bool {
+        self.wanted.is_empty() && self.text_now.is_empty() && self.text_later.is_empty()
+    }
+
+    fn next_work(&mut self) -> Option<Work> {
+        if !self.text_now.is_empty() {
+            return Some(Work::Text(self.text_now.remove(0)));
+        }
+        if !self.wanted.is_empty() {
+            return Some(Work::Draw(self.wanted.remove(0)));
+        }
+        if !self.text_later.is_empty() {
+            return Some(Work::Text(self.text_later.remove(0)));
+        }
+        None
+    }
 }
 
 struct Shared {
@@ -77,7 +122,8 @@ impl Shared {
         let Some(doc) = state.doc.clone() else {
             return;
         };
-        let needed = state.wanted.len().min(self.max_workers);
+        let wanted = state.wanted.len() + state.text_now.len() + state.text_later.len();
+        let needed = wanted.min(self.max_workers);
         let hires = needed
             .saturating_sub(state.idle)
             .min(self.max_workers.saturating_sub(state.workers));
@@ -97,7 +143,7 @@ impl Shared {
 
     /// Since when every worker has been on something nobody wants, with something else wanted.
     fn stuck_since(state: &State) -> Option<Instant> {
-        if state.wanted.is_empty() || state.idle > 0 || state.running.len() < state.workers {
+        if state.nothing_wanted() || state.idle > 0 || state.running.len() < state.workers {
             return None;
         }
         let mut latest = None;
@@ -157,7 +203,7 @@ impl Shared {
     }
 
     fn settle(&self, state: &mut State) {
-        if state.wanted.is_empty() && state.running.is_empty() {
+        if state.nothing_wanted() && state.running.is_empty() {
             state.work = None;
         } else if state.work.is_none() {
             state.work = Some(self.out.work());
@@ -173,39 +219,44 @@ fn work(shared: &Shared, doc: &dyn Document) {
         if done.is_ok() {
             break;
         }
-        let Some(job) = current else {
+        let Some(work) = current else {
             continue;
         };
-        shared.out.send(Event::NotDrawn(job));
         let mut state = shared.lock();
-        state.running.retain(|r| r.job != job);
+        if let Work::Text(page) = work {
+            state.text_sent.insert(page);
+        }
+        shared.out.send(match work {
+            Work::Draw(job) => Event::NotDrawn(job),
+            Work::Text(page) => Event::Text(page, Arc::default()),
+        });
+        state.running.retain(|r| r.work != work);
         shared.settle(&mut state);
     }
 }
 
 /// Draws until there has been nothing to do for a while.
-fn session(shared: &Shared, doc: &dyn Document, current: &mut Option<Job>) {
+fn session(shared: &Shared, doc: &dyn Document, current: &mut Option<Work>) {
     let mut session = doc.session();
     let mut first = true;
     loop {
-        let job = {
+        let work = {
             let mut state = shared.lock();
             loop {
                 // One more than asked for is only there for one job. Leaving counts here, under the
                 // lock, so that nobody counts on a worker that is on its way out.
                 let extra = state.workers > shared.max_workers;
-                if state.stopped || (extra && (!first || state.wanted.is_empty())) {
+                if state.stopped || (extra && (!first || state.nothing_wanted())) {
                     state.workers -= 1;
                     return;
                 }
-                if !state.wanted.is_empty() {
-                    let job = state.wanted.remove(0);
+                if let Some(work) = state.next_work() {
                     state.running.push(Running {
-                        job,
+                        work,
                         unwanted: None,
                     });
                     first = false;
-                    break job;
+                    break work;
                 }
                 state.idle += 1;
                 let (next, timeout) = shared
@@ -214,18 +265,24 @@ fn session(shared: &Shared, doc: &dyn Document, current: &mut Option<Job>) {
                     .expect("no panics with the lock held");
                 state = next;
                 state.idle -= 1;
-                if timeout.timed_out() && state.wanted.is_empty() {
+                if timeout.timed_out() && state.nothing_wanted() {
                     state.workers -= 1;
                     return;
                 }
             }
         };
-        *current = Some(job);
-        let bitmap = session.draw(job);
+        *current = Some(work);
+        let event = match work {
+            Work::Draw(job) => Event::Drawn(job, Arc::new(session.draw(job))),
+            Work::Text(page) => Event::Text(page, Arc::new(session.text(page))),
+        };
         *current = None;
-        shared.out.send(Event::Drawn(job, Arc::new(bitmap)));
         let mut state = shared.lock();
-        state.running.retain(|r| r.job != job);
+        if let Work::Text(page) = work {
+            state.text_sent.insert(page);
+        }
+        shared.out.send(event);
+        state.running.retain(|r| r.work != work);
         shared.settle(&mut state);
     }
 }
@@ -247,6 +304,9 @@ impl Engine {
             state: Mutex::new(State {
                 doc: None,
                 wanted: Vec::new(),
+                text_now: Vec::new(),
+                text_later: Vec::new(),
+                text_sent: HashSet::new(),
                 running: Vec::new(),
                 workers: 0,
                 idle: 0,
@@ -269,10 +329,13 @@ impl Engine {
                         // In this order, so that wanting pages can only start once they can be drawn.
                         {
                             let mut state = thread.lock();
-                            state.doc = Some(doc);
+                            state.doc = Some(doc.clone());
                             thread.hire(&mut state);
                         }
                         thread.out.send(Event::Opened(pages));
+                        // After the first pictures are on their way, as it can take a while.
+                        let outline = catch_unwind(AssertUnwindSafe(|| doc.outline()));
+                        thread.out.send(Event::Outline(outline.unwrap_or_default()));
                     }
                     Err(e) => thread.out.send(Event::Failed(e)),
                 }
@@ -291,14 +354,16 @@ impl Engine {
         let mut state = self.shared.lock();
         let now = Instant::now();
         for running in &mut state.running {
-            if jobs.contains(&running.job) {
-                running.unwanted = None;
-            } else {
-                running.unwanted.get_or_insert(now);
+            if let Work::Draw(job) = running.work {
+                if jobs.contains(&job) {
+                    running.unwanted = None;
+                } else {
+                    running.unwanted.get_or_insert(now);
+                }
             }
         }
         let mut wanted = jobs;
-        wanted.retain(|job| !state.running.iter().any(|r| r.job == *job));
+        wanted.retain(|job| !state.running.iter().any(|r| r.work == Work::Draw(*job)));
         if state.wanted == wanted {
             self.shared.stand_by(&mut state);
             return;
@@ -311,11 +376,44 @@ impl Engine {
         self.shared.changed.notify_all();
     }
 
+    /// Says what text is wanted instead of what was wanted before: what someone is waiting for, and
+    /// what can wait until the pictures are done.
+    pub fn want_text(&self, now: Vec<usize>, later: Vec<usize>) {
+        let mut state = self.shared.lock();
+        let not_running = |state: &State, pages: Vec<usize>| {
+            let mut pages = pages;
+            pages.retain(|&page| {
+                !state.text_sent.contains(&page)
+                    && !state.running.iter().any(|r| r.work == Work::Text(page))
+            });
+            pages
+        };
+        let now = not_running(&state, now);
+        let later = not_running(&state, later);
+        if state.text_now == now && state.text_later == later {
+            return;
+        }
+        state.text_now = now;
+        state.text_later = later;
+        self.shared.hire(&mut state);
+        self.shared.stand_by(&mut state);
+        self.shared.settle(&mut state);
+        drop(state);
+        self.shared.changed.notify_all();
+    }
+
+    /// Says that the text of a page has arrived, so that asking for it again means it.
+    pub fn text_received(&self, page: usize) {
+        self.shared.lock().text_sent.remove(&page);
+    }
+
     /// Lets the workers go. Those drawing finish that first.
     pub fn stop(&self) {
         let mut state = self.shared.lock();
         state.stopped = true;
         state.wanted.clear();
+        state.text_now.clear();
+        state.text_later.clear();
         state.work = None;
         drop(state);
         self.shared.changed.notify_all();
@@ -354,6 +452,10 @@ mod tests {
     }
 
     impl Session for FakeSession<'_> {
+        fn text(&mut self, _: usize) -> PageText {
+            PageText::default()
+        }
+
         fn draw(&mut self, job: Job) -> Bitmap {
             let waits = self.0.stuck_on.is_none_or(|page| page == job.page);
             if let Some(gate) = self.0.gate.as_ref().filter(|_| waits) {

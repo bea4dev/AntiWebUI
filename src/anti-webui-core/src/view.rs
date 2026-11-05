@@ -6,10 +6,10 @@
 use crate::animation::{ListPlaces, request_frame};
 use crate::drag::{DragData, DropConfig, DropEvent, GestureConfig, GrabEvent};
 use crate::event::DragResult;
-use crate::event::{KeyboardEvent, PointerEvent, ScrollEvent};
+use crate::event::{ClipboardKind, KeyboardEvent, PointerEvent, ScrollEvent};
 use crate::geometry::{PointF, PointI, RectI, Scale};
 use crate::images::Bitmap;
-use crate::platform::{ImePurpose, Placement, PopupKind};
+use crate::platform::{ImePurpose, Placement, PlatformRequest, PopupKind};
 use crate::reactive::{
     Owner, Signal, create_child_owner, create_root, effect, memo, on_cleanup, signal, untrack,
 };
@@ -131,6 +131,16 @@ impl NodeRef {
                 d.dirty.paint = true;
             });
         }
+    }
+
+    /// Whether a point of the window, like [`PointerEvent::position`], is on a scrollbar of this
+    /// node or of what it is in, where pressing drags the bar rather than anything else.
+    ///
+    /// [`PointerEvent::position`]: crate::event::PointerEvent::position
+    pub fn is_over_scrollbar(&self, position: PointF) -> bool {
+        self.0
+            .get_untracked()
+            .is_some_and(|id| with_doc(|d| crate::ui::scrollbar_hit(d, id, position).is_some()))
     }
 
     pub fn focus(&self) {
@@ -804,6 +814,22 @@ impl IntoView for Img {
 pub struct BitmapView {
     cfg: ElementConfig,
     bitmap: Box<dyn Fn() -> Option<Arc<Bitmap>>>,
+}
+
+/// Ends the selection of the text of the application, for what has a selection of its own: there is
+/// one selection to be seen.
+pub fn clear_text_selection() {
+    with_doc(|d| {
+        if d.state.selection.take().is_some() {
+            d.mark_paint();
+        }
+    });
+}
+
+/// Puts text on a clipboard, to be pasted from it in any program.
+pub fn set_clipboard(kind: ClipboardKind, text: impl Into<String>) {
+    let text = text.into();
+    with_doc(|d| d.request(PlatformRequest::SetClipboard { kind, text }));
 }
 
 /// Shows pixels the program made, as they are, without decoding, scaling or caching anything: no

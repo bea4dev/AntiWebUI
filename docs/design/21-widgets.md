@@ -27,7 +27,7 @@ cargo run --release -p anti-webui --example widgets [ページ名]
 | `:disabled` | `Sheet::disabled` | 同じ。祖先の無効も受け継ぐ（`fieldset` と同じ） |
 | `accent-color` | `.accent_color(c)` | 同じ。継承する |
 | `transition` | `.transition(...)`、`.transition_of(...)` | 同じ |
-| `<input>` のキャレットや選択色 | `.caret_color(c)`、`.selection_color(c)` | 同じ |
+| `<input>` のキャレットや選択色 | `.caret_color(c)`、`.selection_color(c)` | 同じ。キャレットは指定がなければ文字の色になる（`caret-color: auto`） |
 | `scrollbar-color` | `.scrollbar_color(c)` | つまみの色だけ |
 | `appearance: none` と独自の見た目 | `div()` から組む | 同じ |
 | セレクタ、クラス | なし | M2 の CSS サブセット |

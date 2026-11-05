@@ -1,13 +1,15 @@
 //! Drawing pages with `hayro`.
 
 use crate::engine::{Document, Opened, Session};
+use crate::links::{PdfOutlineItem, Places};
 use crate::plan::Job;
+use crate::text::{CollectionMaps, PageText, TextDevice};
 use crate::{PdfError, PdfSource, fonts};
 use anti_webui_core::images::Bitmap;
-use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_interpret::util::TransformExt;
+use hayro::hayro_interpret::{Context, InterpreterCache, InterpreterSettings, interpret_page};
 use hayro::hayro_syntax::{DecryptionError, LoadPdfError, Pdf, PdfData};
-use hayro::kurbo::Affine;
+use hayro::kurbo::{Affine, Rect};
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::vello_cpu::peniko::ImageAlphaType;
 use hayro::vello_cpu::{Pixmap, RasterizerSettings, RenderContext, Resources, TargetInit};
@@ -27,6 +29,8 @@ impl AsRef<[u8]> for Bytes {
 struct Hayro {
     pdf: Pdf,
     settings: InterpreterSettings,
+    maps: CollectionMaps,
+    places: Places,
 }
 
 /// Reads and opens a document. Takes as long as the file takes to read and its index to parse.
@@ -55,7 +59,13 @@ pub(crate) fn open(source: &PdfSource, password: Option<&str>) -> Result<Opened,
         font_resolver: fonts::resolver(),
         ..Default::default()
     };
-    Ok((Arc::new(Hayro { pdf, settings }), pages))
+    let doc = Hayro {
+        pdf,
+        settings,
+        maps: CollectionMaps::default(),
+        places: Places::default(),
+    };
+    Ok((Arc::new(doc), pages))
 }
 
 impl Document for Hayro {
@@ -63,10 +73,15 @@ impl Document for Hayro {
         Box::new(HayroSession {
             doc: self,
             cache: RenderCache::new(),
+            text_cache: None,
             settings: RenderSettings::default(),
             context: RenderContext::new(1, 1),
             resources: Resources::default(),
         })
+    }
+
+    fn outline(&self) -> Vec<PdfOutlineItem> {
+        self.places.outline(&self.pdf)
     }
 }
 
@@ -74,6 +89,8 @@ impl Document for Hayro {
 struct HayroSession<'a> {
     doc: &'a Hayro,
     cache: RenderCache<'a>,
+    /// What reading the text keeps. `hayro` doesn't let it share what drawing has.
+    text_cache: Option<InterpreterCache<'a>>,
     settings: RenderSettings,
     context: RenderContext,
     resources: Resources,
@@ -111,5 +128,23 @@ impl Session for HayroSession<'_> {
         );
         let pixels = pixmap.take_rgba8(ImageAlphaType::AlphaPremultiplied);
         Bitmap::from_premultiplied(picture_width, picture_height, pixels, true)
+    }
+
+    fn text(&mut self, page: usize) -> PageText {
+        let doc = self.doc;
+        let shown = &doc.pdf.pages()[page];
+        let (w, h) = shown.render_dimensions();
+        let mut context = Context::new(
+            shown.initial_transform(true).to_kurbo(),
+            Rect::new(0.0, 0.0, w as f64, h as f64),
+            self.text_cache.get_or_insert_with(InterpreterCache::new),
+            shown.xref(),
+            doc.settings.clone(),
+        );
+        let mut device = TextDevice::new(shown, &doc.maps);
+        interpret_page(shown, &mut context, &mut device);
+        let mut text = PageText::new(&device.into_glyphs(), (w, h));
+        text.links = doc.places.links(&doc.pdf, shown);
+        text
     }
 }

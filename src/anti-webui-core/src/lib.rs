@@ -37,8 +37,8 @@ pub mod prelude {
         DragData, DraggedText, DropEvent, ExternalDrag, GrabEvent, GrabPhase, dragged,
     };
     pub use crate::event::{
-        DragAction, DragActions, DragResult, Key, KeyboardEvent, Modifiers, NamedKey,
-        PointerButton, PointerEvent, ScrollEvent, ScrollPhase, ScrollSource,
+        ClipboardKind, DragAction, DragActions, DragResult, Key, KeyboardEvent, Modifiers,
+        NamedKey, PointerButton, PointerEvent, ScrollEvent, ScrollPhase, ScrollSource,
     };
     pub use crate::geometry::{PointF, RectI, Scale};
     pub use crate::platform::{ImePurpose, Placement, PopupKind};
@@ -55,9 +55,9 @@ pub mod prelude {
     };
     pub use crate::view::{
         BitmapView, Div, ForEach, Img, IntoImageSource, IntoTextSource, IntoVideoSource, IntoView,
-        NodeRef, Popup, Show, Text, TextInput, Video, View, bitmap_view, div, dyn_view, for_each,
-        fragment, img, node_ref, popup, portal, shader, show, text, text_area, text_input, video,
-        window_scale,
+        NodeRef, Popup, Show, Text, TextInput, Video, View, bitmap_view, clear_text_selection, div,
+        dyn_view, for_each, fragment, img, node_ref, popup, portal, set_clipboard, shader, show,
+        text, text_area, text_input, video, window_scale,
     };
     pub use anti_webui_style::*;
 }

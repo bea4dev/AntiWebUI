@@ -4,6 +4,7 @@
     cargo build --release -p anti-webui-app --example bench_pdf
     src/anti-webui-pdf/tools/compare.py --fetch WORK_DIR
     src/anti-webui-pdf/tools/compare.py WORK_DIR [--zoom PERCENT] [more.pdf ...]
+    src/anti-webui-pdf/tools/compare.py WORK_DIR --find WORD [more.pdf ...]
 
 The samples and PDF.js go in WORK_DIR, which shouldn't be in the repository: the licenses of the
 samples are their own. Chromium is only here to compare with. See `docs/design/26-pdf.md`.
@@ -25,6 +26,7 @@ import urllib.parse
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 BENCH = os.path.join(REPO, "target/release/examples/bench_pdf")
+BENCH_TEXT = os.path.join(REPO, "target/release/examples/bench_pdf_text")
 PDFJS = "https://registry.npmjs.org/pdfjs-dist/-/pdfjs-dist-6.5.438.tgz"
 SAMPLES = {
     "spec-pdf32000.pdf": "https://opensource.adobe.com/dc-acrobat-sdk-docs/pdfstandards/PDF32000_2008.pdf",
@@ -108,12 +110,12 @@ def serve(work, results, finished):
     return server
 
 
-def pdfjs(work, file, speed, seconds, zoom):
+def pdfjs(work, file, speed, seconds, zoom, find=""):
     results, finished = [], threading.Event()
     server = serve(work, results, finished)
     profile = tempfile.mkdtemp()
     query = urllib.parse.urlencode({"file": file, "speed": speed, "seconds": seconds,
-                                    "zoom": zoom / 100 if zoom else 0})
+                                    "zoom": zoom / 100 if zoom else 0, "find": find})
     chromium = subprocess.Popen(
         ["chromium", "--headless=new", "--no-sandbox", "--enable-gpu-rasterization",
          "--ignore-gpu-blocklist", "--use-angle=gl-egl", "--no-first-run",
@@ -141,6 +143,29 @@ def ours(file, speed, seconds, zoom):
     return json.loads(out.splitlines()[-1])
 
 
+def ours_find(file, word):
+    out = subprocess.run([BENCH_TEXT, file, "--no-copy", "--search", word],
+                         capture_output=True, text=True, timeout=300).stdout
+    got = json.loads(out.splitlines()[0])
+    return {"first_ms": got["first_hit_ms"], "all_ms": got["ms"],
+            "longest_frame_ms": got["longest_frame_ms"], "hits": got["hits"]}
+
+
+def compare_find(work, word, files):
+    print(f"{'':30}{'':8}{'first':>9}{'all':>9}{'longest':>9}{'hits':>8}")
+    for file in files:
+        for name, run in (("hayro", lambda: ours_find(file, word)),
+                          ("pdfjs", lambda: pdfjs(work, file, 1, 1, 0, word))):
+            got = [run() for _ in range(2)]
+            bad = [g for g in got if "error" in g]
+            if bad:
+                print(f"{os.path.basename(file)[:28]:30}{name:8}{bad[0]['error']}", flush=True)
+                continue
+            best = lambda key: min(g[key] for g in got)
+            print(f"{os.path.basename(file)[:28]:30}{name:8}{best('first_ms'):9.0f}{best('all_ms'):9.0f}"
+                  f"{best('longest_frame_ms'):9.1f}{got[0]['hits']:8}", flush=True)
+
+
 def main():
     args = sys.argv[1:]
     if args and args[0] == "--fetch":
@@ -149,8 +174,14 @@ def main():
     work, more, zoom = args[0], args[1:], 0
     if more[:1] == ["--zoom"]:
         zoom, more = int(more[1]), more[2:]
+    word = None
+    if more[:1] == ["--find"]:
+        word, more = more[1], more[2:]
     samples = os.path.join(work, "samples")
     files = [os.path.join(samples, f) for f in sorted(os.listdir(samples))] + more
+    if word:
+        compare_find(work, word, files)
+        return
     rounds = 2
     seconds = 5
     print(f"{'':30}{'':8}{'shown':>9}{'sharp':>9}{'sharp%':>8}{'opened':>9}{'blank':>8}{'p95':>8}"

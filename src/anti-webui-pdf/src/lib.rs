@@ -5,7 +5,10 @@
 mod document;
 mod engine;
 mod fonts;
+mod links;
 mod plan;
+mod reading;
+mod text;
 
 use anti_webui_core::channel::ui_channel;
 use anti_webui_core::event::{Key, KeyboardEvent, NamedKey, ScrollEvent};
@@ -13,7 +16,9 @@ use anti_webui_core::geometry::{PointF, RectI};
 use anti_webui_core::images::Bitmap;
 use anti_webui_core::prelude::*;
 use engine::{Engine, Event};
+pub use links::{PdfOutlineItem, PdfTarget};
 use plan::{Direction, Have, Held, Job, PageTable};
+use reading::{BoxKind, HitPlace, Hits, Place, Reader, Selection};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -24,6 +29,10 @@ use std::sync::Arc;
 const PX_PER_PT: f64 = 96.0 / 72.0;
 const MIN_ZOOM: f32 = 0.1;
 const MAX_ZOOM: f32 = 16.0;
+/// What shows on top of text that is selected, was found, and was found and is being looked at.
+const SELECTED: u32 = 0x0054b466;
+const FOUND: u32 = 0xffd60066;
+const CURRENT: u32 = 0xff8a0088;
 
 /// Why a document can't be shown.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,8 +137,18 @@ pub struct PdfViewer {
     page: Signal<usize>,
     count: Signal<usize>,
     state: Signal<PdfState>,
-    go_to: Signal<Option<usize>>,
+    go_to: Signal<Option<PdfTarget>>,
     password: Signal<Option<String>>,
+    outline: Signal<Rc<Vec<PdfOutlineItem>>>,
+    selection: Signal<Option<Selection>>,
+    /// How many times it was asked to copy.
+    copies: Signal<u64>,
+    query: Signal<String>,
+    hits: Signal<Hits>,
+    current_hit: Signal<Option<HitPlace>>,
+    /// How many times it was asked to go to one, which shows it again even if it is the same one.
+    hit_asked: Signal<u64>,
+    search_done: Signal<bool>,
 }
 
 /// Makes what controls a [`pdf_view`], to hand it with [`PdfView::viewer`].
@@ -143,6 +162,14 @@ pub fn pdf_viewer() -> PdfViewer {
         state: signal(PdfState::Loading),
         go_to: signal(None),
         password: signal(None),
+        outline: signal(Rc::new(Vec::new())),
+        selection: signal(None),
+        copies: signal(0),
+        query: signal(String::new()),
+        hits: signal(Hits::default()),
+        current_hit: signal(None),
+        hit_asked: signal(0),
+        search_done: signal(true),
     }
 }
 
@@ -179,15 +206,101 @@ impl PdfViewer {
 
     /// Scrolls to the top of a page, from 0, as soon as there is one.
     pub fn go_to_page(&self, page: usize) {
-        self.go_to.set(Some(page));
+        self.go_to(PdfTarget { page, top: None });
+    }
+
+    /// Scrolls to a place in the document, as soon as there is one.
+    pub fn go_to(&self, target: PdfTarget) {
+        self.go_to.set(Some(target));
+    }
+
+    /// The outline of the document, which is what it has for a table of contents. Most documents
+    /// don't have one, and it comes a little after the pages.
+    pub fn outline(&self) -> Rc<Vec<PdfOutlineItem>> {
+        self.outline.get()
+    }
+
+    /// Whether any text is selected.
+    pub fn has_selection(&self) -> bool {
+        self.selection.with(Option::is_some)
+    }
+
+    /// Selects all of the text of the document.
+    pub fn select_all(&self) {
+        let count = self.count.get_untracked();
+        if count > 0 {
+            self.selection.set(Some((
+                Place { page: 0, glyph: 0 },
+                Place {
+                    page: count - 1,
+                    glyph: usize::MAX,
+                },
+            )));
+        }
+    }
+
+    pub fn clear_selection(&self) {
+        self.selection.set_if_changed(None);
+    }
+
+    /// Puts what is selected on the clipboard, which takes a moment if not all of it has been read.
+    pub fn copy(&self) {
+        self.copies.update(|n| *n += 1);
+    }
+
+    /// Looks for text in all of the document, starting at the page that shows, and scrolls to the
+    /// first it finds. Case, spaces, hyphens and the wide forms of letters don't matter, so that it
+    /// also finds what a line breaks up. Nothing to look for stops it.
+    pub fn search(&self, query: impl Into<String>) {
+        self.query.set_if_changed(query.into());
+    }
+
+    /// How many were found so far. It goes up while [`Self::search_done`] is false.
+    pub fn search_count(&self) -> usize {
+        self.hits.with(|hits| hits.count)
+    }
+
+    /// Which of those found is being looked at, from 0.
+    pub fn search_index(&self) -> Option<usize> {
+        let current = self.current_hit.get()?;
+        Some(self.hits.with(|hits| hits.index_of(current)))
+    }
+
+    /// Whether it has been through all of the document.
+    pub fn search_done(&self) -> bool {
+        self.search_done.get()
+    }
+
+    /// Goes to the next one found, starting over after the last one.
+    pub fn find_next(&self) {
+        let current = self.current_hit.get_untracked();
+        let page = self.page.get_untracked();
+        let next = self.hits.with_untracked(|hits| match current {
+            Some(hit) => hits.after(hit),
+            None => hits.first_from(page),
+        });
+        self.current_hit.set_if_changed(next);
+        self.hit_asked.update(|n| *n += 1);
+    }
+
+    /// Goes to the one found before this one, starting over before the first one.
+    pub fn find_previous(&self) {
+        let current = self.current_hit.get_untracked();
+        let page = self.page.get_untracked();
+        let next = self.hits.with_untracked(|hits| match current {
+            Some(hit) => hits.before(hit),
+            None => hits.first_from(page),
+        });
+        self.current_hit.set_if_changed(next);
+        self.hit_asked.update(|n| *n += 1);
     }
 
     pub fn state(&self) -> PdfState {
         self.state.get()
     }
 
-    /// Gives it the keyboard: PageUp, PageDown, Home, End and the arrows move, and Ctrl with `+`, `-`
-    /// and `0` zooms.
+    /// Gives it the keyboard: PageUp, PageDown, Home, End and the arrows move, Ctrl with `+`, `-` and
+    /// `0` zooms, Ctrl with `A` and `C` selects and copies, and Escape stops selecting.
     pub fn focus(&self) {
         self.node.focus();
     }
@@ -200,6 +313,7 @@ impl PdfViewer {
 
 type ErrorListener = Rc<dyn Fn(&PdfError)>;
 type PageErrorListener = Rc<dyn Fn(usize)>;
+pub(crate) type UrlListener = Rc<dyn Fn(&str)>;
 
 /// A document in a box that scrolls. See [`pdf_view`].
 pub struct PdfView {
@@ -208,6 +322,7 @@ pub struct PdfView {
     viewer: Option<PdfViewer>,
     on_error: Option<ErrorListener>,
     on_page_error: Option<PageErrorListener>,
+    on_link: Option<UrlListener>,
     page_style: Option<Rc<dyn Fn(Style) -> Style>>,
     gap: f32,
     workers: usize,
@@ -233,6 +348,7 @@ pub fn pdf_view(source: impl Into<PdfSource>) -> PdfView {
         viewer: None,
         on_error: None,
         on_page_error: None,
+        on_link: None,
         page_style: None,
         gap: 8.0,
         workers: 2,
@@ -261,6 +377,13 @@ impl PdfView {
     /// Called with a page, from 0, that can't be drawn, which then says so where it would show.
     pub fn on_page_error(mut self, f: impl Fn(usize) + 'static) -> Self {
         self.on_page_error = Some(Rc::new(f));
+        self
+    }
+
+    /// Called with the address of a link to outside of the document that was clicked. Nothing opens
+    /// it unless this does: documents can link to anything. Links within the document just go there.
+    pub fn on_link(mut self, f: impl Fn(&str) + 'static) -> Self {
+        self.on_link = Some(Rc::new(f));
         self
     }
 
@@ -299,6 +422,7 @@ impl IntoView for PdfView {
         let gap = self.gap;
         let on_error = self.on_error;
         let on_page_error = self.on_page_error;
+        let on_link = self.on_link;
 
         let pages = signal(Rc::new(Vec::<(f32, f32)>::new()));
         let pictures = signal(HashMap::<usize, Arc<Bitmap>>::new());
@@ -411,7 +535,7 @@ impl IntoView for PdfView {
         });
 
         effect(move || {
-            let Some(page) = viewer.go_to.get() else {
+            let Some(target) = viewer.go_to.get() else {
                 return;
             };
             let t = table.get();
@@ -419,7 +543,10 @@ impl IntoView for PdfView {
                 return;
             }
             let scale = untrack(window_scale);
-            let y = t.top(page.min(t.len() - 1));
+            let y = pages.with_untracked(|pages| reading::target_position(&t, pages, target));
+            let Some(y) = y else {
+                return;
+            };
             let x = scale.px(untrack(|| offset.get()).x);
             scroller.scroll_to_after_layout(x, y);
             offset.set(PointF::new(
@@ -429,12 +556,26 @@ impl IntoView for PdfView {
             viewer.go_to.set(None);
         });
 
+        let engine = Rc::new(RefCell::new(None::<Engine>));
+        let reader = Reader::new(
+            viewer,
+            table,
+            pages,
+            Rc::new(view),
+            scroller,
+            on_link,
+            engine.clone(),
+        );
+
         // What comes back from the workers. A picture at another size than is wanted now only helps
         // a page that has nothing to show.
         let out = {
             let on_error = on_error.clone();
             let keep = keep.clone();
+            let reader = reader.clone();
             ui_channel(move |event: Event| match event {
+                Event::Text(page, text) => reader.text_arrived(page, text),
+                Event::Outline(outline) => viewer.outline.set(Rc::new(outline)),
                 Event::Opened(sizes) => {
                     viewer.count.set(sizes.len());
                     pages.set(Rc::new(sizes));
@@ -523,7 +664,6 @@ impl IntoView for PdfView {
             })
         };
 
-        let engine = Rc::new(RefCell::new(None::<Engine>));
         {
             let engine = engine.clone();
             effect(move || {
@@ -553,6 +693,28 @@ impl IntoView for PdfView {
                 parts.update(|all| all.retain(|_, p| of_use(&p.0)));
             }
         });
+
+        reader.watch_needs();
+        reader.watch_current_hit();
+        {
+            let reader = reader.clone();
+            effect(move || {
+                let query = viewer.query.get();
+                if viewer.count.get() > 0 {
+                    untrack(|| reader.start_search(&query));
+                }
+            });
+        }
+        {
+            let reader = reader.clone();
+            let asked = Cell::new(0);
+            effect(move || {
+                let copies = viewer.copies.get();
+                if asked.replace(copies) != copies {
+                    untrack(|| reader.copy(ClipboardKind::Clipboard));
+                }
+            });
+        }
 
         // Says what to draw whenever that may have changed.
         {
@@ -596,6 +758,7 @@ impl IntoView for PdfView {
 
         let on_scrolled = {
             let direction = direction.clone();
+            let reader = reader.clone();
             move |at: PointF| {
                 let old = offset.get_untracked();
                 if at.y > old.y {
@@ -604,6 +767,8 @@ impl IntoView for PdfView {
                     direction.set(Direction::Up);
                 }
                 offset.set_if_changed(at);
+                // What is under a pointer that is selecting has changed.
+                reader.extend_selection();
             }
         };
 
@@ -625,6 +790,18 @@ impl IntoView for PdfView {
                     Key::Character(c) if c == "=" || c == "+" => viewer.zoom_by(1.25),
                     Key::Character(c) if c == "-" => viewer.zoom_by(0.8),
                     Key::Character(c) if c == "0" => viewer.set_zoom(PdfZoom::FitWidth),
+                    // Otherwise the text of the application would get these too.
+                    Key::Character(c)
+                        if c.eq_ignore_ascii_case("c")
+                            && viewer.selection.get_untracked().is_some() =>
+                    {
+                        viewer.copy();
+                        e.prevent_default();
+                    }
+                    Key::Character(c) if c.eq_ignore_ascii_case("a") => {
+                        viewer.select_all();
+                        e.prevent_default();
+                    }
                     _ => return,
                 }
                 e.stop_propagation();
@@ -637,86 +814,135 @@ impl IntoView for PdfView {
                 Key::Named(NamedKey::ArrowUp) => at.y - 40.0,
                 Key::Named(NamedKey::Home) => 0.0,
                 Key::Named(NamedKey::End) => total,
+                Key::Named(NamedKey::Escape) if viewer.selection.get_untracked().is_some() => {
+                    viewer.clear_selection();
+                    e.stop_propagation();
+                    return;
+                }
                 _ => return,
             };
             scroller.scroll_to(at.x, y);
             e.stop_propagation();
         };
 
-        let page_view = move |page: usize| {
-            let page_style = page_style.clone();
-            div()
-                .absolute()
-                .dyn_style(move |s| {
-                    let t = table.get();
-                    if page >= t.len() {
-                        return s;
-                    }
-                    let (w, h) = t.size(page);
-                    let s = s
-                        .left(Length::Device(t.left(page)))
-                        .top(Length::Device(t.top(page)))
-                        .w(Length::Device(w))
-                        .h(Length::Device(h))
-                        .bg(Color::WHITE);
-                    match &page_style {
-                        Some(f) => f(s),
-                        None => s,
-                    }
-                })
-                .child(
-                    bitmap_view(move || pictures.with(|all| all.get(&page).cloned()))
-                        .w_full()
-                        .h_full(),
-                )
-                .child(
-                    bitmap_view(move || parts.with(|all| all.get(&page).map(|p| p.1.clone())))
-                        .absolute()
-                        .dyn_style(move |s| {
-                            let t = table.get();
-                            let job = parts.with(|all| all.get(&page).map(|p| p.0));
-                            let (Some(job), true) = (job, page < t.len()) else {
-                                return s;
-                            };
-                            let area = job.area_at(t.size(page));
-                            s.left(Length::Device(area.x))
-                                .top(Length::Device(area.y))
-                                .w(Length::Device(area.width))
-                                .h(Length::Device(area.height))
-                        }),
-                )
-                .child(show(
-                    move || failed.with(|f| f.contains(&page)),
-                    || {
-                        div()
+        let page_view = {
+            let reader = reader.clone();
+            move |page: usize| {
+                let page_style = page_style.clone();
+                let reader = reader.clone();
+                div()
+                    .absolute()
+                    // Pages go while the button is held when selecting past the edge of the box, and
+                    // what was pressed has to stay for the rest of the drag to come.
+                    .pointer_events_none()
+                    .dyn_style(move |s| {
+                        let t = table.get();
+                        if page >= t.len() {
+                            return s;
+                        }
+                        let (w, h) = t.size(page);
+                        let s = s
+                            .left(Length::Device(t.left(page)))
+                            .top(Length::Device(t.top(page)))
+                            .w(Length::Device(w))
+                            .h(Length::Device(h))
+                            .bg(Color::WHITE);
+                        match &page_style {
+                            Some(f) => f(s),
+                            None => s,
+                        }
+                    })
+                    .child(
+                        bitmap_view(move || pictures.with(|all| all.get(&page).cloned()))
+                            .w_full()
+                            .h_full(),
+                    )
+                    .child(
+                        bitmap_view(move || parts.with(|all| all.get(&page).map(|p| p.1.clone())))
                             .absolute()
-                            .inset(Length::Px(0.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                text("This page can't be drawn")
-                                    .text_color(Color::from_rgb(0x666666)),
-                            )
-                    },
-                ))
+                            .dyn_style(move |s| {
+                                let t = table.get();
+                                let job = parts.with(|all| all.get(&page).map(|p| p.0));
+                                let (Some(job), true) = (job, page < t.len()) else {
+                                    return s;
+                                };
+                                let area = job.area_at(t.size(page));
+                                s.left(Length::Device(area.x))
+                                    .top(Length::Device(area.y))
+                                    .w(Length::Device(area.width))
+                                    .h(Length::Device(area.height))
+                            }),
+                    )
+                    .child(show(
+                        move || failed.with(|f| f.contains(&page)),
+                        || {
+                            div()
+                                .absolute()
+                                .inset(Length::Px(0.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    text("This page can't be drawn")
+                                        .text_color(Color::from_rgb(0x666666)),
+                                )
+                        },
+                    ))
+                    .child(for_each(
+                        move || reader.boxes(page),
+                        |b| *b,
+                        |b| {
+                            let color = match b.kind {
+                                BoxKind::Selected => SELECTED,
+                                BoxKind::Found => FOUND,
+                                BoxKind::Current => CURRENT,
+                            };
+                            div()
+                                .absolute()
+                                .left(Length::Device(b.x))
+                                .top(Length::Device(b.y))
+                                .w(Length::Device(b.width))
+                                .h(Length::Device(b.height))
+                                .bg(Color::from_rgba(color))
+                        },
+                    ))
+            }
         };
 
         self.root
             .overflow_scroll()
             .focusable()
+            // Selecting here is up to the reader, and what is pressed isn't text of the application.
+            .select_none()
             .node_ref(scroller)
             .on_scrolled(on_scrolled)
             .on_resized(move |w, h| viewport.set_if_changed((w, h)))
             .on_scroll(on_scroll)
             .on_key_down(on_key)
+            .dyn_style({
+                let cursor = reader.cursor;
+                move |s| s.cursor(cursor.get())
+            })
+            .on_pointer_down({
+                let reader = reader.clone();
+                move |e| reader.pointer_down(e)
+            })
+            .on_pointer_up({
+                let reader = reader.clone();
+                move |e| reader.pointer_up(e)
+            })
             .on_pointer_move({
                 let pointer = pointer.clone();
-                move |e| pointer.set(Some((e.local.x as i32, e.local.y as i32)))
+                let reader = reader.clone();
+                move |e| {
+                    pointer.set(Some((e.local.x as i32, e.local.y as i32)));
+                    reader.pointer_moved(e);
+                }
             })
             .on_hover(move |inside| {
                 if !inside {
                     pointer.set(None);
+                    reader.pointer_left();
                 }
             })
             .child(
@@ -787,6 +1013,10 @@ mod tests {
     }
 
     impl Session for FakeSession<'_> {
+        fn text(&mut self, _: usize) -> text::PageText {
+            text::PageText::default()
+        }
+
         fn draw(&mut self, job: Job) -> Bitmap {
             self.0.draws.fetch_add(1, Ordering::Relaxed);
             assert_ne!(self.0.panics_on, Some(job.page));

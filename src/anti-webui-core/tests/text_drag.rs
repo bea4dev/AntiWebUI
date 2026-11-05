@@ -907,6 +907,48 @@ fn drop_targets_get_it_as_text_or_by_its_type() {
     assert_eq!(dragged::<DraggedText>(), None);
 }
 
+/// The narrow boxes of a color in a frame.
+fn narrow_boxes_of(scene: &Scene, color: Color) -> usize {
+    scene
+        .primitives
+        .iter()
+        .map(|p| match p {
+            Primitive::Quad(q) if q.background == color && q.rect.width <= 4 => 1,
+            Primitive::Layer(l) => narrow_boxes_of(&l.content, color),
+            _ => 0,
+        })
+        .sum()
+}
+
+#[test]
+fn the_caret_takes_the_color_of_the_text_unless_it_has_its_own() {
+    let white = rgb(0xffffff);
+    let value = signal("text".to_owned());
+    let mut h = mount(|| {
+        div()
+            .w(800.0)
+            .h(600.0)
+            .bg(rgb(0x2b2d31))
+            .text_color(white)
+            .child(field_at(0.0, value))
+    });
+    h.press(100.0, 15.0);
+    assert_eq!(narrow_boxes_of(&h.scene(), white), 1);
+
+    let own = rgb(0xff00ff);
+    let mut h = mount(|| {
+        div()
+            .w(800.0)
+            .h(600.0)
+            .text_color(white)
+            .child(field_at(0.0, value).caret_color(own))
+    });
+    h.press(100.0, 15.0);
+    let scene = h.scene();
+    assert_eq!(narrow_boxes_of(&scene, own), 1);
+    assert_eq!(narrow_boxes_of(&scene, white), 0);
+}
+
 /// The caret's quads: only that has this color.
 fn carets(scene: &Scene) -> Vec<(i32, i32)> {
     scene

@@ -172,6 +172,11 @@ impl PageTable {
         first..last
     }
 
+    /// The page at a row, or the next one if it is between pages.
+    pub fn page_near(&self, y: i32) -> usize {
+        self.first_below(y).min(self.len().saturating_sub(1))
+    }
+
     /// The page in the middle of the rows from `top`, `height` of them.
     pub fn page_at_middle(&self, top: i32, height: i32) -> usize {
         let middle = (top as i64 + height as i64 / 2).min(i32::MAX as i64) as i32;

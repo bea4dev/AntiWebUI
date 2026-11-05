@@ -2002,7 +2002,11 @@ pub(crate) fn scroll_node(
 }
 
 /// Hit-tests the scrollbar thumbs of `target`'s scroll containers.
-fn scrollbar_hit(doc: &Document, target: NodeId, p: PointF) -> Option<(NodeId, bool, f32)> {
+pub(crate) fn scrollbar_hit(
+    doc: &Document,
+    target: NodeId,
+    p: PointF,
+) -> Option<(NodeId, bool, f32)> {
     let grab_width = doc.scale.pxf(12.0);
     for id in doc.ancestors(target) {
         let n = doc.get(id)?;

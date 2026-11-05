@@ -1654,7 +1654,8 @@ impl Painter<'_> {
             let caret = edit
                 .drop_caret_rect(at, caret_width(doc))
                 .translate(origin.x, origin.y);
-            self.scene.fill(caret, fade(c.caret_color, opacity), clip);
+            self.scene
+                .fill(caret, fade(c.caret_color.unwrap_or(c.color), opacity), clip);
         } else if focused && doc.state.window_focused && !edit.read_only {
             let elapsed = self.now.saturating_duration_since(edit.caret_epoch);
             let on = (elapsed.as_millis() / CARET_BLINK.as_millis()).is_multiple_of(2);
@@ -1663,7 +1664,8 @@ impl Painter<'_> {
                 let caret = edit
                     .caret_rect(caret_width(doc))
                     .translate(origin.x, origin.y);
-                self.scene.fill(caret, fade(c.caret_color, opacity), clip);
+                self.scene
+                    .fill(caret, fade(c.caret_color.unwrap_or(c.color), opacity), clip);
             }
         }
     }

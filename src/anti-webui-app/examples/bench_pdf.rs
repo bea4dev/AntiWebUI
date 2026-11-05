@@ -1,6 +1,7 @@
 //! How long a PDF takes on the screen and what scrolling it does, without a window:
 //! `bench_pdf <file.pdf> [--dump first.png] [--speed screens-per-second] [--seconds n]
-//! [--zoom percent] [--slow-frames]`. What it prints is one line of JSON, for `src/anti-webui-pdf/tools/compare.py`, which gets the same numbers
+//! [--zoom percent] [--slow-frames] [--search word] [--select]`. The last two are there to look at:
+//! what is found and all that is selected show in the picture. What it prints is one line of JSON, for `src/anti-webui-pdf/tools/compare.py`, which gets the same numbers
 //! from PDF.js. See `docs/design/26-pdf.md`.
 
 use anti_webui_core::Ui;
@@ -124,6 +125,9 @@ fn main() {
         size: SizeI::new(WIDTH as i32, HEIGHT as i32),
         scale: SCALE,
     });
+    if let Some(word) = value("--search") {
+        viewer.search(word.clone());
+    }
 
     // Up to when the first picture has been drawn by the GPU, as a window would.
     let shown;
@@ -137,7 +141,16 @@ fn main() {
         if let PdfState::Failed(e) = untrack(|| viewer.state()) {
             panic!("{e}");
         }
+        if args.iter().any(|a| a == "--select") {
+            viewer.select_all();
+        }
         let scene = ui.paint(Instant::now());
+        let looking = value("--search").is_some() || args.iter().any(|a| a == "--select");
+        // What shows on top comes after the page has been read, a little after its picture.
+        if looking && start.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
         if blank_rows(&scene) < HEIGHT as usize {
             let mut encoder = gpu.device.create_command_encoder(&Default::default());
             renderer.render(&gpu.device, &gpu.queue, &mut encoder, &target.view, &scene);

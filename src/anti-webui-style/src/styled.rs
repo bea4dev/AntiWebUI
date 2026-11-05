@@ -169,7 +169,6 @@ pub trait Styled: Sized {
         letter_spacing => letter_spacing: f32;
         text_align => text_align: TextAlign;
         selection_color => selection_color: Color;
-        caret_color => caret_color: Color;
         scrollbar_color => scrollbar_color: Color;
     }
 
@@ -251,6 +250,11 @@ pub trait Styled: Sized {
     /// checkbox that is on, the track of a slider (CSS `accent-color`).
     fn accent_color(mut self, color: impl Into<Color>) -> Self {
         self.style_mut().accent_color = Some(Some(color.into()));
+        self
+    }
+
+    fn caret_color(mut self, color: Color) -> Self {
+        self.style_mut().caret_color = Some(Some(color));
         self
     }
 

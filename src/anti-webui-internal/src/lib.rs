@@ -17,7 +17,8 @@ pub mod prelude {
     pub use anti_webui_macros::ShaderParams;
     #[cfg(feature = "pdf")]
     pub use anti_webui_pdf::{
-        PdfError, PdfState, PdfView, PdfViewer, PdfZoom, pdf_view, pdf_viewer,
+        PdfError, PdfOutlineItem, PdfState, PdfTarget, PdfView, PdfViewer, PdfZoom, pdf_view,
+        pdf_viewer,
     };
     pub use anti_webui_widgets::*;
 }

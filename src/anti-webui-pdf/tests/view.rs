@@ -2,11 +2,17 @@
 //! `docs/design/26-pdf.md`.
 
 use anti_webui_core::Ui;
+use anti_webui_core::event::{ClipboardKind as Clipboard, Key, KeyEvent, PointerButton};
 use anti_webui_core::event::{Modifiers, ScrollPhase, ScrollSource, WindowEvent};
 use anti_webui_core::geometry::{PointF, Scale, SizeI};
+use anti_webui_core::platform::{CursorIcon, PlatformRequest};
 use anti_webui_core::prelude::*;
 use anti_webui_core::scene::{ImageDraw, Primitive, Scene};
-use anti_webui_pdf::{PdfError, PdfState, PdfViewer, PdfZoom, pdf_view, pdf_viewer};
+use anti_webui_pdf::{
+    PdfError, PdfOutlineItem, PdfState, PdfTarget, PdfViewer, PdfZoom, pdf_view, pdf_viewer,
+};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 const ONE: Scale = Scale(120);
@@ -565,4 +571,649 @@ fn the_wrong_password_says_so_and_another_can_be_tried() {
     viewer.unlock("hello");
     settle(&mut ui);
     assert_eq!(viewer.state(), PdfState::Ready);
+}
+
+/// A document with pages of text in Helvetica, one point of each page's content being what it
+/// says, with more for the catalog, each page and the rest of the objects.
+struct TextDocument {
+    pages: Vec<String>,
+    /// For each page, what else its dictionary has.
+    page_extras: Vec<String>,
+    catalog_extra: String,
+    /// More objects, numbered from 100.
+    objects: Vec<String>,
+}
+
+impl TextDocument {
+    fn new(pages: &[&str]) -> Self {
+        Self {
+            pages: pages.iter().map(|p| p.to_string()).collect(),
+            page_extras: vec![String::new(); pages.len()],
+            catalog_extra: String::new(),
+            objects: Vec::new(),
+        }
+    }
+
+    fn build(&self) -> Vec<u8> {
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut offsets: Vec<(usize, usize)> = Vec::new();
+        let mut object = |out: &mut Vec<u8>, id: usize, body: &str| {
+            offsets.push((id, out.len()));
+            out.extend_from_slice(format!("{id} 0 obj\n{body}\nendobj\n").as_bytes());
+        };
+        let kids: Vec<String> = (0..self.pages.len())
+            .map(|i| format!("{} 0 R", 10 + i * 2))
+            .collect();
+        object(
+            &mut out,
+            1,
+            &format!("<< /Type /Catalog /Pages 2 0 R {} >>", self.catalog_extra),
+        );
+        object(
+            &mut out,
+            2,
+            &format!(
+                "<< /Type /Pages /Count {} /Kids [{}] >>",
+                self.pages.len(),
+                kids.join(" ")
+            ),
+        );
+        object(
+            &mut out,
+            3,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        );
+        for (i, content) in self.pages.iter().enumerate() {
+            object(
+                &mut out,
+                10 + i * 2,
+                &format!(
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Contents {} 0 R \
+                     /Resources << /Font << /F1 3 0 R >> >> {} >>",
+                    11 + i * 2,
+                    self.page_extras[i]
+                ),
+            );
+            object(
+                &mut out,
+                11 + i * 2,
+                &format!(
+                    "<< /Length {} >>\nstream\n{content}\nendstream",
+                    content.len()
+                ),
+            );
+        }
+        for (i, body) in self.objects.iter().enumerate() {
+            object(&mut out, 100 + i, body);
+        }
+        let start = out.len();
+        let size = offsets.iter().map(|o| o.0).max().unwrap_or(0) + 1;
+        out.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+        for (id, offset) in &offsets {
+            out.extend_from_slice(format!("{id} 1\n{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+}
+
+/// A line of text, in 20 point Helvetica, `y` points from the bottom of the page.
+fn line(x: u32, y: u32, text: &str) -> String {
+    format!("BT /F1 20 Tf {x} {y} Td ({text}) Tj ET\n")
+}
+
+/// A viewer of 400x300 pages at 100% at a scale of 1, where a point is 4/3 of a pixel, in a box of
+/// that size. It is kept from scrolling sideways with room to spare.
+fn read(doc: &TextDocument) -> (Ui, PdfViewer) {
+    read_with(doc, |view| view)
+}
+
+fn read_with(
+    doc: &TextDocument,
+    f: impl FnOnce(anti_webui_pdf::PdfView) -> anti_webui_pdf::PdfView,
+) -> (Ui, PdfViewer) {
+    let viewer = Rc::new(RefCell::new(None));
+    let bytes = doc.build();
+    let kept = viewer.clone();
+    let mut ui = mount((560, 420), ONE, move || {
+        let v = pdf_viewer();
+        *kept.borrow_mut() = Some(v);
+        v.set_zoom(PdfZoom::Percent(1.0));
+        f(pdf_view(bytes).viewer(v).gap(0.0)).w_full().h_full()
+    });
+    settle(&mut ui);
+    let v = viewer.borrow().expect("it was made");
+    v.focus();
+    ui.update();
+    (ui, v)
+}
+
+/// Where a point of a page is in the box, for the first page.
+fn at(x: f32, y: f32) -> PointF {
+    PointF::new(x * 4.0 / 3.0, (300.0 - y) * 4.0 / 3.0)
+}
+
+fn move_to(ui: &mut Ui, p: PointF) {
+    ui.handle_event(WindowEvent::PointerMoved {
+        position: p,
+        modifiers: Modifiers::default(),
+    });
+    // What the page says has to come for this to mean anything.
+    settle(ui);
+}
+
+fn press(ui: &mut Ui, p: PointF, time: u32) {
+    ui.handle_event(WindowEvent::PointerMoved {
+        position: p,
+        modifiers: Modifiers::default(),
+    });
+    settle(ui);
+    ui.handle_event(WindowEvent::PointerButton {
+        button: PointerButton::Primary,
+        pressed: true,
+        position: p,
+        modifiers: Modifiers::default(),
+        time,
+    });
+    settle(ui);
+}
+
+fn release(ui: &mut Ui, p: PointF) {
+    ui.handle_event(WindowEvent::PointerButton {
+        button: PointerButton::Primary,
+        pressed: false,
+        position: p,
+        modifiers: Modifiers::default(),
+        time: 0,
+    });
+    settle(ui);
+}
+
+fn drag(ui: &mut Ui, from: PointF, to: PointF) {
+    press(ui, from, 0);
+    move_to(ui, to);
+    release(ui, to);
+}
+
+fn control(ui: &mut Ui, key: &str) {
+    ui.handle_event(WindowEvent::Key(KeyEvent {
+        key: Key::Character(key.into()),
+        text: None,
+        modifiers: Modifiers {
+            ctrl: true,
+            ..Default::default()
+        },
+        pressed: true,
+        repeat: false,
+    }));
+    settle(ui);
+}
+
+/// What was last put on a clipboard.
+fn clipboard(ui: &mut Ui, kind: Clipboard) -> Option<String> {
+    ui.take_requests().into_iter().rev().find_map(|r| match r {
+        PlatformRequest::SetClipboard { kind: k, text } if k == kind => Some(text),
+        _ => None,
+    })
+}
+
+fn copied(ui: &mut Ui) -> Option<String> {
+    control(ui, "c");
+    clipboard(ui, Clipboard::Clipboard)
+}
+
+/// A letter of Helvetica at 20 points takes a little over 10 points on average, so these are in the
+/// middle of the first and last letters.
+const FOX: &str = "quick fox";
+
+#[test]
+fn dragging_selects_text_and_ctrl_c_copies_it() {
+    let doc = TextDocument::new(&[&(line(20, 200, FOX) + &line(20, 170, "lazy dog"))]);
+    let (mut ui, viewer) = read(&doc);
+    assert!(!viewer.has_selection());
+    drag(&mut ui, at(19.0, 205.0), at(300.0, 175.0));
+    assert!(viewer.has_selection());
+    // Letting go also puts it in the primary selection.
+    assert_eq!(
+        clipboard(&mut ui, Clipboard::Primary).as_deref(),
+        Some("quick fox\nlazy dog")
+    );
+    assert_eq!(copied(&mut ui).as_deref(), Some("quick fox\nlazy dog"));
+}
+
+#[test]
+fn the_selection_shows_on_top_of_the_page() {
+    let doc = TextDocument::new(&[&line(20, 200, FOX)]);
+    let (mut ui, viewer) = read(&doc);
+    let boxes = |ui: &mut Ui| {
+        let mut count = 0;
+        fn walk(scene: &Scene, count: &mut usize) {
+            for p in &scene.primitives {
+                match p {
+                    Primitive::Quad(q) if q.background.a > 0.0 && q.background.a < 1.0 => {
+                        *count += 1
+                    }
+                    Primitive::Layer(l) => walk(&l.content, count),
+                    _ => {}
+                }
+            }
+        }
+        walk(&ui.paint(Instant::now()), &mut count);
+        count
+    };
+    assert_eq!(boxes(&mut ui), 0);
+    drag(&mut ui, at(19.0, 205.0), at(300.0, 205.0));
+    assert!(viewer.has_selection());
+    assert_eq!(boxes(&mut ui), 1);
+    // A click on the page takes it away again.
+    press(&mut ui, at(60.0, 205.0), 5000);
+    release(&mut ui, at(60.0, 205.0));
+    assert!(!viewer.has_selection());
+    assert_eq!(boxes(&mut ui), 0);
+}
+
+#[test]
+fn a_double_click_takes_a_word_and_a_triple_click_a_line() {
+    let doc = TextDocument::new(&[&(line(20, 200, FOX) + &line(20, 170, "lazy dog"))]);
+    let (mut ui, _viewer) = read(&doc);
+    let p = at(30.0, 205.0);
+    press(&mut ui, p, 1000);
+    release(&mut ui, p);
+    press(&mut ui, p, 1100);
+    release(&mut ui, p);
+    assert_eq!(copied(&mut ui).as_deref(), Some("quick"));
+    press(&mut ui, p, 1200);
+    release(&mut ui, p);
+    assert_eq!(copied(&mut ui).as_deref(), Some("quick fox"));
+}
+
+/// A viewer with text of the application above it, as a toolbar has. It is 40 pixels high.
+fn read_under_a_toolbar(doc: &TextDocument) -> (Ui, PdfViewer) {
+    let viewer = Rc::new(RefCell::new(None));
+    let bytes = doc.build();
+    let kept = viewer.clone();
+    let mut ui = mount((560, 460), ONE, move || {
+        let v = pdf_viewer();
+        *kept.borrow_mut() = Some(v);
+        v.set_zoom(PdfZoom::Percent(1.0));
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .h_full()
+            .child(div().h(40.0).flex_none().child(text("toolbar")))
+            .child(pdf_view(bytes).viewer(v).gap(0.0).flex_1().min_h(0.0))
+    });
+    settle(&mut ui);
+    let v = viewer.borrow().expect("it was made");
+    (ui, v)
+}
+
+/// Whether the text of the application shows as selected.
+fn application_text_is_selected(ui: &mut Ui) -> bool {
+    control(ui, "c");
+    ui.take_requests().iter().any(
+        |r| matches!(r, PlatformRequest::SetClipboard { text, .. } if text.contains("toolbar")),
+    )
+}
+
+#[test]
+fn selecting_in_a_document_leaves_the_text_around_it_alone() {
+    let doc = TextDocument::new(&[&line(20, 200, FOX)]);
+    let (mut ui, viewer) = read_under_a_toolbar(&doc);
+    let below = |p: PointF| PointF::new(p.x, p.y + 40.0);
+    drag(&mut ui, below(at(19.0, 205.0)), below(at(300.0, 205.0)));
+    assert!(viewer.has_selection());
+    assert_eq!(copied(&mut ui).as_deref(), Some(FOX));
+}
+
+#[test]
+fn ctrl_a_in_a_document_selects_only_the_document() {
+    let doc = TextDocument::new(&[&line(20, 200, FOX)]);
+    let (mut ui, viewer) = read_under_a_toolbar(&doc);
+    let below = |p: PointF| PointF::new(p.x, p.y + 40.0);
+    press(&mut ui, below(at(30.0, 205.0)), 0);
+    release(&mut ui, below(at(30.0, 205.0)));
+    control(&mut ui, "a");
+    assert!(viewer.has_selection());
+    assert_eq!(copied(&mut ui).as_deref(), Some(FOX));
+}
+
+#[test]
+fn pressing_in_a_document_ends_the_selection_of_the_text_around_it() {
+    let doc = TextDocument::new(&[&line(20, 200, FOX)]);
+    let (mut ui, viewer) = read_under_a_toolbar(&doc);
+    drag(&mut ui, PointF::new(1.0, 10.0), PointF::new(300.0, 10.0));
+    assert!(application_text_is_selected(&mut ui));
+    let below = |p: PointF| PointF::new(p.x, p.y + 40.0);
+    press(&mut ui, below(at(300.0, 40.0)), 5000);
+    release(&mut ui, below(at(300.0, 40.0)));
+    assert!(!viewer.has_selection());
+    assert!(!application_text_is_selected(&mut ui));
+}
+
+#[test]
+fn ctrl_c_with_nothing_selected_in_a_document_copies_what_is_selected_around_it() {
+    let doc = TextDocument::new(&[&line(20, 200, FOX)]);
+    let (mut ui, viewer) = read_under_a_toolbar(&doc);
+    viewer.focus();
+    ui.update();
+    drag(&mut ui, PointF::new(1.0, 10.0), PointF::new(300.0, 10.0));
+    viewer.focus();
+    ui.update();
+    assert!(application_text_is_selected(&mut ui));
+}
+
+#[test]
+fn shift_goes_on_from_where_selecting_started() {
+    let doc = TextDocument::new(&[&(line(20, 200, FOX) + &line(20, 170, "lazy dog"))]);
+    let (mut ui, _viewer) = read(&doc);
+    drag(&mut ui, at(19.0, 205.0), at(70.0, 205.0));
+    let selected = clipboard(&mut ui, Clipboard::Primary).expect("something was selected");
+    assert!(
+        selected.starts_with("qu") && !selected.contains("fox"),
+        "{selected}"
+    );
+    let p = at(300.0, 175.0);
+    ui.handle_event(WindowEvent::PointerButton {
+        button: PointerButton::Primary,
+        pressed: true,
+        position: p,
+        modifiers: Modifiers {
+            shift: true,
+            ..Default::default()
+        },
+        time: 5000,
+    });
+    settle(&mut ui);
+    release(&mut ui, p);
+    assert_eq!(
+        clipboard(&mut ui, Clipboard::Primary).as_deref(),
+        Some("quick fox\nlazy dog")
+    );
+}
+
+#[test]
+fn selecting_past_the_edge_of_the_box_scrolls_and_goes_on() {
+    let pages: Vec<String> = (0..6).map(|i| line(20, 200, &format!("page{i}"))).collect();
+    let pages: Vec<&str> = pages.iter().map(String::as_str).collect();
+    let (mut ui, viewer) = read(&TextDocument::new(&pages));
+    press(&mut ui, at(19.0, 205.0), 0);
+    // Far below the box, where the pointer stays while it scrolls by itself.
+    move_to(&mut ui, PointF::new(100.0, 2000.0));
+    let start = Instant::now();
+    for i in 0..40 {
+        ui.animate(start + Duration::from_millis(i * 8));
+        settle(&mut ui);
+    }
+    assert!(viewer.page() >= 3, "{}", viewer.page());
+    release(&mut ui, PointF::new(100.0, 2000.0));
+    let selected = clipboard(&mut ui, Clipboard::Primary).expect("something was selected");
+    assert!(selected.starts_with("page0\npage1\npage2"), "{selected}");
+}
+
+#[test]
+fn pressing_far_from_any_text_selects_nothing() {
+    let doc = TextDocument::new(&[&line(20, 200, FOX)]);
+    let (mut ui, viewer) = read(&doc);
+    drag(&mut ui, at(300.0, 40.0), at(350.0, 20.0));
+    assert!(!viewer.has_selection());
+}
+
+#[test]
+fn text_that_is_filled_and_stroked_is_there_once() {
+    let content = "BT /F1 20 Tf 2 Tr 20 200 Td (twice) Tj ET\n";
+    let (mut ui, viewer) = read(&TextDocument::new(&[content]));
+    drag(&mut ui, at(19.0, 205.0), at(300.0, 205.0));
+    assert!(viewer.has_selection());
+    assert_eq!(copied(&mut ui).as_deref(), Some("twice"));
+}
+
+#[test]
+fn ctrl_a_copies_every_page_even_if_they_have_not_been_read() {
+    let pages: Vec<String> = (0..40)
+        .map(|i| line(20, 200, &format!("page{i}")))
+        .collect();
+    let pages: Vec<&str> = pages.iter().map(String::as_str).collect();
+    let (mut ui, viewer) = read(&TextDocument::new(&pages));
+    control(&mut ui, "a");
+    assert!(viewer.has_selection());
+    let all = copied(&mut ui).expect("all of it was read");
+    let wanted: Vec<String> = (0..40).map(|i| format!("page{i}")).collect();
+    assert_eq!(all, wanted.join("\n"));
+}
+
+#[test]
+fn searching_finds_all_of_it_and_goes_around() {
+    let pages: Vec<String> = (0..50)
+        .map(|i| {
+            if i % 10 == 3 {
+                line(20, 200, "the needle") + &line(20, 170, "and a Needle")
+            } else {
+                line(20, 200, "hay")
+            }
+        })
+        .collect();
+    let pages: Vec<&str> = pages.iter().map(String::as_str).collect();
+    let (mut ui, viewer) = read(&TextDocument::new(&pages));
+    assert!(viewer.search_done());
+    viewer.search("needle");
+    settle(&mut ui);
+    assert!(viewer.search_done());
+    assert_eq!(viewer.search_count(), 10);
+    // It went to the first one, which is on another page, and shows it in the middle of the box.
+    assert_eq!(viewer.search_index(), Some(0));
+    settle(&mut ui);
+    assert_eq!(viewer.page(), 3);
+    viewer.find_next();
+    settle(&mut ui);
+    assert_eq!(viewer.search_index(), Some(1));
+    viewer.find_next();
+    settle(&mut ui);
+    assert_eq!(viewer.search_index(), Some(2));
+    assert_eq!(viewer.page(), 13);
+    viewer.find_previous();
+    viewer.find_previous();
+    viewer.find_previous();
+    settle(&mut ui);
+    assert_eq!(viewer.search_index(), Some(9));
+    assert_eq!(viewer.page(), 43);
+    viewer.search("");
+    settle(&mut ui);
+    assert_eq!(viewer.search_count(), 0);
+    assert_eq!(viewer.search_index(), None);
+}
+
+#[test]
+fn going_to_the_only_one_found_shows_it_again() {
+    let mut pages = vec![line(20, 200, "needle")];
+    pages.extend((0..5).map(|_| line(20, 200, "hay")));
+    let pages: Vec<&str> = pages.iter().map(String::as_str).collect();
+    let (mut ui, viewer) = read(&TextDocument::new(&pages));
+    viewer.search("needle");
+    settle(&mut ui);
+    viewer.go_to_page(4);
+    settle(&mut ui);
+    assert_eq!(viewer.page(), 4);
+    viewer.find_next();
+    settle(&mut ui);
+    assert_eq!(viewer.page(), 0);
+}
+
+#[test]
+fn text_on_a_turned_page_is_selected_where_it_shows() {
+    let mut doc = TextDocument::new(&[&line(20, 200, FOX)]);
+    doc.page_extras[0] = "/Rotate 90".into();
+    let (mut ui, viewer) = read(&doc);
+    viewer.select_all();
+    viewer.copy();
+    settle(&mut ui);
+    assert_eq!(
+        clipboard(&mut ui, Clipboard::Clipboard).as_deref(),
+        Some(FOX)
+    );
+    // It goes down the page now, 200 points in from the left and starting 20 from the top. A page
+    // this way is 300 points wide and 400 tall, in the middle of the box.
+    let left = (560.0 - 400.0) / 2.0;
+    let point = |x: f32, y: f32| PointF::new(left + x * 4.0 / 3.0, y * 4.0 / 3.0);
+    viewer.clear_selection();
+    settle(&mut ui);
+    drag(&mut ui, point(205.0, 19.0), point(205.0, 200.0));
+    assert_eq!(copied(&mut ui).as_deref(), Some(FOX));
+}
+
+#[test]
+fn searching_starts_from_the_page_that_shows() {
+    let pages: Vec<String> = (0..10).map(|_| line(20, 200, "same")).collect();
+    let pages: Vec<&str> = pages.iter().map(String::as_str).collect();
+    let (mut ui, viewer) = read(&TextDocument::new(&pages));
+    viewer.go_to_page(6);
+    settle(&mut ui);
+    assert_eq!(viewer.page(), 6);
+    viewer.search("same");
+    settle(&mut ui);
+    assert_eq!(viewer.search_count(), 10);
+    assert_eq!(viewer.search_index(), Some(6));
+    assert_eq!(viewer.page(), 6);
+}
+
+#[test]
+fn searching_finds_what_a_line_breaks_up() {
+    let content = line(20, 200, "some exam-") + &line(20, 170, "ple text") + &line(20, 140, "two");
+    let (mut ui, viewer) = read(&TextDocument::new(&[&content]));
+    for (query, count) in [
+        ("example", 1),
+        ("EXAMPLE TEXT", 1),
+        ("texttwo", 1),
+        ("text two", 1),
+        ("ＳＯＭＥ", 1),
+        ("none", 0),
+    ] {
+        viewer.search(query);
+        settle(&mut ui);
+        assert_eq!(viewer.search_count(), count, "{query}");
+    }
+}
+
+#[test]
+fn links_go_to_their_pages_and_say_where_else_they_go() {
+    let mut doc = TextDocument::new(&[
+        &line(20, 200, "contents"),
+        &line(20, 200, "second"),
+        &line(20, 200, "third"),
+    ]);
+    // A rectangle for the link to the page after it, one by name and one out of the document.
+    doc.page_extras[0] = "/Annots [\
+        << /Type /Annot /Subtype /Link /Rect [0 250 100 300] /Dest [12 0 R /XYZ 0 300 0] >> \
+        << /Type /Annot /Subtype /Link /Rect [100 250 200 300] /Dest (third) >> \
+        << /Type /Annot /Subtype /Link /Rect [200 250 300 300] \
+           /A << /S /URI /URI (https://example.com/) >> >> ]"
+        .into();
+    doc.catalog_extra = "/Names << /Dests << /Names [(third) [14 0 R /Fit]] >> >>".into();
+    let urls = Rc::new(RefCell::new(Vec::<String>::new()));
+    let told = urls.clone();
+    let (mut ui, viewer) = read_with(&doc, move |view| {
+        view.on_link(move |url| told.borrow_mut().push(url.to_owned()))
+    });
+
+    // Not followed when it is only there. A move says what is there, once the page has been read,
+    // and the one after it shows on the pointer.
+    for _ in 0..3 {
+        move_to(&mut ui, at(50.0, 280.0));
+    }
+    assert_eq!(viewer.page(), 0);
+    let cursors = ui.take_requests();
+    assert!(
+        cursors.contains(&PlatformRequest::SetCursor(CursorIcon::Pointer)),
+        "{cursors:?}"
+    );
+
+    let p = at(250.0, 280.0);
+    press(&mut ui, p, 0);
+    release(&mut ui, p);
+    assert_eq!(*urls.borrow(), ["https://example.com/"]);
+    assert_eq!(viewer.page(), 0);
+
+    let p = at(150.0, 280.0);
+    press(&mut ui, p, 5000);
+    release(&mut ui, p);
+    settle(&mut ui);
+    assert_eq!(viewer.page(), 2);
+
+    viewer.go_to_page(0);
+    settle(&mut ui);
+    let p = at(50.0, 280.0);
+    press(&mut ui, p, 10000);
+    release(&mut ui, p);
+    settle(&mut ui);
+    assert_eq!(viewer.page(), 1);
+}
+
+#[test]
+fn the_outline_says_what_goes_where() {
+    let mut doc = TextDocument::new(&[&line(20, 200, "a"), &line(20, 200, "b")]);
+    doc.catalog_extra = "/Outlines 100 0 R".into();
+    doc.objects = vec![
+        "<< /Type /Outlines /First 101 0 R /Last 102 0 R /Count 2 >>".into(),
+        "<< /Title (One) /Parent 100 0 R /Next 102 0 R /First 103 0 R /Dest [10 0 R /Fit] >>"
+            .into(),
+        // In UTF-16, going to a place on the page.
+        "<< /Title <FEFF65E5672C> /Parent 100 0 R /A << /S /GoTo /D [12 0 R /XYZ 0 150 0] >> >>"
+            .into(),
+        "<< /Title (Inside) /Parent 101 0 R >>".into(),
+    ];
+    let (mut ui, viewer) = read(&doc);
+    settle(&mut ui);
+    let outline = viewer.outline();
+    assert_eq!(
+        *outline,
+        vec![
+            PdfOutlineItem {
+                title: "One".into(),
+                target: Some(PdfTarget { page: 0, top: None }),
+                children: vec![PdfOutlineItem {
+                    title: "Inside".into(),
+                    target: None,
+                    children: Vec::new(),
+                }],
+            },
+            PdfOutlineItem {
+                title: "日本".into(),
+                target: Some(PdfTarget {
+                    page: 1,
+                    top: Some(150.0),
+                }),
+                children: Vec::new(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn an_outline_that_goes_in_circles_ends() {
+    let mut doc = TextDocument::new(&[&line(20, 200, "a")]);
+    doc.catalog_extra = "/Outlines 100 0 R".into();
+    doc.objects = vec![
+        "<< /First 101 0 R >>".into(),
+        "<< /Title (Again) /Next 101 0 R /First 101 0 R >>".into(),
+    ];
+    let (mut ui, viewer) = read(&doc);
+    settle(&mut ui);
+    assert_eq!(viewer.outline().len(), 1);
+}
+
+#[test]
+fn pressing_on_the_scrollbar_does_not_select() {
+    let pages: Vec<String> = (0..5).map(|_| line(20, 200, FOX)).collect();
+    let pages: Vec<&str> = pages.iter().map(String::as_str).collect();
+    let (mut ui, viewer) = read(&TextDocument::new(&pages));
+    // On the right edge of the box, within reach of the text that is nearest.
+    let p = PointF::new(555.0, 120.0);
+    press(&mut ui, p, 0);
+    move_to(&mut ui, PointF::new(555.0, 200.0));
+    release(&mut ui, PointF::new(555.0, 200.0));
+    assert!(!viewer.has_selection());
 }

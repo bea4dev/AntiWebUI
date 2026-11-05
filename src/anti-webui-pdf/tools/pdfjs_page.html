@@ -11,7 +11,8 @@
 // The viewer component of PDF.js with what its own app gives it, at the zoom `bench_pdf` starts at.
 import * as pdfjsLib from '/pdfjs/build/pdf.mjs';
 globalThis.pdfjsLib = pdfjsLib;
-const { PDFViewer, EventBus, PDFLinkService } = await import('/pdfjs/web/pdf_viewer.mjs');
+const { PDFViewer, EventBus, PDFLinkService, PDFFindController, FindState } =
+  await import('/pdfjs/web/pdf_viewer.mjs');
 pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdfjs/build/pdf.worker.mjs';
 pdfjsLib.GlobalWorkerOptions.rendererSrc = '/pdfjs/build/pdf.renderer.mjs';
 const q = new URLSearchParams(location.search);
@@ -26,7 +27,9 @@ const FINISHED = 3;
 try {
   const data = await (await fetch('/file?p=' + encodeURIComponent(q.get('file')))).arrayBuffer();
   await new Promise(r => setTimeout(r, 200));
-  const viewer = new PDFViewer({ container, eventBus, linkService });
+  const find = q.get('find');
+  const findController = find ? new PDFFindController({ linkService, eventBus }) : undefined;
+  const viewer = new PDFViewer({ container, eventBus, linkService, findController });
   linkService.setViewer(viewer);
   const start = performance.now();
   let opened = 0;
@@ -48,10 +51,49 @@ try {
   opened = performance.now() - start;
   viewer.setDocument(doc);
   linkService.setDocument(doc);
+  findController?.setDocument(doc);
   await first;
   // The browser has to get it on the screen after that.
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
   const shown = performance.now() - start;
+
+  // How long searching takes, from the moment it is asked for. "again" keeps PDF.js from waiting for
+  // more typing first, which it does for 250 ms.
+  if (find) {
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+    const began = performance.now();
+    const found = new Promise(resolve => {
+      eventBus.on('updatefindcontrolstate', e => {
+        if (e.state === FindState.FOUND || e.state === FindState.NOT_FOUND) resolve(performance.now() - began);
+      });
+    });
+    const longest = { ms: 0, last: began };
+    const ticking = () => {
+      const now = performance.now();
+      longest.ms = Math.max(longest.ms, now - longest.last);
+      longest.last = now;
+      requestAnimationFrame(ticking);
+    };
+    requestAnimationFrame(ticking);
+    eventBus.dispatch('find', {
+      source: null, type: 'again', query: find, caseSensitive: false, entireWord: false,
+      highlightAll: true, findPrevious: false, matchDiacritics: false,
+    });
+    const first_ms = await found;
+    await new Promise(r => setTimeout(r));
+    await Promise.all(findController._extractTextPromises);
+    while (findController._pendingFindMatches.size || findController._pageMatches.filter(Boolean).length < doc.numPages) {
+      await new Promise(r => setTimeout(r, 1));
+    }
+    await post('/result', JSON.stringify({
+      first_ms,
+      all_ms: performance.now() - began,
+      longest_frame_ms: longest.ms,
+      hits: findController.pageMatches.reduce((sum, m) => sum + (m?.length ?? 0), 0),
+    }));
+    await post('/done', '');
+    throw null;
+  }
 
   // How much of the box shows pixels one to one: a page too big for one picture has a detail canvas
   // for that, which stays while the next is being drawn. `bench_pdf` counts the same.
@@ -123,7 +165,7 @@ try {
     page_reached: viewer.currentPageNumber - 1,
   }));
 } catch (e) {
-  await post('/result', JSON.stringify({ error: String(e) }));
+  if (e !== null) await post('/result', JSON.stringify({ error: String(e) }));
 }
 await post('/done', '');
 </script>

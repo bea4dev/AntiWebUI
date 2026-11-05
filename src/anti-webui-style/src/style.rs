@@ -199,7 +199,8 @@ define_style! {
     strikethrough: bool = false, inherited;
     user_select: UserSelect = UserSelect::Text, inherited;
     selection_color: Color = Color::from_rgba(0x338fff59), inherited;
-    caret_color: Color = Color::from_rgb(0x1f2328), inherited;
+    /// The color of the text unless this says otherwise, as `caret-color: auto` is in CSS.
+    caret_color: Option<Color> = None, inherited;
     scrollbar_color: Color = Color::from_rgba(0x00000055), inherited;
     /// What parts of controls that a sheet marks take instead of their color (CSS `accent-color`).
     accent_color: Option<Color> = None, inherited;
