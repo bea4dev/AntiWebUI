@@ -4,7 +4,8 @@
 //! cargo run -p anti-webui --example video --features video -- clip.mp4
 //! ```
 //!
-//! `--software` after the name decodes on the CPU.
+//! `--software` after the name decodes on the CPU. The button shows the video alone on all of the
+//! screen, and Escape or a double click brings the rest back.
 
 use anti_webui::prelude::*;
 
@@ -36,6 +37,7 @@ fn main() {
             let volume = signal(100.0f32);
             let muted = signal(false);
             let cover = signal(false);
+            let screen = node_ref();
             // The slider follows the time, and the time follows the slider when that is moved.
             effect(move || position.set(player.current_time() as f32));
             effect(move || {
@@ -66,6 +68,16 @@ fn main() {
                         .child(
                             video(source.clone())
                                 .player(player)
+                                .node_ref(screen)
+                                .on_click(move |e| {
+                                    if e.click_count == 2 {
+                                        if screen.is_fullscreen() {
+                                            exit_fullscreen();
+                                        } else {
+                                            screen.request_fullscreen();
+                                        }
+                                    }
+                                })
                                 .autoplay(true)
                                 .looped(true)
                                 .w_full()
@@ -122,6 +134,7 @@ fn main() {
                         .child(checkbox(muted, "消音"))
                         .child(slider(volume, 0.0, 100.0).w(120.0))
                         .child(checkbox(cover, "cover"))
+                        .child(button("全画面").on_click(move |_| screen.request_fullscreen()))
                         .child(text(status))
                         .child(text(move || error.get().unwrap_or_default())),
                 )

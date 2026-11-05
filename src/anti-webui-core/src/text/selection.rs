@@ -100,7 +100,7 @@ pub fn hit_text_point(doc: &Document, p: PointF) -> Option<TextPoint> {
     let mut best = None;
     let (root, offset) = match doc.popup_at(p) {
         Some((popup, _)) => (popup, doc.nodes[popup].popup()?.origin),
-        None => (doc.root?, PointI::default()),
+        None => (doc.shown_root()?, PointI::default()),
     };
     nearest_text(doc, root, offset, RectI::INFINITE, p, &mut best);
     let (_, id, at): ((f32, f32), NodeId, PointF) = best?;

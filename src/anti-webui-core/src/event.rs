@@ -221,6 +221,8 @@ pub enum WindowEvent {
         text: String,
     },
     Focused(bool),
+    /// The window went on all of the screen or came off it, for whatever reason.
+    Fullscreen(bool),
     CloseRequested,
     /// The platform placed a popup. `origin` is its surface's origin in window coordinates, the
     /// coordinates of all pointer events; `size` the logical size granted to its box.

@@ -338,6 +338,7 @@ pub fn resolve_styles(doc: &mut Document) {
         mark_outer_layers_stale(doc, id);
     }
     doc.dirty.content |= out.content;
+    doc.transform_moved |= out.cursor;
     for id in out.spaces {
         // Positioning doesn't go down where nothing seems to have moved.
         for a in doc.ancestors(id) {
@@ -405,6 +406,8 @@ struct Resolution {
     faded: Vec<NodeId>,
     /// What layers hold may be out of date.
     content: bool,
+    /// What shows over a node that didn't move may look different under the pointer.
+    cursor: bool,
     /// Nodes that started or stopped being transformed.
     spaces: Vec<NodeId>,
 }
@@ -538,11 +541,13 @@ fn resolve_node(
         out.layout.push(id);
     }
     let filtered = node.filter.is_some();
-    let (stacked, context) = stacking_role(&node.kind, &computed, filtered, doc.root == Some(id));
+    let root = doc.root == Some(id) || doc.fullscreen.element == Some(id);
+    let (stacked, context) = stacking_role(&node.kind, &computed, filtered, root);
     let stacking_changed = stacked != node.stacked
         || context != node.stacking_context
         || (stacked && node.computed.z_index != computed.z_index);
     let old = &node.computed;
+    out.cursor |= old.cursor != computed.cursor;
     if old.shadows != computed.shadows
         || old.blur != computed.blur
         || old.outline_width != computed.outline_width
@@ -843,7 +848,8 @@ fn overflows(node: &Node) -> bool {
 
 /// Lays out the whole document against the viewport.
 pub fn layout_document(doc: &mut Document, ts: &mut TextSystem) {
-    let Some(root) = doc.root else { return };
+    // What doesn't show waits, with what has changed still marked, until it shows again.
+    let Some(root) = doc.shown_root() else { return };
     let viewport = doc.viewport;
     let scale = doc.scale;
     let mut engine = Engine { doc, ts, scale };
@@ -897,7 +903,7 @@ pub fn child_clip(node: &Node, scale: Scale, parent: Clip) -> Clip {
 /// scrolling it doesn't come here at all. Subtrees that layout didn't touch and that stay where
 /// they were are skipped.
 pub fn position_document(doc: &mut Document) {
-    let Some(root) = doc.root else { return };
+    let Some(root) = doc.shown_root() else { return };
     let mut order = 0u32;
     position_node(doc, root, PointI::default(), Clip::NONE, None, &mut order);
     for id in doc.popups.clone() {
@@ -1088,8 +1094,10 @@ fn position_children(doc: &mut Document, id: NodeId, order: &mut u32) {
     bounds.clear();
     let mut union = RectI::default();
     for &c in &children {
-        // A popup is on another surface, positioned on its own.
-        let popup = doc.nodes.get(c).is_some_and(Node::is_popup);
+        // A popup is on another surface, positioned on its own, and so is what is on all of the
+        // screen in a way.
+        let popup =
+            doc.nodes.get(c).is_some_and(Node::is_popup) || doc.fullscreen.element == Some(c);
         if !popup {
             position_node(doc, c, origin, clip, space, order);
         }
@@ -1206,7 +1214,7 @@ impl Engine<'_> {
             let Some(n) = self.doc.nodes.get(c) else {
                 continue;
             };
-            if n.is_popup() {
+            if n.is_popup() || self.doc.fullscreen.element == Some(c) {
                 continue;
             }
             if matches!(n.kind, NodeKind::Fragment) || n.computed.display == Display::Contents {

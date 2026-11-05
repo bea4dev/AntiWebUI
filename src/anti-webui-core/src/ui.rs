@@ -171,6 +171,7 @@ impl Ui {
 
     /// Recomputes styles, layout and positions as needed.
     pub fn update(&mut self) {
+        crate::view::sync_fullscreen();
         self.start_requested_drag();
         self.apply_pending_focus();
         self.report_scrolled();
@@ -678,6 +679,10 @@ impl Ui {
                     self.cancel_press();
                 }
             }
+            WindowEvent::Fullscreen(on) => {
+                with_doc(|d| d.window_fullscreen_changed(on));
+                crate::view::sync_fullscreen();
+            }
             WindowEvent::CloseRequested => with_doc(|d| d.request(PlatformRequest::Close)),
             WindowEvent::PopupConfigured { id, origin, size } => {
                 self.popup_configured(id, origin, size)
@@ -722,10 +727,12 @@ impl Ui {
                 .popups
                 .iter()
                 .rev()
-                .filter(|&&id| d.nodes[id].popup().is_some_and(|p| p.portal))
+                .filter(|&&id| {
+                    d.nodes[id].popup().is_some_and(|p| p.portal) && !d.holds_fullscreen(id)
+                })
                 // A portal is only what is in it: the rest of the window goes through.
                 .find_map(|&id| hit(d, id, p).filter(|&h| h != id))
-                .or_else(|| d.root.and_then(|r| hit(d, r, p))),
+                .or_else(|| d.shown_root().and_then(|r| hit(d, r, p))),
         })
     }
 
@@ -1412,7 +1419,13 @@ impl Ui {
     }
 
     fn apply_pending_focus(&mut self) {
-        if let Some(target) = with_doc(|d| d.pending_focus.take()) {
+        // What is out of sight would take what is typed without showing it.
+        let target = with_doc(|d| {
+            d.pending_focus
+                .take()
+                .filter(|t| t.is_none_or(|id| !d.behind_fullscreen(id)))
+        });
+        if let Some(target) = target {
             self.set_focus(target);
         }
     }
@@ -1430,6 +1443,7 @@ impl Ui {
                     d.get(*id)
                         .is_some_and(|n| n.focusable && n.visible && !n.is_disabled())
                         && modal.is_none_or(|m| d.is_ancestor(m, *id))
+                        && !d.behind_fullscreen(*id)
                 })
                 .collect();
             if order.is_empty() {
@@ -1465,7 +1479,7 @@ impl Ui {
             return;
         }
         let focused = with_doc(|d| d.state.focused);
-        let target = focused.or_else(|| with_doc(|d| d.root));
+        let target = focused.or_else(|| with_doc(|d| d.shown_root()));
         let ev = KeyboardEvent {
             key: key.key.clone(),
             text: key.text.clone(),
@@ -1513,6 +1527,10 @@ impl Ui {
                 let top = with_doc(|d| open_menus_outside(d, None).pop());
                 if let Some(top) = top {
                     self.dismiss_popups(&[top]);
+                    return;
+                }
+                if with_doc(|d| d.fullscreen.element.is_some()) {
+                    crate::view::exit_fullscreen();
                     return;
                 }
                 with_doc(|d| {

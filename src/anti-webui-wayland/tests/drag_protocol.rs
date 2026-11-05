@@ -488,6 +488,7 @@ fn setup() -> World {
             app_id: "dnd".into(),
             width: 100,
             height: 100,
+            fullscreen: false,
         };
         run(options, client).unwrap();
     });

@@ -53,6 +53,19 @@ impl DmabufFeedback {
         }
         out
     }
+
+    /// Modifiers for `format` that the compositor can put on the screen as they are, if that is what
+    /// it would like most.
+    pub fn scanout_modifiers(&self, format: u32) -> Vec<u64> {
+        let first = self
+            .tranches
+            .iter()
+            .find(|t| t.device == self.main_device && t.formats.iter().any(|&(f, _)| f == format));
+        first.filter(|t| t.scanout).map_or(Vec::new(), |t| {
+            let of_format = t.formats.iter().filter(|&&(f, _)| f == format);
+            of_format.map(|&(_, m)| m).collect()
+        })
+    }
 }
 
 #[derive(Default)]

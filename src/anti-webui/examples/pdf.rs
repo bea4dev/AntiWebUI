@@ -13,6 +13,10 @@
 //! or draw on the page. Clicking on an annotation picks it, which can then be moved or removed with
 //! Delete. Ctrl + Z goes back, Ctrl + Y forward, and Ctrl + S writes `<name>-edited.pdf` next to the
 //! document.
+//!
+//! F11 puts the window on all of the screen. F5 shows the document one page at a time there, where
+//! the arrows, Space, a click and the wheel go through the pages, a number and Enter go to a page,
+//! `B` and `W` blank the screen, and Escape ends it.
 
 use anti_webui::prelude::*;
 
@@ -106,6 +110,12 @@ fn main() {
                             save();
                             e.stop_propagation();
                         }
+                        if matches!(e.key, Key::Named(NamedKey::F(5))) {
+                            viewer.present();
+                        }
+                        if matches!(e.key, Key::Named(NamedKey::F(11))) {
+                            set_window_fullscreen(!window_fullscreen());
+                        }
                     }
                 })
                 .child(
@@ -131,6 +141,17 @@ fn main() {
                         )
                         .child(button("全体").on_click(move |_| viewer.set_zoom(PdfZoom::FitPage)))
                         .child(button("回転").on_click(move |_| viewer.rotate_clockwise()))
+                        .child(button("プレゼン").on_click(move |_| viewer.present()))
+                        .child(
+                            button(move || {
+                                if window_fullscreen() {
+                                    "全画面を解除"
+                                } else {
+                                    "全画面"
+                                }
+                            })
+                            .on_click(move |_| set_window_fullscreen(!window_fullscreen())),
+                        )
                         .child(text(shown))
                         .child(div().flex_1())
                         .child(

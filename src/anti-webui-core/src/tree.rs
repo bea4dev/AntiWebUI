@@ -514,7 +514,7 @@ pub struct Document {
     pub layer_contents: HashMap<NodeId, LayerMemo>,
     /// Layers to paint again although `dirty.content` isn't set: a transform inside moved.
     pub stale_layers: HashSet<NodeId>,
-    /// A transform changed, so what is under the pointer may have too.
+    /// A transform or a cursor changed, so what is under the pointer may have too.
     pub transform_moved: bool,
     /// A translation is between pixels: one more frame shows it on whole pixels if it stops.
     pub settling: bool,
@@ -554,8 +554,24 @@ pub struct Document {
     /// Painting asks for pictures while the rest of the document stays as it is.
     pub images: RefCell<crate::images::ImageStore>,
     pub videos: RefCell<crate::video::VideoStore>,
+    pub fullscreen: Fullscreen,
     /// Errors to tell of when the document isn't borrowed any more.
     pub(crate) videos_failed: Vec<(crate::video::VideoErrorListener, crate::video::VideoError)>,
+}
+
+/// Who is on all of the screen. See `docs/design/27-fullscreen.md`.
+#[derive(Default)]
+pub struct Fullscreen {
+    /// What the platform says of the window.
+    pub window: bool,
+    /// What shows instead of the root.
+    pub element: Option<NodeId>,
+    /// What shows instead of the root as soon as the window is on all of the screen.
+    pub wanted: Option<NodeId>,
+    /// The window went there for the element, and comes back with it.
+    pub window_follows: bool,
+    /// What had the focus when the element took it.
+    pub focus_before: Option<Option<NodeId>>,
 }
 
 /// What a stacking context paints above its own background, besides its children in tree order.
@@ -598,6 +614,7 @@ thread_local! {
         drag_request: None,
         images: RefCell::default(),
         videos: RefCell::default(),
+        fullscreen: Fullscreen::default(),
         videos_failed: Vec::new(),
     });
 }
@@ -616,6 +633,103 @@ impl Document {
                 .get(&id)
                 .map_or((&[][..], &[][..]), |l| l.nodes.split_at(l.negative)),
             None => (&[][..], &[][..]),
+        }
+    }
+
+    /// Where showing the window starts: the root, or what is on all of the screen instead of it.
+    pub fn shown_root(&self) -> Option<NodeId> {
+        self.fullscreen.element.or(self.root)
+    }
+
+    /// Whether a node is out of sight behind what is on all of the screen. What is in a popup isn't,
+    /// as popups go on top of it.
+    pub(crate) fn behind_fullscreen(&self, id: NodeId) -> bool {
+        self.fullscreen.element.is_some_and(|element| {
+            !self.is_ancestor(element, id)
+                && !self.ancestors(id).iter().any(|&a| self.nodes[a].is_popup())
+        })
+    }
+
+    /// Whether a popup has what is on all of the screen in it, which then doesn't show as a popup.
+    pub(crate) fn holds_fullscreen(&self, popup: NodeId) -> bool {
+        self.fullscreen
+            .element
+            .is_some_and(|element| self.is_ancestor(popup, element))
+    }
+
+    pub(crate) fn request_fullscreen(&mut self, id: NodeId) {
+        if self.fullscreen.window {
+            self.set_fullscreen_element(Some(id));
+        } else {
+            self.fullscreen.wanted = Some(id);
+            self.fullscreen.window_follows = true;
+            self.request(PlatformRequest::SetFullscreen(true));
+        }
+    }
+
+    pub(crate) fn exit_fullscreen(&mut self) {
+        let on_its_way = self.fullscreen.wanted.take().is_some();
+        if on_its_way && !self.fullscreen.window {
+            // The window was asked to go there and would stay there.
+            self.fullscreen.window_follows = false;
+            self.request(PlatformRequest::SetFullscreen(false));
+        } else if self.fullscreen.window_follows && self.fullscreen.window {
+            // What shows changes when the window has changed, in the same frame.
+            self.request(PlatformRequest::SetFullscreen(false));
+        } else {
+            self.fullscreen.window_follows = false;
+            self.set_fullscreen_element(None);
+        }
+    }
+
+    pub(crate) fn window_fullscreen_changed(&mut self, on: bool) {
+        self.fullscreen.window = on;
+        if on {
+            if let Some(id) = self.fullscreen.wanted.take() {
+                self.set_fullscreen_element(Some(id));
+            }
+        } else {
+            self.fullscreen.wanted = None;
+            self.fullscreen.window_follows = false;
+            self.set_fullscreen_element(None);
+        }
+    }
+
+    fn set_fullscreen_element(&mut self, element: Option<NodeId>) {
+        let old = std::mem::replace(&mut self.fullscreen.element, element);
+        if old == element {
+            return;
+        }
+        for id in [old, element].into_iter().flatten() {
+            if self.nodes.contains_key(id) {
+                // It lays out differently and becomes or stops being a stacking context. That goes
+                // up to the root, which is what brings it back when the rest shows again.
+                self.mark_style_of(id);
+                self.invalidate_layout(id);
+            }
+        }
+        self.stacking_dirty = true;
+        self.dirty.position = true;
+        let focused = self.state.focused;
+        match element {
+            Some(id) => {
+                if self.fullscreen.focus_before.is_none() {
+                    self.fullscreen.focus_before = Some(focused);
+                }
+                if focused.is_none_or(|f| self.behind_fullscreen(f)) {
+                    let focusable = self.nodes.get(id).is_some_and(|n| n.focusable);
+                    self.pending_focus = Some(focusable.then_some(id));
+                }
+            }
+            None => {
+                let before = self.fullscreen.focus_before.take();
+                let was_inside = |f| old.is_some_and(|old| self.is_ancestor(old, f));
+                if let Some(before) = before
+                    && focused.is_none_or(was_inside)
+                {
+                    self.pending_focus = Some(before.filter(|b| self.nodes.contains_key(*b)));
+                }
+            }
         }
     }
 
@@ -970,7 +1084,16 @@ impl Document {
             return;
         }
         self.detach(id);
+        if self.fullscreen.wanted == Some(id) {
+            self.fullscreen.wanted = None;
+        }
         if let Some(node) = self.nodes.remove(id) {
+            if self.fullscreen.element == Some(id) {
+                self.set_fullscreen_element(None);
+                if std::mem::take(&mut self.fullscreen.window_follows) && self.fullscreen.window {
+                    self.request(PlatformRequest::SetFullscreen(false));
+                }
+            }
             if let Some(source) = node.image().and_then(|d| d.source.as_ref()) {
                 self.images.get_mut().release(id, source);
             }

@@ -108,6 +108,11 @@ pub struct State {
     pub configured: bool,
     pub logical_size: (i32, i32),
     pending_size: Option<(i32, i32)>,
+    /// What the window is, and what it becomes with the next `xdg_surface.configure`.
+    fullscreen: bool,
+    pending_fullscreen: Option<bool>,
+    /// The size to go back to when the compositor leaves it up to us.
+    windowed_size: (i32, i32),
     pub scale: Scale,
     pub buffer_size: SizeI,
     pub size_announced: Option<(SizeI, Scale)>,
@@ -202,6 +207,9 @@ impl State {
             primary_manager: None,
             configured: false,
             logical_size,
+            fullscreen: false,
+            pending_fullscreen: None,
+            windowed_size: logical_size,
             pending_size: None,
             scale: Scale::ONE,
             buffer_size: SizeI::new(logical_size.0, logical_size.1),
@@ -364,6 +372,12 @@ impl State {
     }
 
     fn apply_cursor(&self) {
+        if self.cursor == CursorIcon::None {
+            if let Some(pointer) = &self.pointer {
+                pointer.set_cursor(self.pointer_serial, None, 0, 0);
+            }
+            return;
+        }
         let Some(dev) = &self.cursor_device else {
             return;
         };
@@ -379,6 +393,7 @@ impl State {
             CursorIcon::NsResize => Shape::NsResize,
             CursorIcon::Crosshair => Shape::Crosshair,
             CursorIcon::Copy => Shape::Copy,
+            CursorIcon::None => return,
         };
         dev.set_shape(self.pointer_serial, shape);
     }
@@ -591,8 +606,17 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceId> for State {
                 state.popup_placed(*id);
                 return;
             }
+            if let Some(fullscreen) = state.pending_fullscreen.take()
+                && fullscreen != state.fullscreen
+            {
+                state.fullscreen = fullscreen;
+                state.events.push(WindowEvent::Fullscreen(fullscreen));
+            }
             if let Some(size) = state.pending_size.take() {
                 state.logical_size = size;
+            }
+            if !state.fullscreen {
+                state.windowed_size = state.logical_size;
             }
             state.configured = true;
             state.update_size();
@@ -611,9 +635,20 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            xdg_toplevel::Event::Configure { width, height, .. } => {
+            xdg_toplevel::Event::Configure {
+                width,
+                height,
+                states,
+            } => {
+                let fullscreen = states
+                    .chunks_exact(4)
+                    .map(|s| u32::from_ne_bytes(s.try_into().unwrap()))
+                    .any(|s| s == xdg_toplevel::State::Fullscreen as u32);
+                state.pending_fullscreen = Some(fullscreen);
                 if width > 0 && height > 0 {
                     state.pending_size = Some((width, height));
+                } else if state.fullscreen && !fullscreen {
+                    state.pending_size = Some(state.windowed_size);
                 }
             }
             xdg_toplevel::Event::Close => state.events.push(WindowEvent::CloseRequested),

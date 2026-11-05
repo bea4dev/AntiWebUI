@@ -259,7 +259,7 @@ fn zooming_with_ctrl_keeps_what_is_under_the_pointer() {
 
 #[test]
 fn a_box_getting_its_first_size_stays_at_the_top() {
-    let data = document((100, 200), &vec![RED; 20]);
+    let data = document((100, 200), &[RED; 20]);
     let handed = std::rc::Rc::new(std::cell::Cell::new(None));
     let viewer = handed.clone();
     // As a window goes: the document is open before anyone knows how big the box is.
@@ -282,7 +282,7 @@ fn a_box_getting_its_first_size_stays_at_the_top() {
 
 #[test]
 fn a_box_changing_size_keeps_what_is_at_its_top() {
-    let (mut ui, viewer) = viewer_of((420, 600), &vec![RED; 20]);
+    let (mut ui, viewer) = viewer_of((420, 600), &[RED; 20]);
     settle(&mut ui);
     viewer.go_to_page(5);
     settle(&mut ui);
@@ -1925,4 +1925,493 @@ fn what_is_selected_goes_on_a_surface_of_its_own_when_carried_to_another_program
         icon.hotspot.y >= 0 && icon.hotspot.y < icon.logical.height,
         "{icon:?}"
     );
+}
+
+/// Plays the platform: the window goes on all of the screen or comes back.
+fn window_went(ui: &mut Ui, on: bool, size: (i32, i32)) {
+    ui.handle_event(WindowEvent::Fullscreen(on));
+    ui.handle_event(WindowEvent::Resized {
+        size: SizeI::new(size.0, size.1),
+        scale: ONE,
+    });
+    ui.update();
+}
+
+fn slide_key(ui: &mut Ui, key: Key) {
+    ui.handle_event(WindowEvent::Key(KeyEvent {
+        key,
+        text: None,
+        modifiers: Modifiers::default(),
+        pressed: true,
+        repeat: false,
+    }));
+    ui.update();
+}
+
+fn named(ui: &mut Ui, key: NamedKey) {
+    slide_key(ui, Key::Named(key));
+}
+
+const SCREEN: (i32, i32) = (800, 600);
+
+/// A document of pages 100 by 200 points, presenting from the page that showed.
+fn presenting(colors: &[(f32, f32, f32)], page: usize) -> (Ui, PdfViewer) {
+    let (mut ui, viewer) = viewer_of((420, 300), colors);
+    settle(&mut ui);
+    viewer.go_to_page(page);
+    settle(&mut ui);
+    viewer.present();
+    window_went(&mut ui, true, SCREEN);
+    settle(&mut ui);
+    assert!(viewer.is_presenting());
+    (ui, viewer)
+}
+
+/// The one picture that shows, and what color it is.
+fn the_slide(ui: &mut Ui) -> (ImageDraw, [u8; 4]) {
+    let drawn = pictures(ui);
+    assert_eq!(drawn.len(), 1, "{drawn:?}");
+    let color = pixel(&drawn[0], 5, 5);
+    (drawn[0].clone(), color)
+}
+
+const SHOWS_RED: [u8; 4] = [255, 0, 0, 255];
+const SHOWS_GREEN: [u8; 4] = [0, 255, 0, 255];
+const SHOWS_BLUE: [u8; 4] = [0, 0, 255, 255];
+
+#[test]
+fn presenting_shows_one_page_in_the_middle_of_the_screen_on_black() {
+    let (mut ui, viewer) = presenting(&[RED, GREEN, BLUE], 1);
+    assert_eq!(viewer.page(), 1);
+    let (slide, color) = the_slide(&mut ui);
+    assert_eq!(color, SHOWS_GREEN);
+    // As high as the screen, and half as wide as that, with whole pixels on the screen.
+    assert_eq!(
+        slide.rect,
+        anti_webui_core::geometry::RectI::new(250, 0, 300, 600)
+    );
+    assert_eq!((slide.bitmap.width(), slide.bitmap.height()), (300, 600));
+}
+
+#[test]
+fn the_next_pages_are_there_before_they_are_asked_for() {
+    let (mut ui, _viewer) = presenting(&[RED, GREEN, BLUE, RED], 0);
+    named(&mut ui, NamedKey::ArrowRight);
+    // Right away, with nothing to wait for.
+    let (slide, color) = the_slide(&mut ui);
+    assert_eq!(color, SHOWS_GREEN);
+    assert_eq!((slide.bitmap.width(), slide.bitmap.height()), (300, 600));
+    settle(&mut ui);
+    named(&mut ui, NamedKey::ArrowLeft);
+    let (_, color) = the_slide(&mut ui);
+    assert_eq!(color, SHOWS_RED);
+}
+
+#[test]
+fn a_page_that_isnt_drawn_yet_leaves_the_one_before_it() {
+    let colors: Vec<_> = (0..30).map(|i| if i == 29 { BLUE } else { RED }).collect();
+    let (mut ui, viewer) = presenting(&colors, 0);
+    named(&mut ui, NamedKey::End);
+    assert_eq!(viewer.page(), 29);
+    let (slide, color) = the_slide(&mut ui);
+    assert_eq!(color, SHOWS_RED);
+    assert_eq!(slide.rect.height, 600);
+    settle(&mut ui);
+    let (_, color) = the_slide(&mut ui);
+    assert_eq!(color, SHOWS_BLUE);
+}
+
+#[test]
+fn a_page_that_takes_too_long_goes_ahead_without_its_picture() {
+    let colors = vec![RED; 30];
+    let (mut ui, viewer) = presenting(&colors, 0);
+    named(&mut ui, NamedKey::End);
+    // Whether it is drawn by then or not, the wait ends.
+    std::thread::sleep(Duration::from_millis(350));
+    ui.tick(Instant::now());
+    ui.update();
+    assert_eq!(viewer.page(), 29);
+    let shown = pictures(&mut ui);
+    assert!(shown.len() <= 1, "{shown:?}");
+    settle(&mut ui);
+    assert_eq!(the_slide(&mut ui).0.rect.height, 600);
+}
+
+#[test]
+fn keys_go_through_the_pages_and_stop_at_the_ends() {
+    let (mut ui, viewer) = presenting(&[RED; 12], 0);
+    for key in [
+        NamedKey::ArrowRight,
+        NamedKey::ArrowDown,
+        NamedKey::PageDown,
+        NamedKey::Space,
+        NamedKey::Enter,
+    ] {
+        let before = viewer.page();
+        named(&mut ui, key);
+        assert_eq!(viewer.page(), before + 1, "{key:?}");
+    }
+    slide_key(&mut ui, Key::Character("n".into()));
+    assert_eq!(viewer.page(), 6);
+    for key in [
+        NamedKey::ArrowLeft,
+        NamedKey::ArrowUp,
+        NamedKey::PageUp,
+        NamedKey::Backspace,
+    ] {
+        let before = viewer.page();
+        named(&mut ui, key);
+        assert_eq!(viewer.page(), before - 1, "{key:?}");
+    }
+    slide_key(&mut ui, Key::Character("p".into()));
+    assert_eq!(viewer.page(), 1);
+    named(&mut ui, NamedKey::Home);
+    named(&mut ui, NamedKey::ArrowLeft);
+    assert_eq!(viewer.page(), 0);
+    named(&mut ui, NamedKey::End);
+    named(&mut ui, NamedKey::ArrowRight);
+    assert_eq!(viewer.page(), 11);
+    // A number and Enter go to that page, counting from 1.
+    slide_key(&mut ui, Key::Character("1".into()));
+    slide_key(&mut ui, Key::Character("0".into()));
+    named(&mut ui, NamedKey::Enter);
+    assert_eq!(viewer.page(), 9);
+}
+
+fn mouse(ui: &mut Ui, button: PointerButton, modifiers: Modifiers) {
+    for pressed in [true, false] {
+        ui.handle_event(WindowEvent::PointerButton {
+            button,
+            pressed,
+            position: PointF::new(400.0, 300.0),
+            modifiers,
+            time: 0,
+        });
+        ui.update();
+    }
+}
+
+#[test]
+fn clicks_go_through_the_pages_and_select_nothing() {
+    let (mut ui, viewer) = presenting(&[RED; 5], 0);
+    mouse(&mut ui, PointerButton::Primary, Modifiers::default());
+    assert_eq!(viewer.page(), 1);
+    assert!(!viewer.has_selection());
+    mouse(&mut ui, PointerButton::Primary, Modifiers::default());
+    assert_eq!(viewer.page(), 2);
+    mouse(&mut ui, PointerButton::Secondary, Modifiers::default());
+    assert_eq!(viewer.page(), 1);
+    let shift = Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+    mouse(&mut ui, PointerButton::Primary, shift);
+    assert_eq!(viewer.page(), 0);
+}
+
+fn scrolled(ui: &mut Ui, delta_y: f32, source: ScrollSource, phase: ScrollPhase) {
+    ui.handle_event(WindowEvent::Scroll {
+        position: PointF::new(400.0, 300.0),
+        delta_x: 0.0,
+        delta_y,
+        modifiers: Modifiers::default(),
+        source,
+        phase,
+        time: 0,
+    });
+    ui.update();
+}
+
+#[test]
+fn a_notch_of_a_wheel_is_a_page() {
+    let (mut ui, viewer) = presenting(&[RED; 5], 0);
+    scrolled(&mut ui, 1.0, ScrollSource::Wheel, ScrollPhase::Single);
+    assert_eq!(viewer.page(), 1);
+    scrolled(&mut ui, 1.0, ScrollSource::Wheel, ScrollPhase::Single);
+    assert_eq!(viewer.page(), 2);
+    scrolled(&mut ui, -1.0, ScrollSource::Wheel, ScrollPhase::Single);
+    assert_eq!(viewer.page(), 1);
+}
+
+#[test]
+fn a_swipe_is_a_page_however_long_it_is() {
+    let (mut ui, viewer) = presenting(&[RED; 5], 0);
+    let finger = ScrollSource::Touchpad;
+    scrolled(&mut ui, 5.0, finger, ScrollPhase::Began);
+    assert_eq!(viewer.page(), 0);
+    for _ in 0..50 {
+        scrolled(&mut ui, 30.0, finger, ScrollPhase::Moved);
+    }
+    assert_eq!(viewer.page(), 1);
+    scrolled(&mut ui, 0.0, finger, ScrollPhase::Lifted { fling: false });
+    for _ in 0..50 {
+        scrolled(&mut ui, 30.0, finger, ScrollPhase::Momentum);
+    }
+    assert_eq!(viewer.page(), 1);
+    scrolled(&mut ui, 5.0, finger, ScrollPhase::Began);
+    scrolled(&mut ui, 100.0, finger, ScrollPhase::Moved);
+    assert_eq!(viewer.page(), 2);
+}
+
+#[test]
+fn zooming_does_nothing_while_presenting() {
+    let (mut ui, viewer) = presenting(&[RED; 5], 0);
+    let zoom = viewer.zoom();
+    ui.handle_event(WindowEvent::Scroll {
+        position: PointF::new(400.0, 300.0),
+        delta_x: 0.0,
+        delta_y: 0.0,
+        modifiers: Modifiers {
+            ctrl: true,
+            ..Default::default()
+        },
+        source: ScrollSource::Touchpad,
+        phase: ScrollPhase::Moved,
+        time: 0,
+    });
+    ui.handle_event(WindowEvent::Pinch {
+        position: PointF::new(400.0, 300.0),
+        scale: 2.0,
+        modifiers: Modifiers::default(),
+        phase: PinchPhase::Moved,
+    });
+    ui.update();
+    assert_eq!(viewer.zoom(), zoom);
+    assert_eq!(the_slide(&mut ui).0.rect.height, 600);
+}
+
+#[test]
+fn the_screen_can_go_black_or_white_and_come_back() {
+    let (mut ui, viewer) = presenting(&[RED; 5], 0);
+    let on_top = |ui: &mut Ui| {
+        let scene = ui.paint(Instant::now());
+        let mut quads = Vec::new();
+        fn walk(scene: &Scene, out: &mut Vec<Color>) {
+            for p in &scene.primitives {
+                match p {
+                    Primitive::Quad(q) => out.push(q.background),
+                    Primitive::Layer(l) => walk(&l.content, out),
+                    _ => {}
+                }
+            }
+        }
+        walk(&scene, &mut quads);
+        quads.last().copied()
+    };
+    slide_key(&mut ui, Key::Character("b".into()));
+    assert_eq!(on_top(&mut ui), Some(Color::BLACK));
+    // Whatever comes next only brings back what was there.
+    named(&mut ui, NamedKey::ArrowRight);
+    assert_eq!(viewer.page(), 0);
+    assert_ne!(on_top(&mut ui), Some(Color::BLACK));
+    slide_key(&mut ui, Key::Character("w".into()));
+    assert_eq!(on_top(&mut ui), Some(Color::WHITE));
+    mouse(&mut ui, PointerButton::Primary, Modifiers::default());
+    assert_eq!(viewer.page(), 0);
+    assert_eq!(the_slide(&mut ui).1, SHOWS_RED);
+}
+
+#[test]
+fn escape_goes_back_to_the_same_place_on_the_same_page() {
+    let colors = vec![RED; 20];
+    let (mut ui, viewer) = viewer_of((420, 300), &colors);
+    settle(&mut ui);
+    viewer.set_zoom(PdfZoom::Percent(1.5));
+    ui.update();
+    viewer.go_to(PdfTarget {
+        page: 3,
+        top: Some(50.0),
+    });
+    settle(&mut ui);
+    let before: Vec<_> = pictures(&mut ui).iter().map(|d| d.rect).collect();
+    let zoom = viewer.zoom();
+    let page = viewer.page();
+
+    viewer.present();
+    window_went(&mut ui, true, SCREEN);
+    settle(&mut ui);
+    assert_eq!(viewer.page(), page);
+    named(&mut ui, NamedKey::Escape);
+    let asked = ui.take_requests();
+    assert!(
+        asked.contains(&PlatformRequest::SetFullscreen(false)),
+        "{asked:?}"
+    );
+    assert!(viewer.is_presenting());
+    window_went(&mut ui, false, (420, 300));
+    settle(&mut ui);
+
+    assert!(!viewer.is_presenting());
+    assert_eq!(viewer.zoom(), zoom);
+    assert_eq!(viewer.page(), page);
+    let after: Vec<_> = pictures(&mut ui).iter().map(|d| d.rect).collect();
+    assert_eq!(after.len(), before.len());
+    for (a, b) in after.iter().zip(&before) {
+        assert!(
+            (a.x - b.x).abs() <= 1 && (a.y - b.y).abs() <= 1,
+            "{after:?} {before:?}"
+        );
+    }
+}
+
+#[test]
+fn ending_on_another_page_goes_to_that_page() {
+    let (mut ui, viewer) = presenting(&[RED; 20], 0);
+    slide_key(&mut ui, Key::Character("9".into()));
+    named(&mut ui, NamedKey::Enter);
+    settle(&mut ui);
+    viewer.stop_presenting();
+    window_went(&mut ui, false, (420, 300));
+    settle(&mut ui);
+    assert!(!viewer.is_presenting());
+    assert_eq!(viewer.page(), 8);
+    // It reads on from there as it did before.
+    let drawn = pictures(&mut ui);
+    let rects: Vec<_> = drawn.iter().map(|d| d.rect).collect();
+    assert!(rects.iter().any(|r| r.y >= 0 && r.y <= 10), "{rects:?}");
+}
+
+#[test]
+fn the_system_ending_it_goes_back_too() {
+    let (mut ui, viewer) = presenting(&[RED; 5], 2);
+    window_went(&mut ui, false, (420, 300));
+    settle(&mut ui);
+    assert!(!viewer.is_presenting());
+    assert_eq!(viewer.page(), 2);
+}
+
+#[test]
+fn pages_of_other_sizes_each_fit_the_screen() {
+    // Each page says its own size, which is what the second one takes.
+    let mut data = document((100, 200), &[RED, GREEN]);
+    let box_of_first = b"/MediaBox [0 0 100 200]";
+    let second = data
+        .windows(box_of_first.len())
+        .rposition(|w| w == box_of_first)
+        .unwrap();
+    let wide = b"/MediaBox [0 0 400 100]";
+    data[second..second + wide.len()].copy_from_slice(wide);
+    let viewer = Rc::new(std::cell::Cell::new(None));
+    let handed = viewer.clone();
+    let mut ui = mount((420, 300), ONE, move || {
+        let v = pdf_viewer();
+        handed.set(Some(v));
+        pdf_view(data).viewer(v).w_full().h_full()
+    });
+    settle(&mut ui);
+    let viewer = viewer.get().unwrap();
+    viewer.present();
+    window_went(&mut ui, true, SCREEN);
+    settle(&mut ui);
+    let (slide, _) = the_slide(&mut ui);
+    assert_eq!(
+        slide.rect,
+        anti_webui_core::geometry::RectI::new(250, 0, 300, 600)
+    );
+    named(&mut ui, NamedKey::ArrowRight);
+    settle(&mut ui);
+    let (slide, _) = the_slide(&mut ui);
+    assert_eq!(
+        slide.rect,
+        anti_webui_core::geometry::RectI::new(0, 200, 800, 200)
+    );
+}
+
+#[test]
+fn links_are_followed_while_presenting_and_the_pointer_goes_away_by_itself() {
+    let mut doc = TextDocument::new(&[
+        &line(20, 200, "first"),
+        &line(20, 200, "second"),
+        &line(20, 200, "third"),
+    ]);
+    doc.page_extras[0] = "/Annots [\
+        << /Type /Annot /Subtype /Link /Rect [0 0 300 300] /Dest [14 0 R /Fit] >> ]"
+        .into();
+    let (mut ui, viewer) = read_with(&doc, |view| view);
+    viewer.present();
+    window_went(&mut ui, true, (420, 420));
+    settle(&mut ui);
+    ui.take_requests();
+    let p = PointF::new(210.0, 210.0);
+    move_to(&mut ui, p);
+    settle(&mut ui);
+    move_to(&mut ui, p);
+    settle(&mut ui);
+    let asked = ui.take_requests();
+    assert!(
+        asked.contains(&PlatformRequest::SetCursor(CursorIcon::Pointer)),
+        "{asked:?}"
+    );
+    press(&mut ui, p, 0);
+    release(&mut ui, p);
+    settle(&mut ui);
+    assert_eq!(viewer.page(), 2);
+}
+
+#[test]
+fn the_pointer_goes_away_when_it_stays_where_it_is() {
+    let (mut ui, _viewer) = presenting(&[RED; 5], 0);
+    let p = PointF::new(400.0, 300.0);
+    move_to(&mut ui, p);
+    ui.take_requests();
+    ui.tick(Instant::now() + Duration::from_secs(4));
+    ui.update();
+    let asked = ui.take_requests();
+    assert!(
+        asked.contains(&PlatformRequest::SetCursor(CursorIcon::None)),
+        "{asked:?}"
+    );
+    // Turning a page by the keyboard doesn't bring it back, and moving it does.
+    named(&mut ui, NamedKey::ArrowRight);
+    let asked = ui.take_requests();
+    assert!(
+        !asked.contains(&PlatformRequest::SetCursor(CursorIcon::Default)),
+        "{asked:?}"
+    );
+    move_to(&mut ui, PointF::new(401.0, 300.0));
+    ui.update();
+    let asked = ui.take_requests();
+    assert!(
+        asked.contains(&PlatformRequest::SetCursor(CursorIcon::Default)),
+        "{asked:?}"
+    );
+}
+
+#[test]
+fn a_window_already_on_all_of_the_screen_stays_there_after_presenting() {
+    let (mut ui, viewer) = viewer_of((420, 300), &[RED; 5]);
+    window_went(&mut ui, true, SCREEN);
+    settle(&mut ui);
+    ui.take_requests();
+    viewer.present();
+    ui.update();
+    assert!(viewer.is_presenting());
+    settle(&mut ui);
+    assert_eq!(the_slide(&mut ui).0.rect.height, 600);
+    named(&mut ui, NamedKey::Escape);
+    assert!(!viewer.is_presenting());
+    let asked = ui.take_requests();
+    assert!(
+        !asked
+            .iter()
+            .any(|r| matches!(r, PlatformRequest::SetFullscreen(_))),
+        "{asked:?}"
+    );
+}
+
+#[test]
+fn stopping_before_it_has_started_keeps_it_from_starting() {
+    let (mut ui, viewer) = viewer_of((420, 300), &[RED; 5]);
+    settle(&mut ui);
+    viewer.present();
+    viewer.stop_presenting();
+    let asked = ui.take_requests();
+    assert!(
+        asked.contains(&PlatformRequest::SetFullscreen(false)),
+        "{asked:?}"
+    );
+    // The window may still get there on its way back.
+    window_went(&mut ui, true, SCREEN);
+    settle(&mut ui);
+    assert!(!viewer.is_presenting());
 }

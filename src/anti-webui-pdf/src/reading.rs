@@ -347,6 +347,10 @@ impl Reader {
             if !this.table.with(|t| t.is_empty()) {
                 let v = (this.view)();
                 let visible = this.table.with(|t| t.visible(v.y, v.height));
+                // Its links are all that can be pressed, and the press doesn't wait.
+                if this.table.with(|t| t.slot > 0) {
+                    needed.extend(visible.clone());
+                }
                 let selection = this.viewer.selection.get();
                 let hits_in = this.viewer.hits.with(|hits| {
                     visible
@@ -723,12 +727,13 @@ impl Reader {
         }
     }
 
-    fn follow_link(&self, local: PointF) {
+    /// Goes where a link at a point goes, and says whether there is one.
+    pub fn follow_link(&self, local: PointF) -> bool {
         let Some((page, x, y)) = self.on_page(local) else {
-            return;
+            return false;
         };
         let Some(text) = self.text_of(page) else {
-            return;
+            return false;
         };
         match text
             .links
@@ -742,8 +747,17 @@ impl Reader {
                     f(url);
                 }
             }
-            None => {}
+            None => return false,
         }
+        true
+    }
+
+    /// Whether there is a link at a point.
+    pub fn has_link_at(&self, local: PointF) -> bool {
+        self.on_page(local).is_some_and(|(page, x, y)| {
+            self.text_of(page)
+                .is_some_and(|text| text.links.iter().any(|l| l.contains(x, y)))
+        })
     }
 
     /// Scrolls while selecting with the pointer outside of the box.

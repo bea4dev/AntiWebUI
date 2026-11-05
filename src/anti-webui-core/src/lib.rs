@@ -57,8 +57,9 @@ pub mod prelude {
     pub use crate::view::{
         BitmapView, Div, ForEach, Img, IntoImageSource, IntoTextSource, IntoVideoSource, IntoView,
         NodeRef, Popup, Show, Text, TextInput, Video, View, bitmap_view, clear_text_selection, div,
-        dyn_view, for_each, fragment, img, node_ref, popup, portal, set_clipboard, shader, show,
-        text, text_area, text_input, video, window_scale,
+        dyn_view, exit_fullscreen, for_each, fragment, img, node_ref, popup, portal, set_clipboard,
+        set_window_fullscreen, shader, show, text, text_area, text_input, video, window_fullscreen,
+        window_scale,
     };
     pub use anti_webui_style::*;
 }

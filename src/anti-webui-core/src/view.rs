@@ -11,7 +11,8 @@ use crate::geometry::{PointF, PointI, RectI, Scale};
 use crate::images::Bitmap;
 use crate::platform::{ImePurpose, Placement, PlatformRequest, PopupKind};
 use crate::reactive::{
-    Owner, Signal, create_child_owner, create_root, effect, memo, on_cleanup, signal, untrack,
+    Owner, Signal, batch, create_child_owner, create_root, effect, memo, on_cleanup, signal,
+    untrack,
 };
 use crate::shader::{Image, IntoImage, IntoPaint, ShaderPaint};
 use crate::text::TextLayout;
@@ -66,6 +67,22 @@ impl NodeRef {
 
     pub(crate) fn id_untracked(&self) -> Option<NodeId> {
         self.0.get_untracked()
+    }
+
+    /// Shows the node alone on all of the screen, whatever its style and what it is in: the rest of
+    /// the window stays as it is and comes back with [`exit_fullscreen`] or Escape. Unless the window
+    /// is already on all of the screen, that takes a moment and the window comes back too.
+    pub fn request_fullscreen(&self) {
+        if let Some(id) = self.0.get_untracked() {
+            with_doc(|d| d.request_fullscreen(id));
+            sync_fullscreen();
+        }
+    }
+
+    /// Whether this is what shows on all of the screen. Reading it tracks it.
+    pub fn is_fullscreen(&self) -> bool {
+        let element = fullscreen_signals().1.get();
+        element.is_some() && element == self.0.get()
     }
 
     /// Scrolls what contains the node, after the next layout, until the node is in view.
@@ -261,6 +278,50 @@ pub(crate) fn also_bool(
 
 thread_local! {
     static WINDOW_SCALE: Cell<Option<Signal<Scale>>> = const { Cell::new(None) };
+    static FULLSCREEN: Cell<Option<FullscreenSignals>> = const { Cell::new(None) };
+}
+
+/// Whether the window is on all of the screen, and what shows there alone.
+type FullscreenSignals = (Signal<bool>, Signal<Option<NodeId>>);
+
+fn fullscreen_signals() -> FullscreenSignals {
+    FULLSCREEN.with(|s| {
+        s.get().unwrap_or_else(|| {
+            let (signals, _) = create_root(|| {
+                let (window, element) = with_doc(|d| (d.fullscreen.window, d.fullscreen.element));
+                (signal(window), signal(element))
+            });
+            s.set(Some(signals));
+            signals
+        })
+    })
+}
+
+/// Tells those who are watching what has become of the window. Not while the document is borrowed.
+pub(crate) fn sync_fullscreen() {
+    let (window, element) = fullscreen_signals();
+    let now = with_doc(|d| (d.fullscreen.window, d.fullscreen.element));
+    batch(|| {
+        window.set_if_changed(now.0);
+        element.set_if_changed(now.1);
+    });
+}
+
+/// Whether the window is on all of the screen, as the platform says. Reading it tracks it.
+pub fn window_fullscreen() -> bool {
+    fullscreen_signals().0.get()
+}
+
+/// Asks to put the window on all of the screen, with all that is in it, or to take it off.
+/// [`window_fullscreen`] says when it has happened: the system may have something to say about it.
+pub fn set_window_fullscreen(on: bool) {
+    with_doc(|d| d.request(PlatformRequest::SetFullscreen(on)));
+}
+
+/// Ends what [`NodeRef::request_fullscreen`] started.
+pub fn exit_fullscreen() {
+    with_doc(Document::exit_fullscreen);
+    sync_fullscreen();
 }
 
 fn window_scale_signal() -> Signal<Scale> {

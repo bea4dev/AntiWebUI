@@ -345,13 +345,13 @@ pub fn paint_document(doc: &mut Document, now: Instant) -> Frame {
     let mut settling = Vec::new();
     paint_drag_preview(doc, now, &mut old_layers, &mut new_layers, &mut settling);
     let doc_ref = &*doc;
-    let window = doc_ref.root.map(|root| {
+    let window = doc_ref.shown_root().map(|root| {
         let size = (doc_ref.viewport.width, doc_ref.viewport.height);
         paint_root(
             doc_ref,
             root,
             size,
-            Color::WHITE,
+            window_clear(doc_ref),
             now,
             &mut old_layers,
             &mut new_layers,
@@ -393,6 +393,15 @@ pub fn paint_document(doc: &mut Document, now: Instant) -> Frame {
     }
 }
 
+/// What shows where nothing else does: behind what is on all of the screen, that is `::backdrop`.
+fn window_clear(doc: &Document) -> Color {
+    if doc.fullscreen.element.is_some() {
+        Color::BLACK
+    } else {
+        Color::WHITE
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_root(
     doc: &Document,
@@ -428,10 +437,16 @@ fn paint_root(
     if doc.nodes[root].is_popup() {
         painter.contents(root, 1.0, screen);
     } else {
-        painter.node(root, 1.0, screen);
+        if doc.fullscreen.element == Some(root) {
+            // Whatever it is in the document, which isn't showing.
+            painter.node_contents(root, 1.0, screen);
+        } else {
+            painter.node(root, 1.0, screen);
+        }
         for &portal in &doc.popups {
             let node = &doc.nodes[portal];
             if node.visible
+                && !doc.holds_fullscreen(portal)
                 && node
                     .popup()
                     .is_some_and(|p| p.portal && p.preview_of.is_none())
@@ -704,7 +719,7 @@ pub fn paint_everything(doc: &Document, now: Instant) -> Scene {
     let mut scene = Scene {
         width: doc.viewport.width.max(0) as u32,
         height: doc.viewport.height.max(0) as u32,
-        clear: Color::WHITE,
+        clear: window_clear(doc),
         primitives: Vec::new(),
         chunks: Vec::new(),
     };
@@ -721,7 +736,9 @@ pub fn paint_everything(doc: &Document, now: Instant) -> Scene {
         magnified: 1.0,
         pictures: 0,
     };
-    if let Some(root) = doc.root {
+    if let Some(root) = doc.fullscreen.element {
+        painter.node_contents(root, 1.0, RectI::INFINITE);
+    } else if let Some(root) = doc.root {
         painter.node(root, 1.0, RectI::INFINITE);
     }
     if let Some(drag) = doc.drag.as_ref().filter(|d| !d.icon)

@@ -24,6 +24,7 @@ pub struct App {
     app_id: String,
     width: i32,
     height: i32,
+    fullscreen: bool,
     settings: Vec<SettingsChange>,
 }
 
@@ -40,6 +41,7 @@ impl App {
             app_id: "dev.antiwebui.app".into(),
             width: 800,
             height: 600,
+            fullscreen: false,
             settings: Vec::new(),
         }
     }
@@ -58,6 +60,15 @@ impl App {
     pub fn size(mut self, width: i32, height: i32) -> Self {
         self.width = width;
         self.height = height;
+        self
+    }
+
+    /// Whether the window opens on all of the screen. See also [`set_window_fullscreen`] for
+    /// changes while running.
+    ///
+    /// [`set_window_fullscreen`]: anti_webui_core::view::set_window_fullscreen
+    pub fn fullscreen(mut self, on: bool) -> Self {
+        self.fullscreen = on;
         self
     }
 
@@ -167,6 +178,7 @@ mod wayland {
                     PlatformRequest::SetClipboard { kind, text } => ctx.set_clipboard(kind, text),
                     PlatformRequest::Paste(kind) => ctx.request_paste(kind),
                     PlatformRequest::SetTitle(t) => ctx.set_title(&t),
+                    PlatformRequest::SetFullscreen(on) => ctx.set_fullscreen(on),
                     PlatformRequest::Close => ctx.exit(),
                     PlatformRequest::ShowPopup(params) => ctx.show_popup(params),
                     PlatformRequest::UpdatePopup(params) => ctx.update_popup(params),
@@ -395,6 +407,7 @@ mod wayland {
             app_id: app.app_id,
             width: app.width,
             height: app.height,
+            fullscreen: app.fullscreen,
         };
         let mut runner = runner;
         anti_webui_wayland::run(options, &mut runner)?;

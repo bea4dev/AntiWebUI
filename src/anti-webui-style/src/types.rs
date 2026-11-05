@@ -390,6 +390,8 @@ pub enum CursorIcon {
     EwResize,
     NsResize,
     Crosshair,
+    /// No cursor at all.
+    None,
     /// What is dragged is going to be copied.
     Copy,
 }

@@ -62,6 +62,8 @@ pub struct WindowOptions {
     /// Initial size in logical pixels.
     pub width: i32,
     pub height: i32,
+    /// Whether it opens on all of the screen.
+    pub fullscreen: bool,
 }
 
 /// Callbacks from the event loop.
@@ -158,6 +160,14 @@ impl Ctx<'_> {
 
     pub fn set_title(&mut self, title: &str) {
         self.state.toplevel.set_title(title.to_owned());
+    }
+
+    pub fn set_fullscreen(&mut self, on: bool) {
+        if on {
+            self.state.toplevel.set_fullscreen(None);
+        } else {
+            self.state.toplevel.unset_fullscreen();
+        }
     }
 
     pub fn exit(&mut self) {
@@ -362,6 +372,9 @@ pub fn run<H: WaylandHandler>(options: WindowOptions, mut handler: H) -> Result<
     let toplevel = xdg_surface.get_toplevel(&qh, ());
     toplevel.set_title(options.title.clone());
     toplevel.set_app_id(options.app_id.clone());
+    if options.fullscreen {
+        toplevel.set_fullscreen(None);
+    }
 
     let (paste_tx, paste_rx) = mpsc::channel();
     let (wake_read, wake_write) = rustix::pipe::pipe_with(

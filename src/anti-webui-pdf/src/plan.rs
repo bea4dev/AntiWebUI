@@ -182,6 +182,8 @@ pub(crate) struct PageTable {
     pub width: i32,
     pub height: i32,
     pub turn: Turn,
+    /// With one page at a time, how many rows each has, with the page in the middle of them.
+    pub slot: i32,
 }
 
 impl PageTable {
@@ -220,7 +222,40 @@ impl PageTable {
             width: (widest + 2 * gap).max(viewport_width),
             height: y.min(i32::MAX as i64) as i32,
             turn,
+            slot: 0,
         }
+    }
+
+    /// One page at a time, each as big as fits in a box this size.
+    pub fn slides(pages: &[(f32, f32)], turn: Turn, (width, height): (i32, i32)) -> Self {
+        let (width, slot) = (width.max(1), height.max(1));
+        let mut tops = Vec::with_capacity(pages.len());
+        let mut sizes = Vec::with_capacity(pages.len());
+        for (i, &page) in pages.iter().enumerate() {
+            let (w, h) = turn.size(page);
+            let (w, h) = (w.max(1.0) as f64, h.max(1.0) as f64);
+            let k = (width as f64 / w).min(slot as f64 / h);
+            let size = (
+                ((w * k).round() as i32).clamp(1, width),
+                ((h * k).round() as i32).clamp(1, slot),
+            );
+            let top = i as i64 * slot as i64 + ((slot - size.1) / 2) as i64;
+            tops.push(top.min(i32::MAX as i64) as i32);
+            sizes.push(size);
+        }
+        Self {
+            tops,
+            sizes,
+            width,
+            height: (pages.len() as i64 * slot as i64).min(i32::MAX as i64) as i32,
+            turn,
+            slot,
+        }
+    }
+
+    /// How many rows are above the place where a page starts, with one page at a time.
+    pub fn slot_top(&self, page: usize) -> i32 {
+        (page as i64 * self.slot as i64).min(i32::MAX as i64) as i32
     }
 
     pub fn len(&self) -> usize {

@@ -13,6 +13,7 @@ mod links;
 mod marks;
 mod plan;
 mod reading;
+mod slides;
 mod text;
 mod thumbnails;
 mod writer;
@@ -33,11 +34,13 @@ pub use marks::{
 };
 use plan::{Direction, Have, Held, Job, PageTable, Turn};
 use reading::{BoxKind, HitPlace, Hits, Place, Reader, Selection};
+use slides::Slides;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 pub use thumbnails::{PdfThumbnails, pdf_thumbnails};
 
 /// How many physical pixels a point takes at 100% and a scale of 1, as in CSS.
@@ -57,6 +60,8 @@ const FIELD_TINT: u32 = 0x0036ff21;
 const HIGHLIGHT: u32 = 0xffd900;
 const LINE: u32 = 0xe02020;
 const TEXT: u32 = 0x000000;
+/// How long a page that isn't drawn yet leaves the one before it showing when presenting.
+const SLIDE_WAITS: Duration = Duration::from_millis(300);
 
 /// Why a document can't be shown.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -208,6 +213,11 @@ pub struct PdfViewer {
     save_to: Signal<Option<PathBuf>>,
     save_result: Signal<Option<SaveResult>>,
     edit_error: Signal<Option<String>>,
+    /// Asked to present, which starts when it is on all of the screen.
+    present_asked: Signal<bool>,
+    presenting: Signal<bool>,
+    /// The page that is wanted when presenting.
+    slide: Signal<usize>,
 }
 
 /// Makes what controls a [`pdf_view`], to hand it with [`PdfView::viewer`].
@@ -249,6 +259,9 @@ pub fn pdf_viewer() -> PdfViewer {
         save_to: signal(None),
         save_result: signal(None),
         edit_error: signal(None),
+        present_asked: signal(false),
+        presenting: signal(false),
+        slide: signal(0),
     }
 }
 
@@ -404,6 +417,28 @@ impl PdfViewer {
     /// stops selecting.
     pub fn focus(&self) {
         self.node.focus();
+    }
+
+    /// Shows the document one page at a time on all of the screen, starting with the page that shows,
+    /// wherever the box is. The keys, a click and the wheel go through the pages, and Escape or
+    /// [`Self::stop_presenting`] goes back to how it was. It takes a moment:
+    /// [`Self::is_presenting`] says when it has started.
+    pub fn present(&self) {
+        self.present_asked.set(true);
+        self.node.request_fullscreen();
+    }
+
+    pub fn stop_presenting(&self) {
+        // Asked for and not there yet counts too, as it would start later otherwise.
+        let asked = self.present_asked.get_untracked();
+        self.present_asked.set(false);
+        if asked || self.node.is_fullscreen() {
+            exit_fullscreen();
+        }
+    }
+
+    pub fn is_presenting(&self) -> bool {
+        self.presenting.get()
     }
 
     /// Opens it again with a password, after [`PdfError::NeedsPassword`].
@@ -922,19 +957,6 @@ impl IntoView for PdfView {
         // Where the pointer is in the box, in physical pixels: what zooming with it keeps in place.
         let pointer = Rc::new(Cell::new(None::<(i32, i32)>));
 
-        // What the box shows, in the physical pixels of what scrolls.
-        let view = move || {
-            let scale = window_scale();
-            let at = offset.get();
-            let (width, height) = viewport.get();
-            RectI::new(
-                scale.px(at.x),
-                scale.px(at.y),
-                scale.px(width),
-                scale.px(height),
-            )
-        };
-
         let px_per_pt = memo(move || {
             let scale = window_scale();
             let css = PX_PER_PT * scale.as_f32() as f64;
@@ -965,12 +987,34 @@ impl IntoView for PdfView {
 
         let table = memo(move || {
             let scale = window_scale();
-            let width = scale.px(viewport.get().0);
+            let (width, height) = viewport.get();
+            let (width, height) = (scale.px(width), scale.px(height));
             let turn = viewer.turn.get();
+            if viewer.presenting.get() {
+                return Rc::new(
+                    pages.with(|pages| PageTable::slides(pages, turn, (width, height))),
+                );
+            }
             Rc::new(pages.with(|pages| {
                 PageTable::turned(pages, turn, px_per_pt.get(), scale.px(gap), width)
             }))
         });
+
+        // What the box shows, in the physical pixels of what scrolls. When presenting that goes by
+        // the page and `offset` stays for later.
+        let view = move || {
+            let scale = window_scale();
+            let (width, height) = viewport.get();
+            let (x, y) = table.with(|t| {
+                if t.slot > 0 {
+                    (0, t.slot_top(viewer.slide.get()))
+                } else {
+                    let at = offset.get();
+                    (scale.px(at.x), scale.px(at.y))
+                }
+            });
+            RectI::new(x, y, scale.px(width), scale.px(height))
+        };
 
         // Whatever makes the pages move keeps the same place on the same page in the same place of
         // the box: what is under the pointer or in the middle when zooming, and what is at the top
@@ -985,8 +1029,9 @@ impl IntoView for PdfView {
                 let old = std::mem::replace(&mut *last.borrow_mut(), new.clone());
                 let (width, height) = untrack(|| viewport.get());
                 let was = last_size.replace((width, height));
-                // Nothing showed before the box had a size, so there is no place to keep.
-                if old.is_empty() || *old == *new || was.1 <= 0.0 {
+                // Nothing showed before the box had a size, so there is no place to keep. Presenting
+                // takes care of itself.
+                if old.is_empty() || *old == *new || was.1 <= 0.0 || old.slot > 0 || new.slot > 0 {
                     return;
                 }
                 let scale = untrack(window_scale);
@@ -1010,12 +1055,10 @@ impl IntoView for PdfView {
 
         // The page that is being read.
         effect(move || {
-            let scale = window_scale();
-            let top = scale.px(offset.get().y);
-            let height = scale.px(viewport.get().1);
+            let v = view();
             let t = table.get();
             if !t.is_empty() {
-                viewer.page.set_if_changed(t.page_at_middle(top, height));
+                viewer.page.set_if_changed(t.page_at_middle(v.y, v.height));
             }
         });
 
@@ -1025,6 +1068,11 @@ impl IntoView for PdfView {
             };
             let t = table.get();
             if t.is_empty() || viewport.get().1 <= 0.0 {
+                return;
+            }
+            if t.slot > 0 {
+                viewer.slide.set(target.page.min(t.len() - 1));
+                viewer.go_to.set(None);
                 return;
             }
             let scale = untrack(window_scale);
@@ -1068,6 +1116,58 @@ impl IntoView for PdfView {
                     editor.mark(kind, pages);
                 }
             }));
+        }
+
+        let slides = Slides::new(viewer, reader.clone(), direction.clone());
+        // The page that shows when presenting, which stays until the next has been drawn.
+        let displayed = signal(0usize);
+
+        // When it is on all of the screen, for whatever reason.
+        {
+            let slides = slides.clone();
+            let editor = editor.clone();
+            // Where it was, and on which page it was reading.
+            let left = RefCell::new(None::<(Rc<PageTable>, (i32, i32), usize)>);
+            effect(move || {
+                let full = scroller.is_fullscreen();
+                untrack(|| {
+                    let presenting = viewer.presenting.get();
+                    if full && !presenting && viewer.present_asked.get() {
+                        let page = viewer.page.get();
+                        let v = view();
+                        *left.borrow_mut() = Some((table.get(), (v.x, v.y), page));
+                        editor.commit();
+                        viewer.clear_selection();
+                        viewer.selected.set_if_changed(None);
+                        viewer.slide.set(page);
+                        displayed.set(page);
+                        viewer.presenting.set(true);
+                        viewer.node.focus();
+                        slides.started();
+                    } else if !full && presenting {
+                        viewer.presenting.set(false);
+                        viewer.present_asked.set(false);
+                        slides.stopped();
+                        let Some((before, (x, y), page)) = left.borrow_mut().take() else {
+                            return;
+                        };
+                        let slide = viewer.slide.get();
+                        if slide != page {
+                            viewer.go_to_page(slide);
+                            return;
+                        }
+                        // The same page goes back to the same place on it.
+                        let scale = window_scale();
+                        let (x, y) = before.move_point(&table.get(), x, y);
+                        let (x, y) = (x.max(0), y.max(0));
+                        scroller.scroll_to_after_layout(x, y);
+                        offset.set(PointF::new(
+                            scale.to_logical(x as f32),
+                            scale.to_logical(y as f32),
+                        ));
+                    }
+                });
+            });
         }
 
         // What comes back from the workers. A picture at another size than is wanted now only helps
@@ -1442,10 +1542,52 @@ impl IntoView for PdfView {
             });
         }
 
+        // Goes on to the next page when it has been drawn, or when that takes too long. Whatever else
+        // changes in the meantime starts this over, and that doesn't start the wait over.
+        {
+            let waiting = Cell::new(None::<(usize, Instant)>);
+            let gave_up = signal(None::<usize>);
+            effect(move || {
+                if !viewer.presenting.get() {
+                    waiting.set(None);
+                    return;
+                }
+                let page = viewer.slide.get();
+                let t = table.get();
+                if page >= t.len() {
+                    return;
+                }
+                let drawn = pictures.with(|all| {
+                    all.get(&page)
+                        .is_some_and(|b| plan::is_right_size(t.size(page), (b.width(), b.height())))
+                });
+                if drawn || failed.with(|f| f.contains(&page)) || gave_up.get() == Some(page) {
+                    waiting.set(None);
+                    displayed.set_if_changed(page);
+                    return;
+                }
+                if displayed.get_untracked() == page {
+                    return;
+                }
+                let since = match waiting.get() {
+                    Some((p, since)) if p == page => since,
+                    _ => Instant::now(),
+                };
+                waiting.set(Some((page, since)));
+                set_timeout(SLIDE_WAITS.saturating_sub(since.elapsed()), move || {
+                    gave_up.set(Some(page));
+                });
+            });
+        }
+
         let on_scrolled = {
             let direction = direction.clone();
             let reader = reader.clone();
             move |at: PointF| {
+                // The box doesn't scroll then, and what it did goes back to `offset` afterwards.
+                if viewer.presenting.get_untracked() {
+                    return;
+                }
                 let old = offset.get_untracked();
                 if at.y > old.y {
                     direction.set(Direction::Down);
@@ -1461,6 +1603,10 @@ impl IntoView for PdfView {
         let on_pinch = {
             let pointer = pointer.clone();
             move |e: &PinchEvent| {
+                if viewer.presenting.get_untracked() {
+                    e.stop_propagation();
+                    return;
+                }
                 pinching.set_if_changed(matches!(e.phase, PinchPhase::Began | PinchPhase::Moved));
                 if e.phase == PinchPhase::Moved {
                     pointer.set(Some((e.local.x as i32, e.local.y as i32)));
@@ -1470,18 +1616,26 @@ impl IntoView for PdfView {
             }
         };
 
-        let on_scroll = move |e: &ScrollEvent| {
-            if e.modifiers.ctrl {
-                // A notch of a wheel is about a tenth, and a touchpad gets there in small steps.
-                viewer.zoom_by((-e.delta_y / 1000.0).exp());
-                e.stop_propagation();
+        let on_scroll = {
+            let slides = slides.clone();
+            move |e: &ScrollEvent| {
+                if viewer.presenting.get_untracked() {
+                    slides.scroll(e);
+                    return;
+                }
+                if e.modifiers.ctrl {
+                    // A notch of a wheel is about a tenth, and a touchpad gets there in small steps.
+                    viewer.zoom_by((-e.delta_y / 1000.0).exp());
+                    e.stop_propagation();
+                }
             }
         };
 
         let on_key = {
             let editor = editor.clone();
+            let slides = slides.clone();
             move |e: &KeyboardEvent| {
-                if editor.key(e) {
+                if slides.key(e) || editor.key(e) {
                     return;
                 }
                 let scale = untrack(window_scale);
@@ -1553,13 +1707,13 @@ impl IntoView for PdfView {
                         let (w, h) = t.size(page);
                         let s = s
                             .left(Length::Device(t.left(page)))
-                            .top(Length::Device(t.top(page)))
+                            .top(Length::Device(t.top(page) - t.slot_top(displayed.get())))
                             .w(Length::Device(w))
                             .h(Length::Device(h))
                             .bg(Color::WHITE);
                         match &page_style {
-                            Some(f) => f(s),
-                            None => s,
+                            Some(f) if t.slot == 0 => f(s),
+                            _ => s,
                         }
                     })
                     .child(
@@ -1600,6 +1754,9 @@ impl IntoView for PdfView {
                     ))
                     .child(for_each(
                         move || {
+                            if viewer.presenting.get() {
+                                return Vec::new();
+                            }
                             let mut boxes = editor.field_boxes(page);
                             boxes.extend(reader.boxes(page));
                             boxes
@@ -1637,13 +1794,27 @@ impl IntoView for PdfView {
             .on_key_down(on_key)
             .dyn_style({
                 let cursor = reader.cursor;
-                move |s| s.cursor(cursor.get())
+                let hidden = slides.pointer_hidden;
+                move |s| {
+                    if hidden.get() {
+                        return s.cursor(CursorIcon::None);
+                    }
+                    let s = s.cursor(cursor.get());
+                    if viewer.presenting.get() {
+                        s.bg(Color::BLACK)
+                    } else {
+                        s
+                    }
+                }
             })
             .on_pointer_down({
                 let reader = reader.clone();
                 let editor = editor.clone();
+                let slides = slides.clone();
                 move |e| {
-                    if !editor.pointer_down(e) {
+                    if viewer.presenting.get_untracked() {
+                        slides.pointer_down(e);
+                    } else if !editor.pointer_down(e) {
                         reader.pointer_down(e);
                     }
                 }
@@ -1652,6 +1823,9 @@ impl IntoView for PdfView {
                 let reader = reader.clone();
                 let editor = editor.clone();
                 move |e| {
+                    if viewer.presenting.get_untracked() {
+                        return;
+                    }
                     let taken = editor.is_pressed();
                     if !taken {
                         reader.pointer_up(e);
@@ -1663,7 +1837,12 @@ impl IntoView for PdfView {
                 let pointer = pointer.clone();
                 let reader = reader.clone();
                 let editor = editor.clone();
+                let slides = slides.clone();
                 move |e| {
+                    if viewer.presenting.get_untracked() {
+                        slides.pointer_moved(e);
+                        return;
+                    }
                     pointer.set(Some((e.local.x as i32, e.local.y as i32)));
                     if editor.pointer_moved(e) {
                         return;
@@ -1686,10 +1865,15 @@ impl IntoView for PdfView {
                     .flex_none()
                     .dyn_style(move |s| {
                         let t = table.get();
-                        s.w(Length::Device(t.width)).h(Length::Device(t.height))
+                        // One page at a time doesn't scroll.
+                        let height = if t.slot > 0 { t.slot } else { t.height };
+                        s.w(Length::Device(t.width)).h(Length::Device(height))
                     })
                     .child(for_each(
                         move || {
+                            if table.with(|t| t.slot > 0) {
+                                return vec![displayed.get()];
+                            }
                             let scale = window_scale();
                             let top = scale.px(offset.get().y);
                             let height = scale.px(viewport.get().1);
@@ -1703,8 +1887,30 @@ impl IntoView for PdfView {
                         |page| *page,
                         page_view,
                     ))
-                    .child(editor.layer()),
+                    .child(show(
+                        move || !viewer.presenting.get(),
+                        move || editor.layer(),
+                    )),
             )
+            .child(show(
+                {
+                    let blank = slides.blank;
+                    move || blank.get().is_some()
+                },
+                {
+                    let blank = slides.blank;
+                    move || {
+                        div()
+                            .absolute()
+                            .inset(Length::Px(0.0))
+                            .pointer_events_none()
+                            .dyn_style(move |s| match blank.get() {
+                                Some(color) => s.bg(color),
+                                None => s,
+                            })
+                    }
+                },
+            ))
             .into_view()
     }
 }

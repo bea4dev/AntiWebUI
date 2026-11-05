@@ -5,7 +5,7 @@ use crate::pacing::PresentTrace;
 use anti_webui_core::damage::{self, Damage, DamageHistory};
 use anti_webui_core::scene::Scene;
 use anti_webui_wayland::{
-    BufferEvent, BufferId, Ctx, DmabufPlaneDesc, SurfaceId, SyncPoints, TimelineId,
+    BufferEvent, BufferId, Ctx, DmabufFeedback, DmabufPlaneDesc, SurfaceId, SyncPoints, TimelineId,
 };
 use anti_webui_wgpu::dmabuf::{DRM_FORMAT_ARGB8888, DmabufContext, DmabufImage};
 use anti_webui_wgpu::linux_sync::{self, DrmDevice};
@@ -324,7 +324,14 @@ impl Presenter {
             && f.generation != d.generation
         {
             d.generation = f.generation;
-            let modifiers = f.modifiers(DRM_FORMAT_ARGB8888);
+            let modifiers = wanted_modifiers(f, &d.ctx);
+            if debug_enabled() {
+                let scanout = f.tranches.iter().map(|t| t.scanout).collect::<Vec<_>>();
+                eprintln!(
+                    "[anti-webui] dmabuf feedback: tranches that can scan out {scanout:?}, using {} modifiers",
+                    modifiers.len()
+                );
+            }
             if modifiers != d.modifiers {
                 d.modifiers = modifiers;
                 for t in &mut targets {
@@ -498,14 +505,25 @@ impl DmabufTarget {
     }
 }
 
+/// What buffers may be made with. What the compositor can put on the screen as it is comes first if
+/// it can be drawn to, as the driver would otherwise pick from all of them.
+fn wanted_modifiers(feedback: &DmabufFeedback, ctx: &DmabufContext) -> Vec<u64> {
+    let scanout = feedback.scanout_modifiers(DRM_FORMAT_ARGB8888);
+    if ctx.supports_any(&scanout) {
+        scanout
+    } else {
+        feedback.modifiers(DRM_FORMAT_ARGB8888)
+    }
+}
+
 impl DmabufPresenter {
     fn new(ctx: &mut Ctx<'_>) -> Result<(Gpu, Self), GpuError> {
         let feedback = ctx
             .dmabuf_feedback()
             .ok_or_else(|| GpuError::Dmabuf("the compositor sent no dmabuf feedback".into()))?;
-        let modifiers = feedback.modifiers(DRM_FORMAT_ARGB8888);
         let generation = feedback.generation;
         let (gpu, dctx) = Gpu::for_dmabuf(feedback.main_device)?;
+        let modifiers = wanted_modifiers(feedback, &dctx);
         if !dctx.supports_any(&modifiers) {
             return Err(GpuError::Dmabuf(
                 "no ARGB8888 modifier shared with the compositor".into(),

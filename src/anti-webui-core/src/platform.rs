@@ -108,6 +108,9 @@ pub enum PlatformRequest {
     /// Ask for the clipboard contents; answered with `WindowEvent::Paste`.
     Paste(ClipboardKind),
     SetTitle(String),
+    /// Puts the window on all of the screen or takes it off. `WindowEvent::Fullscreen` says when it
+    /// has happened, if it does.
+    SetFullscreen(bool),
     Close,
     /// Answered with `WindowEvent::PopupConfigured`.
     ShowPopup(PopupParams),
