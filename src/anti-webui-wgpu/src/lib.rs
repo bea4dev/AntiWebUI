@@ -55,6 +55,13 @@ impl HasDisplayHandle for Display {
     }
 }
 
+/// The instance and adapter of everything headless, for the life of the process. The Vulkan loader
+/// crashes when one instance is created while another is destroyed, which tests running side by
+/// side would do.
+static HEADLESS: std::sync::OnceLock<
+    Result<(wgpu::Instance, wgpu::Adapter), wgpu::RequestAdapterError>,
+> = std::sync::OnceLock::new();
+
 /// Shared GPU objects.
 pub struct Gpu {
     pub instance: wgpu::Instance,
@@ -173,11 +180,18 @@ impl Gpu {
 
     /// Creates a GPU context without a window, for offscreen rendering.
     pub fn headless() -> Result<Gpu, GpuError> {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-                .map_err(GpuError::Adapter)?;
+        let (instance, adapter) = HEADLESS
+            .get_or_init(|| {
+                let instance = wgpu::Instance::new(
+                    wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
+                );
+                let adapter = pollster::block_on(
+                    instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+                )?;
+                Ok((instance, adapter))
+            })
+            .clone()
+            .map_err(GpuError::Adapter)?;
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
                 .map_err(GpuError::Device)?;

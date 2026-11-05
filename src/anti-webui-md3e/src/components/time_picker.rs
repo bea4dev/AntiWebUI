@@ -136,7 +136,7 @@ pub fn time_picker(
     let from_pointer = {
         let time = time.clone();
         let on_change = on_change.clone();
-        Rc::new(move |e: &PointerEvent, snap: bool| {
+        Rc::new(move |e: &GrabEvent, snap: bool| {
             let scale = with_doc(|d| d.scale.as_f64() as f32);
             let x = e.local.x - e.rect.width as f32 / 2.0;
             let y = e.local.y - e.rect.height as f32 / 2.0;
@@ -257,27 +257,25 @@ pub fn time_picker(
             })
         })
         .on_focus_visible(move |on| dial_focused.set(on))
-        .on_pointer_down(move |e| {
-            dragging.set(true);
-            down_moved.set(false);
-            press(e, true);
-        })
-        .on_pointer_move(move |e| {
-            if dragging.get_untracked() {
+        .grab_threshold(0.0)
+        .on_grab(move |g| match g.phase {
+            GrabPhase::Start => {
+                dragging.set(true);
+                down_moved.set(false);
+                press(g, true);
+            }
+            GrabPhase::Move => {
                 move_moved.set(true);
-                moving(e, false);
+                moving(g, false);
             }
-        })
-        .on_active(move |on| {
-            if on {
-                return;
-            }
-            dragging.set(false);
-            let dragged = up_moved.get();
-            if !tap_mode.get_untracked() {
-                // After a tap the numbers change a moment later, after a drag at once.
-                let wait = if dragged { 0 } else { 100 };
-                set_timeout(Duration::from_millis(wait), move || tap_mode.set(true));
+            GrabPhase::End | GrabPhase::Cancel => {
+                dragging.set(false);
+                let dragged = up_moved.get();
+                if !tap_mode.get_untracked() {
+                    // After a tap the numbers change a moment later, after a drag at once.
+                    let wait = if dragged { 0 } else { 100 };
+                    set_timeout(Duration::from_millis(wait), move || tap_mode.set(true));
+                }
             }
         })
         .on_key_down(move |e| {

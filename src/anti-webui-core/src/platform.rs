@@ -1,8 +1,9 @@
 //! Requests from the UI to the platform layer.
 
-use crate::event::ClipboardKind;
+use crate::event::{ClipboardKind, DragAction, DragActions};
 use crate::geometry::{PointI, RectI, SizeI};
 pub use anti_webui_style::CursorIcon;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ImePurpose {
@@ -87,6 +88,14 @@ pub struct PopupParams {
     pub position: Option<PointI>,
 }
 
+/// What a drag offers to whoever it is dragged to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DragOffer {
+    /// The formats, with the data of each.
+    pub items: Vec<(String, Arc<[u8]>)>,
+    pub actions: DragActions,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlatformRequest {
     SetCursor(CursorIcon),
@@ -105,4 +114,17 @@ pub enum PlatformRequest {
     UpdatePopup(PopupParams),
     /// Closes it and what is attached to it.
     ClosePopup(PopupId),
+    /// Hands what is dragged to the system, with a surface for what shows with the pointer.
+    /// Answered with `WindowEvent::DragEntered` and the others, and `DragSourceEnded`.
+    StartDrag(DragOffer),
+    /// Ends a drag that was started, which is then told as `DragSourceEnded`.
+    CancelDrag,
+    /// The surface of the drag is not needed any more.
+    CloseDragIcon,
+    /// The format what is over the window would be taken in here, if it can be.
+    AcceptDrag(Option<(String, DragAction)>),
+    /// Reads what was dropped; answered with `WindowEvent::DropData`.
+    ReceiveDrop(String),
+    /// What was dropped has been dealt with without reading it.
+    FinishDrop,
 }

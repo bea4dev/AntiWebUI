@@ -3,6 +3,7 @@
 pub mod actions;
 pub mod communication;
 pub mod containment;
+pub mod dragging;
 pub mod inputs;
 pub mod navigation;
 pub mod selection;

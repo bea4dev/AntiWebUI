@@ -14,6 +14,7 @@ cargo run --release -p anti-webui-md3e --example showcase [actions|selection|com
 | 通知 | `linear_progress`、`circular_progress`、`circular_wavy_progress`、`indeterminate_*` 4 種、`badge`、`text_badge`、`badged`、`tooltip`、`rich_tooltip`、`snackbars` |
 | 容器 | `filled_card`、`elevated_card`、`outlined_card`、`clickable_card`、`divider`、`vertical_divider`、`list_item`、`segmented_list`、`dialog`、`alert_dialog`、`bottom_sheet`、`side_sheet`、`navigation_drawer`、`carousel`、`card_media`、`carousel_image` |
 | 画像 | `image`、`avatar`、`initials_avatar`（[22](22-images.md)） |
+| 並べ替え | `sortable_list`、`sortable_row`（[23](23-drag-and-drop.md)） |
 | 移動 | `navigation_bar`、`short_navigation_bar`、`navigation_rail`、`wide_navigation_rail`、`drawer_item`、`tabs`、`styled_tabs`、`top_app_bar`、`top_app_bar_over`、`bottom_app_bar`、`flexible_bottom_app_bar`、`floating_toolbar`、`floating_toolbar_with_fab` |
 | 入力 | `text_field`、`outlined_text_field`、`dropdown_field`、`search_bar`、`menu`、`fab_menu`、`split_button`、`date_picker`、`date_picker_dialog`、`time_picker`、`time_picker_dialog` |
 

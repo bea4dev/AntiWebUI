@@ -1,5 +1,6 @@
 //! The retained node tree (a small DOM) and the per-window document state.
 
+use crate::drag::{DropConfig, GestureConfig};
 use crate::event::{KeyboardEvent, PointerEvent, ScrollEvent};
 use crate::geometry::{Affine, PointF, PointI, RectI, Scale, SizeI};
 use crate::layout::{MeasureCache, MeasureKey, Resolved, child_clip};
@@ -39,10 +40,12 @@ pub struct Listeners {
     pub focus_visible: Option<Rc<dyn Fn(bool)>>,
     pub scrolled: Option<Rc<dyn Fn(PointF)>>,
     pub resized: Option<Rc<dyn Fn(f32, f32)>>,
+    pub(crate) gesture: Option<Rc<GestureConfig>>,
+    pub(crate) drop: Option<Rc<DropConfig>>,
 }
 
-/// Style layers, applied in order: sheet → base → dynamic → hover → focus → active → disabled. The
-/// sheet has its part in each of them, below what the node has itself.
+/// Style layers, applied in order: sheet → base → dynamic → hover → focus → active → dragging →
+/// drag_over → disabled. The sheet has its part in each of them, below what the node has itself.
 #[derive(Default)]
 pub struct NodeStyle {
     pub sheet: Option<Rc<Sheet>>,
@@ -51,6 +54,8 @@ pub struct NodeStyle {
     pub hover: Option<Style>,
     pub focus: Option<Style>,
     pub active: Option<Style>,
+    pub dragging: Option<Style>,
+    pub drag_over: Option<Style>,
 }
 
 impl NodeStyle {
@@ -96,6 +101,9 @@ pub struct PopupData {
     pub portal: bool,
     /// While it exists, Tab stays inside of it.
     pub modal: bool,
+    /// What a drag shows, which the painter puts where the pointer is. It goes by what was dragged
+    /// for what is inherited.
+    pub preview_of: Option<Box<ComputedStyle>>,
 
     /// The size it would like to have, in physical pixels.
     pub natural: SizeI,
@@ -448,6 +456,10 @@ pub struct WindowState {
     pub focus_visible: bool,
     pub selection: Option<DocSelection>,
     pub window_focused: bool,
+    /// What is being dragged, for as long as it exists.
+    pub dragging: Option<NodeId>,
+    /// What would take what is being dragged.
+    pub drag_over: Option<NodeId>,
 }
 
 pub struct Document {
@@ -490,6 +502,8 @@ pub struct Document {
     pub stacking_dirty: bool,
     /// All popups, parents before what is attached to them once `stacking` is built.
     pub popups: Vec<NodeId>,
+    /// What shows for something being dragged.
+    pub(crate) drag: Option<crate::paint::DragVisual>,
     /// Nodes to bring into view after the next layout.
     pub pending_scroll: Vec<NodeId>,
     /// Nodes that scrolled and have someone waiting to hear about it.
@@ -532,6 +546,7 @@ thread_local! {
         stacking: HashMap::new(),
         stacking_dirty: false,
         popups: Vec::new(),
+        drag: None,
         pending_scroll: Vec::new(),
         scrolled: Vec::new(),
         resized: Vec::new(),
@@ -927,6 +942,12 @@ impl Document {
         let st = &mut self.state;
         st.hovered.retain(|h| *h != id);
         st.active.retain(|a| *a != id);
+        if st.dragging == Some(id) {
+            st.dragging = None;
+        }
+        if st.drag_over == Some(id) {
+            st.drag_over = None;
+        }
         if st.focused == Some(id) {
             st.focused = None;
             self.requests.push(PlatformRequest::SetIme(None));

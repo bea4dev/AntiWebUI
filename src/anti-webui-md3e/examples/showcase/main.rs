@@ -16,11 +16,12 @@ use anti_webui_md3e::components::{
 };
 use anti_webui_md3e::{ColorScheme, color_scheme, icons, set_color_scheme};
 
-const PAGES: [(&str, &str); 6] = [
+const PAGES: [(&str, &str); 7] = [
     ("actions", "Actions"),
     ("selection", "Selection"),
     ("communication", "Feedback"),
     ("containment", "Containers"),
+    ("dragging", "Dragging"),
     ("navigation", "Navigation"),
     ("inputs", "Inputs"),
 ];
@@ -31,6 +32,7 @@ fn page(name: &str) -> Div {
         "selection" => pages::selection::page(),
         "communication" => pages::communication::page(),
         "containment" => pages::containment::page(),
+        "dragging" => pages::dragging::page(),
         "navigation" => pages::navigation::page(),
         "inputs" => pages::inputs::page(),
         _ => div(),
@@ -57,8 +59,9 @@ fn app_at(current: Signal<usize>, dark_at_start: bool) -> Div {
         nav_item(icons::TOGGLE_ON, PAGES[1].1),
         nav_item(icons::NOTIFICATIONS, PAGES[2].1),
         nav_item(icons::DASHBOARD, PAGES[3].1),
-        nav_item(icons::EXPLORE, PAGES[4].1),
-        nav_item(icons::KEYBOARD, PAGES[5].1),
+        nav_item(icons::PAN_TOOL, PAGES[4].1),
+        nav_item(icons::EXPLORE, PAGES[5].1),
+        nav_item(icons::KEYBOARD, PAGES[6].1),
     ];
     let content = for_each(
         move || vec![current.get()],

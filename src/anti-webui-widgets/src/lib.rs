@@ -15,6 +15,7 @@ mod long;
 mod menu;
 mod select;
 mod slider;
+mod sortable;
 mod structure;
 mod theme;
 mod toast;
@@ -34,6 +35,7 @@ pub use menu::{
 };
 pub use select::*;
 pub use slider::*;
+pub use sortable::*;
 pub use structure::*;
 pub use theme::{Theme, page, set_theme, theme};
 pub use toast::*;

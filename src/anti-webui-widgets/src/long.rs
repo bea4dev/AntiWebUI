@@ -3,6 +3,7 @@
 
 use crate::theme::{Theme, ring, shared, theme};
 use anti_webui_core::prelude::*;
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::hash::Hash;
@@ -523,7 +524,7 @@ pub fn table<R: Clone + 'static>(
                         .enumerate()
                         .map(|(c, col)| {
                             let sorts = col.compare.is_some();
-                            let drag_from = signal(None::<(f32, f32)>);
+                            let drag_from = Cell::new(MIN_COLUMN);
                             let mut head = cell_frame(c, col.fill, col.align_end)
                                 .gap(4.0)
                                 .sheet(|| shared(header_cell_sheet))
@@ -545,29 +546,20 @@ pub fn table<R: Clone + 'static>(
                                         .w(5.0)
                                         .sheet(|| shared(handle_sheet))
                                         .on_click(|e| e.stop_propagation())
-                                        .on_pointer_down(move |e| {
-                                            e.stop_propagation();
-                                            let w = widths
-                                                .with_untracked(|w| w.get(c).copied())
-                                                .unwrap_or(MIN_COLUMN);
-                                            drag_from.set(Some((e.position.x, w)));
-                                        })
-                                        .on_pointer_move(move |e| {
-                                            let Some((x, w)) = drag_from.get_untracked() else {
-                                                return;
-                                            };
-                                            let scale = window_scale().as_f32();
-                                            let to = w + (e.position.x - x) / scale;
-                                            widths.update(|all| {
+                                        .grab_threshold(0.0)
+                                        .on_grab(move |g| match g.phase {
+                                            GrabPhase::Start => drag_from.set(
+                                                widths
+                                                    .with_untracked(|w| w.get(c).copied())
+                                                    .unwrap_or(MIN_COLUMN),
+                                            ),
+                                            GrabPhase::Move => widths.update(|all| {
                                                 if let Some(slot) = all.get_mut(c) {
-                                                    *slot = to.max(MIN_COLUMN);
+                                                    *slot = (drag_from.get() + g.total.x)
+                                                        .max(MIN_COLUMN);
                                                 }
-                                            });
-                                        })
-                                        .on_active(move |on| {
-                                            if !on {
-                                                drag_from.set(None);
-                                            }
+                                            }),
+                                            GrabPhase::End | GrabPhase::Cancel => {}
                                         }),
                                 );
                             if sorts {

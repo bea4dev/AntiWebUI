@@ -12,7 +12,7 @@ mod pages;
 use anti_webui::app::headless;
 use anti_webui::prelude::*;
 
-const PAGES: [(&str, &str); 9] = [
+const PAGES: [(&str, &str); 10] = [
     ("buttons", "Buttons"),
     ("selection", "Selection"),
     ("inputs", "Inputs"),
@@ -22,6 +22,7 @@ const PAGES: [(&str, &str); 9] = [
     ("data", "Data"),
     ("layout", "Layout"),
     ("images", "Images"),
+    ("dragging", "Dragging"),
 ];
 
 fn page_view(name: &str) -> Div {
@@ -35,6 +36,7 @@ fn page_view(name: &str) -> Div {
         "data" => pages::data(),
         "layout" => pages::layout(),
         "images" => pages::images(),
+        "dragging" => pages::dragging(),
         _ => div(),
     }
 }

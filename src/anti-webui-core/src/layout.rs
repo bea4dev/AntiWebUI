@@ -471,6 +471,10 @@ fn resolve_node(
     let Some(node) = doc.nodes.get(id) else {
         return;
     };
+    let parent = node
+        .popup()
+        .and_then(|p| p.preview_of.as_deref())
+        .unwrap_or(parent);
     let mut computed = ComputedStyle::inherit_from(parent);
     computed.disabled |= node.disabled;
     if let Some(sheet) = node.style.sheet.as_deref() {
@@ -492,6 +496,16 @@ fn resolve_node(
     }
     if let Some(s) = &node.style.active
         && doc.state.active.contains(&id)
+    {
+        s.apply_to(&mut computed);
+    }
+    if let Some(s) = &node.style.dragging
+        && doc.state.dragging == Some(id)
+    {
+        s.apply_to(&mut computed);
+    }
+    if let Some(s) = &node.style.drag_over
+        && doc.state.drag_over == Some(id)
     {
         s.apply_to(&mut computed);
     }

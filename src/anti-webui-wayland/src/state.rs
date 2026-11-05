@@ -77,6 +77,8 @@ pub struct PointerFrame {
 pub enum SurfaceId {
     Window,
     Popup(PopupId),
+    /// What shows with the pointer during a drag.
+    DragIcon,
 }
 
 /// How long a popup may hold up the next frame by not getting its frame callback.
@@ -151,6 +153,7 @@ pub struct State {
     )>,
     pub paste_tx: mpsc::Sender<(ClipboardKind, String)>,
     pub wake: OwnedFd,
+    pub(crate) drag: crate::drag::DragState,
 
     pub(crate) window_frame: SurfaceFrame,
     pub(crate) popups: HashMap<PopupId, Popup>,
@@ -238,13 +241,19 @@ impl State {
             redraw_at: None,
             events: Vec::new(),
             present: Default::default(),
+            drag: Default::default(),
         }
     }
 
     /// A position on the pointer's surface in window coordinates.
     fn physical(&self, x: f64, y: f64) -> PointF {
+        self.physical_on(self.pointer_surface, x, y)
+    }
+
+    /// A position on a surface in window coordinates.
+    pub(crate) fn physical_on(&self, surface: SurfaceId, x: f64, y: f64) -> PointF {
         let s = self.scale.as_f64();
-        let origin = self.surface_origin(self.pointer_surface);
+        let origin = self.surface_origin(surface);
         PointF::new(
             (x * s) as f32 + origin.x as f32,
             (y * s) as f32 + origin.y as f32,
@@ -255,7 +264,7 @@ impl State {
     pub(crate) fn surface_origin(&self, surface: SurfaceId) -> PointI {
         match surface {
             SurfaceId::Popup(id) => self.popups.get(&id).map_or(PointI::default(), |p| p.origin),
-            SurfaceId::Window => PointI::default(),
+            SurfaceId::Window | SurfaceId::DragIcon => PointI::default(),
         }
     }
 
@@ -263,6 +272,7 @@ impl State {
         match surface {
             SurfaceId::Window => Some(&mut self.window_frame),
             SurfaceId::Popup(id) => self.popups.get_mut(&id).map(|p| &mut p.frame),
+            SurfaceId::DragIcon => self.drag.icon.as_mut().map(|i| &mut i.frame),
         }
     }
 
@@ -270,6 +280,7 @@ impl State {
         match surface {
             SurfaceId::Window => Some(&self.surface),
             SurfaceId::Popup(id) => self.popups.get(&id).map(|p| &p.surface),
+            SurfaceId::DragIcon => self.drag.icon.as_ref().map(|i| &i.surface),
         }
     }
 
@@ -360,6 +371,7 @@ impl State {
             CursorIcon::EwResize => Shape::EwResize,
             CursorIcon::NsResize => Shape::NsResize,
             CursorIcon::Crosshair => Shape::Crosshair,
+            CursorIcon::Copy => Shape::Copy,
         };
         dev.set_shape(self.pointer_serial, shape);
     }
@@ -757,6 +769,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 let pressed = matches!(btn_state, WEnum::Value(wl_pointer::ButtonState::Pressed));
                 if pressed {
                     state.press_serial = serial;
+                    state.drag.button_serial = serial;
                 }
                 let button = match button {
                     0x110 => PointerButton::Primary,
@@ -828,7 +841,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
     }
 }
 
-fn surface_id(surface: &wl_surface::WlSurface) -> SurfaceId {
+pub(crate) fn surface_id(surface: &wl_surface::WlSurface) -> SurfaceId {
     surface
         .data::<SurfaceId>()
         .copied()
@@ -1052,6 +1065,16 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
                 }
                 state.selection_offer = id;
             }
+            wl_data_device::Event::Enter {
+                serial,
+                surface,
+                x,
+                y,
+                id,
+            } => state.drag_entered(serial, surface_id(&surface), x, y, id),
+            wl_data_device::Event::Motion { x, y, .. } => state.drag_moved(x, y),
+            wl_data_device::Event::Leave => state.drag_left(),
+            wl_data_device::Event::Drop => state.drag_dropped(),
             _ => {}
         }
     }
@@ -1070,8 +1093,14 @@ impl Dispatch<wl_data_offer::WlDataOffer, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_data_offer::Event::Offer { mime_type } = event {
-            state.offers.entry(offer.id()).or_default().push(mime_type);
+        match event {
+            wl_data_offer::Event::Offer { mime_type } => {
+                state.offers.entry(offer.id()).or_default().push(mime_type);
+            }
+            wl_data_offer::Event::Action {
+                dnd_action: WEnum::Value(action),
+            } => state.drag.offer_action = action,
+            _ => {}
         }
     }
 }
@@ -1086,17 +1115,27 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            wl_data_source::Event::Send { fd, .. } => {
+            wl_data_source::Event::Send { fd, mime_type } => {
                 if let Some((s, text)) = &state.data_source
                     && s == source
                 {
                     write_async(fd, text.clone());
+                } else {
+                    state.drag_data_wanted(source, &mime_type, fd);
                 }
             }
             wl_data_source::Event::Cancelled => {
                 if state.data_source.as_ref().is_some_and(|(s, _)| s == source) {
                     state.data_source = None;
                 }
+                state.drag_source_cancelled(source);
+                source.destroy();
+            }
+            wl_data_source::Event::Action {
+                dnd_action: WEnum::Value(action),
+            } => state.drag.source_action = action,
+            wl_data_source::Event::DndFinished => {
+                state.drag_source_finished(source);
                 source.destroy();
             }
             _ => {}

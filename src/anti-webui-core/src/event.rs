@@ -137,6 +137,31 @@ pub enum ScrollPhase {
     MomentumEnded,
 }
 
+/// What is done with what is dragged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DragAction {
+    #[default]
+    Move,
+    Copy,
+}
+
+/// What may be done with what is dragged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DragActions {
+    Move,
+    Copy,
+    #[default]
+    Both,
+}
+
+/// What became of what was dragged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DragResult {
+    Moved,
+    Copied,
+    Cancelled,
+}
+
 /// Events sent by the platform layer to a window. Coordinates are physical pixels.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WindowEvent {
@@ -187,6 +212,28 @@ pub enum WindowEvent {
     },
     /// The platform closed a popup, because of something happening outside of it.
     PopupDismissed(PopupId),
+    /// Something being dragged came over the window: from here, or from another program.
+    DragEntered {
+        position: PointF,
+        mimes: Vec<String>,
+        modifiers: Modifiers,
+    },
+    DragMoved {
+        position: PointF,
+        modifiers: Modifiers,
+    },
+    DragLeft,
+    DragDropped {
+        position: PointF,
+        action: DragAction,
+    },
+    /// What `PlatformRequest::ReceiveDrop` asked for. Empty if it couldn't be read.
+    DropData {
+        mime: String,
+        bytes: Vec<u8>,
+    },
+    /// What `PlatformRequest::StartDrag` started is over.
+    DragSourceEnded(DragResult),
 }
 
 /// Information passed to pointer handlers.

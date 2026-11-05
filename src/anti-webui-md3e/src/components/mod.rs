@@ -23,6 +23,7 @@ mod progress;
 mod search;
 mod slider;
 mod snackbar;
+mod sortable;
 mod split_button;
 mod surface;
 mod switch;
@@ -80,6 +81,7 @@ pub use progress::{
 pub use search::{SearchStyle, search_bar};
 pub use slider::{SliderStyle, range_slider, slider, styled_slider};
 pub use snackbar::{Snackbar, Snackbars, snackbars};
+pub use sortable::{sortable_list, sortable_row};
 pub use split_button::{SplitButtonStyle, split_button};
 pub use switch::{SwitchStyle, styled_switch, switch};
 pub use tabs::{Tab, TabsStyle, icon_tab, styled_tabs, tab, tabs};

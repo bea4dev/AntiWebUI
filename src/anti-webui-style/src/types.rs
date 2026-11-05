@@ -354,6 +354,8 @@ pub enum CursorIcon {
     EwResize,
     NsResize,
     Crosshair,
+    /// What is dragged is going to be copied.
+    Copy,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

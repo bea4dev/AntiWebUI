@@ -2,7 +2,7 @@
 
 use crate::damage::primitive_bounds;
 use crate::geometry::Affine;
-use crate::geometry::{PointI, RectI};
+use crate::geometry::{PointI, RectI, SizeI};
 use crate::layout::{child_clip, mark_outer_layers_stale};
 use crate::platform::PopupId;
 use crate::scene::{
@@ -32,12 +32,192 @@ const SCROLLBAR_WIDTH: f32 = 6.0;
 pub struct Frame {
     pub window: Scene,
     pub popups: Vec<(PopupId, Scene)>,
+    /// What shows with the pointer for something being dragged, when it isn't in the window.
+    pub drag_icon: Option<DragIconFrame>,
+}
+
+/// What goes on the surface of a drag.
+#[derive(Debug)]
+pub struct DragIconFrame {
+    pub scene: Scene,
+    /// The size of the surface.
+    pub logical: SizeI,
+    /// Where the pointer is in it, in logical pixels.
+    pub hotspot: PointI,
+}
+
+/// Identifies what shows for something being dragged in scenes.
+const DRAG_LAYER: u64 = u64::MAX - 1;
+
+/// What it is painted from.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DragContent {
+    /// What was painted when it started.
+    Snapshot,
+    /// What is in this portal.
+    Live(NodeId),
+}
+
+/// What is painted, what it touches, and the box of what it is of.
+pub(crate) type DragPainted = (Arc<Scene>, RectI, RectI);
+
+/// What shows for something being dragged.
+pub(crate) struct DragVisual {
+    pub content: DragContent,
+    /// Where the pointer is, in window coordinates.
+    pub position: PointI,
+    /// Where in the box the pointer is, from 0 to 1.
+    pub grip: (f32, f32),
+    pub opacity: f32,
+    /// It goes on a surface of its own.
+    pub icon: bool,
+    pub painted: Option<DragPainted>,
+}
+
+impl DragVisual {
+    /// Where the pointer is in what is painted.
+    fn hotspot(&self, b: RectI) -> PointI {
+        PointI::new(
+            b.x + (b.width as f32 * self.grip.0).round() as i32,
+            b.y + (b.height as f32 * self.grip.1).round() as i32,
+        )
+    }
+
+    /// What goes in a scene, with its hotspot at `at`.
+    fn layer(&self, at: PointI) -> Option<Layer> {
+        let (content, touched, b) = self.painted.as_ref()?;
+        let hot = self.hotspot(*b);
+        Some(Layer {
+            key: DRAG_LAYER,
+            clip: Clip::NONE,
+            origin: PointI::new(at.x - hot.x, at.y - hot.y),
+            transform: Affine::IDENTITY,
+            bounds: *touched,
+            opacity: snapped_opacity(self.opacity),
+            content: content.clone(),
+            filter: None,
+        })
+    }
+}
+
+/// Gives the layers in a scene keys of their own, because the nodes they are of are also painted
+/// where they are.
+fn rekeyed(mut scene: Scene) -> Scene {
+    for p in &mut scene.primitives {
+        if let Primitive::Layer(l) = p {
+            l.key = !l.key;
+            l.content = Arc::new(rekeyed((*l.content).clone()));
+        }
+    }
+    scene
+}
+
+/// What a node looks like now, for what is dragged.
+pub(crate) fn paint_snapshot(doc: &Document, id: NodeId, now: Instant) -> Option<DragPainted> {
+    let b = doc.get(id)?.abs;
+    let mut scene = Scene::default();
+    let mut painter = Painter {
+        doc,
+        scene: &mut scene,
+        now,
+        screen: RectI::new(0, 0, doc.viewport.width, doc.viewport.height),
+        old_layers: HashMap::new(),
+        new_layers: HashMap::new(),
+        reuse_layers: false,
+        cull: false,
+        settling: Vec::new(),
+        magnified: 1.0,
+        pictures: 0,
+    };
+    painter.node_contents(id, 1.0, RectI::INFINITE);
+    let touched = what_it_touches(&scene);
+    Some((Arc::new(rekeyed(scene)), touched, b))
+}
+
+/// Paints what shows for what is dragged again, if it can change.
+fn paint_drag_preview(
+    doc: &mut Document,
+    now: Instant,
+    old_layers: &mut HashMap<NodeId, LayerMemo>,
+    new_layers: &mut HashMap<NodeId, LayerMemo>,
+    settling: &mut Vec<NodeId>,
+) {
+    let Some(DragContent::Live(portal)) = doc.drag.as_ref().map(|d| d.content) else {
+        return;
+    };
+    let doc_ref = &*doc;
+    let Some(inner) = doc_ref
+        .get(portal)
+        .and_then(|n| n.children.first().copied())
+    else {
+        return;
+    };
+    let b = doc_ref.nodes[inner].abs;
+    let mut scene = Scene::default();
+    let mut painter = Painter {
+        doc: doc_ref,
+        scene: &mut scene,
+        now,
+        screen: RectI::new(0, 0, doc_ref.viewport.width, doc_ref.viewport.height),
+        old_layers: std::mem::take(old_layers),
+        new_layers: std::mem::take(new_layers),
+        reuse_layers: !doc_ref.dirty.content,
+        cull: true,
+        settling: Vec::new(),
+        magnified: 1.0,
+        pictures: 0,
+    };
+    painter.contents(portal, 1.0, RectI::INFINITE);
+    settling.append(&mut painter.settling);
+    *old_layers = painter.old_layers;
+    *new_layers = painter.new_layers;
+    let touched = what_it_touches(&scene);
+    let drag = doc.drag.as_mut().expect("just looked");
+    // Sharing the allocation is what says the content stays.
+    let same = drag.painted.as_ref().is_some_and(|(old, _, _)| {
+        old.primitives == scene.primitives && old.chunks == scene.chunks
+    });
+    if same {
+        if let Some(painted) = &mut drag.painted {
+            painted.1 = touched;
+            painted.2 = b;
+        }
+    } else {
+        drag.painted = Some((Arc::new(scene), touched, b));
+    }
+}
+
+/// The surface of what is dragged, if it has one.
+fn drag_icon_frame(doc: &Document) -> Option<DragIconFrame> {
+    let drag = doc.drag.as_ref().filter(|d| d.icon)?;
+    let (_, touched, b) = drag.painted.as_ref()?;
+    if touched.is_empty() {
+        return None;
+    }
+    let (logical, buffer) = crate::drag::icon_sizes(touched.size(), doc.scale);
+    let hot = drag.hotspot(*b);
+    // In the scene the pointer goes where it is relative to what is touched.
+    let at = PointI::new(hot.x - touched.x, hot.y - touched.y);
+    let layer = drag.layer(at)?;
+    let scene = Scene {
+        width: buffer.width.max(1) as u32,
+        height: buffer.height.max(1) as u32,
+        clear: Color::TRANSPARENT,
+        primitives: vec![Primitive::Layer(layer)],
+        chunks: Vec::new(),
+    };
+    Some(DragIconFrame {
+        scene,
+        logical,
+        hotspot: crate::drag::logical_point(at, doc.scale),
+    })
 }
 
 pub fn paint_document(doc: &mut Document, now: Instant) -> Frame {
     let mut old_layers = std::mem::take(&mut doc.layer_contents);
     let mut new_layers = HashMap::new();
     let mut settling = Vec::new();
+    paint_drag_preview(doc, now, &mut old_layers, &mut new_layers, &mut settling);
     let doc_ref = &*doc;
     let window = doc_ref.root.map(|root| {
         let size = (doc_ref.viewport.width, doc_ref.viewport.height);
@@ -71,6 +251,7 @@ pub fn paint_document(doc: &mut Document, now: Instant) -> Frame {
             Some((popup_id(id), scene))
         })
         .collect();
+    let drag_icon = drag_icon_frame(doc_ref);
     doc.layer_contents = new_layers;
     doc.images.get_mut().end_frame();
     doc.stale_layers.clear();
@@ -82,6 +263,7 @@ pub fn paint_document(doc: &mut Document, now: Instant) -> Frame {
     Frame {
         window: window.unwrap_or_default(),
         popups,
+        drag_icon,
     }
 }
 
@@ -123,9 +305,22 @@ fn paint_root(
         painter.node(root, 1.0, screen);
         for &portal in &doc.popups {
             let node = &doc.nodes[portal];
-            if node.visible && node.popup().is_some_and(|p| p.portal) {
+            if node.visible
+                && node
+                    .popup()
+                    .is_some_and(|p| p.portal && p.preview_of.is_none())
+            {
                 painter.contents(portal, 1.0, screen);
             }
+        }
+        if let Some(drag) = doc.drag.as_ref().filter(|d| !d.icon)
+            && let Some(layer) = drag.layer(drag.position)
+        {
+            painter.scene.begin_chunk(ChunkKey {
+                node: DRAG_LAYER,
+                part: part::LAYER,
+            });
+            painter.scene.primitives.push(Primitive::Layer(layer));
         }
     }
     settling.append(&mut painter.settling);

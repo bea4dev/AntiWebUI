@@ -3,6 +3,7 @@
 
 pub mod animation;
 pub mod damage;
+pub mod drag;
 pub mod event;
 pub mod geometry;
 pub mod images;
@@ -26,9 +27,10 @@ pub mod prelude {
     pub use crate::animation::{
         Animatable, Animated, Spring, Timeout, animated, request_frame, set_timeout,
     };
+    pub use crate::drag::{DragData, DropEvent, ExternalDrag, GrabEvent, GrabPhase, dragged};
     pub use crate::event::{
-        Key, KeyboardEvent, Modifiers, NamedKey, PointerButton, PointerEvent, ScrollEvent,
-        ScrollPhase, ScrollSource,
+        DragAction, DragActions, DragResult, Key, KeyboardEvent, Modifiers, NamedKey,
+        PointerButton, PointerEvent, ScrollEvent, ScrollPhase, ScrollSource,
     };
     pub use crate::geometry::{PointF, RectI, Scale};
     pub use crate::platform::{ImePurpose, Placement, PopupKind};

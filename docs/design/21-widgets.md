@@ -101,6 +101,7 @@ let t = theme(); // 読むと追跡する
 | `tree_view` | 上下、左で閉じるか親へ、右で開くか子へ、Home / End、Enter / Space で開閉 |
 | `table` | 上下、PageUp / PageDown、Home / End |
 | `split_row`、`split_col` | 分割線で矢印 |
+| `sortable_list`、`sortable_row` | Alt と矢印で項目を動かす |
 
 メニュー、ダイアログ、`select` のリストの中で押したものとキーは、宣言された場所の祖先に伝えない。祖先はそこで起きたことを知らないからである（たとえば `dropdown_button` は押されると開閉する）。
 
@@ -154,7 +155,7 @@ GPU の時間、実ウィンドウでの CPU と消費電力、Chrome との比�
 
 重なる処理（ツールチップの待ち時間、モーダルの枠組み）は共通化しない。必要な量が少なく、動きが違うからである。MD3E が必要とする共通部分は `portal`、`modal`、`set_timeout` としてすでに core にある。
 
-画像を持つ部品（`image_view`、`avatar`、`image_avatar`、`media_card`）は [22](22-images.md) にある。
+画像を持つ部品（`image_view`、`avatar`、`image_avatar`、`media_card`）は [22](22-images.md)、並べ替え（`sortable_list`、`sortable_row`）は [23](23-drag-and-drop.md) にある。
 
 ## 今回やらないこと
 

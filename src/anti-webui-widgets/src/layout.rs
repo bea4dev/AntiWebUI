@@ -16,7 +16,6 @@ const SMALLEST: f32 = 0.05;
 
 fn split(horizontal: bool, ratio: Signal<f32>, first: View, second: View) -> Div {
     let area = node_ref();
-    let dragging = signal(false);
     let clamp = |v: f32| v.clamp(SMALLEST, 1.0 - SMALLEST);
     let handle = div()
         .relative()
@@ -37,24 +36,18 @@ fn split(horizontal: bool, ratio: Signal<f32>, first: View, second: View) -> Div
                 s.left(0.0).right(0.0).top(-3.0).bottom(-3.0)
             }
         }))
-        .on_pointer_down(move |_| dragging.set(true))
-        .on_pointer_move(move |e| {
-            if !dragging.get_untracked() {
-                return;
-            }
+        .grab_threshold(1.0)
+        .on_grab(move |g| {
             let Some(rect) = area.rect() else {
                 return;
             };
             let v = if horizontal {
-                (e.position.x - rect.x as f32) / rect.width.max(1) as f32
+                (g.position.x - rect.x as f32) / rect.width.max(1) as f32
             } else {
-                (e.position.y - rect.y as f32) / rect.height.max(1) as f32
+                (g.position.y - rect.y as f32) / rect.height.max(1) as f32
             };
-            ratio.set(clamp(v));
-        })
-        .on_active(move |on| {
-            if !on {
-                dragging.set(false);
+            if matches!(g.phase, GrabPhase::Start | GrabPhase::Move) {
+                ratio.set(clamp(v));
             }
         })
         .on_key_down(move |e| {

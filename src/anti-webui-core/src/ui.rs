@@ -1,6 +1,7 @@
 //! The per-window UI state machine: input handling, selection, editing, focus and frames.
 
 use crate::animation;
+use crate::drag::{DragSession, EdgeScroll, Gesture};
 use crate::event::*;
 use crate::geometry::PointI;
 use crate::geometry::{PointF, RectI, Scale, SizeI};
@@ -32,7 +33,7 @@ const DOUBLE_CLICK_MS: u32 = 500;
 const MOMENTUM_MOVE_SLOP: f32 = 8.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Drag {
+pub(crate) enum Drag {
     None,
     /// Selecting document text.
     Select,
@@ -42,10 +43,11 @@ enum Drag {
     Scrollbar(NodeId, bool, f32),
 }
 
-struct Press {
-    target: Option<NodeId>,
-    button: PointerButton,
-    drag: Drag,
+pub(crate) struct Press {
+    pub target: Option<NodeId>,
+    pub button: PointerButton,
+    pub drag: Drag,
+    pub gesture: Option<Gesture>,
 }
 
 /// A touchpad gesture from its first motion to the end of its inertia, which goes to the same
@@ -76,13 +78,18 @@ enum Scrolled {
 
 pub struct Ui {
     owner: Owner,
-    pointer: Option<PointF>,
-    modifiers: Modifiers,
-    press: Option<Press>,
+    pub(crate) pointer: Option<PointF>,
+    pub(crate) modifiers: Modifiers,
+    pub(crate) press: Option<Press>,
+    /// What is being dragged.
+    pub(crate) drag: Option<DragSession>,
+    /// What scrolls because of something held near its edge.
+    pub(crate) edge: Option<EdgeScroll>,
+    pub(crate) platform_drag: bool,
     last_click: Option<(u32, PointF, PointerButton, u32)>,
     /// The focus being set is reached with the keyboard.
     focus_by_keyboard: bool,
-    cursor: Option<CursorIcon>,
+    pub(crate) cursor: Option<CursorIcon>,
     ime_sent: Option<Option<ImeState>>,
     /// Where a pending paste should go.
     paste_target: Option<NodeId>,
@@ -142,6 +149,9 @@ impl Ui {
             pointer: None,
             modifiers: Modifiers::default(),
             press: None,
+            drag: None,
+            edge: None,
+            platform_drag: false,
             last_click: None,
             focus_by_keyboard: false,
             cursor: None,
@@ -168,7 +178,9 @@ impl Ui {
         // styles and even layout again.
         for _ in 0..4 {
             let changed = self.update_once();
-            if changed
+            if changed && self.drag.is_some() {
+                self.retarget(false);
+            } else if changed
                 && self.press.is_none()
                 && let Some(p) = self.pointer
             {
@@ -287,6 +299,7 @@ impl Ui {
     /// Whether frames must keep coming even if nothing else changes. See [`Ui::animate`].
     pub fn animating(&self) -> bool {
         self.fling.is_some()
+            || self.edge.is_some()
             || animation::frame_requested()
             || with_doc(|d| {
                 d.settling || !d.transitioning.is_empty() || d.images.get_mut().has_news()
@@ -344,6 +357,7 @@ impl Ui {
         self.poll_images();
         animation::run_frame_callbacks(now);
         with_doc(|d| animation::advance_transitions(d, now));
+        self.scroll_edge(now);
         let Some(fling) = &mut self.fling else {
             return;
         };
@@ -523,7 +537,7 @@ impl Ui {
             WindowEvent::PointerLeft => {
                 self.end_scroll_gesture();
                 self.pointer = None;
-                if self.press.is_none() {
+                if self.press.is_none() && self.drag.is_none() {
                     self.set_hovered(Vec::new());
                 }
             }
@@ -575,6 +589,7 @@ impl Ui {
                     d.mark_paint();
                 });
                 if !focused {
+                    self.cancel_gesture_for_focus();
                     self.cancel_press();
                 }
             }
@@ -583,6 +598,12 @@ impl Ui {
                 self.popup_configured(id, origin, size)
             }
             WindowEvent::PopupDismissed(id) => self.dismiss_popups(&[popup_node(id)]),
+            event @ (WindowEvent::DragEntered { .. }
+            | WindowEvent::DragMoved { .. }
+            | WindowEvent::DragLeft
+            | WindowEvent::DragDropped { .. }
+            | WindowEvent::DropData { .. }
+            | WindowEvent::DragSourceEnded(_)) => self.drag_event(event),
         }
         self.sync_ime();
     }
@@ -603,13 +624,13 @@ impl Ui {
         crate::view::tell_window_scale(scale);
     }
 
-    fn ensure_layout(&mut self) {
+    pub(crate) fn ensure_layout(&mut self) {
         if with_doc(|d| Self::needs_update(d)) {
             self.update();
         }
     }
 
-    fn hit_test(&self, p: PointF) -> Option<NodeId> {
+    pub(crate) fn hit_test(&self, p: PointF) -> Option<NodeId> {
         with_doc(|d| match d.popup_at(p) {
             Some((popup, local)) => hit(d, popup, local),
             None => d
@@ -623,20 +644,17 @@ impl Ui {
         })
     }
 
-    fn update_hover(&mut self, p: PointF) {
+    pub(crate) fn update_hover(&mut self, p: PointF) {
         let target = self.hit_test(p);
         let chain = target
             .map(|t| with_doc(|d| d.ancestors(t)))
             .unwrap_or_default();
         self.set_hovered(chain);
         let cursor = with_doc(|d| cursor_for(d, target));
-        if self.cursor != Some(cursor) {
-            self.cursor = Some(cursor);
-            with_doc(|d| d.request(PlatformRequest::SetCursor(cursor)));
-        }
+        self.set_cursor(cursor);
     }
 
-    fn set_hovered(&mut self, chain: Vec<NodeId>) {
+    pub(crate) fn set_hovered(&mut self, chain: Vec<NodeId>) {
         let (entered, left) = with_doc(|d| {
             if d.state.hovered == chain {
                 return (Vec::new(), Vec::new());
@@ -708,8 +726,11 @@ impl Ui {
         }
     }
 
-    fn pointer_moved(&mut self, p: PointF) {
+    pub(crate) fn pointer_moved(&mut self, p: PointF) {
         self.pointer = Some(p);
+        if self.drag_moved(p) {
+            return;
+        }
         // Hit testing needs a fresh layout; during a drag the captured target is known and the
         // previous frame's geometry is good enough, so moves don't force a re-layout each.
         if self.press.is_none() {
@@ -739,6 +760,14 @@ impl Ui {
             }
             Drag::None => {}
         }
+        if drag == Drag::Select {
+            self.update_selection_edge(p);
+        }
+        self.gesture_moved(p);
+        // It may have become something dragged.
+        if self.drag.is_some() {
+            return;
+        }
         // While a button is held, moves go to the pressed node (implicit pointer capture).
         let target = match &self.press {
             Some(press) => press.target,
@@ -750,6 +779,7 @@ impl Ui {
     }
 
     fn pointer_down(&mut self, p: PointF, button: PointerButton, time: u32) {
+        self.drop_stale_drag();
         self.ensure_layout();
         let target = self.hit_test(p);
         let slop = with_doc(|d| d.scale.pxf(4.0));
@@ -791,6 +821,7 @@ impl Ui {
         }
 
         let mut drag = Drag::None;
+        let mut gesture = None;
         if button == PointerButton::Primary {
             if let Some(t) = target {
                 let chain = with_doc(|d| d.ancestors(t));
@@ -815,6 +846,8 @@ impl Ui {
                     d.mark_paint();
                 });
                 drag = Drag::Edit(edit);
+            } else if let Some(found) = target.and_then(|t| self.find_gesture(t, p)) {
+                gesture = Some(found);
             } else if target.is_some_and(|t| {
                 with_doc(|d| {
                     d.get(t)
@@ -857,14 +890,19 @@ impl Ui {
             target,
             button,
             drag,
+            gesture,
         });
         if let Some(t) = target {
             self.dispatch_pointer(PointerKind::Down, t, p, Some(button), clicks);
         }
+        self.gesture_pressed(p);
     }
 
     fn pointer_up(&mut self, p: PointF, button: PointerButton) {
-        let Some(press) = self.press.take() else {
+        if self.drag_released(p) {
+            return;
+        }
+        let Some(mut press) = self.press.take() else {
             return;
         };
         let target = self.hit_test(p);
@@ -873,8 +911,11 @@ impl Ui {
         if let Some(t) = press.target.or(target) {
             self.dispatch_pointer(PointerKind::Up, t, p, Some(button), 0);
         }
+        self.gesture_released(&mut press, p);
+        let eats_click = press.gesture.as_ref().is_some_and(Gesture::eats_click);
         // Click goes to the deepest common ancestor of the press and release targets.
         if press.button == button
+            && !eats_click
             && let (Some(a), Some(b)) = (press.target, target)
         {
             let common = with_doc(|d| {
@@ -921,6 +962,7 @@ impl Ui {
     /// Ends a press that will never see its release (e.g. the window lost focus), so handlers
     /// waiting for `pointer_up` do not stay stuck.
     fn cancel_press(&mut self) {
+        self.edge = None;
         let Some(press) = self.press.take() else {
             return;
         };
@@ -1254,6 +1296,9 @@ impl Ui {
 
     fn key(&mut self, key: KeyEvent) {
         self.ensure_layout();
+        if key.pressed && matches!(key.key, Key::Named(NamedKey::Escape)) && self.cancel_gesture() {
+            return;
+        }
         let focused = with_doc(|d| d.state.focused);
         let target = focused.or_else(|| with_doc(|d| d.root));
         let ev = KeyboardEvent {
@@ -1633,7 +1678,7 @@ impl Drop for Ui {
 type ActiveChanges = Vec<(Rc<dyn Fn(bool)>, bool)>;
 
 /// Sets the pressed nodes, and tells those that listen.
-fn set_active(chain: Vec<NodeId>) {
+pub(crate) fn set_active(chain: Vec<NodeId>) {
     let listeners = with_doc(|d| d.set_active(chain));
     if !listeners.is_empty() {
         batch(|| {
@@ -1763,7 +1808,7 @@ fn hit_stacked(doc: &Document, nodes: &[NodeId], p: PointF) -> Option<NodeId> {
     })
 }
 
-fn cursor_for(doc: &Document, target: Option<NodeId>) -> CursorIcon {
+pub(crate) fn cursor_for(doc: &Document, target: Option<NodeId>) -> CursorIcon {
     let Some(n) = target.and_then(|t| doc.get(t)) else {
         return CursorIcon::Default;
     };
@@ -1777,7 +1822,7 @@ fn cursor_for(doc: &Document, target: Option<NodeId>) -> CursorIcon {
 }
 
 /// Whether motion in this direction would move `id`, given enough of it.
-fn can_scroll(doc: &Document, id: NodeId, dx: f32, dy: f32) -> bool {
+pub(crate) fn can_scroll(doc: &Document, id: NodeId, dx: f32, dy: f32) -> bool {
     let Some(n) = doc.get(id) else {
         return false;
     };
@@ -1807,7 +1852,13 @@ fn advance(scroll: &mut i32, delta: f32, max: i32, rest: &mut f32) -> bool {
     changed
 }
 
-fn scroll_node(doc: &mut Document, id: NodeId, dx: f32, dy: f32, rest: &mut (f32, f32)) -> bool {
+pub(crate) fn scroll_node(
+    doc: &mut Document,
+    id: NodeId,
+    dx: f32,
+    dy: f32,
+    rest: &mut (f32, f32),
+) -> bool {
     let Some(n) = doc.get_mut(id) else {
         return false;
     };

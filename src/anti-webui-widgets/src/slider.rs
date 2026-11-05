@@ -45,11 +45,6 @@ fn frame(value: Signal<f32>, min: f32, max: f32, step: Option<f32>) -> Div {
             None => v,
         }
     };
-    let dragging = signal(false);
-    let set_from = move |e: &PointerEvent| {
-        let t = (e.local.x / e.rect.width.max(1) as f32).clamp(0.0, 1.0);
-        value.set(snap(min + (max - min) * t));
-    };
     let fraction = move || ((value.get() - min) / (max - min)).clamp(0.0, 1.0);
     div()
         .relative()
@@ -60,19 +55,11 @@ fn frame(value: Signal<f32>, min: f32, max: f32, step: Option<f32>) -> Div {
         .select_none()
         .focusable()
         .sheet(|| shared(slider_sheet))
-        .on_pointer_down(move |e| {
-            dragging.set(true);
-            set_from(e);
-        })
-        .on_pointer_move(move |e| {
-            if dragging.get_untracked() {
-                set_from(e);
-            }
-        })
-        // Also when it is released somewhere else.
-        .on_active(move |on| {
-            if !on {
-                dragging.set(false);
+        .grab_threshold(0.0)
+        .on_grab(move |g| {
+            if matches!(g.phase, GrabPhase::Start | GrabPhase::Move) {
+                let t = (g.local.x / g.rect.width.max(1) as f32).clamp(0.0, 1.0);
+                value.set(snap(min + (max - min) * t));
             }
         })
         .on_key_down(move |e| {

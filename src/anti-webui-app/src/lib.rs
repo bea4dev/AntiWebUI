@@ -146,6 +146,7 @@ mod wayland {
                 && let Some(waker) = ctx.waker()
             {
                 self.ui.set_image_waker(std::sync::Arc::new(waker));
+                self.ui.set_platform_drag(ctx.supports_drag());
             }
         }
 
@@ -172,6 +173,17 @@ mod wayland {
                         self.forget_popup(ctx, id);
                         ctx.close_popup(id);
                     }
+                    PlatformRequest::StartDrag(offer) => ctx.start_drag(offer),
+                    PlatformRequest::CancelDrag => ctx.cancel_drag(),
+                    PlatformRequest::CloseDragIcon => {
+                        if let Some(p) = &mut self.presenter {
+                            p.forget(ctx, SurfaceId::DragIcon);
+                        }
+                        ctx.close_drag_icon();
+                    }
+                    PlatformRequest::AcceptDrag(wanted) => ctx.accept_drag(wanted),
+                    PlatformRequest::ReceiveDrop(mime) => ctx.receive_drop(mime),
+                    PlatformRequest::FinishDrop => ctx.finish_drop(),
                 }
             }
         }
@@ -206,6 +218,7 @@ mod wayland {
                 renderer.set_target(match surface {
                     SurfaceId::Window => 0,
                     SurfaceId::Popup(id) => id.0,
+                    SurfaceId::DragIcon => u64::MAX,
                 });
                 let pixels = presenter.gpu().render_to_rgba(renderer, scene);
                 let path = format!("{path}{suffix}");
@@ -270,6 +283,11 @@ mod wayland {
             for (id, scene) in frame.popups {
                 let surface = SurfaceId::Popup(id);
                 results.push((surface, presenter.present(ctx, surface, scene)));
+            }
+            if let Some(icon) = frame.drag_icon {
+                ctx.place_drag_icon(icon.logical, icon.hotspot);
+                let surface = SurfaceId::DragIcon;
+                results.push((surface, presenter.present(ctx, surface, icon.scene)));
             }
             if let Some(trace) = presenter.take_trace() {
                 let feedback = ctx.presentation_clock().is_some();

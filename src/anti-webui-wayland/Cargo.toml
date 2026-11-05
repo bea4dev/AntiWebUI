@@ -12,3 +12,7 @@ wayland-protocols.workspace = true
 xkbcommon.workspace = true
 raw-window-handle.workspace = true
 rustix.workspace = true
+
+[dev-dependencies]
+wayland-server = "0.31"
+wayland-protocols = { workspace = true, features = ["server"] }

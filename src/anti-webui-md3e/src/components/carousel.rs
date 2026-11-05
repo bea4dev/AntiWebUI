@@ -184,8 +184,7 @@ pub fn carousel<V: IntoView>(count: usize, preferred: f32, item: impl Fn(usize) 
         scroll.spring_to(to, Spring::from_ratio(400.0, 1.0));
     };
     let waiting: Rc<Cell<Option<Timeout>>> = Rc::default();
-    let drag_from = Rc::new(Cell::new(None::<(f32, f32)>));
-    let (down, moving, ended) = (drag_from.clone(), drag_from.clone(), drag_from);
+    let from = Cell::new(0.0f32);
     let items: Vec<Div> = (0..count)
         .map(|i| {
             let content = item(i).into_view();
@@ -242,20 +241,13 @@ pub fn carousel<V: IntoView>(count: usize, preferred: f32, item: impl Fn(usize) 
             waiting.set(Some(set_timeout(Duration::from_millis(120), settle)));
             e.stop_propagation();
         })
-        .on_pointer_down(move |e| {
-            down.set(Some((e.position.x, scroll.get_untracked())));
-        })
-        .on_pointer_move(move |e| {
-            if let Some((from, start)) = moving.get() {
-                let scale = anti_webui::core::tree::with_doc(|d| d.scale.as_f64() as f32);
-                let to = start - (e.position.x - from) / scale;
+        .on_grab(move |g| match g.phase {
+            GrabPhase::Start => from.set(scroll.get_untracked()),
+            GrabPhase::Move => {
+                let to = from.get() - g.total.x;
                 scroll.set(to.clamp(0.0, untrack(max_scroll)));
             }
-        })
-        .on_active(move |on| {
-            if !on && ended.take().is_some() {
-                settle();
-            }
+            GrabPhase::End | GrabPhase::Cancel => settle(),
         })
         .children(items)
 }

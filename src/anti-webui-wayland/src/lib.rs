@@ -1,5 +1,6 @@
 //! The Wayland backend (see `docs/design/06-platform-wayland.md`).
 
+mod drag;
 mod keyboard;
 mod popup;
 mod present;
@@ -10,9 +11,9 @@ pub use present::{
     SyncPoints, TimelineId,
 };
 
-use anti_webui_core::event::{ClipboardKind, WindowEvent};
-use anti_webui_core::geometry::{RectI, Scale, SizeI};
-use anti_webui_core::platform::{CursorIcon, ImeState, PopupId, PopupParams};
+use anti_webui_core::event::{ClipboardKind, DragAction, WindowEvent};
+use anti_webui_core::geometry::{PointI, RectI, Scale, SizeI};
+use anti_webui_core::platform::{CursorIcon, DragOffer, ImeState, PopupId, PopupParams};
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
 };
@@ -249,6 +250,46 @@ impl Ctx<'_> {
         self.state.update_popup(params);
     }
 
+    /// Whether drags can be handed to the compositor.
+    pub fn supports_drag(&self) -> bool {
+        self.state.supports_drag()
+    }
+
+    /// Hands what is dragged to the compositor. See `docs/design/23-drag-and-drop.md`.
+    pub fn start_drag(&mut self, offer: DragOffer) {
+        self.state.start_drag(offer);
+    }
+
+    /// Ends what was started with [`Ctx::start_drag`].
+    pub fn cancel_drag(&mut self) {
+        self.state.cancel_drag();
+    }
+
+    /// Sets the size of the surface of a drag, and where the pointer is on it.
+    pub fn place_drag_icon(&mut self, logical: SizeI, hotspot: PointI) {
+        self.state.place_drag_icon(logical, hotspot);
+    }
+
+    /// Closes the surface of a drag. GPU surfaces on it must go first.
+    pub fn close_drag_icon(&mut self) {
+        self.state.close_drag_icon();
+    }
+
+    /// Says how what is over the window would be taken.
+    pub fn accept_drag(&mut self, wanted: Option<(String, DragAction)>) {
+        self.state.accept_drag(wanted);
+    }
+
+    /// Reads what was dropped, which comes as [`WindowEvent::DropData`].
+    pub fn receive_drop(&mut self, mime: String) {
+        self.state.receive_drop(self.conn, mime);
+    }
+
+    /// Ends a drop that didn't need reading.
+    pub fn finish_drop(&mut self) {
+        self.state.finish_drop();
+    }
+
     /// Closes a popup and what is attached to it. GPU surfaces on them must go first.
     pub fn close_popup(&mut self, id: PopupId) {
         self.state.close_popup(id);
@@ -442,6 +483,7 @@ impl Loop<'_> {
             while let Ok((kind, text)) = paste_rx.try_recv() {
                 state.events.push(WindowEvent::Paste { kind, text });
             }
+            state.take_dropped_data();
 
             if state.keyboard_focused != state.focus_announced {
                 state.focus_announced = state.keyboard_focused;
@@ -453,8 +495,13 @@ impl Loop<'_> {
             // Only the last of consecutive pointer moves matters; high-rate mice send many per
             // frame.
             events.dedup_by(|next, prev| {
-                let both = matches!(prev, WindowEvent::PointerMoved { .. })
-                    && matches!(next, WindowEvent::PointerMoved { .. });
+                let both = matches!(
+                    (&*prev, &*next),
+                    (
+                        WindowEvent::PointerMoved { .. },
+                        WindowEvent::PointerMoved { .. }
+                    ) | (WindowEvent::DragMoved { .. }, WindowEvent::DragMoved { .. })
+                );
                 if both {
                     *prev = next.clone();
                 }

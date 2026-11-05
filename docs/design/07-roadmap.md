@@ -31,12 +31,12 @@
 - [x] MD3E のトグル、アイコンボタン、FAB、ボタングループ（[19](19-buttons.md)）
 - [x] MD3E の残りの部品、`portal`、`set_timeout`、ショーケース（[20](20-md3e-components.md)）
 - [x] 標準の部品の一式、`Sheet`、テーマ、見えている行だけ作るリストとテーブル（[21](21-widgets.md)）
+- [x] つかみ、アプリ内と OS の DnD、並べ替え（[23](23-drag-and-drop.md)）
 
 ### M1 の既知の制限
 
 - 実機での確認が必要: IME（fcitx5 等）・クリップボード・primary selection の Wayland 往復
 - フレームの先行は、コンポジタが AMD で動く構成で NVIDIA dGPU も有効なときを未確認
-- 選択ドラッグがウィンドウ端に達したときの自動スクロールは未実装
 - パスワード入力のマスク表示は未実装（`ImePurpose::Password` は IME へのヒントのみ）
 - サーバ側装飾が無いコンポジタではタイトルバーが出ない（CSD は M2）
 - カスタムシェーダー、MD3E の部品、`filter` と backdrop、可変フォントの軸、アイコン、画像は、内蔵 GPU をコンポジタの出力にした状態と 60 Hz での性能が未計測

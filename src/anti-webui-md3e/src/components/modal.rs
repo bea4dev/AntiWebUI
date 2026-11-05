@@ -11,7 +11,6 @@ use crate::typography::TextStyle;
 use anti_webui::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
-use std::time::Instant;
 
 const SCRIM: f32 = 0.32;
 
@@ -247,51 +246,6 @@ pub fn alert_dialog(
     })
 }
 
-/// Follows a drag along one axis: how far it went from where it started, and how fast it is going.
-#[derive(Clone)]
-struct Drag {
-    from: Rc<Cell<Option<f32>>>,
-    last: Rc<Cell<(f32, Instant)>>,
-    speed: Rc<Cell<f32>>,
-}
-
-impl Drag {
-    fn new() -> Self {
-        Self {
-            from: Rc::default(),
-            last: Rc::new(Cell::new((0.0, Instant::now()))),
-            speed: Rc::default(),
-        }
-    }
-
-    fn start(&self, at: f32) {
-        self.from.set(Some(at));
-        self.last.set((at, Instant::now()));
-        self.speed.set(0.0);
-    }
-
-    fn moved(&self, at: f32) -> Option<f32> {
-        let from = self.from.get()?;
-        let (before, then) = self.last.get();
-        let now = Instant::now();
-        let elapsed = now.duration_since(then).as_secs_f32();
-        if elapsed > 0.0 {
-            self.speed.set((at - before) / elapsed);
-        }
-        self.last.set((at, now));
-        Some(at - from)
-    }
-
-    /// How fast it was going when it ended, if there was a drag.
-    fn end(&self) -> Option<f32> {
-        self.from.take().map(|_| self.speed.get())
-    }
-}
-
-fn logical(physical: f32) -> f32 {
-    anti_webui::core::tree::with_doc(|d| d.scale.to_logical(physical))
-}
-
 /// A sheet that comes from the bottom of the window. It goes down when dragged by its handle.
 pub fn bottom_sheet(
     open: impl Fn() -> bool + 'static,
@@ -305,9 +259,7 @@ pub fn bottom_sheet(
     let dismiss = modal.dismiss.clone();
     modal.view(move || {
         let height = signal(800.0f32);
-        let drag = Drag::new();
         let dismiss = dismiss.clone();
-        let (down, moving, ending) = (drag.clone(), drag.clone(), drag);
         div()
             .size_full()
             .flex()
@@ -338,27 +290,22 @@ pub fn bottom_sheet(
                             .justify_center()
                             .py(22.0)
                             .cursor(CursorIcon::Grab)
-                            .on_pointer_down(move |e| down.start(logical(e.position.y)))
-                            .on_pointer_move(move |e| {
-                                if let Some(by) = moving.moved(logical(e.position.y)) {
+                            .on_grab(move |g| match g.phase {
+                                GrabPhase::Start => {}
+                                GrabPhase::Move => {
                                     let h = height.get_untracked().max(1.0);
-                                    shown.set(1.0 - by.max(0.0) / h);
+                                    shown.set(1.0 - g.total.y.max(0.0) / h);
                                 }
-                            })
-                            .on_active(move |on| {
-                                if on {
-                                    return;
+                                GrabPhase::End => {
+                                    let h = height.get_untracked().max(1.0);
+                                    let away = (1.0 - shown.get_untracked()) * h;
+                                    if away > 56.0 || g.velocity.y > 125.0 {
+                                        dismiss();
+                                    } else {
+                                        shown.spring_to(1.0, default_spatial());
+                                    }
                                 }
-                                let Some(speed) = ending.end() else {
-                                    return;
-                                };
-                                let h = height.get_untracked().max(1.0);
-                                let away = (1.0 - shown.get_untracked()) * h;
-                                if away > 56.0 || speed > 125.0 {
-                                    dismiss();
-                                } else {
-                                    shown.spring_to(1.0, default_spatial());
-                                }
+                                GrabPhase::Cancel => shown.spring_to(1.0, default_spatial()),
                             })
                             .child(
                                 div()
@@ -393,9 +340,7 @@ fn edge_sheet(
     let dismiss = modal.dismiss.clone();
     modal.view(move || {
         let width = signal(max_width);
-        let drag = Drag::new();
         let dismiss = dismiss.clone();
-        let (down, moving, ending) = (drag.clone(), drag.clone(), drag);
         let side = if edge == Edge::Left { -1.0 } else { 1.0 };
         let radius = 16.0;
         let sheet = div()
@@ -412,28 +357,23 @@ fn edge_sheet(
                     .text_color(c.on_surface)
                     .translate_x(side * (1.0 - shown.get()) * width.get())
             })
-            .on_pointer_down(move |e| down.start(logical(e.position.x)))
-            .on_pointer_move(move |e| {
-                if let Some(by) = moving.moved(logical(e.position.x)) {
+            .on_grab(move |g| match g.phase {
+                GrabPhase::Start => {}
+                GrabPhase::Move => {
                     let w = width.get_untracked().max(1.0);
-                    shown.set(1.0 - (by * side).max(0.0) / w);
+                    shown.set(1.0 - (g.total.x * side).max(0.0) / w);
                 }
-            })
-            .on_active(move |on| {
-                if on {
-                    return;
+                GrabPhase::End => {
+                    if shown.get_untracked() >= 1.0 {
+                        return;
+                    }
+                    if shown.get_untracked() < 0.5 || g.velocity.x * side > 400.0 {
+                        dismiss();
+                    } else {
+                        shown.spring_to(1.0, default_spatial());
+                    }
                 }
-                let Some(speed) = ending.end() else {
-                    return;
-                };
-                if shown.get_untracked() >= 1.0 {
-                    return;
-                }
-                if shown.get_untracked() < 0.5 || speed * side > 400.0 {
-                    dismiss();
-                } else {
-                    shown.spring_to(1.0, default_spatial());
-                }
+                GrabPhase::Cancel => shown.spring_to(1.0, default_spatial()),
             });
         let mut sheet = sheet;
         let style = sheet.style_mut();

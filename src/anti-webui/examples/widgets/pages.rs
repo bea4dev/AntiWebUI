@@ -851,3 +851,217 @@ pub fn images() -> Div {
                 ),
         ))
 }
+
+/// A card from one column to another, which stays where it was with Ctrl.
+#[derive(Clone)]
+struct CardDrag {
+    title: String,
+    from: usize,
+}
+
+fn board_column(index: usize, columns: Signal<[Vec<String>; 2]>) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(6.0)
+        .p(8.0)
+        .w(180.0)
+        .min_h(160.0)
+        .rounded(8.0)
+        .border(1.0)
+        .dyn_style(|s| s.border_color(theme().border).bg(theme().surface_muted))
+        .drag_over(|s| {
+            s.border_color(rgb(0x2f81f7))
+                .bg(rgb(0x2f81f7).with_alpha(0.15))
+        })
+        .drop_accepts(move |c: &CardDrag| c.from != index)
+        .drop_target(move |c: &CardDrag, e: &DropEvent| {
+            columns.update(|all| {
+                if e.action == DragAction::Move {
+                    all[c.from].retain(|t| *t != c.title);
+                }
+                all[index].push(c.title.clone());
+            });
+        })
+        .child(for_each(
+            move || columns.with(|all| all[index].clone()),
+            |t: &String| t.clone(),
+            move |title: String| {
+                let carried = title.clone();
+                div()
+                    .px(10.0)
+                    .py(8.0)
+                    .rounded(6.0)
+                    .select_none()
+                    .cursor(CursorIcon::Grab)
+                    .dyn_style(|s| s.bg(theme().surface))
+                    .dragging(|s| s.opacity(0.4))
+                    .draggable(move || CardDrag {
+                        title: carried.clone(),
+                        from: index,
+                    })
+                    .child(text(title))
+            },
+        ))
+}
+
+pub fn dragging() -> Div {
+    let at = signal((16.0f32, 16.0f32));
+    let from = std::cell::Cell::new((0.0f32, 0.0f32));
+    let columns = signal([
+        vec!["Write the docs".to_string(), "Fix the bug".to_string()],
+        vec!["Ship it".to_string()],
+    ]);
+    let tasks = signal(
+        ["Coffee", "Mail", "A long walk", "Review", "Lunch"]
+            .map(str::to_string)
+            .to_vec(),
+    );
+    let chips = signal(vec![1u32, 2, 3, 4, 5]);
+    let dropped = signal(Vec::<String>::new());
+    let told = signal("Nothing yet".to_string());
+    sections()
+        .child(section(
+            "on_grab: it follows the pointer, and Escape puts it back",
+            div()
+                .relative()
+                .h(140.0)
+                .rounded(8.0)
+                .overflow_hidden()
+                .dyn_style(|s| s.bg(theme().surface_muted))
+                .child(
+                    div()
+                        .absolute()
+                        .w(120.0)
+                        .h(56.0)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(8.0)
+                        .select_none()
+                        .cursor(CursorIcon::Grab)
+                        .dyn_style(move |s| {
+                            let (x, y) = at.get();
+                            s.bg(theme().accent)
+                                .text_color(theme().on_accent)
+                                .translate(x, y)
+                        })
+                        .on_grab(move |g| match g.phase {
+                            GrabPhase::Start => from.set(at.get_untracked()),
+                            GrabPhase::Move => {
+                                let (x, y) = from.get();
+                                at.set((x + g.total.x, y + g.total.y));
+                            }
+                            GrabPhase::End => {}
+                            GrabPhase::Cancel => at.set(from.get()),
+                        })
+                        .child(text("Grab me")),
+                ),
+        ))
+        .child(section(
+            "draggable and drop_target: from one column to the other, with Ctrl to copy",
+            row()
+                .items_start()
+                .child(board_column(0, columns))
+                .child(board_column(1, columns)),
+        ))
+        .child(section(
+            "sortable_list: by its grip, or with Alt and the arrows",
+            sortable_list(
+                tasks,
+                |t: &String| t.clone(),
+                |t, row_of| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(8.0)
+                        .px(8.0)
+                        .py(6.0)
+                        .rounded(6.0)
+                        .child(row_of.grip(div().px(4.0).child(text("≡"))))
+                        .child(text(t))
+                },
+            )
+            .gap(2.0)
+            .w(280.0),
+        ))
+        .child(section(
+            "sortable_row: all of it moves",
+            sortable_row(
+                chips,
+                |n: &u32| *n,
+                |n, _| {
+                    div()
+                        .w(56.0)
+                        .h(56.0)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(8.0)
+                        .dyn_style(|s| s.bg(theme().accent_muted))
+                        .child(text(n.to_string()))
+                },
+            )
+            .gap(8.0),
+        ))
+        .child(section(
+            "To and from other programs",
+            row()
+                .items_start()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(4.0)
+                        .w(320.0)
+                        .min_h(110.0)
+                        .p(12.0)
+                        .rounded(8.0)
+                        .border(1.0)
+                        .dyn_style(move |s| {
+                            let t = theme();
+                            let waiting = dragged::<ExternalDrag>().is_some();
+                            s.border_color(if waiting { t.accent } else { t.border })
+                        })
+                        .drag_over(|s| s.bg(rgb(0x2f81f7).with_alpha(0.15)))
+                        .on_drop_files(move |files, _| {
+                            dropped.set(files.iter().map(|f| f.display().to_string()).collect());
+                        })
+                        .on_drop_text(move |s, _| dropped.set(vec![s.to_owned()]))
+                        .child(text("Drop files or text from another program here"))
+                        .child(for_each(
+                            move || dropped.get(),
+                            |s: &String| s.clone(),
+                            |s: String| text(s).text_size(12.0),
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(8.0)
+                        .child(
+                            div()
+                                .px(12.0)
+                                .py(10.0)
+                                .rounded(8.0)
+                                .select_none()
+                                .cursor(CursorIcon::Grab)
+                                .dyn_style(|s| s.bg(theme().surface_muted))
+                                .draggable(|| DragData::default().text("Text from AntiWebUI"))
+                                .drag_preview(|_: &()| {
+                                    div()
+                                        .px(10.0)
+                                        .py(6.0)
+                                        .rounded(14.0)
+                                        .bg(rgb(0x2f81f7))
+                                        .text_color(Color::WHITE)
+                                        .child(text("Text"))
+                                })
+                                .on_drag_end(move |r| told.set(format!("{r:?}")))
+                                .child(text("Drag this text out")),
+                        )
+                        .child(text(move || format!("Last: {}", told.get())).text_size(12.0)),
+                ),
+        ))
+}

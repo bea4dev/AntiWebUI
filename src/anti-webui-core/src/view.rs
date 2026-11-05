@@ -4,6 +4,8 @@
 //! the current reactive owner, and removed again when that owner is disposed.
 
 use crate::animation::{ListPlaces, request_frame};
+use crate::drag::{DragData, DropConfig, DropEvent, GestureConfig, GrabEvent};
+use crate::event::DragResult;
 use crate::event::{KeyboardEvent, PointerEvent, ScrollEvent};
 use crate::geometry::{PointF, PointI, RectI, Scale};
 use crate::platform::{ImePurpose, Placement, PopupKind};
@@ -253,6 +255,10 @@ struct ElementConfig {
     hover: Option<Style>,
     focus: Option<Style>,
     active: Option<Style>,
+    dragging: Option<Style>,
+    drag_over: Option<Style>,
+    gesture: GestureConfig,
+    drop: DropConfig,
     dynamic: Vec<StyleFn>,
     fill: Option<PaintFn>,
     overlay: Option<PaintFn>,
@@ -269,7 +275,15 @@ impl ElementConfig {
         node.style.hover = self.hover;
         node.style.focus = self.focus;
         node.style.active = self.active;
+        node.style.dragging = self.dragging;
+        node.style.drag_over = self.drag_over;
         node.listeners = self.listeners;
+        if !self.gesture.is_empty() {
+            node.listeners.gesture = Some(Rc::new(self.gesture));
+        }
+        if !self.drop.is_empty() {
+            node.listeners.drop = Some(Rc::new(self.drop));
+        }
         node.focusable |= self.focusable;
         let id = create_node(node);
         if let Some(f) = self.sheet {
@@ -411,6 +425,120 @@ macro_rules! element_methods {
         /// pointer is released somewhere else.
         pub fn on_active(mut self, f: impl Fn(bool) + 'static) -> Self {
             self.cfg.listeners.active = also_bool(self.cfg.listeners.active.take(), f);
+            self
+        }
+
+        /// Called while the node is moved with the primary button held, wherever the pointer goes.
+        /// It starts after the pointer moved a little, and pressing without moving stays a click;
+        /// moving it far enough keeps it from being one. See `docs/design/23-drag-and-drop.md`.
+        pub fn on_grab(mut self, f: impl Fn(&GrabEvent) + 'static) -> Self {
+            self.cfg.gesture.grab = also(self.cfg.gesture.grab.take(), f);
+            self
+        }
+
+        /// How many logical pixels it has to move before it counts as grabbed or dragged. It is 4
+        /// by default. With 0, `on_grab` starts when pressed.
+        pub fn grab_threshold(mut self, logical: f32) -> Self {
+            self.cfg.gesture.threshold = Some(logical);
+            self
+        }
+
+        /// Scrolls what contains the node when it is held near the edge of that, telling
+        /// `on_grab` each time.
+        pub fn grab_autoscroll(mut self) -> Self {
+            self.cfg.gesture.autoscroll = true;
+            self
+        }
+
+        /// Makes the node something that can be dragged to where it is taken. When it starts to
+        /// move, `f` makes what it carries: any value for this program, or a [`DragData`] to also
+        /// offer it to others.
+        pub fn draggable<T: 'static>(mut self, f: impl Fn() -> T + 'static) -> Self {
+            self.cfg.gesture.data = Some(Rc::new(move || DragData::from_any(f())));
+            self
+        }
+
+        /// Style applied to the node while it is being dragged.
+        pub fn dragging(mut self, f: impl FnOnce(Style) -> Style) -> Self {
+            self.cfg.dragging = Some(f(self.cfg.dragging.take().unwrap_or_default()));
+            self
+        }
+
+        /// What shows with the pointer when a `T` is dragged from here, instead of what the node
+        /// looked like. It lives on its own: it shouldn't read signals that go with the node.
+        pub fn drag_preview<T: 'static, V: IntoView>(
+            mut self,
+            f: impl Fn(&T) -> V + 'static,
+        ) -> Self {
+            self.cfg.gesture.preview = Some(Rc::new(move |data: &DragData| {
+                data.value::<T>().map(|v| f(v).into_view())
+            }));
+            self
+        }
+
+        /// Called when what was dragged from here has been dropped or wasn't, if the node is still
+        /// there.
+        pub fn on_drag_end(mut self, f: impl Fn(DragResult) + 'static) -> Self {
+            let old = self.cfg.gesture.end.take();
+            self.cfg.gesture.end = Some(Rc::new(move |r| {
+                if let Some(old) = &old {
+                    old(r);
+                }
+                f(r);
+            }));
+            self
+        }
+
+        /// Takes a `T` dropped here. It can be given for several types.
+        pub fn drop_target<T: 'static>(mut self, f: impl Fn(&T, &DropEvent) + 'static) -> Self {
+            self.cfg.drop.typed_drop(f);
+            self
+        }
+
+        /// Only takes the `T` this says yes to.
+        pub fn drop_accepts<T: 'static>(mut self, f: impl Fn(&T) -> bool + 'static) -> Self {
+            self.cfg.drop.typed_filter(f);
+            self
+        }
+
+        /// Called with where a `T` is while it would be taken here. Use [`ExternalDrag`] for what
+        /// comes from other programs.
+        pub fn on_drag_over<T: 'static>(mut self, f: impl Fn(&T, &DropEvent) + 'static) -> Self {
+            self.cfg.drop.typed_over(f);
+            self
+        }
+
+        /// Told when what is dragged starts and stops being over here where it would be taken.
+        /// Also when it is dropped.
+        pub fn on_drag_hover(mut self, f: impl Fn(bool) + 'static) -> Self {
+            self.cfg.drop.hover = also_bool(self.cfg.drop.hover.take(), f);
+            self
+        }
+
+        /// Style applied while what is dragged is over here where it would be taken.
+        pub fn drag_over(mut self, f: impl FnOnce(Style) -> Style) -> Self {
+            self.cfg.drag_over = Some(f(self.cfg.drag_over.take().unwrap_or_default()));
+            self
+        }
+
+        /// Takes files dropped here.
+        pub fn on_drop_files(
+            mut self,
+            f: impl Fn(&[std::path::PathBuf], &DropEvent) + 'static,
+        ) -> Self {
+            self.cfg.drop.files(f);
+            self
+        }
+
+        /// Takes text dropped here.
+        pub fn on_drop_text(mut self, f: impl Fn(&str, &DropEvent) + 'static) -> Self {
+            self.cfg.drop.text(f);
+            self
+        }
+
+        /// Takes data of this format dropped here.
+        pub fn on_drop_data(mut self, mime: &str, f: impl Fn(&[u8], &DropEvent) + 'static) -> Self {
+            self.cfg.drop.data(mime, f);
             self
         }
 
@@ -1353,6 +1481,10 @@ pub fn portal() -> Popup {
 }
 
 impl Popup {
+    pub(crate) fn data_mut(&mut self) -> &mut PopupData {
+        &mut self.data
+    }
+
     pub fn kind(mut self, kind: PopupKind) -> Self {
         self.data.kind = kind;
         self

@@ -50,6 +50,7 @@ fn renderer_target(surface: SurfaceId) -> u64 {
     match surface {
         SurfaceId::Window => 0,
         SurfaceId::Popup(id) => id.0,
+        SurfaceId::DragIcon => u64::MAX,
     }
 }
 

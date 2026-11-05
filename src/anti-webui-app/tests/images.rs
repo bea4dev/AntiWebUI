@@ -3,7 +3,6 @@
 use anti_webui_app::headless::render_rgba;
 use anti_webui_core::prelude::*;
 use image::{ImageEncoder, codecs::png::PngEncoder};
-use std::sync::{Mutex, MutexGuard};
 
 const W: u32 = 64;
 
@@ -44,16 +43,7 @@ fn png(w: u32, h: u32, pixels: &[u8]) -> Vec<u8> {
     out
 }
 
-/// One GPU context at a time: making and dropping them on several threads crashes in the Vulkan
-/// loader now and then, with nothing else going on.
-static ONE_GPU: Mutex<()> = Mutex::new(());
-
-fn one_gpu() -> MutexGuard<'static, ()> {
-    ONE_GPU.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 fn draw<V: IntoView>(view: impl FnOnce() -> V) -> Vec<u8> {
-    let _gpu = one_gpu();
     render_rgba(W, W, 1.0, view).unwrap()
 }
 
@@ -414,7 +404,6 @@ fn drawing_opaque_pictures_without_blending_comes_out_the_same() {
 }
 
 mod on_the_gpu {
-    use super::one_gpu;
     use anti_webui_core::Ui;
     use anti_webui_core::event::WindowEvent;
     use anti_webui_core::geometry::{Scale, SizeI};
@@ -440,7 +429,6 @@ mod on_the_gpu {
     #[test]
     fn what_is_on_the_gpu_goes_when_nothing_has_its_pixels() {
         update_settings(|s| s.images.cache_bytes = 0);
-        let _gpu = one_gpu();
         let gpu = Gpu::headless().unwrap();
         let mut renderer = Renderer::new(&gpu.device, TextureFormat::Rgba8Unorm);
         let on = signal(true);
@@ -468,7 +456,6 @@ mod on_the_gpu {
 
     #[test]
     fn pixels_can_go_once_the_gpu_has_them() {
-        let _gpu = one_gpu();
         let gpu = Gpu::headless().unwrap();
         let mut renderer = Renderer::new(&gpu.device, TextureFormat::Rgba8Unorm);
         renderer.set_release_picture_pixels(true);
@@ -510,7 +497,6 @@ mod on_the_gpu {
                     .unwrap();
             }
         }
-        let _gpu = one_gpu();
         let gpu = Gpu::headless().unwrap();
         let mut renderer = Renderer::new(&gpu.device, TextureFormat::Rgba8Unorm);
         let mut ui = mount(|| div().child(img(file).w(8.0).h(8.0)));
@@ -529,7 +515,6 @@ mod on_the_gpu {
     /// The renderer's damaged path has to come to the same as drawing all of it.
     #[test]
     fn redrawing_part_of_a_window_with_a_picture_comes_out_the_same() {
-        let _gpu = one_gpu();
         let gpu = Gpu::headless().unwrap();
         let which = signal(false);
         let (a, b) = (solid([255, 0, 0, 255], 32), solid([0, 0, 255, 255], 32));

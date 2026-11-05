@@ -281,15 +281,15 @@ fn build(
     let press_off = disabled.clone();
     let press_values = values.clone();
     let press_change = change.clone();
-    let along = move |e: &PointerEvent| {
+    let along = move |g: &GrabEvent| {
         let scale = with_scale();
         let inset = INSET * scale;
         if vertical {
-            let h = e.rect.height as f32;
-            (h - e.local.y - inset) / (h - inset * 2.0).max(1.0)
+            let h = g.rect.height as f32;
+            (h - g.local.y - inset) / (h - inset * 2.0).max(1.0)
         } else {
-            let w = e.rect.width as f32;
-            (e.local.x - inset) / (w - inset * 2.0).max(1.0)
+            let w = g.rect.width as f32;
+            (g.local.x - inset) / (w - inset * 2.0).max(1.0)
         }
     };
     let move_change = change.clone();
@@ -486,35 +486,34 @@ fn build(
             })
         })
         .on_hover(move |on| hover.set(on))
-        .on_pointer_down(move |e| {
-            if press_off() {
-                return;
-            }
-            let t = along(e).clamp(0.0, 1.0);
-            let i = if two {
-                let (start, end) = untrack(|| press_values());
-                let (a, b) = (to_fraction(start), to_fraction(end));
-                if (t - a).abs() < (t - b).abs() || (t < a && a == b) {
-                    0
+        .grab_threshold(0.0)
+        .on_grab(move |g| match g.phase {
+            GrabPhase::Start => {
+                if press_off() {
+                    return;
+                }
+                let t = along(g).clamp(0.0, 1.0);
+                let i = if two {
+                    let (start, end) = untrack(|| press_values());
+                    let (a, b) = (to_fraction(start), to_fraction(end));
+                    if (t - a).abs() < (t - b).abs() || (t < a && a == b) {
+                        0
+                    } else {
+                        1
+                    }
                 } else {
                     1
+                };
+                dragging.set(Some(i));
+                thumbs[i].focus();
+                press_change(i, from_fraction(t));
+            }
+            GrabPhase::Move => {
+                if let Some(i) = dragging.get_untracked() {
+                    move_change(i, from_fraction(along(g)));
                 }
-            } else {
-                1
-            };
-            dragging.set(Some(i));
-            thumbs[i].focus();
-            press_change(i, from_fraction(t));
-        })
-        .on_pointer_move(move |e| {
-            if let Some(i) = dragging.get_untracked() {
-                move_change(i, from_fraction(along(e)));
             }
-        })
-        .on_active(move |on| {
-            if !on {
-                dragging.set(None);
-            }
+            GrabPhase::End | GrabPhase::Cancel => dragging.set(None),
         });
     let root = if two {
         root.child(thumb(0, change_rc.clone(), values.clone()))
