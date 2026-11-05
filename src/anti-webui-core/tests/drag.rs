@@ -1278,3 +1278,125 @@ fn a_type_only_drag_stays_in_the_window_even_with_the_platform() {
     let scene = ui.paint(Instant::now());
     assert!(drag_layer(&scene).is_some());
 }
+
+/// Something that says when to start dragging by itself, once the pointer gets far enough.
+fn starts_by_itself(data: fn() -> DragData) -> Div {
+    boxed().on_pointer_move(move |e| {
+        if e.position.x > 150.0 {
+            start_drag(data(), (0.5, 0.5), || {
+                div().w(20.0).h(10.0).bg(Color::from_rgb(0xff0000))
+            });
+        }
+    })
+}
+
+#[test]
+fn start_drag_carries_what_it_is_given_from_when_it_says_so() {
+    let mut ui = mount(|| starts_by_itself(|| DragData::new(5u8).text("carried")));
+    ui.set_platform_drag(true);
+    press(&mut ui, 50.0, 30.0);
+    moved(&mut ui, 60.0, 30.0);
+    assert!(
+        !ui.take_requests()
+            .iter()
+            .any(|r| matches!(r, PlatformRequest::StartDrag(_)))
+    );
+    moved(&mut ui, 160.0, 30.0);
+    let offered = ui.take_requests().into_iter().find_map(|r| match r {
+        PlatformRequest::StartDrag(DragOffer { items, .. }) => Some(items),
+        _ => None,
+    });
+    let items = offered.expect("it started");
+    assert!(
+        items
+            .iter()
+            .any(|(mime, bytes)| mime == "text/plain" && &bytes[..] == b"carried")
+    );
+    assert_eq!(untrack(dragged::<u8>), Some(5));
+    ui.handle_event(WindowEvent::DragSourceEnded(DragResult::Copied));
+    ui.update();
+    assert_eq!(untrack(dragged::<u8>), None);
+}
+
+#[test]
+fn start_drag_shows_what_it_is_given_where_it_says() {
+    let mut ui = mount(|| starts_by_itself(|| DragData::new(5u8)));
+    press(&mut ui, 50.0, 30.0);
+    moved(&mut ui, 160.0, 30.0);
+    ui.update();
+    let scene = ui.paint(Instant::now());
+    let layer = drag_layer(&scene).expect("it shows");
+    // Half of 20 across and half of 10 down from where the pointer is.
+    assert_eq!((layer.origin.x, layer.origin.y), (150, 25));
+}
+
+#[test]
+fn start_drag_does_nothing_without_a_button_held() {
+    let mut ui = mount(|| {
+        boxed().on_pointer_move(|_| {
+            start_drag(DragData::new(5u8), (0.0, 0.0), || div().w(20.0).h(10.0));
+        })
+    });
+    moved(&mut ui, 60.0, 30.0);
+    ui.update();
+    assert_eq!(untrack(dragged::<u8>), None);
+    assert!(drag_layer(&ui.paint(Instant::now())).is_none());
+}
+
+fn pinched(ui: &mut Ui, scale: f32, phase: PinchPhase) {
+    ui.handle_event(WindowEvent::Pinch {
+        position: at(50.0, 30.0),
+        scale,
+        modifiers: Modifiers::default(),
+        phase,
+    });
+}
+
+#[test]
+fn a_pinch_goes_to_what_was_under_the_pointer_until_it_is_over() {
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let (inner, outer) = (log.clone(), log.clone());
+    let mut ui = mount(move || {
+        div()
+            .w(400.0)
+            .h(300.0)
+            .on_pinch(move |e| outer.borrow_mut().push(("outer", e.phase, e.scale)))
+            .child(boxed().on_pinch(move |e| {
+                inner.borrow_mut().push(("inner", e.phase, e.scale));
+                if e.scale != 2.0 {
+                    e.stop_propagation();
+                }
+            }))
+    });
+    pinched(&mut ui, 1.0, PinchPhase::Began);
+    pinched(&mut ui, 2.0, PinchPhase::Moved);
+    pinched(&mut ui, 0.5, PinchPhase::Moved);
+    pinched(&mut ui, 1.0, PinchPhase::Ended);
+    // Nothing goes on without another one starting.
+    pinched(&mut ui, 3.0, PinchPhase::Moved);
+    assert_eq!(
+        *log.borrow(),
+        [
+            ("inner", PinchPhase::Began, 1.0),
+            ("inner", PinchPhase::Moved, 2.0),
+            ("outer", PinchPhase::Moved, 2.0),
+            ("inner", PinchPhase::Moved, 0.5),
+            ("inner", PinchPhase::Ended, 1.0),
+        ]
+    );
+}
+
+#[test]
+fn a_pinch_says_where_it_is_in_the_node() {
+    let seen = Rc::new(Cell::new(PointF::new(0.0, 0.0)));
+    let kept = seen.clone();
+    let mut ui = mount(move || {
+        div()
+            .w(400.0)
+            .h(300.0)
+            .pl(20.0)
+            .child(div().w(100.0).h(100.0).on_pinch(move |e| kept.set(e.local)))
+    });
+    pinched(&mut ui, 1.0, PinchPhase::Began);
+    assert_eq!(seen.get(), PointF::new(30.0, 30.0));
+}

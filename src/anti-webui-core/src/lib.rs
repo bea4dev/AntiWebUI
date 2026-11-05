@@ -34,11 +34,12 @@ pub mod prelude {
     };
     pub use crate::channel::{UiSender, UiWork, ui_channel};
     pub use crate::drag::{
-        DragData, DraggedText, DropEvent, ExternalDrag, GrabEvent, GrabPhase, dragged,
+        DragData, DraggedText, DropEvent, ExternalDrag, GrabEvent, GrabPhase, dragged, start_drag,
     };
     pub use crate::event::{
         ClipboardKind, DragAction, DragActions, DragResult, Key, KeyboardEvent, Modifiers,
-        NamedKey, PointerButton, PointerEvent, ScrollEvent, ScrollPhase, ScrollSource,
+        NamedKey, PinchEvent, PinchPhase, PointerButton, PointerEvent, ScrollEvent, ScrollPhase,
+        ScrollSource,
     };
     pub use crate::geometry::{PointF, RectI, Scale};
     pub use crate::platform::{ImePurpose, Placement, PopupKind};

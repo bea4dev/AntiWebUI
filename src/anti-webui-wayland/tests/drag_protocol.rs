@@ -1,8 +1,10 @@
 //! Drag and drop against a small compositor that keeps to the protocol and writes down what it is
 //! asked. It shows the requests are what `wl_data_device` wants, not how a real compositor behaves.
-//! See `docs/design/23-drag-and-drop.md`.
+//! See `docs/design/23-drag-and-drop.md`. Pinching goes through the same small compositor.
 
-use anti_webui_core::event::{DragAction, DragActions, DragResult, PointerButton, WindowEvent};
+use anti_webui_core::event::{
+    DragAction, DragActions, DragResult, PinchPhase, PointerButton, WindowEvent,
+};
 use anti_webui_core::geometry::{PointF, PointI, SizeI};
 use anti_webui_core::platform::DragOffer;
 use anti_webui_wayland::{Ctx, WaylandHandler, WindowOptions, run};
@@ -10,6 +12,10 @@ use std::io::{Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
+use wayland_protocols::wp::pointer_gestures::zv1::server::{
+    zwp_pointer_gesture_hold_v1, zwp_pointer_gesture_pinch_v1, zwp_pointer_gesture_swipe_v1,
+    zwp_pointer_gestures_v1,
+};
 use wayland_protocols::xdg::shell::server::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use wayland_server::protocol::wl_data_device_manager::DndAction;
 use wayland_server::protocol::{
@@ -43,6 +49,8 @@ struct Compositor {
     received: Vec<(String, OwnedFd)>,
     finished: u32,
     offers_destroyed: u32,
+    pinch: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
+    holds: u32,
 }
 
 struct NoData;
@@ -68,7 +76,8 @@ macro_rules! global {
 global!(
     wl_compositor::WlCompositor,
     xdg_wm_base::XdgWmBase,
-    wl_data_device_manager::WlDataDeviceManager
+    wl_data_device_manager::WlDataDeviceManager,
+    zwp_pointer_gestures_v1::ZwpPointerGesturesV1
 );
 
 impl GlobalDispatch<wl_seat::WlSeat, ()> for Compositor {
@@ -105,8 +114,36 @@ macro_rules! ignored {
 ignored!(
     xdg_toplevel::XdgToplevel,
     wl_pointer::WlPointer,
-    wl_callback::WlCallback
+    wl_callback::WlCallback,
+    zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1,
+    zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1,
+    zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1
 );
+
+impl Dispatch<zwp_pointer_gestures_v1::ZwpPointerGesturesV1, ()> for Compositor {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &zwp_pointer_gestures_v1::ZwpPointerGesturesV1,
+        request: zwp_pointer_gestures_v1::Request,
+        _: &(),
+        _: &DisplayHandle,
+        init: &mut DataInit<'_, Self>,
+    ) {
+        use zwp_pointer_gestures_v1::Request;
+        match request {
+            Request::GetPinchGesture { id, .. } => state.pinch = Some(init.init(id, ())),
+            Request::GetHoldGesture { id, .. } => {
+                state.holds += 1;
+                init.init(id, ());
+            }
+            Request::GetSwipeGesture { id, .. } => {
+                init.init(id, ());
+            }
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<wl_compositor::WlCompositor, ()> for Compositor {
     fn request(
@@ -431,6 +468,7 @@ fn setup() -> World {
     dh.create_global::<Compositor, xdg_wm_base::XdgWmBase, ()>(6, ());
     dh.create_global::<Compositor, wl_seat::WlSeat, ()>(8, ());
     dh.create_global::<Compositor, wl_data_device_manager::WlDataDeviceManager, ()>(3, ());
+    dh.create_global::<Compositor, zwp_pointer_gestures_v1::ZwpPointerGesturesV1, ()>(3, ());
     // SAFETY: the only test here, and nothing runs yet that reads the environment.
     unsafe {
         std::env::set_var("WAYLAND_DISPLAY", &path);
@@ -706,5 +744,53 @@ fn drag_and_drop_goes_by_the_protocol() {
     );
     w.until("the source to go", |w| w.state.sources_destroyed == 3);
 
+    pinching_says_how_much_bigger_it_got(&mut w);
+
     w.commands.send(Command::Exit).unwrap();
+}
+
+/// A pinch goes through as how much bigger it got since the last time.
+fn pinching_says_how_much_bigger_it_got(w: &mut World) {
+    w.until("the gesture", |w| w.state.pinch.is_some());
+    assert_eq!(w.state.holds, 1);
+    w.press();
+    let pinch = w.state.pinch.clone().unwrap();
+    let window = w.state.surfaces[0].clone();
+    let next = |w: &mut World, want: PinchPhase, scale: f32| loop {
+        if let WindowEvent::Pinch {
+            phase,
+            scale: got,
+            position,
+            ..
+        } = w.next_event()
+        {
+            assert_eq!(phase, want);
+            assert!((got - scale).abs() < 0.001, "{got} and not {scale}");
+            assert_eq!(position, PointF::new(10.0, 20.0));
+            return;
+        }
+    };
+    let serial = w.next_serial();
+    pinch.begin(serial, 0, &window, 2);
+    pinch.update(1, 5.0, 5.0, 1.5, 0.0);
+    pinch.update(2, 0.0, 0.0, 3.0, 0.0);
+    pinch.update(3, 0.0, 0.0, 1.5, 0.0);
+    let serial = w.next_serial();
+    pinch.end(serial, 4, 0);
+    w.pump();
+    next(w, PinchPhase::Began, 1.0);
+    next(w, PinchPhase::Moved, 1.5);
+    next(w, PinchPhase::Moved, 2.0);
+    next(w, PinchPhase::Moved, 0.5);
+    next(w, PinchPhase::Ended, 1.0);
+    // It starts counting again.
+    let serial = w.next_serial();
+    pinch.begin(serial, 5, &window, 2);
+    pinch.update(6, 0.0, 0.0, 2.0, 0.0);
+    let serial = w.next_serial();
+    pinch.end(serial, 7, 1);
+    w.pump();
+    next(w, PinchPhase::Began, 1.0);
+    next(w, PinchPhase::Moved, 2.0);
+    next(w, PinchPhase::Cancelled, 1.0);
 }

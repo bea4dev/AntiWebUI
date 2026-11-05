@@ -137,6 +137,17 @@ pub enum ScrollPhase {
     MomentumEnded,
 }
 
+/// Where a pinch is in a gesture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PinchPhase {
+    Began,
+    Moved,
+    Ended,
+    /// The system took it for something else: what it did so far should be taken back, if that
+    /// matters.
+    Cancelled,
+}
+
 /// What is done with what is dragged.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum DragAction {
@@ -193,6 +204,14 @@ pub enum WindowEvent {
         phase: ScrollPhase,
         /// Milliseconds, monotonic, platform-defined origin.
         time: u32,
+    },
+    /// Fingers moved apart or together on a touch surface. `scale` is how many times bigger it got
+    /// since the last one.
+    Pinch {
+        position: PointF,
+        scale: f32,
+        modifiers: Modifiers,
+        phase: PinchPhase,
     },
     Key(KeyEvent),
     Ime(ImeUpdate),
@@ -291,6 +310,28 @@ pub struct ScrollEvent {
 }
 
 impl ScrollEvent {
+    pub fn stop_propagation(&self) {
+        self.stopped.set(true);
+    }
+}
+
+/// Fingers moved apart or together. See [`Div::on_pinch`](crate::view::Div::on_pinch).
+#[derive(Debug)]
+pub struct PinchEvent {
+    /// How many times bigger it got since the last one, which multiplies up over the gesture.
+    pub scale: f32,
+    pub phase: PinchPhase,
+    /// Where the pointer is. It stays there during a gesture.
+    pub position: PointF,
+    /// The same relative to the handling node's border box.
+    pub local: PointF,
+    /// The handling node's border box in window coordinates.
+    pub rect: RectI,
+    pub modifiers: Modifiers,
+    pub(crate) stopped: Cell<bool>,
+}
+
+impl PinchEvent {
     pub fn stop_propagation(&self) {
         self.stopped.set(true);
     }

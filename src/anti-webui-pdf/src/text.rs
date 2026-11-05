@@ -40,6 +40,8 @@ const SPACE: f64 = 0.15;
 const SPACE_WITHOUT_WORDS: f64 = 0.8;
 /// The gap, in ems, from which what comes next on a line is something else, like in a table.
 const FAR_ON_LINE: f64 = 3.0;
+/// What is drawn past the box of a glyph on any side at most, for nearly all fonts, in ems.
+const INK_ROOM: f32 = 0.12;
 /// How far, in points, a pointer can be from the text to be at it, as in Chromium's viewer.
 pub(crate) const NEAR_TEXT: f32 = 20.0;
 /// How much further away something counts as being across lines than along one.
@@ -532,6 +534,16 @@ impl PageText {
 
     /// The boxes of the glyphs in a range, with those next to each other on a line as one.
     pub fn boxes(&self, from: usize, to: usize) -> Vec<[f32; 4]> {
+        self.boxes_with_room(from, to, 0.0)
+    }
+
+    /// The same with room around them for what sticks out of them, like the tail of a g.
+    pub fn ink_boxes(&self, from: usize, to: usize) -> Vec<[f32; 4]> {
+        self.boxes_with_room(from, to, INK_ROOM)
+    }
+
+    /// `room` is how much on all sides, in ems.
+    fn boxes_with_room(&self, from: usize, to: usize, room: f32) -> Vec<[f32; 4]> {
         let mut out: Vec<[f32; 4]> = Vec::new();
         if from >= to {
             return out;
@@ -554,9 +566,21 @@ impl PageText {
             let (low, high) = (a.start.min(b.start), a.end.max(b.end));
             let r = &self.runs[run];
             let rect = if r.down {
-                [r.bounds[0], low, r.bounds[2], high]
+                let room = room * (r.bounds[2] - r.bounds[0]);
+                [
+                    r.bounds[0] - room,
+                    low - room,
+                    r.bounds[2] + room,
+                    high + room,
+                ]
             } else {
-                [low, r.bounds[1], high, r.bounds[3]]
+                let room = room * (r.bounds[3] - r.bounds[1]);
+                [
+                    low - room,
+                    r.bounds[1] - room,
+                    high + room,
+                    r.bounds[3] + room,
+                ]
             };
             match out.last_mut() {
                 Some(last) if on_same_line(last, &rect) => {

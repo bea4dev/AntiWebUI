@@ -547,6 +547,67 @@ fn acceptance(drop: &DropConfig, typed: bool, session: &DragSession) -> Option<A
     })
 }
 
+/// What [`start_drag`] asked for.
+pub(crate) struct DragRequest {
+    data: DragData,
+    grip: (f32, f32),
+    preview: Box<dyn FnOnce() -> View>,
+}
+
+/// Starts dragging right away, for what decides by itself when that is, like a viewer with a text
+/// selection of its own. Everything else is better off with
+/// [`Div::draggable`](crate::view::Div::draggable), which also knows when a press has moved far
+/// enough. It takes the button still being held, and does nothing otherwise.
+///
+/// `preview` makes what shows with the pointer, which it runs outside of whatever made it. `grip`
+/// says where in that the pointer is, from 0 to 1 across and down.
+pub fn start_drag<V: IntoView>(
+    data: DragData,
+    grip: (f32, f32),
+    preview: impl FnOnce() -> V + 'static,
+) {
+    with_doc(|d| {
+        d.drag_request = Some(DragRequest {
+            data,
+            grip,
+            preview: Box::new(move || preview().into_view()),
+        });
+        d.mark_paint();
+    });
+}
+
+/// Puts what shows for something being dragged in the document, in the style of what it came from.
+fn mount_preview(
+    inherit: &anti_webui_style::ComputedStyle,
+    make: impl FnOnce() -> Option<View>,
+) -> Option<(View, Owner)> {
+    let (view, owner) = create_root(|| {
+        let inner = untrack(make)?;
+        let mut outer = portal().child(
+            div()
+                .absolute()
+                .left(0.0)
+                .top(0.0)
+                .pointer_events_none()
+                .child(inner),
+        );
+        outer.data_mut().preview_of = Some(Box::new(inherit.clone()));
+        Some(outer.into_view())
+    });
+    let Some(view) = view else {
+        owner.dispose();
+        return None;
+    };
+    with_doc(|d| {
+        if let Some(root) = d.root {
+            let mut children = d.nodes[root].children.clone();
+            children.push(view.0);
+            d.set_children(root, children);
+        }
+    });
+    Some((view, owner))
+}
+
 impl Ui {
     /// Says whether the platform can hand drags to the system. Without it, drags stay in the
     /// window whatever they carry.
@@ -713,39 +774,14 @@ impl Ui {
         );
         // Painted before it starts looking like what is being dragged.
         let now = Instant::now();
-        let built = config.preview.as_ref().and_then(|f| {
-            let (view, owner) = create_root(|| {
-                let inner = untrack(|| f(&data))?;
-                let mut outer = portal().child(
-                    div()
-                        .absolute()
-                        .left(0.0)
-                        .top(0.0)
-                        .pointer_events_none()
-                        .child(inner),
-                );
-                outer.data_mut().preview_of = Some(Box::new(inherit.clone()));
-                Some(outer.into_view())
-            });
-            match view {
-                Some(view) => Some((view, owner)),
-                None => {
-                    owner.dispose();
-                    None
-                }
-            }
-        });
+        let built = config
+            .preview
+            .as_ref()
+            .and_then(|f| mount_preview(&inherit, || f(&data)));
         let mut preview = None;
         let visual = match built {
             Some((view, owner)) => {
                 preview = Some(owner);
-                with_doc(|d| {
-                    if let Some(root) = d.root {
-                        let mut children = d.nodes[root].children.clone();
-                        children.push(view.0);
-                        d.set_children(root, children);
-                    }
-                });
                 DragVisual {
                     content: DragContent::Live(view.0),
                     position: whole(p),
@@ -768,6 +804,46 @@ impl Ui {
             }
         };
         self.begin_drag(Some(node), None, data, visual, preview, p);
+    }
+
+    /// Does what [`start_drag`] asked for, if the button is still being held.
+    pub(crate) fn start_requested_drag(&mut self) {
+        let Some(request) = with_doc(|d| d.drag_request.take()) else {
+            return;
+        };
+        let Some(press) = self.press.take() else {
+            return;
+        };
+        let inherit = with_doc(|d| {
+            press
+                .target
+                .or(d.root)
+                .and_then(|t| d.get(t))
+                .map(|n| n.computed.clone())
+        });
+        let Some(inherit) = inherit else {
+            return;
+        };
+        let p = self.pointer.unwrap_or_default();
+        let DragRequest {
+            data,
+            grip,
+            preview,
+        } = request;
+        let wants_platform = self.platform_drag && !data.items.is_empty();
+        let Some((view, owner)) = mount_preview(&inherit, || Some(preview())) else {
+            return;
+        };
+        let visual = DragVisual {
+            content: DragContent::Live(view.0),
+            position: whole(p),
+            grip,
+            opacity: 1.0,
+            icon: wants_platform,
+            painted: None,
+        };
+        self.edge = None;
+        self.begin_drag(None, None, data, visual, Some(owner), p);
     }
 
     /// The pointer moved with selected text pressed. Returns whether it is being dragged now.

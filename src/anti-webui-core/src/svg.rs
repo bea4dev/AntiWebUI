@@ -3,7 +3,7 @@
 //! `docs/design/25-svg.md`.
 
 use crate::drag::{DragData, DropEvent, GrabEvent};
-use crate::event::{DragResult, KeyboardEvent, PointerEvent, ScrollEvent};
+use crate::event::{DragResult, KeyboardEvent, PinchEvent, PointerEvent, ScrollEvent};
 use crate::geometry::{Affine, PointF, RectI};
 use crate::scene::{ClipQuad, PathDraw, PathGeometry, PathPaint, StrokeStyle};
 use crate::shader::IntoImage;

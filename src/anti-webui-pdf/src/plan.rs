@@ -4,15 +4,72 @@ use anti_webui_core::geometry::RectI;
 use std::collections::HashMap;
 use std::ops::Range;
 
+/// How far pages are turned clockwise, in quarter turns. Text and places keep to the points of the
+/// page as the document has it, so that they stay the same when this changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct Turn(pub u8);
+
+impl Turn {
+    pub fn degrees(degrees: i32) -> Self {
+        Self((degrees.div_euclid(90)).rem_euclid(4) as u8)
+    }
+
+    /// This much further, in quarter turns.
+    pub fn by(self, quarters: i32) -> Self {
+        Self((self.0 as i32 + quarters).rem_euclid(4) as u8)
+    }
+
+    /// How far it is turned from `other`, in quarter turns clockwise.
+    fn since(self, other: Self) -> Self {
+        self.by(-(other.0 as i32))
+    }
+
+    /// How big something this size looks.
+    pub fn size<T>(self, (w, h): (T, T)) -> (T, T) {
+        if self.0 % 2 == 1 { (h, w) } else { (w, h) }
+    }
+
+    /// Where a point of a page this size shows.
+    pub fn point(self, (x, y): (f64, f64), (w, h): (f64, f64)) -> (f64, f64) {
+        match self.0 {
+            1 => (h - y, x),
+            2 => (w - x, h - y),
+            3 => (y, w - x),
+            _ => (x, y),
+        }
+    }
+
+    /// What of a page this size shows at a point.
+    pub fn back(self, (x, y): (f64, f64), (w, h): (f64, f64)) -> (f64, f64) {
+        match self.0 {
+            1 => (y, h - x),
+            2 => (w - x, h - y),
+            3 => (w - y, x),
+            _ => (x, y),
+        }
+    }
+
+    /// What [`Self::point`] does as a matrix, in the order `kurbo` has it.
+    pub fn matrix(self, (w, h): (f64, f64)) -> [f64; 6] {
+        match self.0 {
+            1 => [0.0, 1.0, -1.0, 0.0, h, 0.0],
+            2 => [-1.0, 0.0, 0.0, -1.0, w, h],
+            3 => [0.0, -1.0, 1.0, 0.0, 0.0, w],
+            _ => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        }
+    }
+}
+
 /// A picture to draw of a page, in pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Job {
     pub page: usize,
-    /// How big all of the page is drawn.
+    /// How big all of the page is drawn, as it shows when turned.
     pub width: u32,
     pub height: u32,
     /// The part of that to make a picture of, or `None` for all of it.
     pub area: Option<RectI>,
+    pub turn: Turn,
 }
 
 impl Job {
@@ -47,6 +104,31 @@ impl Job {
             (bottom.round() - top.round()) as i32,
         )
     }
+}
+
+/// What pixels of a page on white look like without the white, inside of `boxes` of the picture and
+/// nothing outside of them, for when it shows on something else. It goes by how much the darkest of
+/// the three colors takes away from white, which gets text back as it was drawn.
+pub(crate) fn cut_out(pixels: &[u8], width: u32, boxes: &[RectI]) -> Vec<u8> {
+    let width = width as usize;
+    let mut out = vec![0; pixels.len()];
+    for area in boxes {
+        for y in area.y.max(0) as usize..area.bottom().max(0) as usize {
+            let row = y * width * 4;
+            let (from, to) = (
+                row + area.x.max(0) as usize * 4,
+                row + area.right().clamp(0, width as i32) as usize * 4,
+            );
+            let (Some(pixels), Some(out)) = (pixels.get(from..to), out.get_mut(from..to)) else {
+                break;
+            };
+            for (from, to) in pixels.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
+                let white = from[0].min(from[1]).min(from[2]);
+                to.copy_from_slice(&[from[0] - white, from[1] - white, from[2] - white, !white]);
+            }
+        }
+    }
+    out
 }
 
 /// The most pixels in a picture of a whole page. A bigger page shows a stretched one.
@@ -84,6 +166,12 @@ pub(crate) fn is_right_size(box_size: (i32, i32), have: (u32, u32)) -> bool {
         || (needs_part(box_size) && have.0.abs_diff(want.0) <= 2 && have.1.abs_diff(want.1) <= 2)
 }
 
+/// How many times bigger or smaller a picture is than it should be, which is 1 or more.
+pub(crate) fn size_is_off(have: (u32, u32), want: (u32, u32)) -> f64 {
+    let ratio = have.0.max(1) as f64 / want.0.max(1) as f64;
+    ratio.max(1.0 / ratio)
+}
+
 /// Where the pages of a document go at some zoom, in physical pixels.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct PageTable {
@@ -93,17 +181,30 @@ pub(crate) struct PageTable {
     /// All of it, with the gaps around the pages.
     pub width: i32,
     pub height: i32,
+    pub turn: Turn,
 }
 
 impl PageTable {
     /// `pages` are in points, and `px_per_pt` says how many pixels each takes. `viewport_width`
     /// keeps narrow pages in the middle of it.
     pub fn new(pages: &[(f32, f32)], px_per_pt: f64, gap: i32, viewport_width: i32) -> Self {
+        Self::turned(pages, Turn::default(), px_per_pt, gap, viewport_width)
+    }
+
+    /// The same with the pages turned, which `pages` aren't yet.
+    pub fn turned(
+        pages: &[(f32, f32)],
+        turn: Turn,
+        px_per_pt: f64,
+        gap: i32,
+        viewport_width: i32,
+    ) -> Self {
         let mut tops = Vec::with_capacity(pages.len());
         let mut sizes = Vec::with_capacity(pages.len());
         let mut y = gap as i64;
         let mut widest = 0;
-        for &(w, h) in pages {
+        for &page in pages {
+            let (w, h) = turn.size(page);
             let size = (
                 ((w as f64 * px_per_pt).round() as i32).max(1),
                 ((h as f64 * px_per_pt).round() as i32).max(1),
@@ -118,6 +219,7 @@ impl PageTable {
             sizes,
             width: (widest + 2 * gap).max(viewport_width),
             height: y.min(i32::MAX as i64) as i32,
+            turn,
         }
     }
 
@@ -190,9 +292,12 @@ impl PageTable {
         }
         let page = self.first_below(y).min(self.len() - 1);
         let (w, h) = self.sizes[page];
-        let (fx, fy) = (
-            (x - self.left(page)) as f64 / w as f64,
-            (y - self.tops[page]) as f64 / h as f64,
+        let (fx, fy) = other.turn.since(self.turn).point(
+            (
+                (x - self.left(page)) as f64 / w as f64,
+                (y - self.tops[page]) as f64 / h as f64,
+            ),
+            (1.0, 1.0),
         );
         let (w, h) = other.sizes[page];
         (
@@ -329,6 +434,7 @@ where
             width,
             height,
             area: None,
+            turn: table.turn,
         }
     };
     let wanted = |job: &Job| {
@@ -352,6 +458,7 @@ where
         }
         let good = |job: &Job| {
             (job.width as i32, job.height as i32) == size
+                && job.turn == table.turn
                 && job
                     .area
                     .is_some_and(|area| area_will_do(area, shown, view_size, size))
@@ -365,6 +472,7 @@ where
                 width: size.0 as u32,
                 height: size.1 as u32,
                 area: Some(part_for(shown, view_size, size)),
+                turn: table.turn,
             });
         goals.insert(page, goal);
         used += goal.bytes();
@@ -495,6 +603,61 @@ mod tests {
         assert_eq!(y, big.top(1) + 75);
         assert_eq!(x, big.left(1) + 75);
         assert_eq!(big.move_point(&small, x, y), (75, 145));
+    }
+
+    #[test]
+    fn turning_a_page_keeps_what_is_where_it_was_on_it() {
+        let size = (100.0, 200.0);
+        let point = (10.0, 30.0);
+        // A quarter turn clockwise takes the top left to the top right.
+        assert_eq!(Turn(1).point((0.0, 0.0), size), (200.0, 0.0));
+        assert_eq!(Turn(2).point((0.0, 0.0), size), (100.0, 200.0));
+        assert_eq!(Turn(3).point((0.0, 0.0), size), (0.0, 100.0));
+        for turn in (0..4).map(Turn) {
+            assert_eq!(turn.back(turn.point(point, size), size), point, "{turn:?}");
+            let [a, b, c, d, e, f] = turn.matrix(size);
+            let by_matrix = (a * point.0 + c * point.1 + e, b * point.0 + d * point.1 + f);
+            assert_eq!(by_matrix, turn.point(point, size), "{turn:?}");
+        }
+        assert_eq!(Turn(1).size((100, 200)), (200, 100));
+        assert_eq!(Turn(2).size((100, 200)), (100, 200));
+        assert_eq!(Turn::degrees(-90), Turn(3));
+        assert_eq!(Turn::degrees(450), Turn(1));
+        assert_eq!(Turn(3).by(1), Turn(0));
+    }
+
+    #[test]
+    fn turning_keeps_the_same_place_on_the_same_page() {
+        let pages = [(100.0, 200.0), (100.0, 200.0)];
+        let upright = PageTable::new(&pages, 1.0, 10, 500);
+        let turned = PageTable::turned(&pages, Turn(1), 1.0, 10, 500);
+        assert_eq!(turned.size(1), (200, 100));
+        // A tenth across and a quarter down the second page goes a tenth down from the right.
+        let (x, y) = (upright.left(1) + 10, upright.top(1) + 50);
+        let (a, b) = upright.move_point(&turned, x, y);
+        assert_eq!((a - turned.left(1), b - turned.top(1)), (150, 10));
+        assert_eq!(turned.move_point(&upright, a, b), (x, y));
+    }
+
+    #[test]
+    fn what_is_white_goes_when_cut_out() {
+        let box_of_all = [RectI::new(0, 0, 3, 1)];
+        // White, black, half black and a color on white.
+        let pixels = [
+            255, 255, 255, 255, 0, 0, 0, 255, 128, 128, 128, 255, 255, 100, 100, 255,
+        ];
+        let cut = cut_out(&pixels[..12], 3, &box_of_all);
+        assert_eq!(cut, [0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 0, 127]);
+        let cut = cut_out(&pixels[12..], 1, &[RectI::new(0, 0, 1, 1)]);
+        assert_eq!(cut, [155, 0, 0, 155]);
+    }
+
+    #[test]
+    fn only_what_is_in_the_boxes_is_cut_out() {
+        let black = [0, 0, 0, 255].repeat(4);
+        let cut = cut_out(&black, 2, &[RectI::new(1, 0, 1, 1), RectI::new(0, 1, 5, 5)]);
+        assert_eq!(cut[..4], [0, 0, 0, 0]);
+        assert_eq!(cut[4..], [0, 0, 0, 255].repeat(3)[..]);
     }
 
     const LOTS: usize = 1 << 40;
@@ -725,6 +888,7 @@ mod tests {
             width: 1000,
             height: 1000,
             area: Some(area),
+            turn: Turn::default(),
         }
     }
 

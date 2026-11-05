@@ -3,8 +3,8 @@
 use crate::keyboard::{Keyboard, Repeat};
 use crate::popup::{Popup, SurfaceFrame};
 use anti_webui_core::event::{
-    AXIS_MOTION_GAIN, ClipboardKind, ImeUpdate, PointerButton, ScrollPhase, ScrollSource,
-    WindowEvent,
+    AXIS_MOTION_GAIN, ClipboardKind, ImeUpdate, PinchPhase, PointerButton, ScrollPhase,
+    ScrollSource, WindowEvent,
 };
 use anti_webui_core::geometry::{PointF, PointI, Scale, SizeI};
 use anti_webui_core::platform::{CursorIcon, ImePurpose, ImeState, PopupId, PopupParams};
@@ -29,7 +29,7 @@ use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
 };
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
-    zwp_pointer_gesture_hold_v1, zwp_pointer_gestures_v1,
+    zwp_pointer_gesture_hold_v1, zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
 };
 use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1,
@@ -81,6 +81,8 @@ pub enum SurfaceId {
     DragIcon,
 }
 
+/// `zwp_pointer_gestures_v1.get_hold_gesture` came in this version.
+const HOLD_VERSION: u32 = 3;
 /// How long a popup may hold up the next frame by not getting its frame callback.
 const POPUP_FRAME_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -123,6 +125,9 @@ pub struct State {
     pub finger_scrolling: bool,
     pub pointer_gestures: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
     pub hold_gesture: Option<zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1>,
+    pub pinch_gesture: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
+    /// How big the pinch going on says it is, which it counts from where it began.
+    pub pinch_scale: f64,
     pub keyboard: Option<wl_keyboard::WlKeyboard>,
     pub kb: Keyboard,
     /// What the keyboard is on, which the IME's cursor rectangle is relative to.
@@ -211,6 +216,8 @@ impl State {
             frame: PointerFrame::default(),
             finger_scrolling: false,
             pointer_gestures: None,
+            pinch_gesture: None,
+            pinch_scale: 1.0,
             hold_gesture: None,
             keyboard: None,
             kb: Keyboard::new(),
@@ -696,7 +703,10 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
                 state.cursor_device = Some(mgr.get_pointer(&pointer, qh, ()));
             }
             if let Some(mgr) = &state.pointer_gestures {
-                state.hold_gesture = Some(mgr.get_hold_gesture(&pointer, qh, ()));
+                state.pinch_gesture = Some(mgr.get_pinch_gesture(&pointer, qh, ()));
+                if mgr.version() >= HOLD_VERSION {
+                    state.hold_gesture = Some(mgr.get_hold_gesture(&pointer, qh, ()));
+                }
             }
             state.pointer = Some(pointer);
         }
@@ -925,6 +935,48 @@ impl Dispatch<zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1, ()> for Stat
                 time,
             });
         }
+    }
+}
+
+impl Dispatch<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1,
+        event: zwp_pointer_gesture_pinch_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use zwp_pointer_gesture_pinch_v1::Event;
+        let (phase, scale) = match event {
+            Event::Begin { .. } => {
+                state.pinch_scale = 1.0;
+                (PinchPhase::Began, 1.0)
+            }
+            Event::Update { scale, .. } if scale > 0.0 => {
+                let ratio = scale / state.pinch_scale;
+                state.pinch_scale = scale;
+                (PinchPhase::Moved, ratio as f32)
+            }
+            Event::End { cancelled, .. } => (
+                if cancelled != 0 {
+                    PinchPhase::Cancelled
+                } else {
+                    PinchPhase::Ended
+                },
+                1.0,
+            ),
+            _ => return,
+        };
+        let (x, y) = state.pointer_pos;
+        let position = state.physical(x, y);
+        let modifiers = state.kb.modifiers;
+        state.events.push(WindowEvent::Pinch {
+            position,
+            scale,
+            modifiers,
+            phase,
+        });
     }
 }
 

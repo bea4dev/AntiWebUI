@@ -4,9 +4,10 @@
 //! cargo run --release -p anti-webui --example pdf --features pdf -- paper.pdf [percent]
 //! ```
 //!
-//! Ctrl + the wheel zooms, and so do Ctrl + `+`, `-` and `0`. PageUp, PageDown, Home and End move.
-//! Dragging selects text, a double click takes a word and a triple click a line, and Ctrl + C copies
-//! it. Ctrl + F goes to the search box, where Enter goes to the next one found.
+//! Ctrl + the wheel and pinching zoom, and so do Ctrl + `+`, `-` and `0`. Ctrl + `]` and `[` turn the
+//! pages. PageUp, PageDown, Home and End move. Dragging selects text, a double click takes a word and
+//! a triple click a line, Ctrl + C copies it, and dragging what is selected takes it to another
+//! program. Ctrl + F goes to the search box, where Enter goes to the next one found.
 
 use anti_webui::prelude::*;
 
@@ -54,6 +55,7 @@ fn main() {
                 format!("{at} / {count}{more}")
             };
             let contents = signal(false);
+            let thumbnails = signal(false);
             let search_box = node_ref();
             request_frame(move |_| viewer.focus());
             div()
@@ -80,6 +82,9 @@ fn main() {
                         .text_color(Color::WHITE)
                         .select_none()
                         .child(button("目次").on_click(move |_| contents.update(|c| *c = !*c)))
+                        .child(
+                            button("サムネイル").on_click(move |_| thumbnails.update(|t| *t = !*t)),
+                        )
                         .child(button("−").on_click(move |_| viewer.zoom_by(0.8)))
                         .child(button("+").on_click(move |_| viewer.zoom_by(1.25)))
                         .child(
@@ -87,6 +92,7 @@ fn main() {
                                 .on_click(move |_| viewer.set_zoom(PdfZoom::FitWidth)),
                         )
                         .child(button("全体").on_click(move |_| viewer.set_zoom(PdfZoom::FitPage)))
+                        .child(button("回転").on_click(move |_| viewer.rotate_clockwise()))
                         .child(text(shown))
                         .child(div().flex_1())
                         .child(
@@ -108,6 +114,17 @@ fn main() {
                         .flex_row()
                         .flex_1()
                         .min_h(0.0)
+                        .child(show(
+                            move || thumbnails.get(),
+                            move || {
+                                pdf_thumbnails(viewer)
+                                    .w(140.0)
+                                    .h_full()
+                                    .flex_none()
+                                    .bg(bar)
+                                    .text_color(Color::WHITE)
+                            },
+                        ))
                         .child(show(
                             move || contents.get(),
                             move || {

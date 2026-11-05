@@ -6,7 +6,7 @@
 use crate::animation::{ListPlaces, request_frame};
 use crate::drag::{DragData, DropConfig, DropEvent, GestureConfig, GrabEvent};
 use crate::event::DragResult;
-use crate::event::{ClipboardKind, KeyboardEvent, PointerEvent, ScrollEvent};
+use crate::event::{ClipboardKind, KeyboardEvent, PinchEvent, PointerEvent, ScrollEvent};
 use crate::geometry::{PointF, PointI, RectI, Scale};
 use crate::images::Bitmap;
 use crate::platform::{ImePurpose, Placement, PlatformRequest, PopupKind};
@@ -431,6 +431,13 @@ macro_rules! element_methods {
 
         pub fn on_scroll(mut self, f: impl Fn(&ScrollEvent) + 'static) -> Self {
             self.cfg.listeners.scroll = also(self.cfg.listeners.scroll.take(), f);
+            self
+        }
+
+        /// Called while fingers move apart or together on a touch surface over the node. Nothing
+        /// zooms by itself: it is up to this what that does.
+        pub fn on_pinch(mut self, f: impl Fn(&PinchEvent) + 'static) -> Self {
+            self.cfg.listeners.pinch = also(self.cfg.listeners.pinch.take(), f);
             self
         }
 

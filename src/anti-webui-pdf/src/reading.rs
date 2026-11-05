@@ -2,14 +2,15 @@
 //! following links. All of it runs on the UI thread, with the text of the pages coming from the
 //! workers when it is asked for. See `docs/design/26-pdf.md`.
 
-use crate::engine::Engine;
+use crate::engine::{CutOut, Engine};
 use crate::links::{LinkTarget, PdfTarget};
-use crate::plan::PageTable;
+use crate::plan::{Job, PageTable};
 use crate::text::{self, NEAR_TEXT, PageText};
 use crate::{PdfViewer, UrlListener};
 use anti_webui_core::animation::request_frame;
 use anti_webui_core::event::{ClipboardKind, PointerButton, PointerEvent};
 use anti_webui_core::geometry::{PointF, RectI};
+use anti_webui_core::images::Bitmap;
 use anti_webui_core::prelude::*;
 use anti_webui_core::view::{clear_text_selection, set_clipboard};
 use std::cell::{Cell, RefCell};
@@ -28,6 +29,8 @@ const READ_AHEAD: usize = 64;
 const SEARCH_SLICE: Duration = Duration::from_millis(3);
 /// How far, in logical pixels, a press can move and still be a click.
 const CLICK_SLOP: f32 = 4.0;
+/// What shows with the pointer shows through this much: `kDragImageAlpha` in Blink.
+const DRAG_OPACITY: f32 = 0.75;
 /// How many pixels a frame scrolling goes for each pixel the pointer is outside of the box when
 /// selecting.
 const AUTOSCROLL: f32 = 0.25;
@@ -140,9 +143,17 @@ struct Search {
     pump_is_due: bool,
 }
 
-/// Text that is on its way to a clipboard, as all of a selection may not have been read.
+/// Where text that was asked for goes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CopyTo {
+    Clipboard(ClipboardKind),
+    /// What is dragged, which can't start without it.
+    Drag,
+}
+
+/// Text that is on its way, as all of a selection may not have been read.
 struct Copying {
-    kind: ClipboardKind,
+    to: Vec<CopyTo>,
     selection: Selection,
     /// What each page of the selection gets.
     parts: Vec<Option<String>>,
@@ -154,12 +165,16 @@ struct Copying {
 #[derive(Clone, Copy, Debug)]
 struct Press {
     position: PointF,
+    /// Where it went down in the box, and where it is now.
+    first_local: PointF,
     local: PointF,
     clicks: u32,
     shift: bool,
     moved: bool,
     /// It is known what it pressed, which takes the text of the page.
     resolved: bool,
+    /// It pressed what is selected, which stays that way until it is known what this is.
+    on_selection: bool,
 }
 
 /// A box on a page, in its pixels, and what it is for.
@@ -215,6 +230,13 @@ pub(crate) struct Reader {
     copying: RefCell<Option<Copying>>,
     /// The pages it takes to copy what is being copied.
     copy_wants: Signal<Vec<usize>>,
+
+    /// Which press of what is selected this is, to know what comes back from the workers for.
+    press_number: Cell<u64>,
+    /// What shows with the pointer if what is selected gets dragged, as it comes.
+    cut_outs: Signal<Vec<(usize, RectI, Arc<Bitmap>)>>,
+    /// All of that together, in the box.
+    cut_bounds: Cell<RectI>,
 }
 
 impl Reader {
@@ -250,6 +272,9 @@ impl Reader {
             search_wants: signal(Vec::new()),
             copying: RefCell::new(None),
             copy_wants: signal(Vec::new()),
+            press_number: Cell::new(0),
+            cut_outs: signal(Vec::new()),
+            cut_bounds: Cell::new(RectI::default()),
         })
     }
 
@@ -340,16 +365,24 @@ impl Reader {
         }
         let page = table.page_near(y as i32);
         let (width, height) = table.size(page);
-        let (pw, ph) = self
-            .pages
-            .with_untracked(|p| *p.get(page).unwrap_or(&(1.0, 1.0)));
+        let size = self.size_in_points(page);
+        let (shown_width, shown_height) = table.turn.size(size);
         let left = table.left(page) as f32;
         let top = table.top(page) as f32;
-        Some((
-            page,
-            (x - left) * pw / width.max(1) as f32,
-            (y - top) * ph / height.max(1) as f32,
-        ))
+        let shown = (
+            ((x - left) * shown_width as f32 / width.max(1) as f32) as f64,
+            ((y - top) * shown_height as f32 / height.max(1) as f32) as f64,
+        );
+        let (x, y) = table.turn.back(shown, size);
+        Some((page, x as f32, y as f32))
+    }
+
+    /// How big a page is as the document has it.
+    fn size_in_points(&self, page: usize) -> (f64, f64) {
+        let (w, h) = self
+            .pages
+            .with_untracked(|p| *p.get(page).unwrap_or(&(1.0, 1.0)));
+        (w as f64, h as f64)
     }
 
     pub fn pointer_down(self: &Rc<Self>, e: &PointerEvent) {
@@ -359,11 +392,13 @@ impl Reader {
         clear_text_selection();
         self.press.set(Some(Press {
             position: e.position,
+            first_local: e.local,
             local: e.local,
             clicks: e.click_count,
             shift: e.modifiers.shift,
             moved: false,
             resolved: false,
+            on_selection: false,
         }));
         self.selecting.set(None);
         if let Some((page, ..)) = self.on_page(e.local) {
@@ -384,7 +419,14 @@ impl Reader {
             return;
         };
         press.resolved = true;
+        // As in Blink, a single press of what is selected may be the start of dragging it.
+        press.on_selection =
+            press.clicks == 1 && !press.shift && self.is_selected_at(page, x, y, &text);
         self.press.set(Some(press));
+        if press.on_selection {
+            self.prepare_cut_outs();
+            return;
+        }
         let caret = text.caret_at(x, y);
         let caret = caret.filter(|c| press.clicks > 1 || press.shift || c.distance <= NEAR_TEXT);
         let Some(caret) = caret else {
@@ -408,6 +450,126 @@ impl Reader {
         };
         self.selecting.set(Some((base, unit)));
         self.extend_selection();
+    }
+
+    /// Whether a point of a page is in the box of something selected.
+    fn is_selected_at(&self, page: usize, x: f32, y: f32, text: &PageText) -> bool {
+        let Some(selection) = self.viewer.selection.get_untracked() else {
+            return false;
+        };
+        let (from, to) = selected_on(selection, page, text.len());
+        text.boxes(from, to)
+            .iter()
+            .any(|b| x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3])
+    }
+
+    /// Asks for what shows with the pointer if what is selected gets dragged: what shows of it and
+    /// nothing else, as `kSelectionDragImageOnly` in Blink. It is done on the press, so that it is
+    /// there by the time the pointer has moved far enough.
+    fn prepare_cut_outs(&self) {
+        let Some(selection) = self.viewer.selection.get_untracked() else {
+            return;
+        };
+        let (v, table) = untrack(|| ((self.view)(), self.table.get()));
+        let number = self.press_number.get() + 1;
+        self.press_number.set(number);
+        self.cut_outs.set(Vec::new());
+        let mut bounds = RectI::default();
+        let mut cuts = Vec::new();
+        for page in table.visible(v.y, v.height) {
+            let Some(text) = self.text_of(page) else {
+                continue;
+            };
+            let (from, to) = selected_on(selection, page, text.len());
+            let shown = table.shown(page, v);
+            let boxes: Vec<RectI> = text
+                .ink_boxes(from, to)
+                .iter()
+                .map(|area| self.to_pixels(&table, page, area).intersect(&shown))
+                .filter(|area| !area.is_empty())
+                .collect();
+            let area = boxes
+                .iter()
+                .fold(RectI::default(), |all, area| all.union(area));
+            if area.is_empty() {
+                continue;
+            }
+            let (width, height) = table.size(page);
+            let at = area.translate(table.left(page) - v.x, table.top(page) - v.y);
+            bounds = bounds.union(&at);
+            cuts.push(CutOut {
+                press: number,
+                job: Job {
+                    page,
+                    width: width as u32,
+                    height: height as u32,
+                    area: Some(area),
+                    turn: table.turn,
+                },
+                boxes: boxes
+                    .iter()
+                    .map(|b| b.translate(-area.x, -area.y))
+                    .collect(),
+                at,
+            });
+        }
+        self.cut_bounds.set(bounds);
+        if let Some(engine) = &*self.engine.borrow() {
+            engine.want_cut_outs(cuts);
+        }
+    }
+
+    /// Something that shows with the pointer came from a worker.
+    pub fn cut_out_arrived(&self, cut: &CutOut, picture: Arc<Bitmap>) {
+        if cut.press == self.press_number.get() {
+            self.cut_outs.update(|all| {
+                all.push((cut.job.page, cut.at, picture));
+            });
+        }
+    }
+
+    /// Lets go of what could have shown with the pointer.
+    fn forget_cut_outs(&self) {
+        self.press_number.set(self.press_number.get() + 1);
+        if self.cut_outs.with_untracked(|all| !all.is_empty()) {
+            self.cut_outs.set(Vec::new());
+        }
+    }
+
+    /// Starts carrying what is selected, now that it is all there and the press has moved.
+    fn start_dragging(self: &Rc<Self>, text: String) {
+        let Some(press) = self.press.get().filter(|p| p.on_selection && p.moved) else {
+            return;
+        };
+        self.press.set(None);
+        let data = DragData::new(DraggedText(text.clone()))
+            .text(text)
+            .actions(DragActions::Copy);
+        let bounds = self.cut_bounds.get();
+        let grip = (
+            ((press.first_local.x - bounds.x as f32) / bounds.width.max(1) as f32).clamp(0.0, 1.0),
+            ((press.first_local.y - bounds.y as f32) / bounds.height.max(1) as f32).clamp(0.0, 1.0),
+        );
+        let cut_outs = self.cut_outs;
+        start_drag(data, grip, move || {
+            div()
+                .relative()
+                .w(Length::Device(bounds.width))
+                .h(Length::Device(bounds.height))
+                .opacity(DRAG_OPACITY)
+                .child(for_each(
+                    move || cut_outs.get(),
+                    |cut| cut.0,
+                    move |(_, at, picture)| {
+                        bitmap_view(move || Some(picture.clone()))
+                            .absolute()
+                            .left(Length::Device(at.x - bounds.x))
+                            .top(Length::Device(at.y - bounds.y))
+                            .w(Length::Device(at.width))
+                            .h(Length::Device(at.height))
+                    },
+                ))
+        });
     }
 
     /// Makes the selection reach to where the pointer is.
@@ -436,13 +598,27 @@ impl Reader {
     pub fn pointer_moved(self: &Rc<Self>, e: &PointerEvent) {
         if let Some(mut press) = self.press.get() {
             let slop = window_scale().pxf(CLICK_SLOP);
-            press.moved |= press.position.distance(e.position) > slop;
             press.local = e.local;
+            if press.on_selection {
+                // Per axis, like `DragThresholdExceeded` in Blink.
+                let far = (press.position.x - e.position.x).abs() >= slop
+                    || (press.position.y - e.position.y).abs() >= slop;
+                let starts = far && !press.moved;
+                press.moved |= far;
+                self.press.set(Some(press));
+                if starts {
+                    self.copy_to(CopyTo::Drag);
+                }
+                return;
+            }
+            press.moved |= press.position.distance(e.position) > slop;
             self.press.set(Some(press));
             self.extend_selection();
             self.keep_scrolling();
             return;
         }
+        // What was dragged, if anything, is over by the time the pointer moves here again.
+        self.forget_cut_outs();
         let Some((page, x, y)) = self.on_page(e.local) else {
             return;
         };
@@ -468,6 +644,12 @@ impl Reader {
             return;
         };
         self.selecting.set(None);
+        self.forget_cut_outs();
+        // It would have been dragged, but what is selected was still being read.
+        if press.on_selection && press.moved {
+            self.forget_drag_copy();
+            return;
+        }
         if !press.moved && press.clicks == 1 && !press.shift {
             // A click selects nothing, even if it was on text.
             self.viewer.selection.set_if_changed(None);
@@ -547,13 +729,40 @@ impl Reader {
     }
 
     /// Puts what is selected on a clipboard, as soon as all of it has been read.
-    pub fn copy(&self, kind: ClipboardKind) {
+    pub fn copy(self: &Rc<Self>, kind: ClipboardKind) {
+        self.copy_to(CopyTo::Clipboard(kind));
+    }
+
+    /// Stops getting text only for what didn't get dragged after all.
+    fn forget_drag_copy(&self) {
+        let mut copying = self.copying.borrow_mut();
+        if let Some(c) = copying.as_mut() {
+            c.to.retain(|to| *to != CopyTo::Drag);
+            if c.to.is_empty() {
+                *copying = None;
+                drop(copying);
+                self.copy_wants.set_if_changed(Vec::new());
+            }
+        }
+    }
+
+    /// Sends what is selected somewhere, as soon as all of it has been read.
+    fn copy_to(self: &Rc<Self>, to: CopyTo) {
         let Some(selection) = self.viewer.selection.get_untracked() else {
             return;
         };
+        if let Some(c) = self
+            .copying
+            .borrow_mut()
+            .as_mut()
+            .filter(|c| c.selection == selection)
+        {
+            c.to.push(to);
+            return;
+        }
         let (a, b) = selection;
         let mut copying = Copying {
-            kind,
+            to: vec![to],
             selection,
             parts: vec![None; b.page - a.page + 1],
             next: 0,
@@ -567,7 +776,7 @@ impl Reader {
         self.copy_or_wait(copying);
     }
 
-    fn copy_or_wait(&self, mut copying: Copying) {
+    fn copy_or_wait(self: &Rc<Self>, mut copying: Copying) {
         while copying.parts.get(copying.next).is_some_and(Option::is_some) {
             copying.next += 1;
         }
@@ -579,9 +788,14 @@ impl Reader {
                 .map(String::as_str)
                 .collect::<Vec<_>>()
                 .join("\n");
-            set_clipboard(copying.kind, text);
             *self.copying.borrow_mut() = None;
             self.copy_wants.set_if_changed(Vec::new());
+            for to in copying.to {
+                match to {
+                    CopyTo::Clipboard(kind) => set_clipboard(kind, text.clone()),
+                    CopyTo::Drag => self.start_dragging(text.clone()),
+                }
+            }
             return;
         }
         let start = copying.selection.0.page;
@@ -594,7 +808,7 @@ impl Reader {
         self.copy_wants.set_if_changed(wants);
     }
 
-    fn copy_arrived(&self, page: usize, text: &PageText) {
+    fn copy_arrived(self: &Rc<Self>, page: usize, text: &PageText) {
         let Some(mut copying) = self.copying.borrow_mut().take() else {
             return;
         };
@@ -723,12 +937,22 @@ impl Reader {
     /// A box in the points of a page in its pixels.
     fn to_pixels(&self, table: &PageTable, page: usize, area: &[f32; 4]) -> RectI {
         let (width, height) = table.size(page);
-        let (pw, ph) = self
-            .pages
-            .with_untracked(|p| *p.get(page).unwrap_or(&(1.0, 1.0)));
-        let (sx, sy) = (width as f32 / pw.max(1.0), height as f32 / ph.max(1.0));
-        let (x0, y0) = ((area[0] * sx).floor() as i32, (area[1] * sy).floor() as i32);
-        let (x1, y1) = ((area[2] * sx).ceil() as i32, (area[3] * sy).ceil() as i32);
+        let size = self.size_in_points(page);
+        let (shown_width, shown_height) = table.turn.size(size);
+        let (sx, sy) = (
+            width as f64 / shown_width.max(1.0),
+            height as f64 / shown_height.max(1.0),
+        );
+        let a = table.turn.point((area[0] as f64, area[1] as f64), size);
+        let b = table.turn.point((area[2] as f64, area[3] as f64), size);
+        let (x0, y0) = (
+            (a.0.min(b.0) * sx).floor() as i32,
+            (a.1.min(b.1) * sy).floor() as i32,
+        );
+        let (x1, y1) = (
+            (a.0.max(b.0) * sx).ceil() as i32,
+            (a.1.max(b.1) * sy).ceil() as i32,
+        );
         RectI::new(x0, y0, x1 - x0, y1 - y0)
     }
 
@@ -819,9 +1043,13 @@ pub(crate) fn target_position(
         return None;
     }
     let page = target.page.min(table.len() - 1);
+    let (width, tall) = pages.get(page).copied().unwrap_or((1.0, 1.0));
+    let size = (width.max(1.0) as f64, tall.max(1.0) as f64);
     let down = target.top.map_or(0.0, |top| {
-        let tall = pages.get(page).map_or(1.0, |p| p.1).max(1.0);
-        top.clamp(0.0, tall) * table.size(page).1 as f32 / tall
+        // What is at the left of a page that is turned is as good as it gets.
+        let top = top.clamp(0.0, tall) as f64;
+        let down = table.turn.point((0.0, top), size).1;
+        down * table.size(page).1 as f64 / table.turn.size(size).1
     });
     Some(table.top(page) + down as i32)
 }

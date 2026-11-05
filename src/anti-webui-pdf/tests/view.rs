@@ -3,13 +3,14 @@
 
 use anti_webui_core::Ui;
 use anti_webui_core::event::{ClipboardKind as Clipboard, Key, KeyEvent, PointerButton};
-use anti_webui_core::event::{Modifiers, ScrollPhase, ScrollSource, WindowEvent};
+use anti_webui_core::event::{Modifiers, PinchPhase, ScrollPhase, ScrollSource, WindowEvent};
 use anti_webui_core::geometry::{PointF, Scale, SizeI};
 use anti_webui_core::platform::{CursorIcon, PlatformRequest};
 use anti_webui_core::prelude::*;
 use anti_webui_core::scene::{ImageDraw, Primitive, Scene};
 use anti_webui_pdf::{
-    PdfError, PdfOutlineItem, PdfState, PdfTarget, PdfViewer, PdfZoom, pdf_view, pdf_viewer,
+    PdfError, PdfOutlineItem, PdfState, PdfTarget, PdfViewer, PdfZoom, pdf_thumbnails, pdf_view,
+    pdf_viewer,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -1216,4 +1217,701 @@ fn pressing_on_the_scrollbar_does_not_select() {
     move_to(&mut ui, PointF::new(555.0, 200.0));
     release(&mut ui, PointF::new(555.0, 200.0));
     assert!(!viewer.has_selection());
+}
+
+/// A page that is red in its top half and green in its bottom half.
+fn two_colors() -> Vec<u8> {
+    let content = "1 0 0 rg 0 100 100 100 re f 0 1 0 rg 0 0 100 100 re f".to_owned();
+    document_of((100, 200), &[content])
+}
+
+fn upright(ui: &mut Ui) -> ImageDraw {
+    settle(ui);
+    let drawn = pictures(ui);
+    assert_eq!(drawn.len(), 1, "{drawn:?}");
+    drawn.into_iter().next().unwrap()
+}
+
+#[test]
+fn turning_changes_the_box_and_draws_it_turned() {
+    let data = two_colors();
+    let viewer = Rc::new(std::cell::Cell::new(None));
+    let handed = viewer.clone();
+    let mut ui = mount((420, 420), ONE, move || {
+        let v = pdf_viewer();
+        handed.set(Some(v));
+        v.set_zoom(PdfZoom::Percent(0.75));
+        pdf_view(data).viewer(v).w_full().h_full().gap(0.0)
+    });
+    let viewer = viewer.get().unwrap();
+    let d = upright(&mut ui);
+    assert_eq!((d.rect.width, d.rect.height), (100, 200));
+    assert_eq!(pixel(&d, 50, 20), [255, 0, 0, 255]);
+    assert_eq!(pixel(&d, 50, 180), [0, 255, 0, 255]);
+
+    // A quarter turn clockwise takes the top to the right.
+    viewer.rotate_clockwise();
+    let d = upright(&mut ui);
+    assert_eq!(viewer.rotation(), 90);
+    assert_eq!((d.rect.width, d.rect.height), (200, 100));
+    assert_eq!(pixel(&d, 180, 50), [255, 0, 0, 255]);
+    assert_eq!(pixel(&d, 20, 50), [0, 255, 0, 255]);
+
+    viewer.rotate_clockwise();
+    let d = upright(&mut ui);
+    assert_eq!(viewer.rotation(), 180);
+    assert_eq!((d.rect.width, d.rect.height), (100, 200));
+    assert_eq!(pixel(&d, 50, 180), [255, 0, 0, 255]);
+
+    viewer.rotate_counterclockwise();
+    viewer.rotate_counterclockwise();
+    viewer.rotate_counterclockwise();
+    let d = upright(&mut ui);
+    assert_eq!(viewer.rotation(), 270);
+    assert_eq!(pixel(&d, 20, 50), [255, 0, 0, 255]);
+    viewer.set_rotation(0);
+    let d = upright(&mut ui);
+    assert_eq!(pixel(&d, 50, 20), [255, 0, 0, 255]);
+}
+
+#[test]
+fn a_page_that_fits_is_not_left_at_its_old_turn() {
+    // It is square, so that its size doesn't say that it has to be drawn again.
+    let content = "1 0 0 rg 0 100 200 100 re f 0 1 0 rg 0 0 200 100 re f".to_owned();
+    let data = document_of((200, 200), &[content]);
+    let viewer = Rc::new(std::cell::Cell::new(None));
+    let handed = viewer.clone();
+    let mut ui = mount((420, 420), ONE, move || {
+        let v = pdf_viewer();
+        handed.set(Some(v));
+        v.set_zoom(PdfZoom::Percent(0.75));
+        pdf_view(data).viewer(v).w_full().h_full().gap(0.0)
+    });
+    let viewer = viewer.get().unwrap();
+    assert_eq!(pixel(&upright(&mut ui), 100, 20), [255, 0, 0, 255]);
+    viewer.rotate_clockwise();
+    assert_eq!(pixel(&upright(&mut ui), 20, 100), [0, 255, 0, 255]);
+}
+
+#[test]
+fn fitting_goes_by_the_turned_page() {
+    let (mut ui, viewer) = viewer_of((420, 300), &[RED]);
+    settle(&mut ui);
+    let upright = viewer.percent();
+    viewer.rotate_clockwise();
+    settle(&mut ui);
+    // It is twice as wide as it is tall now, in a box as wide as it was.
+    let ratio = viewer.percent() / upright;
+    assert!((ratio - 0.5).abs() < 0.01, "{ratio}");
+    let d = pictures(&mut ui).remove(0);
+    assert_eq!(d.rect.width, 400);
+}
+
+#[test]
+fn control_with_brackets_turns_the_pages() {
+    let doc = TextDocument::new(&[&line(20, 200, FOX)]);
+    let (mut ui, viewer) = read(&doc);
+    control(&mut ui, "]");
+    assert_eq!(viewer.rotation(), 90);
+    control(&mut ui, "[");
+    control(&mut ui, "[");
+    assert_eq!(viewer.rotation(), 270);
+}
+
+/// Where a point of the first page is in the box when turned a quarter turn clockwise, at the same
+/// zoom as [`at`]. It takes 400 of the 560 pixels across then, in the middle.
+fn at_turned(x: f32, y: f32) -> PointF {
+    let (shown_x, shown_y) = (y, x);
+    PointF::new(80.0 + shown_x * 4.0 / 3.0, shown_y * 4.0 / 3.0)
+}
+
+#[test]
+fn text_is_selected_where_it_shows_when_turned() {
+    let doc = TextDocument::new(&[&line(20, 200, FOX)]);
+    let (mut ui, viewer) = read(&doc);
+    viewer.rotate_clockwise();
+    settle(&mut ui);
+    // Turning kept what was in the middle there.
+    viewer.go_to_page(0);
+    settle(&mut ui);
+    drag(&mut ui, at_turned(19.0, 205.0), at_turned(300.0, 205.0));
+    assert!(viewer.has_selection());
+    assert_eq!(copied(&mut ui).as_deref(), Some(FOX));
+}
+
+#[test]
+fn what_is_selected_stays_selected_and_moves_when_turning() {
+    let doc = TextDocument::new(&[&line(20, 200, FOX)]);
+    let (mut ui, viewer) = read(&doc);
+    drag(&mut ui, at(19.0, 205.0), at(300.0, 205.0));
+    let selected = |ui: &mut Ui| {
+        fn walk(scene: &Scene, at: (i32, i32), out: &mut Vec<(i32, i32, i32, i32)>) {
+            for p in &scene.primitives {
+                match p {
+                    Primitive::Quad(q) if q.background == Color::from_rgba(0x0054b466) => {
+                        out.push((
+                            q.rect.x + at.0,
+                            q.rect.y + at.1,
+                            q.rect.width,
+                            q.rect.height,
+                        ))
+                    }
+                    Primitive::Layer(l) => {
+                        walk(&l.content, (at.0 + l.origin.x, at.1 + l.origin.y), out)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&ui.paint(Instant::now()), (0, 0), &mut out);
+        out
+    };
+    let before = selected(&mut ui);
+    assert_eq!(before.len(), 1, "{before:?}");
+    assert!(before[0].2 > before[0].3, "it goes across: {before:?}");
+    viewer.rotate_clockwise();
+    settle(&mut ui);
+    assert!(viewer.has_selection());
+    let after = selected(&mut ui);
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert!(after[0].3 > after[0].2, "it goes down: {after:?}");
+    assert_eq!((after[0].2, after[0].3), (before[0].3, before[0].2));
+}
+
+#[test]
+fn turning_keeps_what_shows_on_the_same_page() {
+    let (mut ui, viewer) = viewer_of((420, 300), &[RED, GREEN, RED, GREEN, RED]);
+    settle(&mut ui);
+    viewer.go_to_page(3);
+    settle(&mut ui);
+    assert_eq!(viewer.page(), 3);
+    viewer.rotate_clockwise();
+    settle(&mut ui);
+    assert_eq!(viewer.page(), 3);
+    viewer.rotate_counterclockwise();
+    settle(&mut ui);
+    assert_eq!(viewer.page(), 3);
+}
+
+#[test]
+fn a_place_in_a_turned_document_is_where_it_shows() {
+    let doc = TextDocument::new(&[
+        &line(20, 200, FOX),
+        &line(20, 200, FOX),
+        &line(20, 200, FOX),
+    ]);
+    let (mut ui, viewer) = read(&doc);
+    viewer.set_rotation(180);
+    settle(&mut ui);
+    // 280 points down from the top is 20 from the top when it is upside down.
+    viewer.go_to(PdfTarget {
+        page: 1,
+        top: Some(280.0),
+    });
+    settle(&mut ui);
+    let drawn = pictures(&mut ui);
+    let top_of_page = drawn
+        .iter()
+        .map(|d| d.rect.y)
+        .find(|y| (-400..=0).contains(y))
+        .expect("it shows");
+    assert!(
+        (top_of_page + (20.0f32 * 4.0 / 3.0) as i32).abs() <= 1,
+        "{drawn:?}"
+    );
+}
+
+fn pinch(ui: &mut Ui, p: PointF, scale: f32, phase: PinchPhase) {
+    ui.handle_event(WindowEvent::Pinch {
+        position: p,
+        scale,
+        modifiers: Modifiers::default(),
+        phase,
+    });
+    settle(ui);
+}
+
+#[test]
+fn pinching_zooms_and_keeps_what_is_under_the_pointer() {
+    let (mut ui, viewer) = viewer_of((420, 300), &[RED, GREEN]);
+    viewer.set_zoom(PdfZoom::Percent(1.0));
+    settle(&mut ui);
+    let p = PointF::new(210.0, 150.0);
+    let d = pictures(&mut ui).remove(0);
+    let (fx, fy) = (
+        (p.x - d.rect.x as f32) / d.rect.width as f32,
+        (p.y - d.rect.y as f32) / d.rect.height as f32,
+    );
+    pinch(&mut ui, p, 1.0, PinchPhase::Began);
+    assert_eq!(viewer.percent(), 1.0);
+    pinch(&mut ui, p, 1.2, PinchPhase::Moved);
+    pinch(&mut ui, p, 1.5, PinchPhase::Moved);
+    pinch(&mut ui, p, 1.0, PinchPhase::Ended);
+    assert!(
+        (viewer.percent() - 1.8).abs() < 0.001,
+        "{}",
+        viewer.percent()
+    );
+    let d = pictures(&mut ui).remove(0);
+    let (gx, gy) = (
+        (p.x - d.rect.x as f32) / d.rect.width as f32,
+        (p.y - d.rect.y as f32) / d.rect.height as f32,
+    );
+    assert!(
+        (fx - gx).abs() < 0.01 && (fy - gy).abs() < 0.01,
+        "{fx},{fy} {gx},{gy}"
+    );
+    pinch(&mut ui, p, 1.0, PinchPhase::Began);
+    pinch(&mut ui, p, 0.5, PinchPhase::Moved);
+    assert!(
+        (viewer.percent() - 0.9).abs() < 0.001,
+        "{}",
+        viewer.percent()
+    );
+}
+
+/// A viewer with thumbnails in a column to the left of it, as tall as `height`.
+fn with_thumbnails(pages: usize, height: i32) -> (Ui, PdfViewer, Signal<bool>) {
+    let contents = vec![String::from("0 0 1 rg 0 0 100 100 re f"); pages];
+    let data = document_of((100, 100), &contents);
+    let handed = Rc::new(RefCell::new(None));
+    let kept = handed.clone();
+    let mut ui = mount((600, height), ONE, move || {
+        let v = pdf_viewer();
+        let open = signal(true);
+        *kept.borrow_mut() = Some((v, open));
+        div()
+            .flex()
+            .w_full()
+            .h_full()
+            .child(show(
+                move || open.get(),
+                move || {
+                    pdf_thumbnails(v)
+                        .thumbnail_width(100.0)
+                        .w(150.0)
+                        .h_full()
+                        .flex_none()
+                },
+            ))
+            .child(pdf_view(data).viewer(v).flex_1().h_full())
+    });
+    settle(&mut ui);
+    let (v, open) = handed.borrow().expect("it was made");
+    (ui, v, open)
+}
+
+/// The thumbnails that show, by being 100 pixels wide.
+fn thumbnails(ui: &mut Ui) -> Vec<ImageDraw> {
+    pictures(ui)
+        .into_iter()
+        .filter(|d| d.bitmap.width() == 100)
+        .collect()
+}
+
+#[test]
+fn thumbnails_are_drawn_at_their_own_size_for_what_shows() {
+    let (mut ui, _viewer, _) = with_thumbnails(50, 400);
+    let shown = thumbnails(&mut ui);
+    // Each takes 100 pixels, 22 for the number and 10 between them, from 10 down.
+    assert_eq!(shown.len(), 3, "{shown:?}");
+    assert_eq!((shown[0].rect.width, shown[0].rect.height), (100, 100));
+    assert_eq!(pixel(&shown[0], 50, 50), [0, 0, 255, 255]);
+    assert_eq!(shown[1].rect.y - shown[0].rect.y, 132);
+}
+
+#[test]
+fn clicking_a_thumbnail_goes_to_its_page() {
+    let (mut ui, viewer, _) = with_thumbnails(20, 400);
+    let d = thumbnails(&mut ui)[2].clone();
+    let p = PointF::new(d.rect.x as f32 + 50.0, d.rect.y as f32 + 50.0);
+    press(&mut ui, p, 0);
+    release(&mut ui, p);
+    assert_eq!(viewer.page(), 2);
+}
+
+/// Where the thumbnail of the page being read is.
+fn outlined(ui: &mut Ui) -> Option<i32> {
+    fn walk(scene: &Scene, at: i32, found: &mut Option<i32>) {
+        for p in &scene.primitives {
+            match p {
+                Primitive::Quad(q) if q.border_widths[0] > 0 => *found = Some(q.rect.y + at),
+                Primitive::Layer(l) => walk(&l.content, at + l.origin.y, found),
+                _ => {}
+            }
+        }
+    }
+    let mut found = None;
+    walk(&ui.paint(Instant::now()), 0, &mut found);
+    found
+}
+
+#[test]
+fn thumbnails_keep_up_with_the_page_being_read() {
+    let (mut ui, viewer, _) = with_thumbnails(100, 400);
+    viewer.go_to_page(60);
+    settle(&mut ui);
+    settle(&mut ui);
+    // The row of that page shows: it is the only one with an outline.
+    let shown = thumbnails(&mut ui);
+    assert!(!shown.is_empty());
+    let scene_y = shown[0].rect.y;
+    assert!(outlined(&mut ui).is_some_and(|y| (0..300).contains(&y)));
+    // Scrolling it by hand stays.
+    ui.handle_event(WindowEvent::Scroll {
+        position: PointF::new(50.0, 200.0),
+        delta_x: 0.0,
+        delta_y: 2000.0,
+        modifiers: Modifiers::default(),
+        source: ScrollSource::Unknown,
+        phase: ScrollPhase::Single,
+        time: 0,
+    });
+    settle(&mut ui);
+    let moved = thumbnails(&mut ui);
+    assert_ne!(
+        moved[0].rect.y, scene_y,
+        "it stays where it was scrolled to"
+    );
+    assert_eq!(viewer.page(), 60);
+}
+
+#[test]
+fn thumbnails_are_let_go_of_when_they_are_gone() {
+    let (mut ui, _, open) = with_thumbnails(20, 400);
+    assert!(!thumbnails(&mut ui).is_empty());
+    open.set(false);
+    settle(&mut ui);
+    assert!(thumbnails(&mut ui).is_empty());
+    open.set(true);
+    settle(&mut ui);
+    assert_eq!(thumbnails(&mut ui).len(), 3);
+}
+
+#[test]
+fn thumbnails_turn_with_the_pages() {
+    let (mut ui, viewer, _) = with_thumbnails(4, 400);
+    viewer.rotate_clockwise();
+    settle(&mut ui);
+    settle(&mut ui);
+    assert_eq!(thumbnails(&mut ui).len(), 3);
+    assert_eq!(viewer.rotation(), 90);
+}
+
+/// A selection across the words of a line, ready to be pressed in the middle.
+fn selected_fox() -> (Ui, PdfViewer) {
+    let doc = TextDocument::new(&[&line(20, 200, FOX)]);
+    let (mut ui, viewer) = read(&doc);
+    drag(&mut ui, at(19.0, 205.0), at(300.0, 205.0));
+    assert!(viewer.has_selection());
+    ui.take_requests();
+    (ui, viewer)
+}
+
+fn offered_text(ui: &mut Ui) -> Option<String> {
+    ui.take_requests().into_iter().find_map(|r| match r {
+        PlatformRequest::StartDrag(offer) => offer
+            .items
+            .iter()
+            .find(|(mime, _)| mime.starts_with("text/plain"))
+            .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned()),
+        _ => None,
+    })
+}
+
+#[test]
+fn what_is_selected_can_be_carried_to_another_program() {
+    let (mut ui, viewer) = selected_fox();
+    ui.set_platform_drag(true);
+    let p = at(100.0, 205.0);
+    press(&mut ui, p, 5000);
+    // Pressing it doesn't change it.
+    assert!(viewer.has_selection());
+    // Not yet: it could still be a click.
+    move_to(&mut ui, PointF::new(p.x + 2.0, p.y + 2.0));
+    assert_eq!(offered_text(&mut ui), None);
+    // It goes as soon as it has moved enough one way.
+    move_to(&mut ui, PointF::new(p.x + 5.0, p.y));
+    assert_eq!(offered_text(&mut ui).as_deref(), Some(FOX));
+    assert!(viewer.has_selection());
+    // It is over when the system says so, and the selection is still there.
+    ui.handle_event(WindowEvent::DragSourceEnded(DragResult::Copied));
+    settle(&mut ui);
+    assert!(viewer.has_selection());
+    assert_eq!(copied(&mut ui).as_deref(), Some(FOX));
+}
+
+#[test]
+fn carrying_a_selection_only_lets_it_be_copied() {
+    let (mut ui, _) = selected_fox();
+    ui.set_platform_drag(true);
+    let p = at(100.0, 205.0);
+    press(&mut ui, p, 5000);
+    move_to(&mut ui, PointF::new(p.x + 8.0, p.y));
+    let actions = ui.take_requests().into_iter().find_map(|r| match r {
+        PlatformRequest::StartDrag(offer) => Some(offer.actions),
+        _ => None,
+    });
+    assert_eq!(actions, Some(DragActions::Copy));
+}
+
+#[test]
+fn a_click_on_what_is_selected_lets_go_of_it() {
+    let (mut ui, viewer) = selected_fox();
+    let p = at(100.0, 205.0);
+    press(&mut ui, p, 5000);
+    assert!(viewer.has_selection());
+    release(&mut ui, p);
+    assert!(!viewer.has_selection());
+}
+
+#[test]
+fn a_press_beside_what_is_selected_starts_over() {
+    let doc = TextDocument::new(&[&line(20, 200, FOX)]);
+    let (mut ui, viewer) = read(&doc);
+    // Only part of the line.
+    drag(&mut ui, at(19.0, 205.0), at(45.0, 205.0));
+    let first = copied(&mut ui).expect("something is selected");
+    ui.set_platform_drag(true);
+    ui.take_requests();
+    let p = at(70.0, 205.0);
+    press(&mut ui, p, 5000);
+    assert!(!viewer.has_selection());
+    move_to(&mut ui, at(90.0, 205.0));
+    assert_eq!(offered_text(&mut ui), None);
+    assert!(viewer.has_selection());
+    assert_ne!(copied(&mut ui), Some(first));
+}
+
+#[test]
+fn a_second_click_on_what_is_selected_still_takes_a_word() {
+    let (mut ui, viewer) = selected_fox();
+    ui.set_platform_drag(true);
+    let p = at(100.0, 205.0);
+    press(&mut ui, p, 5000);
+    release(&mut ui, p);
+    press(&mut ui, p, 5100);
+    release(&mut ui, p);
+    assert!(viewer.has_selection());
+    let word = copied(&mut ui).expect("a word");
+    assert!(!word.contains(' '), "{word}");
+    assert!(FOX.contains(&word), "{word}");
+}
+
+#[test]
+fn shift_on_what_is_selected_goes_on_selecting() {
+    let (mut ui, viewer) = selected_fox();
+    ui.set_platform_drag(true);
+    let p = at(100.0, 205.0);
+    ui.handle_event(WindowEvent::PointerMoved {
+        position: p,
+        modifiers: Modifiers::default(),
+    });
+    let shift = Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+    ui.handle_event(WindowEvent::PointerButton {
+        button: PointerButton::Primary,
+        pressed: true,
+        position: p,
+        modifiers: shift,
+        time: 5000,
+    });
+    settle(&mut ui);
+    ui.handle_event(WindowEvent::PointerMoved {
+        position: PointF::new(p.x + 20.0, p.y),
+        modifiers: shift,
+    });
+    settle(&mut ui);
+    assert_eq!(offered_text(&mut ui), None);
+    assert!(viewer.has_selection());
+}
+
+#[test]
+fn all_of_a_long_selection_is_carried_even_if_it_was_not_read_yet() {
+    // More pages than keep their text, of which what doesn't show hasn't been read.
+    let pages: Vec<String> = (0..60)
+        .map(|i| line(20, 200, &format!("page{i}")))
+        .collect();
+    let refs: Vec<&str> = pages.iter().map(String::as_str).collect();
+    let doc = TextDocument::new(&refs);
+    let (mut ui, viewer) = read(&doc);
+    let p = at(30.0, 205.0);
+    press(&mut ui, p, 0);
+    release(&mut ui, p);
+    control(&mut ui, "a");
+    assert!(viewer.has_selection());
+    ui.set_platform_drag(true);
+    ui.take_requests();
+    press(&mut ui, p, 5000);
+    move_to(&mut ui, PointF::new(p.x + 8.0, p.y));
+    let text = offered_text(&mut ui).expect("it started");
+    assert!(text.contains("page0") && text.contains("page59"), "{text}");
+}
+
+#[test]
+fn only_the_text_shows_with_the_pointer_and_not_the_page() {
+    let (mut ui, _) = selected_fox();
+    let p = at(100.0, 205.0);
+    press(&mut ui, p, 5000);
+    let before = pictures(&mut ui).len();
+    move_to(&mut ui, PointF::new(p.x + 8.0, p.y));
+    let drawn = pictures(&mut ui);
+    assert_eq!(drawn.len(), before + 1, "{drawn:?}");
+    let d = drawn
+        .iter()
+        .find(|d| !d.bitmap.is_opaque())
+        .expect("what is carried isn't opaque");
+    let mut there = (0u64, 0u64);
+    d.bitmap.with_levels(|level, _, pixels| {
+        if level == 0 {
+            for px in pixels.chunks_exact(4) {
+                if px[3] == 0 {
+                    there.0 += 1;
+                } else {
+                    there.1 += 1;
+                }
+                assert!(px[0] <= px[3] && px[1] <= px[3] && px[2] <= px[3], "{px:?}");
+            }
+        }
+    });
+    let share = there.1 as f64 / (there.0 + there.1) as f64;
+    assert!(there.0 > 0 && there.1 > 0, "{there:?}");
+    assert!(share < 0.5, "{share}");
+    // The pointer stays on what was pressed, as far along it as it was.
+    let moved = PointF::new(p.x + 8.0, p.y);
+    assert!(
+        d.rect.x as f32 <= moved.x && d.rect.right() as f32 >= moved.x,
+        "{d:?} {moved:?}"
+    );
+    assert!(
+        d.rect.y as f32 <= moved.y && d.rect.bottom() as f32 >= moved.y,
+        "{d:?} {moved:?}"
+    );
+}
+
+#[test]
+fn what_is_selected_can_be_dropped_in_an_input_next_to_it() {
+    let doc = TextDocument::new(&[&line(20, 200, FOX)]);
+    let bytes = doc.build();
+    let handed = Rc::new(RefCell::new(None));
+    let kept = handed.clone();
+    let mut ui = mount((560, 460), ONE, move || {
+        let v = pdf_viewer();
+        let value = signal(String::new());
+        *kept.borrow_mut() = Some((v, value));
+        v.set_zoom(PdfZoom::Percent(1.0));
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .h_full()
+            .child(text_input().value(value).h(40.0).flex_none().w_full())
+            .child(pdf_view(bytes).viewer(v).gap(0.0).flex_1().min_h(0.0))
+    });
+    settle(&mut ui);
+    let (viewer, value) = handed.borrow().expect("it was made");
+    let below = |p: PointF| PointF::new(p.x, p.y + 40.0);
+    drag(&mut ui, below(at(19.0, 205.0)), below(at(300.0, 205.0)));
+    assert!(viewer.has_selection());
+    let p = below(at(100.0, 205.0));
+    press(&mut ui, p, 5000);
+    move_to(&mut ui, PointF::new(p.x, p.y - 100.0));
+    let input = PointF::new(50.0, 20.0);
+    move_to(&mut ui, input);
+    release(&mut ui, input);
+    assert_eq!(value.get_untracked(), FOX);
+    assert!(viewer.has_selection());
+}
+
+#[test]
+fn what_is_selected_shows_turned_when_carried_from_a_turned_page() {
+    let doc = TextDocument::new(&[&line(20, 200, FOX)]);
+    let (mut ui, viewer) = read(&doc);
+    viewer.rotate_clockwise();
+    settle(&mut ui);
+    // Turning kept what was in the middle there.
+    viewer.go_to_page(0);
+    settle(&mut ui);
+    drag(&mut ui, at_turned(19.0, 205.0), at_turned(300.0, 205.0));
+    assert!(viewer.has_selection());
+    let p = at_turned(60.0, 205.0);
+    press(&mut ui, p, 5000);
+    move_to(&mut ui, PointF::new(p.x, p.y + 8.0));
+    let drawn = pictures(&mut ui);
+    let d = drawn
+        .iter()
+        .find(|d| !d.bitmap.is_opaque())
+        .expect("what is carried isn't opaque");
+    assert!(d.bitmap.height() > d.bitmap.width(), "{d:?}");
+}
+
+#[test]
+fn pages_stay_as_they_are_while_pinching_and_get_drawn_when_it_is_over() {
+    let (mut ui, viewer) = viewer_of((420, 300), &[RED, GREEN]);
+    viewer.set_zoom(PdfZoom::Percent(1.0));
+    settle(&mut ui);
+    let p = PointF::new(210.0, 150.0);
+    let first = pictures(&mut ui).remove(0);
+    let (width, id) = (first.bitmap.width(), first.bitmap.id());
+    pinch(&mut ui, p, 1.0, PinchPhase::Began);
+    pinch(&mut ui, p, 1.5, PinchPhase::Moved);
+    let d = pictures(&mut ui).remove(0);
+    assert_eq!(d.bitmap.id(), id, "it stays");
+    assert_eq!(d.rect.width as f32, (width as f32 * 1.5).round());
+    // It is more than twice as big as what there is now.
+    pinch(&mut ui, p, 1.5, PinchPhase::Moved);
+    let d = pictures(&mut ui).remove(0);
+    assert_ne!(d.bitmap.id(), id, "it was too far off");
+    assert_eq!(d.bitmap.width() as i32, d.rect.width);
+    let again = d.bitmap.id();
+    pinch(&mut ui, p, 1.2, PinchPhase::Moved);
+    assert_eq!(pictures(&mut ui).remove(0).bitmap.id(), again);
+    pinch(&mut ui, p, 1.0, PinchPhase::Ended);
+    let d = pictures(&mut ui).remove(0);
+    assert_eq!(d.bitmap.width() as i32, d.rect.width, "it is sharp again");
+}
+
+#[test]
+fn nothing_ahead_is_drawn_while_pinching() {
+    let (mut ui, viewer) = viewer_of((420, 300), &[RED, GREEN, RED, GREEN, RED, GREEN]);
+    viewer.set_zoom(PdfZoom::Percent(1.0));
+    settle(&mut ui);
+    let p = PointF::new(210.0, 150.0);
+    pinch(&mut ui, p, 1.0, PinchPhase::Began);
+    pinch(&mut ui, p, 0.7, PinchPhase::Moved);
+    pinch(&mut ui, p, 0.7, PinchPhase::Moved);
+    // More pages show now, and those that have nothing are all that is drawn.
+    for d in pictures(&mut ui) {
+        assert_ne!(d.bitmap.width(), 0);
+    }
+    pinch(&mut ui, p, 1.0, PinchPhase::Cancelled);
+    for d in pictures(&mut ui) {
+        assert_eq!(d.bitmap.width() as i32, d.rect.width, "{d:?}");
+    }
+}
+
+#[test]
+fn what_is_selected_goes_on_a_surface_of_its_own_when_carried_to_another_program() {
+    let (mut ui, _) = selected_fox();
+    ui.set_platform_drag(true);
+    let p = at(60.0, 205.0);
+    press(&mut ui, p, 5000);
+    move_to(&mut ui, PointF::new(p.x + 8.0, p.y));
+    let icon = ui
+        .paint_frame(Instant::now())
+        .drag_icon
+        .expect("it has one");
+    assert!(icon.logical.width > 0 && icon.logical.height > 0);
+    // The pointer is on what it was pressed on.
+    assert!(
+        icon.hotspot.x > 0 && icon.hotspot.x < icon.logical.width,
+        "{icon:?}"
+    );
+    assert!(
+        icon.hotspot.y >= 0 && icon.hotspot.y < icon.logical.height,
+        "{icon:?}"
+    );
 }

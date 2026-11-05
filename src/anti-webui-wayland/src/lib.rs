@@ -411,7 +411,7 @@ pub fn run<H: WaylandHandler>(options: WindowOptions, mut handler: H) -> Result<
         .bind::<zwp_text_input_manager_v3::ZwpTextInputManagerV3, _, _>(&qh, 1..=1, ())
         .ok();
     state.pointer_gestures = globals
-        .bind::<zwp_pointer_gestures_v1::ZwpPointerGesturesV1, _, _>(&qh, 3..=3, ())
+        .bind::<zwp_pointer_gestures_v1::ZwpPointerGesturesV1, _, _>(&qh, 1..=3, ())
         .ok();
     state.data_device_manager = globals.bind(&qh, 1..=3, ()).ok();
     state.primary_manager = globals

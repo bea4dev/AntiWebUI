@@ -9,26 +9,31 @@ mod links;
 mod plan;
 mod reading;
 mod text;
+mod thumbnails;
 
 use anti_webui_core::channel::ui_channel;
-use anti_webui_core::event::{Key, KeyboardEvent, NamedKey, ScrollEvent};
+use anti_webui_core::event::{Key, KeyboardEvent, NamedKey, PinchPhase, ScrollEvent};
 use anti_webui_core::geometry::{PointF, RectI};
 use anti_webui_core::images::Bitmap;
 use anti_webui_core::prelude::*;
 use engine::{Engine, Event};
 pub use links::{PdfOutlineItem, PdfTarget};
-use plan::{Direction, Have, Held, Job, PageTable};
+use plan::{Direction, Have, Held, Job, PageTable, Turn};
 use reading::{BoxKind, HitPlace, Hits, Place, Reader, Selection};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+pub use thumbnails::{PdfThumbnails, pdf_thumbnails};
 
 /// How many physical pixels a point takes at 100% and a scale of 1, as in CSS.
 const PX_PER_PT: f64 = 96.0 / 72.0;
 const MIN_ZOOM: f32 = 0.1;
 const MAX_ZOOM: f32 = 16.0;
+/// How many times off a picture can be while pinching before it gets drawn again:
+/// `kMaxScaleRatioDuringPinch` in Chromium.
+const PINCH_RATIO: f64 = 2.0;
 /// What shows on top of text that is selected, was found, and was found and is being looked at.
 const SELECTED: u32 = 0x0054b466;
 const FOUND: u32 = 0xffd60066;
@@ -127,11 +132,23 @@ impl From<Arc<[u8]>> for PdfSource {
     }
 }
 
+/// The thumbnails there are, by page.
+type Thumbnails = HashMap<usize, (Job, Option<Arc<Bitmap>>)>;
+
 /// Controls a [`pdf_view`] and says how far it has come. It can be copied into closures like a
 /// signal.
 #[derive(Clone, Copy)]
 pub struct PdfViewer {
     node: NodeRef,
+    /// How big each page is, in points, as the document has it.
+    pages: Signal<Rc<Vec<(f32, f32)>>>,
+    turn: Signal<Turn>,
+    /// What [`pdf_thumbnails`] has, and what it wants next. A thumbnail that couldn't be drawn has
+    /// no picture.
+    thumbnails: Signal<Thumbnails>,
+    thumbnails_wanted: Signal<Vec<Job>>,
+    /// How many are showing, as there is nothing to keep thumbnails for without one.
+    thumbnail_lists: Signal<usize>,
     zoom: Signal<PdfZoom>,
     percent: Signal<f32>,
     page: Signal<usize>,
@@ -155,6 +172,11 @@ pub struct PdfViewer {
 pub fn pdf_viewer() -> PdfViewer {
     PdfViewer {
         node: node_ref(),
+        pages: signal(Rc::new(Vec::new())),
+        turn: signal(Turn::default()),
+        thumbnails: signal(HashMap::new()),
+        thumbnails_wanted: signal(Vec::new()),
+        thumbnail_lists: signal(0),
         zoom: signal(PdfZoom::FitWidth),
         percent: signal(1.0),
         page: signal(0),
@@ -187,6 +209,27 @@ impl PdfViewer {
         let now = self.percent.get_untracked();
         self.zoom
             .set(PdfZoom::Percent((now * factor).clamp(MIN_ZOOM, MAX_ZOOM)));
+    }
+
+    /// How far the pages are turned clockwise, in degrees: 0, 90, 180 or 270. Only the view turns,
+    /// and the document stays as it is.
+    pub fn rotation(&self) -> i32 {
+        self.turn.get().0 as i32 * 90
+    }
+
+    /// Turns the pages to this many degrees clockwise, down to a quarter turn.
+    pub fn set_rotation(&self, degrees: i32) {
+        self.turn.set_if_changed(Turn::degrees(degrees));
+    }
+
+    /// Turns the pages a quarter turn clockwise, keeping what is in the middle there.
+    pub fn rotate_clockwise(&self) {
+        self.turn.update(|turn| *turn = turn.by(1));
+    }
+
+    /// Turns the pages a quarter turn counterclockwise, keeping what is in the middle there.
+    pub fn rotate_counterclockwise(&self) {
+        self.turn.update(|turn| *turn = turn.by(-1));
     }
 
     /// How big it shows now, whatever the zoom was: 1.0 is 100%.
@@ -300,7 +343,8 @@ impl PdfViewer {
     }
 
     /// Gives it the keyboard: PageUp, PageDown, Home, End and the arrows move, Ctrl with `+`, `-` and
-    /// `0` zooms, Ctrl with `A` and `C` selects and copies, and Escape stops selecting.
+    /// `0` zooms, Ctrl with `]` and `[` turns, Ctrl with `A` and `C` selects and copies, and Escape
+    /// stops selecting.
     pub fn focus(&self) {
         self.node.focus();
     }
@@ -424,7 +468,8 @@ impl IntoView for PdfView {
         let on_page_error = self.on_page_error;
         let on_link = self.on_link;
 
-        let pages = signal(Rc::new(Vec::<(f32, f32)>::new()));
+        let pages = viewer.pages;
+        let pinching = signal(false);
         let pictures = signal(HashMap::<usize, Arc<Bitmap>>::new());
         // A sharp picture of what shows, of pages too big for one of all of it.
         let parts = signal(HashMap::<usize, (Job, Arc<Bitmap>)>::new());
@@ -458,15 +503,16 @@ impl IntoView for PdfView {
             let (width, height) = viewport.get();
             let (width, height) = (scale.px(width) as f64, scale.px(height) as f64);
             let gap = scale.px(gap) as f64;
+            let turn = viewer.turn.get();
             let fit_width = move |pages: &[(f32, f32)]| {
-                let widest = pages.iter().map(|p| p.0).fold(0.0, f32::max) as f64;
+                let widest = pages.iter().map(|p| turn.size(*p).0).fold(0.0, f32::max) as f64;
                 ((width - 2.0 * gap) / widest.max(1.0)).max(0.0)
             };
             let wanted = pages.with(|pages| match viewer.zoom.get() {
                 PdfZoom::Percent(p) => p as f64 * css,
                 PdfZoom::FitWidth => fit_width(pages),
                 PdfZoom::FitPage => {
-                    let tall = pages.first().map_or(1.0, |p| p.1) as f64;
+                    let tall = pages.first().map_or(1.0, |p| turn.size(*p).1) as f64;
                     fit_width(pages).min(((height - 2.0 * gap) / tall.max(1.0)).max(0.0))
                 }
             });
@@ -482,9 +528,10 @@ impl IntoView for PdfView {
         let table = memo(move || {
             let scale = window_scale();
             let width = scale.px(viewport.get().0);
-            Rc::new(
-                pages.with(|pages| PageTable::new(pages, px_per_pt.get(), scale.px(gap), width)),
-            )
+            let turn = viewer.turn.get();
+            Rc::new(pages.with(|pages| {
+                PageTable::turned(pages, turn, px_per_pt.get(), scale.px(gap), width)
+            }))
         });
 
         // Whatever makes the pages move keeps the same place on the same page in the same place of
@@ -602,9 +649,18 @@ impl IntoView for PdfView {
                         f(job.page);
                     }
                 }
+                Event::Thumbnail(job, bitmap) => {
+                    let turn = viewer.turn.get_untracked();
+                    if viewer.thumbnail_lists.get_untracked() > 0 && job.turn == turn {
+                        viewer.thumbnails.update(|all| {
+                            all.insert(job.page, (job, bitmap));
+                        });
+                    }
+                }
+                Event::CutOut(cut, picture) => reader.cut_out_arrived(&cut, picture),
                 Event::Drawn(job, bitmap) => {
                     let t = untrack(|| table.get());
-                    if job.page >= t.len() {
+                    if job.page >= t.len() || job.turn != t.turn {
                         return;
                     }
                     let v = untrack(view);
@@ -623,8 +679,17 @@ impl IntoView for PdfView {
                     } else {
                         let right = plan::is_right_size(size, job.size());
                         let wanted = keep.borrow().contains(&job.page);
-                        let there = pictures.with_untracked(|all| all.contains_key(&job.page));
-                        if !right && (there || !wanted) {
+                        let there = pictures.with_untracked(|all| {
+                            all.get(&job.page).map(|b| (b.width(), b.height()))
+                        });
+                        // What was drawn while pinching stays closer than what is there, even if
+                        // the size has moved on since.
+                        let want = plan::picture_size(size);
+                        let closer = pinching.get_untracked()
+                            && there.is_some_and(|there| {
+                                plan::size_is_off(job.size(), want) < plan::size_is_off(there, want)
+                            });
+                        if !right && !closer && (there.is_some() || !wanted) {
                             return;
                         }
                         pictures.update(|all| {
@@ -685,6 +750,30 @@ impl IntoView for PdfView {
             on_cleanup(move || *engine.borrow_mut() = None);
         }
 
+        // Pictures can't be used turned. As in Chromium and PDF.js, the pages are white until they
+        // have been drawn again.
+        {
+            let last = Cell::new(Turn::default());
+            effect(move || {
+                let turn = viewer.turn.get();
+                if last.replace(turn) != turn {
+                    pictures.update(HashMap::clear);
+                    parts.update(HashMap::clear);
+                    viewer.thumbnails.update(HashMap::clear);
+                }
+            });
+        }
+
+        {
+            let engine = engine.clone();
+            effect(move || {
+                let wanted = viewer.thumbnails_wanted.get();
+                if let Some(engine) = &*engine.borrow() {
+                    engine.want_thumbnails(wanted);
+                }
+            });
+        }
+
         // What no longer shows goes right away.
         effect(move || {
             let (t, v) = (table.get(), view());
@@ -716,7 +805,9 @@ impl IntoView for PdfView {
             });
         }
 
-        // Says what to draw whenever that may have changed.
+        // Says what to draw whenever that may have changed. While pinching what there is gets
+        // stretched, as nearly all that gets drawn would be for a size that has gone by the time it
+        // comes. Only what is too far off gets drawn again, as in Chromium.
         {
             let direction = direction.clone();
             let keep = keep.clone();
@@ -724,6 +815,7 @@ impl IntoView for PdfView {
             effect(move || {
                 let t = table.get();
                 let v = view();
+                let pinching = pinching.get();
                 let plan = failed.with(|failed| {
                     failed_parts.with(|failed_parts| {
                         pictures.with(|have| {
@@ -738,10 +830,22 @@ impl IntoView for PdfView {
                                             if failed.contains(&page) {
                                                 return Some(plan::picture_size(t.size(page)));
                                             }
-                                            have.get(&page).map(|b| (b.width(), b.height()))
+                                            let size =
+                                                have.get(&page).map(|b| (b.width(), b.height()));
+                                            let wanted = plan::picture_size(t.size(page));
+                                            match size {
+                                                Some(size)
+                                                    if pinching
+                                                        && plan::size_is_off(size, wanted)
+                                                            < PINCH_RATIO =>
+                                                {
+                                                    Some(wanted)
+                                                }
+                                                size => size,
+                                            }
                                         },
                                         part: |page| parts.get(&page).map(|p| p.0),
-                                        gave_up: |page| failed_parts.contains(&page),
+                                        gave_up: |page| pinching || failed_parts.contains(&page),
                                     },
                                     &mut goals.borrow_mut(),
                                 )
@@ -749,9 +853,14 @@ impl IntoView for PdfView {
                         })
                     })
                 });
+                let mut jobs = plan.jobs;
+                if pinching {
+                    let visible = t.visible(v.y, v.height);
+                    jobs.retain(|job| visible.contains(&job.page));
+                }
                 *keep.borrow_mut() = plan.keep;
                 if let Some(engine) = &*engine.borrow() {
-                    engine.want(plan.jobs);
+                    engine.want(jobs);
                 }
             });
         }
@@ -769,6 +878,18 @@ impl IntoView for PdfView {
                 offset.set_if_changed(at);
                 // What is under a pointer that is selecting has changed.
                 reader.extend_selection();
+            }
+        };
+
+        let on_pinch = {
+            let pointer = pointer.clone();
+            move |e: &PinchEvent| {
+                pinching.set_if_changed(matches!(e.phase, PinchPhase::Began | PinchPhase::Moved));
+                if e.phase == PinchPhase::Moved {
+                    pointer.set(Some((e.local.x as i32, e.local.y as i32)));
+                    viewer.zoom_by(e.scale);
+                }
+                e.stop_propagation();
             }
         };
 
@@ -790,6 +911,9 @@ impl IntoView for PdfView {
                     Key::Character(c) if c == "=" || c == "+" => viewer.zoom_by(1.25),
                     Key::Character(c) if c == "-" => viewer.zoom_by(0.8),
                     Key::Character(c) if c == "0" => viewer.set_zoom(PdfZoom::FitWidth),
+                    // As in Chromium's viewer.
+                    Key::Character(c) if c == "]" => viewer.rotate_clockwise(),
+                    Key::Character(c) if c == "[" => viewer.rotate_counterclockwise(),
                     // Otherwise the text of the application would get these too.
                     Key::Character(c)
                         if c.eq_ignore_ascii_case("c")
@@ -918,6 +1042,7 @@ impl IntoView for PdfView {
             .on_scrolled(on_scrolled)
             .on_resized(move |w, h| viewport.set_if_changed((w, h)))
             .on_scroll(on_scroll)
+            .on_pinch(on_pinch)
             .on_key_down(on_key)
             .dyn_style({
                 let cursor = reader.cursor;
@@ -1015,6 +1140,10 @@ mod tests {
     impl Session for FakeSession<'_> {
         fn text(&mut self, _: usize) -> text::PageText {
             text::PageText::default()
+        }
+
+        fn cut_out(&mut self, job: Job, _: &[RectI]) -> Bitmap {
+            self.draw(job)
         }
 
         fn draw(&mut self, job: Job) -> Bitmap {

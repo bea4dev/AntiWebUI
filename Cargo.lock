@@ -134,6 +134,7 @@ dependencies = [
  "anti-webui-core",
  "fontique",
  "hayro",
+ "libc",
  "log",
 ]
 

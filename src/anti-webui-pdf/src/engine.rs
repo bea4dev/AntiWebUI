@@ -7,6 +7,7 @@ use crate::links::PdfOutlineItem;
 use crate::plan::Job;
 use crate::text::PageText;
 use anti_webui_core::channel::{UiSender, UiWork};
+use anti_webui_core::geometry::RectI;
 use anti_webui_core::images::Bitmap;
 use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -35,11 +36,26 @@ pub(crate) trait Document: Send + Sync + 'static {
 pub(crate) trait Session {
     fn draw(&mut self, job: Job) -> Bitmap;
 
+    /// A picture of only `boxes` of a job, without the white of the page.
+    fn cut_out(&mut self, job: Job, boxes: &[RectI]) -> Bitmap;
+
     fn text(&mut self, page: usize) -> PageText;
 }
 
 /// An open document and the size of each page, in points.
 pub(crate) type Opened = (Arc<dyn Document>, Vec<(f32, f32)>);
+
+/// A picture of part of a page that shows with the pointer when dragging what is selected.
+#[derive(Debug, PartialEq)]
+pub(crate) struct CutOut {
+    /// Which press it is for.
+    pub press: u64,
+    pub job: Job,
+    /// What of the picture to keep.
+    pub boxes: Vec<RectI>,
+    /// Where it goes in the box of what is dragged.
+    pub at: RectI,
+}
 
 /// What the engine has to say to the UI thread.
 pub(crate) enum Event {
@@ -48,28 +64,38 @@ pub(crate) enum Event {
     Drawn(Job, Arc<Bitmap>),
     /// It panicked. The page won't be asked for again.
     NotDrawn(Job),
+    /// A thumbnail, which there is none of if drawing it panicked.
+    Thumbnail(Job, Option<Arc<Bitmap>>),
+    CutOut(Arc<CutOut>, Arc<Bitmap>),
     /// The text of a page, which there is none of if reading it panicked.
     Text(usize, Arc<PageText>),
     Outline(Vec<PdfOutlineItem>),
 }
 
 /// What a worker does.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Work {
     Draw(Job),
+    Thumbnail(Job),
     Text(usize),
+    CutOut(Arc<CutOut>),
 }
 
 /// What a worker is on.
 struct Running {
     work: Work,
-    /// Since when it hasn't been wanted. Text doesn't take long enough for this to matter.
+    /// Since when it hasn't been wanted, or something else has been more. Text doesn't take long
+    /// enough for this to matter.
     unwanted: Option<Instant>,
 }
 
 struct State {
     doc: Option<Arc<dyn Document>>,
     wanted: Vec<Job>,
+    /// What shows with the pointer, which comes before everything else.
+    cut_outs: Vec<Arc<CutOut>>,
+    /// The thumbnails, which come after all of the pictures of the pages.
+    thumbnails: Vec<Job>,
     /// The text someone is waiting for, which comes before all pictures.
     text_now: Vec<usize>,
     /// The text searching goes through, which comes after them.
@@ -88,15 +114,25 @@ struct State {
 
 impl State {
     fn nothing_wanted(&self) -> bool {
-        self.wanted.is_empty() && self.text_now.is_empty() && self.text_later.is_empty()
+        self.wanted.is_empty()
+            && self.cut_outs.is_empty()
+            && self.thumbnails.is_empty()
+            && self.text_now.is_empty()
+            && self.text_later.is_empty()
     }
 
     fn next_work(&mut self) -> Option<Work> {
+        if !self.cut_outs.is_empty() {
+            return Some(Work::CutOut(self.cut_outs.remove(0)));
+        }
         if !self.text_now.is_empty() {
             return Some(Work::Text(self.text_now.remove(0)));
         }
         if !self.wanted.is_empty() {
             return Some(Work::Draw(self.wanted.remove(0)));
+        }
+        if !self.thumbnails.is_empty() {
+            return Some(Work::Thumbnail(self.thumbnails.remove(0)));
         }
         if !self.text_later.is_empty() {
             return Some(Work::Text(self.text_later.remove(0)));
@@ -122,7 +158,11 @@ impl Shared {
         let Some(doc) = state.doc.clone() else {
             return;
         };
-        let wanted = state.wanted.len() + state.text_now.len() + state.text_later.len();
+        let wanted = state.wanted.len()
+            + state.cut_outs.len()
+            + state.thumbnails.len()
+            + state.text_now.len()
+            + state.text_later.len();
         let needed = wanted.min(self.max_workers);
         let hires = needed
             .saturating_sub(state.idle)
@@ -217,6 +257,12 @@ fn work(shared: &Shared, doc: &dyn Document) {
         let mut current = None;
         let done = catch_unwind(AssertUnwindSafe(|| session(shared, doc, &mut current)));
         if done.is_ok() {
+            // What it kept is small pieces, which `malloc` wouldn't give back by itself.
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            // SAFETY: this takes no pointers and only touches what `malloc` has free.
+            unsafe {
+                libc::malloc_trim(0);
+            }
             break;
         }
         let Some(work) = current else {
@@ -226,10 +272,13 @@ fn work(shared: &Shared, doc: &dyn Document) {
         if let Work::Text(page) = work {
             state.text_sent.insert(page);
         }
-        shared.out.send(match work {
-            Work::Draw(job) => Event::NotDrawn(job),
-            Work::Text(page) => Event::Text(page, Arc::default()),
-        });
+        match &work {
+            Work::Draw(job) => shared.out.send(Event::NotDrawn(*job)),
+            Work::Thumbnail(job) => shared.out.send(Event::Thumbnail(*job, None)),
+            Work::Text(page) => shared.out.send(Event::Text(*page, Arc::default())),
+            // It only shows for as long as it is dragged.
+            Work::CutOut(_) => {}
+        }
         state.running.retain(|r| r.work != work);
         shared.settle(&mut state);
     }
@@ -252,7 +301,7 @@ fn session(shared: &Shared, doc: &dyn Document, current: &mut Option<Work>) {
                 }
                 if let Some(work) = state.next_work() {
                     state.running.push(Running {
-                        work,
+                        work: work.clone(),
                         unwanted: None,
                     });
                     first = false;
@@ -271,10 +320,15 @@ fn session(shared: &Shared, doc: &dyn Document, current: &mut Option<Work>) {
                 }
             }
         };
-        *current = Some(work);
-        let event = match work {
-            Work::Draw(job) => Event::Drawn(job, Arc::new(session.draw(job))),
-            Work::Text(page) => Event::Text(page, Arc::new(session.text(page))),
+        *current = Some(work.clone());
+        let event = match &work {
+            Work::Draw(job) => Event::Drawn(*job, Arc::new(session.draw(*job))),
+            Work::Thumbnail(job) => Event::Thumbnail(*job, Some(Arc::new(session.draw(*job)))),
+            Work::Text(page) => Event::Text(*page, Arc::new(session.text(*page))),
+            Work::CutOut(cut) => {
+                let picture = session.cut_out(cut.job, &cut.boxes);
+                Event::CutOut(cut.clone(), Arc::new(picture))
+            }
         };
         *current = None;
         let mut state = shared.lock();
@@ -304,6 +358,8 @@ impl Engine {
             state: Mutex::new(State {
                 doc: None,
                 wanted: Vec::new(),
+                cut_outs: Vec::new(),
+                thumbnails: Vec::new(),
                 text_now: Vec::new(),
                 text_later: Vec::new(),
                 text_sent: HashSet::new(),
@@ -354,12 +410,16 @@ impl Engine {
         let mut state = self.shared.lock();
         let now = Instant::now();
         for running in &mut state.running {
-            if let Work::Draw(job) = running.work {
-                if jobs.contains(&job) {
-                    running.unwanted = None;
-                } else {
-                    running.unwanted.get_or_insert(now);
-                }
+            let wanted = match &running.work {
+                Work::Draw(job) => jobs.contains(job),
+                // There is something better to do than this, however much it is wanted.
+                Work::Thumbnail(_) => jobs.is_empty(),
+                Work::Text(_) | Work::CutOut(_) => continue,
+            };
+            if wanted {
+                running.unwanted = None;
+            } else {
+                running.unwanted.get_or_insert(now);
             }
         }
         let mut wanted = jobs;
@@ -369,6 +429,37 @@ impl Engine {
             return;
         }
         state.wanted = wanted;
+        self.shared.hire(&mut state);
+        self.shared.stand_by(&mut state);
+        self.shared.settle(&mut state);
+        drop(state);
+        self.shared.changed.notify_all();
+    }
+
+    /// Says what thumbnails are wanted, most urgent first, instead of what was wanted before.
+    pub fn want_thumbnails(&self, jobs: Vec<Job>) {
+        let mut state = self.shared.lock();
+        let mut wanted = jobs;
+        wanted.retain(|job| {
+            !state
+                .running
+                .iter()
+                .any(|r| r.work == Work::Thumbnail(*job))
+        });
+        if state.thumbnails == wanted {
+            return;
+        }
+        state.thumbnails = wanted;
+        self.shared.hire(&mut state);
+        self.shared.settle(&mut state);
+        drop(state);
+        self.shared.changed.notify_all();
+    }
+
+    /// Says what should show with the pointer if what is selected gets dragged.
+    pub fn want_cut_outs(&self, cuts: Vec<CutOut>) {
+        let mut state = self.shared.lock();
+        state.cut_outs = cuts.into_iter().map(Arc::new).collect();
         self.shared.hire(&mut state);
         self.shared.stand_by(&mut state);
         self.shared.settle(&mut state);
@@ -412,6 +503,8 @@ impl Engine {
         let mut state = self.shared.lock();
         state.stopped = true;
         state.wanted.clear();
+        state.cut_outs.clear();
+        state.thumbnails.clear();
         state.text_now.clear();
         state.text_later.clear();
         state.work = None;
@@ -456,6 +549,10 @@ mod tests {
             PageText::default()
         }
 
+        fn cut_out(&mut self, job: Job, _: &[RectI]) -> Bitmap {
+            self.draw(job)
+        }
+
         fn draw(&mut self, job: Job) -> Bitmap {
             let waits = self.0.stuck_on.is_none_or(|page| page == job.page);
             if let Some(gate) = self.0.gate.as_ref().filter(|_| waits) {
@@ -477,6 +574,7 @@ mod tests {
             width: 1,
             height: 1,
             area: None,
+            turn: Default::default(),
         }
     }
 
@@ -509,7 +607,9 @@ mod tests {
                 anti_webui_core::channel::pump();
                 while let Some(e) = self.seen.borrow_mut().pop_front() {
                     match e {
-                        Event::Drawn(job, _) | Event::NotDrawn(job) => pages.push(job.page),
+                        Event::Drawn(job, _) | Event::NotDrawn(job) | Event::Thumbnail(job, _) => {
+                            pages.push(job.page)
+                        }
                         _ => {}
                     }
                 }
@@ -576,6 +676,41 @@ mod tests {
         *gate.0.lock().unwrap() = 2;
         gate.1.notify_all();
         assert_eq!(rig.drawn(2), [1, 2]);
+    }
+
+    #[test]
+    fn thumbnails_wait_for_the_pictures_of_the_pages() {
+        let gate = Arc::new((Mutex::new(0), Condvar::new()));
+        let rig = Rig::new(
+            Fake {
+                gate: Some(gate.clone()),
+                stuck_on: Some(0),
+                ..fake()
+            },
+            1,
+        );
+        rig.engine.want(vec![job(0)]);
+        while rig.engine.shared.lock().running.is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        rig.engine.want_thumbnails(vec![job(5), job(6)]);
+        rig.engine.want(vec![job(0), job(1)]);
+        *gate.0.lock().unwrap() = 1;
+        gate.1.notify_all();
+        assert_eq!(rig.drawn(4), [0, 1, 5, 6]);
+    }
+
+    #[test]
+    fn a_thumbnail_that_panics_says_so_and_loses_nothing_else() {
+        let rig = Rig::new(
+            Fake {
+                panics_on: Some(2),
+                ..fake()
+            },
+            1,
+        );
+        rig.engine.want_thumbnails(vec![job(1), job(2), job(3)]);
+        assert_eq!(rig.drawn(3), [1, 2, 3]);
     }
 
     #[test]

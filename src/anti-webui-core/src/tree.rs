@@ -1,7 +1,7 @@
 //! The retained node tree (a small DOM) and the per-window document state.
 
 use crate::drag::{DropConfig, GestureConfig};
-use crate::event::{KeyboardEvent, PointerEvent, ScrollEvent};
+use crate::event::{KeyboardEvent, PinchEvent, PointerEvent, ScrollEvent};
 use crate::geometry::{Affine, PointF, PointI, RectI, Scale, SizeI};
 use crate::layout::{MeasureCache, MeasureKey, Resolved, child_clip};
 use crate::platform::{Placement, PlatformRequest, PopupId, PopupKind, PopupParams};
@@ -35,6 +35,7 @@ pub struct Listeners {
     pub key_down: Option<Handler<KeyboardEvent>>,
     pub key_up: Option<Handler<KeyboardEvent>>,
     pub scroll: Option<Handler<ScrollEvent>>,
+    pub pinch: Option<Handler<PinchEvent>>,
     pub focus: Option<Rc<dyn Fn(bool)>>,
     pub active: Option<Rc<dyn Fn(bool)>>,
     pub focus_visible: Option<Rc<dyn Fn(bool)>>,
@@ -548,6 +549,8 @@ pub struct Document {
     pub scrolled: Vec<NodeId>,
     /// Nodes that got another size and have someone waiting to hear about it.
     pub resized: Vec<NodeId>,
+    /// What [`start_drag`](crate::drag::start_drag) asked for, which the next event picks up.
+    pub(crate) drag_request: Option<crate::drag::DragRequest>,
     /// Painting asks for pictures while the rest of the document stays as it is.
     pub images: RefCell<crate::images::ImageStore>,
     pub videos: RefCell<crate::video::VideoStore>,
@@ -592,6 +595,7 @@ thread_local! {
         pending_scroll_to: Vec::new(),
         scrolled: Vec::new(),
         resized: Vec::new(),
+        drag_request: None,
         images: RefCell::default(),
         videos: RefCell::default(),
         videos_failed: Vec::new(),

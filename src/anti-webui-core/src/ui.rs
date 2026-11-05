@@ -100,6 +100,8 @@ pub struct Ui {
     booster: Option<Booster>,
     /// The fraction of a pixel not yet scrolled, and the node it belongs to.
     scroll_rest: Option<(NodeId, f32, f32)>,
+    /// The nodes a pinch goes to, innermost first.
+    pinching: Option<Vec<NodeId>>,
 }
 
 fn pointer_event(
@@ -163,11 +165,13 @@ impl Ui {
             fling: None,
             booster: None,
             scroll_rest: None,
+            pinching: None,
         }
     }
 
     /// Recomputes styles, layout and positions as needed.
     pub fn update(&mut self) {
+        self.start_requested_drag();
         self.apply_pending_focus();
         self.report_scrolled();
         self.update_layout_and_reports();
@@ -641,6 +645,15 @@ impl Ui {
                 self.modifiers = modifiers;
                 self.scroll(position, delta_x, delta_y, source, phase, time);
             }
+            WindowEvent::Pinch {
+                position,
+                scale,
+                modifiers,
+                phase,
+            } => {
+                self.modifiers = modifiers;
+                self.pinch(position, scale, phase);
+            }
             WindowEvent::Key(key) => {
                 self.modifiers = key.modifiers;
                 if key.pressed {
@@ -853,6 +866,7 @@ impl Ui {
         if let Some(target) = target {
             self.dispatch_pointer(PointerKind::Move, target, p, None, 0);
         }
+        self.start_requested_drag();
     }
 
     fn pointer_down(&mut self, p: PointF, button: PointerButton, time: u32) {
@@ -1137,7 +1151,8 @@ impl Ui {
         }
     }
 
-    fn begin_scroll_gesture(&mut self, p: PointF, source: ScrollSource) {
+    /// The nodes a gesture at a point goes to, innermost first.
+    fn gesture_chain(&mut self, p: PointF) -> Option<Vec<NodeId>> {
         self.ensure_layout();
         let target = self.hit_test(p).filter(|&t| {
             // Open menus take the input.
@@ -1145,17 +1160,61 @@ impl Ui {
                 let popup = d.popup_of(t);
                 popup.is_some() || open_menus_outside(d, popup).is_empty()
             })
-        });
-        self.gesture = target.map(|target| ScrollGesture {
+        })?;
+        // It doesn't go from a popup to what is behind it.
+        Some(with_doc(|d| {
+            let mut chain = d.ancestors(target);
+            if let Some(i) = chain.iter().position(|&id| d.nodes[id].is_popup()) {
+                chain.truncate(i + 1);
+            }
+            chain
+        }))
+    }
+
+    /// Fingers moved apart or together. All of a gesture goes to what was under the pointer when it
+    /// began, whatever moves under it because of that.
+    fn pinch(&mut self, p: PointF, scale: f32, phase: PinchPhase) {
+        if phase == PinchPhase::Began {
+            // Resting fingers stop inertia, and these may not have rested long enough to say so.
+            self.end_scroll_gesture();
+            self.pinching = self.gesture_chain(p);
+        }
+        let Some(chain) = self.pinching.clone() else {
+            return;
+        };
+        self.ensure_layout();
+        for id in chain {
+            let found = with_doc(|d| {
+                let n = d.get(id).filter(|n| !n.is_disabled())?;
+                Some((n.listeners.pinch.clone()?, d.window_rect(id)?))
+            });
+            let Some((handler, rect)) = found else {
+                continue;
+            };
+            let event = PinchEvent {
+                scale,
+                phase,
+                position: p,
+                local: PointF::new(p.x - rect.x as f32, p.y - rect.y as f32),
+                rect,
+                modifiers: self.modifiers,
+                stopped: Cell::new(false),
+            };
+            batch(|| handler(&event));
+            if event.stopped.get() {
+                break;
+            }
+        }
+        if matches!(phase, PinchPhase::Ended | PinchPhase::Cancelled) {
+            self.pinching = None;
+        }
+    }
+
+    fn begin_scroll_gesture(&mut self, p: PointF, source: ScrollSource) {
+        let chain = self.gesture_chain(p);
+        self.gesture = chain.map(|chain| ScrollGesture {
             position: p,
-            // Scrolling doesn't go from a popup to what is behind it.
-            chain: with_doc(|d| {
-                let mut chain = d.ancestors(target);
-                if let Some(i) = chain.iter().position(|&id| d.nodes[id].is_popup()) {
-                    chain.truncate(i + 1);
-                }
-                chain
-            }),
+            chain,
             scroller: None,
             source,
             shift: self.modifiers.shift,

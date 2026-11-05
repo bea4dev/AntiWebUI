@@ -2,9 +2,10 @@
 
 use crate::engine::{Document, Opened, Session};
 use crate::links::{PdfOutlineItem, Places};
-use crate::plan::Job;
+use crate::plan::{self, Job};
 use crate::text::{CollectionMaps, PageText, TextDevice};
 use crate::{PdfError, PdfSource, fonts};
+use anti_webui_core::geometry::RectI;
 use anti_webui_core::images::Bitmap;
 use hayro::hayro_interpret::util::TransformExt;
 use hayro::hayro_interpret::{Context, InterpreterCache, InterpreterSettings, interpret_page};
@@ -15,6 +16,9 @@ use hayro::vello_cpu::peniko::ImageAlphaType;
 use hayro::vello_cpu::{Pixmap, RasterizerSettings, RenderContext, Resources, TargetInit};
 use hayro::{RenderCache, RenderSettings, render_into};
 use std::sync::Arc;
+
+/// How many sizes a worker keeps the glyphs of: those of the pages and those of the thumbnails.
+const MOST_SCALES: usize = 2;
 
 /// `Arc<[u8]>` isn't `Sized`, so `hayro` can't take it as it is.
 struct Bytes(Arc<[u8]>);
@@ -73,6 +77,7 @@ impl Document for Hayro {
         Box::new(HayroSession {
             doc: self,
             cache: RenderCache::new(),
+            scales: Vec::new(),
             text_cache: None,
             settings: RenderSettings::default(),
             context: RenderContext::new(1, 1),
@@ -89,6 +94,9 @@ impl Document for Hayro {
 struct HayroSession<'a> {
     doc: &'a Hayro,
     cache: RenderCache<'a>,
+    /// The sizes `cache` has seen, in percent. It keeps a picture of every glyph at every size and
+    /// never lets go of them, which takes a gigabyte after a few seconds of zooming.
+    scales: Vec<u32>,
     /// What reading the text keeps. `hayro` doesn't let it share what drawing has.
     text_cache: Option<InterpreterCache<'a>>,
     settings: RenderSettings,
@@ -96,17 +104,30 @@ struct HayroSession<'a> {
     resources: Resources,
 }
 
-impl Session for HayroSession<'_> {
-    fn draw(&mut self, job: Job) -> Bitmap {
+impl HayroSession<'_> {
+    /// The pixels of a picture, on white.
+    fn pixels(&mut self, job: Job) -> Vec<u8> {
         let page = &self.doc.pdf.pages()[job.page];
         let (w, h) = page.render_dimensions();
+        let size = (w as f64, h as f64);
+        let (shown_w, shown_h) = job.turn.size(size);
+        let scale = (job.width as f64 / shown_w * 100.0).round() as u32;
+        if !self.scales.contains(&scale) {
+            // What it has of the fonts goes too, as nothing else can be let go of.
+            if self.scales.len() >= MOST_SCALES {
+                self.cache = RenderCache::new();
+                self.scales.clear();
+            }
+            self.scales.push(scale);
+        }
         // Exactly as many pixels as the box has, so that they meet those of the screen one to one.
         let (x, y) = job.area.map_or((0, 0), |area| (area.x, area.y));
         let transform = Affine::translate((-x as f64, -y as f64))
-            * Affine::scale_non_uniform(job.width as f64 / w as f64, job.height as f64 / h as f64)
+            * Affine::scale_non_uniform(job.width as f64 / shown_w, job.height as f64 / shown_h)
+            * Affine::new(job.turn.matrix(size))
             * page.initial_transform(true).to_kurbo();
-        let (picture_width, picture_height) = job.size();
-        let (width, height) = (picture_width as u16, picture_height as u16);
+        let (width, height) = job.size();
+        let (width, height) = (width as u16, height as u16);
         self.context.reset_and_resize(width, height);
         render_into(
             page,
@@ -126,8 +147,20 @@ impl Session for HayroSession<'_> {
                 ..Default::default()
             },
         );
-        let pixels = pixmap.take_rgba8(ImageAlphaType::AlphaPremultiplied);
-        Bitmap::from_premultiplied(picture_width, picture_height, pixels, true)
+        pixmap.take_rgba8(ImageAlphaType::AlphaPremultiplied)
+    }
+}
+
+impl Session for HayroSession<'_> {
+    fn draw(&mut self, job: Job) -> Bitmap {
+        let (width, height) = job.size();
+        Bitmap::from_premultiplied(width, height, self.pixels(job), true)
+    }
+
+    fn cut_out(&mut self, job: Job, boxes: &[RectI]) -> Bitmap {
+        let (width, height) = job.size();
+        let pixels = plan::cut_out(&self.pixels(job), width, boxes);
+        Bitmap::from_premultiplied(width, height, pixels, false)
     }
 
     fn text(&mut self, page: usize) -> PageText {
