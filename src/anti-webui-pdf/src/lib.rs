@@ -9,11 +9,11 @@ mod plan;
 
 use anti_webui_core::channel::ui_channel;
 use anti_webui_core::event::{Key, KeyboardEvent, NamedKey, ScrollEvent};
-use anti_webui_core::geometry::PointF;
+use anti_webui_core::geometry::{PointF, RectI};
 use anti_webui_core::images::Bitmap;
 use anti_webui_core::prelude::*;
 use engine::{Engine, Event};
-use plan::{Direction, PageTable};
+use plan::{Direction, Have, Held, Job, PageTable};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -78,6 +78,8 @@ pub enum PdfState {
 pub enum PdfSource {
     Path(PathBuf),
     Bytes(Arc<[u8]>),
+    #[cfg(test)]
+    Fake(tests::FakeSource),
 }
 
 impl From<&str> for PdfSource {
@@ -197,6 +199,7 @@ impl PdfViewer {
 }
 
 type ErrorListener = Rc<dyn Fn(&PdfError)>;
+type PageErrorListener = Rc<dyn Fn(usize)>;
 
 /// A document in a box that scrolls. See [`pdf_view`].
 pub struct PdfView {
@@ -204,6 +207,7 @@ pub struct PdfView {
     source: PdfSource,
     viewer: Option<PdfViewer>,
     on_error: Option<ErrorListener>,
+    on_page_error: Option<PageErrorListener>,
     page_style: Option<Rc<dyn Fn(Style) -> Style>>,
     gap: f32,
     workers: usize,
@@ -228,6 +232,7 @@ pub fn pdf_view(source: impl Into<PdfSource>) -> PdfView {
         source: source.into(),
         viewer: None,
         on_error: None,
+        on_page_error: None,
         page_style: None,
         gap: 8.0,
         workers: 2,
@@ -253,6 +258,12 @@ impl PdfView {
         self
     }
 
+    /// Called with a page, from 0, that can't be drawn, which then says so where it would show.
+    pub fn on_page_error(mut self, f: impl Fn(usize) + 'static) -> Self {
+        self.on_page_error = Some(Rc::new(f));
+        self
+    }
+
     /// Styles each page, like with a shadow. A page is white unless this says otherwise.
     pub fn page_style(mut self, f: impl Fn(Style) -> Style + 'static) -> Self {
         self.page_style = Some(Rc::new(f));
@@ -273,7 +284,7 @@ impl PdfView {
     }
 
     /// How many bytes the pictures of the pages may take, 256 MiB unless this says otherwise. What
-    /// shows stays even if that is more.
+    /// shows stays even if that is more, and pages that don't show aren't drawn ahead then.
     pub fn cache_bytes(mut self, bytes: usize) -> Self {
         self.cache_bytes = bytes;
         self
@@ -287,16 +298,35 @@ impl IntoView for PdfView {
         let page_style = self.page_style;
         let gap = self.gap;
         let on_error = self.on_error;
+        let on_page_error = self.on_page_error;
 
         let pages = signal(Rc::new(Vec::<(f32, f32)>::new()));
         let pictures = signal(HashMap::<usize, Arc<Bitmap>>::new());
+        // A sharp picture of what shows, of pages too big for one of all of it.
+        let parts = signal(HashMap::<usize, (Job, Arc<Bitmap>)>::new());
         let failed = signal(HashSet::<usize>::new());
+        let failed_parts = signal(HashSet::<usize>::new());
+        // The pages the last plan wants to have a picture.
+        let keep = Rc::new(RefCell::new(Vec::<usize>::new()));
         let viewport = signal((0.0f32, 0.0f32));
         let offset = signal(PointF::new(0.0, 0.0));
         let direction = Rc::new(Cell::new(Direction::Down));
         let scroller = viewer.node;
         // Where the pointer is in the box, in physical pixels: what zooming with it keeps in place.
         let pointer = Rc::new(Cell::new(None::<(i32, i32)>));
+
+        // What the box shows, in the physical pixels of what scrolls.
+        let view = move || {
+            let scale = window_scale();
+            let at = offset.get();
+            let (width, height) = viewport.get();
+            RectI::new(
+                scale.px(at.x),
+                scale.px(at.y),
+                scale.px(width),
+                scale.px(height),
+            )
+        };
 
         let px_per_pt = memo(move || {
             let scale = window_scale();
@@ -403,6 +433,7 @@ impl IntoView for PdfView {
         // a page that has nothing to show.
         let out = {
             let on_error = on_error.clone();
+            let keep = keep.clone();
             ui_channel(move |event: Event| match event {
                 Event::Opened(sizes) => {
                     viewer.count.set(sizes.len());
@@ -417,33 +448,77 @@ impl IntoView for PdfView {
                 }
                 Event::NotDrawn(job) => {
                     log::warn!("couldn't draw page {} of a PDF", job.page + 1);
+                    if job.area.is_some() {
+                        failed_parts.update(|f| {
+                            f.insert(job.page);
+                        });
+                        return;
+                    }
                     failed.update(|f| {
                         f.insert(job.page);
                     });
+                    if let Some(f) = &on_page_error {
+                        f(job.page);
+                    }
                 }
                 Event::Drawn(job, bitmap) => {
                     let t = untrack(|| table.get());
                     if job.page >= t.len() {
                         return;
                     }
-                    let right = plan::picture_size(t.size(job.page)) == (job.width, job.height);
-                    let scale = untrack(window_scale);
-                    let top = scale.px(untrack(|| offset.get()).y);
-                    let height = scale.px(untrack(|| viewport.get()).1);
-                    let keep = t.visible(top, height);
-                    let center = t.page_at_middle(top, height);
-                    pictures.update(|all| {
-                        if !right && all.contains_key(&job.page) {
+                    let v = untrack(view);
+                    let size = t.size(job.page);
+                    if job.area.is_some() {
+                        let shown = t.shown(job.page, v);
+                        let current = parts.with_untracked(|all| all.get(&job.page).map(|p| p.0));
+                        if !plan::part_is_of_use(&t, &job, v)
+                            || !plan::takes_over(&job, current.as_ref(), size, shown)
+                        {
                             return;
                         }
-                        all.insert(job.page, bitmap);
-                        let sizes = all
-                            .iter()
-                            .map(|(page, b)| (*page, b.width() as usize * b.height() as usize * 4));
-                        for page in plan::evict(sizes, &keep, center, budget) {
-                            all.remove(&page);
+                        parts.update(|all| {
+                            all.insert(job.page, (job, bitmap));
+                        });
+                    } else {
+                        let right = plan::is_right_size(size, job.size());
+                        let wanted = keep.borrow().contains(&job.page);
+                        let there = pictures.with_untracked(|all| all.contains_key(&job.page));
+                        if !right && (there || !wanted) {
+                            return;
                         }
+                        pictures.update(|all| {
+                            all.insert(job.page, bitmap);
+                        });
+                    }
+                    // The parts show, so only the rest of the budget is for the whole pictures.
+                    let taken: usize =
+                        parts.with_untracked(|all| all.values().map(|p| p.0.bytes()).sum());
+                    let visible = t.visible(v.y, v.height);
+                    let center = t.page_at_middle(v.y, v.height);
+                    let dropped = pictures.with_untracked(|all| {
+                        let held = all.iter().map(|(&page, b)| {
+                            let size = (b.width(), b.height());
+                            Held {
+                                page,
+                                bytes: size.0 as usize * size.1 as usize * 4,
+                                right_size: plan::is_right_size(t.size(page), size),
+                            }
+                        });
+                        plan::evict(
+                            held,
+                            &visible,
+                            &keep.borrow(),
+                            center,
+                            budget.saturating_sub(taken),
+                        )
                     });
+                    if !dropped.is_empty() {
+                        pictures.update(|all| {
+                            for page in dropped {
+                                all.remove(&page);
+                            }
+                        });
+                    }
                 }
             })
         };
@@ -470,26 +545,51 @@ impl IntoView for PdfView {
             on_cleanup(move || *engine.borrow_mut() = None);
         }
 
+        // What no longer shows goes right away.
+        effect(move || {
+            let (t, v) = (table.get(), view());
+            let of_use = |job: &Job| job.page < t.len() && plan::part_is_of_use(&t, job, v);
+            if parts.with(|all| all.values().any(|p| !of_use(&p.0))) {
+                parts.update(|all| all.retain(|_, p| of_use(&p.0)));
+            }
+        });
+
         // Says what to draw whenever that may have changed.
         {
             let direction = direction.clone();
+            let keep = keep.clone();
+            let goals = RefCell::new(HashMap::new());
             effect(move || {
                 let t = table.get();
-                let scale = window_scale();
-                let top = scale.px(offset.get().y);
-                let height = scale.px(viewport.get().1);
-                let jobs = failed.with(|failed| {
-                    pictures.with(|have| {
-                        plan::plan(&t, top, height, direction.get(), |page| {
-                            if failed.contains(&page) {
-                                return Some(plan::picture_size(t.size(page)));
-                            }
-                            have.get(&page).map(|b| (b.width(), b.height()))
+                let v = view();
+                let plan = failed.with(|failed| {
+                    failed_parts.with(|failed_parts| {
+                        pictures.with(|have| {
+                            parts.with(|parts| {
+                                plan::plan(
+                                    &t,
+                                    v,
+                                    direction.get(),
+                                    budget,
+                                    Have {
+                                        whole: |page| {
+                                            if failed.contains(&page) {
+                                                return Some(plan::picture_size(t.size(page)));
+                                            }
+                                            have.get(&page).map(|b| (b.width(), b.height()))
+                                        },
+                                        part: |page| parts.get(&page).map(|p| p.0),
+                                        gave_up: |page| failed_parts.contains(&page),
+                                    },
+                                    &mut goals.borrow_mut(),
+                                )
+                            })
                         })
                     })
                 });
+                *keep.borrow_mut() = plan.keep;
                 if let Some(engine) = &*engine.borrow() {
-                    engine.want(jobs);
+                    engine.want(plan.jobs);
                 }
             });
         }
@@ -569,6 +669,37 @@ impl IntoView for PdfView {
                         .w_full()
                         .h_full(),
                 )
+                .child(
+                    bitmap_view(move || parts.with(|all| all.get(&page).map(|p| p.1.clone())))
+                        .absolute()
+                        .dyn_style(move |s| {
+                            let t = table.get();
+                            let job = parts.with(|all| all.get(&page).map(|p| p.0));
+                            let (Some(job), true) = (job, page < t.len()) else {
+                                return s;
+                            };
+                            let area = job.area_at(t.size(page));
+                            s.left(Length::Device(area.x))
+                                .top(Length::Device(area.y))
+                                .w(Length::Device(area.width))
+                                .h(Length::Device(area.height))
+                        }),
+                )
+                .child(show(
+                    move || failed.with(|f| f.contains(&page)),
+                    || {
+                        div()
+                            .absolute()
+                            .inset(Length::Px(0.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                text("This page can't be drawn")
+                                    .text_color(Color::from_rgb(0x666666)),
+                            )
+                    },
+                ))
         };
 
         self.root
@@ -613,5 +744,153 @@ impl IntoView for PdfView {
                     )),
             )
             .into_view()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anti_webui_core::Ui;
+    use anti_webui_core::event::WindowEvent;
+    use anti_webui_core::geometry::{Scale, SizeI};
+    use anti_webui_core::scene::{ImageDraw, Primitive, Scene};
+    use engine::{Document, Session};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Pages that can't be drawn, as there is no real document that makes `hayro` panic.
+    #[derive(Clone)]
+    pub struct FakeSource {
+        pub doc: Arc<Fake>,
+        pub pages: Vec<(f32, f32)>,
+    }
+
+    impl std::fmt::Debug for FakeSource {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("FakeSource")
+        }
+    }
+
+    #[derive(Default)]
+    pub struct Fake {
+        panics_on: Option<usize>,
+        panics_on_parts: bool,
+        draws: AtomicUsize,
+    }
+
+    struct FakeSession<'a>(&'a Fake);
+
+    impl Document for Fake {
+        fn session(&self) -> Box<dyn Session + '_> {
+            Box::new(FakeSession(self))
+        }
+    }
+
+    impl Session for FakeSession<'_> {
+        fn draw(&mut self, job: Job) -> Bitmap {
+            self.0.draws.fetch_add(1, Ordering::Relaxed);
+            assert_ne!(self.0.panics_on, Some(job.page));
+            assert!(!(self.0.panics_on_parts && job.area.is_some()));
+            let (width, height) = job.size();
+            let pixels = vec![255; width as usize * height as usize * 4];
+            Bitmap::from_premultiplied(width, height, pixels, true)
+        }
+    }
+
+    fn pictures(scene: &Scene, out: &mut Vec<ImageDraw>) {
+        for p in &scene.primitives {
+            match p {
+                Primitive::Image(d) => out.push(d.clone()),
+                Primitive::Layer(l) => pictures(&l.content, out),
+                _ => {}
+            }
+        }
+    }
+
+    fn mount(
+        doc: Fake,
+        pages: Vec<(f32, f32)>,
+        zoom: f32,
+    ) -> (Ui, Arc<Fake>, Rc<RefCell<Vec<usize>>>) {
+        let doc = Arc::new(doc);
+        let errors = Rc::new(RefCell::new(Vec::new()));
+        let source = PdfSource::Fake(FakeSource {
+            doc: doc.clone(),
+            pages,
+        });
+        let told = errors.clone();
+        let mut ui = Ui::new(move || {
+            let viewer = pdf_viewer();
+            viewer.set_zoom(PdfZoom::Percent(zoom));
+            let told = told.clone();
+            pdf_view(source)
+                .viewer(viewer)
+                .w_full()
+                .h_full()
+                .on_page_error(move |page| told.borrow_mut().push(page))
+        });
+        ui.handle_event(WindowEvent::Resized {
+            size: SizeI::new(420, 300),
+            scale: Scale(120),
+        });
+        for _ in 0..5 {
+            ui.update();
+            ui.wait_for_images(Duration::from_secs(20));
+        }
+        (ui, doc, errors)
+    }
+
+    fn has_glyphs(scene: &Scene) -> bool {
+        scene.primitives.iter().any(|p| match p {
+            Primitive::Glyphs(_) => true,
+            Primitive::Layer(l) => has_glyphs(&l.content),
+            _ => false,
+        })
+    }
+
+    /// How many more it draws in a while, which should be none when it has come to rest.
+    fn draws_after_a_while(ui: &mut Ui, doc: &Fake) -> usize {
+        let before = doc.draws.load(Ordering::Relaxed);
+        let end = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < end {
+            ui.update();
+            let _ = ui.paint(Instant::now());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        doc.draws.load(Ordering::Relaxed) - before
+    }
+
+    #[test]
+    fn a_page_that_cannot_be_drawn_says_so_and_is_not_tried_again() {
+        let doc = Fake {
+            panics_on: Some(0),
+            ..Default::default()
+        };
+        let (mut ui, doc, errors) = mount(doc, vec![(100.0, 100.0); 3], 1.0);
+        assert_eq!(*errors.borrow(), [0]);
+        assert_eq!(draws_after_a_while(&mut ui, &doc), 0);
+        let scene = ui.paint(Instant::now());
+        let mut drawn = Vec::new();
+        pictures(&scene, &mut drawn);
+        // The next page still comes, below where the broken one says so.
+        assert!(drawn.iter().all(|d| d.rect.y >= 133), "{drawn:?}");
+        assert!(!drawn.is_empty());
+        assert!(has_glyphs(&scene));
+    }
+
+    #[test]
+    fn a_part_that_cannot_be_drawn_leaves_the_whole_picture() {
+        let doc = Fake {
+            panics_on_parts: true,
+            ..Default::default()
+        };
+        // 1000 points at 400% are too many pixels for a picture of all of it.
+        let (mut ui, doc, errors) = mount(doc, vec![(1000.0, 1000.0)], 4.0);
+        assert!(errors.borrow().is_empty());
+        assert_eq!(draws_after_a_while(&mut ui, &doc), 0);
+        let mut drawn = Vec::new();
+        pictures(&ui.paint(Instant::now()), &mut drawn);
+        assert_eq!(drawn.len(), 1);
+        assert_eq!(drawn[0].bitmap.width(), 4000);
     }
 }

@@ -36,6 +36,8 @@ pub(crate) fn open(source: &PdfSource, password: Option<&str>) -> Result<Opened,
             .map_err(|e| PdfError::Source(e.to_string()))?
             .into(),
         PdfSource::Bytes(bytes) => Arc::new(Bytes(bytes.clone())).into(),
+        #[cfg(test)]
+        PdfSource::Fake(fake) => return Ok((fake.doc.clone(), fake.pages.clone())),
     };
     let pdf = Pdf::new_with_password(data, password.unwrap_or("")).map_err(|e| match e {
         LoadPdfError::Decryption(DecryptionError::PasswordProtected) if password.is_some() => {
@@ -82,10 +84,12 @@ impl Session for HayroSession<'_> {
         let page = &self.doc.pdf.pages()[job.page];
         let (w, h) = page.render_dimensions();
         // Exactly as many pixels as the box has, so that they meet those of the screen one to one.
-        let transform =
-            Affine::scale_non_uniform(job.width as f64 / w as f64, job.height as f64 / h as f64)
-                * page.initial_transform(true).to_kurbo();
-        let (width, height) = (job.width as u16, job.height as u16);
+        let (x, y) = job.area.map_or((0, 0), |area| (area.x, area.y));
+        let transform = Affine::translate((-x as f64, -y as f64))
+            * Affine::scale_non_uniform(job.width as f64 / w as f64, job.height as f64 / h as f64)
+            * page.initial_transform(true).to_kurbo();
+        let (picture_width, picture_height) = job.size();
+        let (width, height) = (picture_width as u16, picture_height as u16);
         self.context.reset_and_resize(width, height);
         render_into(
             page,
@@ -106,6 +110,6 @@ impl Session for HayroSession<'_> {
             },
         );
         let pixels = pixmap.take_rgba8(ImageAlphaType::AlphaPremultiplied);
-        Bitmap::from_premultiplied(job.width, job.height, pixels, true)
+        Bitmap::from_premultiplied(picture_width, picture_height, pixels, true)
     }
 }

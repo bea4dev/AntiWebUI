@@ -18,6 +18,7 @@ const q = new URLSearchParams(location.search);
 const post = (path, body) => fetch(path, { method: 'POST', body });
 const speed = Number(q.get('speed'));
 const seconds = Number(q.get('seconds'));
+const zoom = Number(q.get('zoom')) || 0;
 const container = document.getElementById('container');
 const eventBus = new EventBus();
 const linkService = new PDFLinkService({ eventBus });
@@ -30,7 +31,10 @@ try {
   const start = performance.now();
   let opened = 0;
   const first = new Promise(resolve => eventBus.on('pagerendered', resolve, { once: true }));
-  eventBus.on('pagesinit', () => { viewer.currentScaleValue = 'page-width'; });
+  eventBus.on('pagesinit', () => {
+    if (zoom) viewer.currentScale = zoom;
+    else viewer.currentScaleValue = 'page-width';
+  });
   const doc = await pdfjsLib.getDocument({
     data,
     cMapUrl: '/pdfjs/cmaps/',
@@ -49,8 +53,38 @@ try {
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
   const shown = performance.now() - start;
 
+  // How much of the box shows pixels one to one: a page too big for one picture has a detail canvas
+  // for that, which stays while the next is being drawn. `bench_pdf` counts the same.
+  const sharpShare = () => {
+    const box = container.getBoundingClientRect();
+    const seen = rect => {
+      const width = Math.min(rect.right, box.right) - Math.max(rect.left, box.left);
+      const height = Math.min(rect.bottom, box.bottom) - Math.max(rect.top, box.top);
+      return Math.max(width, 0) * Math.max(height, 0);
+    };
+    let sharp = 0;
+    for (const v of viewer._getVisiblePages().views) {
+      if (v.view.detailView) {
+        const shown = [...v.view.div.querySelectorAll('canvas')]
+          .filter(c => c !== v.view.canvas && !c.hidden);
+        sharp += Math.max(0, ...shown.map(c => seen(c.getBoundingClientRect())));
+      } else if (v.view.renderingState === FINISHED) {
+        sharp += seen(v.view.div.getBoundingClientRect());
+      }
+    }
+    return sharp / (box.width * box.height);
+  };
+  await new Promise(resolve => {
+    const tick = () => {
+      if (sharpShare() >= 0.9 || performance.now() - start > 60000) resolve();
+      else requestAnimationFrame(tick);
+    };
+    tick();
+  });
+  const sharpAt = performance.now() - start;
+
   const frames = [];
-  let blank = 0, blankShare = 0;
+  let blank = 0, blankShare = 0, sharpSum = 0;
   const began = performance.now();
   let last = began, y = container.scrollTop;
   const screen = container.clientHeight;
@@ -65,6 +99,7 @@ try {
       for (const v of views) {
         if (v.view.renderingState !== FINISHED) missing += v.percent * v.view.div.clientHeight / 100;
       }
+      sharpSum += sharpShare();
       if (missing > 32) { blank += 1; blankShare += missing / screen; }
       if (now - began < seconds * 1000) requestAnimationFrame(tick);
       else resolve();
@@ -76,6 +111,8 @@ try {
   await post('/result', JSON.stringify({
     opened_ms: opened,
     shown_gpu_ms: shown,
+    sharp_ms: sharpAt,
+    sharp_share: sharpSum / frames.length,
     pages: doc.numPages,
     frames: frames.length,
     frame_p50_ms: at(0.5),

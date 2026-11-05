@@ -1,19 +1,61 @@
 //! Where pages go and which of them to draw: nothing here touches a PDF or a thread.
 
+use anti_webui_core::geometry::RectI;
+use std::collections::HashMap;
 use std::ops::Range;
 
 /// A picture to draw of a page, in pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Job {
     pub page: usize,
+    /// How big all of the page is drawn.
     pub width: u32,
     pub height: u32,
+    /// The part of that to make a picture of, or `None` for all of it.
+    pub area: Option<RectI>,
+}
+
+impl Job {
+    /// How many pixels the picture has.
+    pub fn size(&self) -> (u32, u32) {
+        match self.area {
+            Some(area) => (area.width as u32, area.height as u32),
+            None => (self.width, self.height),
+        }
+    }
+
+    pub fn bytes(&self) -> usize {
+        let (width, height) = self.size();
+        width as usize * height as usize * 4
+    }
+
+    /// Where the part it is of goes on a page that is `size` big now.
+    pub fn area_at(&self, size: (i32, i32)) -> RectI {
+        let area = self
+            .area
+            .unwrap_or(RectI::new(0, 0, self.width as i32, self.height as i32));
+        let (kx, ky) = (
+            size.0 as f64 / self.width as f64,
+            size.1 as f64 / self.height as f64,
+        );
+        let (left, top) = (area.x as f64 * kx, area.y as f64 * ky);
+        let (right, bottom) = (area.right() as f64 * kx, area.bottom() as f64 * ky);
+        RectI::new(
+            left.round() as i32,
+            top.round() as i32,
+            (right.round() - left.round()) as i32,
+            (bottom.round() - top.round()) as i32,
+        )
+    }
 }
 
 /// The most pixels in a picture of a whole page. A bigger page shows a stretched one.
 const MAX_PICTURE_PIXELS: f64 = 16_000_000.0;
 /// The longest side of a picture, which every GPU we run on can hold.
 const MAX_PICTURE_SIDE: f64 = 8192.0;
+/// How much more than what shows a picture of part of a page takes on each side, as a part of the
+/// box. Less if that makes it too many pixels, which only a big screen would.
+const PART_MARGIN: f64 = 0.5;
 
 /// How many pixels a page that takes `box_size` gets, which is the same unless that is too many.
 pub(crate) fn picture_size(box_size: (i32, i32)) -> (u32, u32) {
@@ -27,6 +69,19 @@ pub(crate) fn picture_size(box_size: (i32, i32)) -> (u32, u32) {
         ((w * shrink).round() as u32).max(1),
         ((h * shrink).round() as u32).max(1),
     )
+}
+
+/// A whole picture doesn't do for this page: part of it gets one of its own.
+pub(crate) fn needs_part(box_size: (i32, i32)) -> bool {
+    picture_size(box_size) != (box_size.0.max(1) as u32, box_size.1.max(1) as u32)
+}
+
+/// Whether a picture of a whole page is as good as it gets. A stretched one can be a pixel off,
+/// since the rounding changes with the zoom, which isn't worth drawing it again.
+pub(crate) fn is_right_size(box_size: (i32, i32), have: (u32, u32)) -> bool {
+    let want = picture_size(box_size);
+    have == want
+        || (needs_part(box_size) && have.0.abs_diff(want.0) <= 2 && have.1.abs_diff(want.1) <= 2)
 }
 
 /// Where the pages of a document go at some zoom, in physical pixels.
@@ -80,6 +135,15 @@ impl PageTable {
 
     pub fn size(&self, page: usize) -> (i32, i32) {
         self.sizes[page]
+    }
+
+    /// What of a page shows in `view`, in the pixels of the page.
+    pub fn shown(&self, page: usize, view: RectI) -> RectI {
+        let (left, top) = (self.left(page), self.tops[page]);
+        let (width, height) = self.sizes[page];
+        RectI::new(left, top, width, height)
+            .intersect(&view)
+            .translate(-left, -top)
     }
 
     /// The first page that reaches below `y`.
@@ -148,26 +212,162 @@ pub(crate) enum Direction {
 const AHEAD: usize = 2;
 const BEHIND: usize = 1;
 
-/// The pictures that are wanted, most urgent first, leaving out those that are there: what shows,
-/// the most of it first, and then what comes next. `have` says what size a page has.
-pub(crate) fn plan(
+/// `rect` with `x` more on the left and right and `y` more above and below, as far as `size` goes.
+fn grown(rect: RectI, x: i32, y: i32, size: (i32, i32)) -> RectI {
+    let (left, top) = ((rect.x - x).max(0), (rect.y - y).max(0));
+    RectI::new(
+        left,
+        top,
+        (rect.right() + x).min(size.0) - left,
+        (rect.bottom() + y).min(size.1) - top,
+    )
+}
+
+/// How far past what shows a picture of part of a page goes, in pixels of a view that big.
+fn margins(view: (i32, i32)) -> (i32, i32) {
+    let (w, h) = (view.0.max(1) as f64, view.1.max(1) as f64);
+    let most = MAX_PICTURE_PIXELS.max(w * h);
+    let margin = PART_MARGIN.min(((most / (w * h)).sqrt() - 1.0) / 2.0);
+    ((w * margin) as i32, (h * margin) as i32)
+}
+
+/// Whether `area` is a good enough picture of what shows: what shows and half of the margin is in
+/// there, so that there is time to draw the next one.
+fn area_will_do(area: RectI, shown: RectI, view: (i32, i32), size: (i32, i32)) -> bool {
+    let (x, y) = margins(view);
+    let needed = grown(shown, x / 2, y / 2, size);
+    area.x <= needed.x
+        && area.y <= needed.y
+        && area.right() >= needed.right()
+        && area.bottom() >= needed.bottom()
+}
+
+/// The part of a page to draw when `shown` shows of it. It goes no further than a texture can.
+fn part_for(shown: RectI, view: (i32, i32), size: (i32, i32)) -> RectI {
+    let (x, y) = margins(view);
+    let mut area = grown(shown, x, y, size);
+    area.width = area.width.min(MAX_PICTURE_SIDE as i32);
+    area.height = area.height.min(MAX_PICTURE_SIDE as i32);
+    area
+}
+
+/// Whether a picture of part of a page that has just come goes in place of the one there, if any:
+/// not if the zoom has moved on, and not if less of what shows is in it.
+pub(crate) fn takes_over(new: &Job, current: Option<&Job>, size: (i32, i32), shown: RectI) -> bool {
+    let right = |job: &Job| (job.width as i32, job.height as i32) == size;
+    let seen = |job: &Job| {
+        let part = job.area_at(size).intersect(&shown);
+        part.width.max(0) as i64 * part.height.max(0) as i64
+    };
+    right(new) && current.is_none_or(|current| !right(current) || seen(new) >= seen(current))
+}
+
+/// Whether a picture of part of a page is any use where the view is now.
+pub(crate) fn part_is_of_use(table: &PageTable, job: &Job, view: RectI) -> bool {
+    let size = table.size(job.page);
+    needs_part(size) && job.area_at(size).intersects(&table.shown(job.page, view))
+}
+
+/// What there is to show of the pages.
+pub(crate) struct Have<W, P, G> {
+    /// The size of the picture of a whole page. One that can't be drawn counts as right.
+    pub whole: W,
+    /// The picture of part of a page.
+    pub part: P,
+    /// A picture of part of a page couldn't be drawn, so no more are asked for.
+    pub gave_up: G,
+}
+
+/// What to draw, and what to hold on to.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Plan {
+    /// The most urgent first.
+    pub jobs: Vec<Job>,
+    /// The pages that should have a picture, which fit in the budget unless what shows doesn't.
+    pub keep: Vec<usize>,
+}
+
+/// What is wanted, leaving out what is there: the whole of what shows, the most of it first, then
+/// the parts of what shows that are too big for that, and then what comes next as far as `budget`
+/// bytes go. `goals` remembers the part each page is after, so that one being drawn isn't replaced
+/// for every step of scrolling.
+pub(crate) fn plan<W, P, G>(
     table: &PageTable,
-    top: i32,
-    height: i32,
+    view: RectI,
     direction: Direction,
-    have: impl Fn(usize) -> Option<(u32, u32)>,
-) -> Vec<Job> {
-    if table.is_empty() || height <= 0 {
-        return Vec::new();
+    budget: usize,
+    have: Have<W, P, G>,
+    goals: &mut HashMap<usize, Job>,
+) -> Plan
+where
+    W: Fn(usize) -> Option<(u32, u32)>,
+    P: Fn(usize) -> Option<Job>,
+    G: Fn(usize) -> bool,
+{
+    if table.is_empty() || view.height <= 0 {
+        goals.clear();
+        return Plan::default();
     }
-    let visible = table.visible(top, height);
-    let shown = |page: usize| {
-        let start = table.top(page) as i64;
-        let end = start + table.size(page).1 as i64;
-        (end.min(top as i64 + height as i64) - start.max(top as i64)).max(0)
+    let visible = table.visible(view.y, view.height);
+    goals.retain(|page, _| visible.contains(page));
+    let shown_area = |page: usize| {
+        let shown = table.shown(page, view);
+        shown.width.max(0) as i64 * shown.height.max(0) as i64
     };
     let mut pages: Vec<usize> = visible.clone().collect();
-    pages.sort_by_key(|&page| std::cmp::Reverse(shown(page)));
+    pages.sort_by_key(|&page| std::cmp::Reverse(shown_area(page)));
+
+    let whole = |page: usize| {
+        let (width, height) = picture_size(table.size(page));
+        Job {
+            page,
+            width,
+            height,
+            area: None,
+        }
+    };
+    let wanted = |job: &Job| {
+        (have.whole)(job.page).is_none_or(|size| !is_right_size(table.size(job.page), size))
+    };
+
+    let mut jobs: Vec<Job> = pages
+        .iter()
+        .map(|&page| whole(page))
+        .filter(wanted)
+        .collect();
+    let mut used: usize = pages.iter().map(|&page| whole(page).bytes()).sum();
+
+    let view_size = (view.width, view.height);
+    for &page in &pages {
+        let size = table.size(page);
+        let shown = table.shown(page, view);
+        if !needs_part(size) || (have.gave_up)(page) || shown.is_empty() {
+            goals.remove(&page);
+            continue;
+        }
+        let good = |job: &Job| {
+            (job.width as i32, job.height as i32) == size
+                && job
+                    .area
+                    .is_some_and(|area| area_will_do(area, shown, view_size, size))
+        };
+        let there = (have.part)(page);
+        let goal = there
+            .filter(good)
+            .or_else(|| goals.get(&page).copied().filter(good))
+            .unwrap_or(Job {
+                page,
+                width: size.0 as u32,
+                height: size.1 as u32,
+                area: Some(part_for(shown, view_size, size)),
+            });
+        goals.insert(page, goal);
+        used += goal.bytes();
+        if there != Some(goal) {
+            jobs.push(goal);
+        }
+    }
+
     let before = (0..visible.start).rev().take(match direction {
         Direction::Down => BEHIND,
         Direction::Up => AHEAD,
@@ -176,43 +376,60 @@ pub(crate) fn plan(
         Direction::Down => AHEAD,
         Direction::Up => BEHIND,
     });
-    match direction {
-        Direction::Down => pages.extend(after.chain(before)),
-        Direction::Up => pages.extend(before.chain(after)),
+    let next: Vec<usize> = match direction {
+        Direction::Down => after.chain(before).collect(),
+        Direction::Up => before.chain(after).collect(),
+    };
+    for page in next {
+        let job = whole(page);
+        used += job.bytes();
+        // Drawing what would have to go again right away would never end.
+        if used > budget {
+            break;
+        }
+        pages.push(page);
+        if wanted(&job) {
+            jobs.push(job);
+        }
     }
-    pages
-        .into_iter()
-        .filter_map(|page| {
-            let (width, height) = picture_size(table.size(page));
-            (have(page) != Some((width, height))).then_some(Job {
-                page,
-                width,
-                height,
-            })
-        })
-        .collect()
+    Plan { jobs, keep: pages }
 }
 
-/// Which of the pictures to drop to stay within `budget` bytes: the furthest from `center` first,
-/// and never those in `keep`.
+/// A picture of a whole page, as far as dropping it goes.
+pub(crate) struct Held {
+    pub page: usize,
+    pub bytes: usize,
+    pub right_size: bool,
+}
+
+/// Which of the pictures to drop to stay within `budget` bytes: those that aren't wanted, the
+/// furthest from `center` first, and then those at a size that is about to be replaced. What shows
+/// stays, or there would be nothing to stretch, and so does what is wanted, or it would be drawn
+/// again.
 pub(crate) fn evict(
-    pictures: impl IntoIterator<Item = (usize, usize)>,
-    keep: &Range<usize>,
+    pictures: impl IntoIterator<Item = Held>,
+    visible: &Range<usize>,
+    keep: &[usize],
     center: usize,
     budget: usize,
 ) -> Vec<usize> {
-    let mut pictures: Vec<(usize, usize)> = pictures.into_iter().collect();
-    let mut total: usize = pictures.iter().map(|p| p.1).sum();
-    pictures.sort_by_key(|p| std::cmp::Reverse(p.0.abs_diff(center)));
+    let mut total = 0;
+    let mut droppable = Vec::new();
+    for picture in pictures {
+        total += picture.bytes;
+        let wanted = keep.contains(&picture.page);
+        if !visible.contains(&picture.page) && (!wanted || !picture.right_size) {
+            droppable.push((wanted, picture));
+        }
+    }
+    droppable.sort_by_key(|(wanted, p)| (*wanted, std::cmp::Reverse(p.page.abs_diff(center))));
     let mut dropped = Vec::new();
-    for (page, bytes) in pictures {
+    for (_, picture) in droppable {
         if total <= budget {
             break;
         }
-        if !keep.contains(&page) {
-            total -= bytes;
-            dropped.push(page);
-        }
+        total -= picture.bytes;
+        dropped.push(picture.page);
     }
     dropped
 }
@@ -275,14 +492,39 @@ mod tests {
         assert_eq!(big.move_point(&small, x, y), (75, 145));
     }
 
+    const LOTS: usize = 1 << 40;
+
+    type NoPictures =
+        Have<fn(usize) -> Option<(u32, u32)>, fn(usize) -> Option<Job>, fn(usize) -> bool>;
+
+    fn nothing() -> NoPictures {
+        Have {
+            whole: |_| None,
+            part: |_| None,
+            gave_up: |_| false,
+        }
+    }
+
+    fn view(top: i32, height: i32) -> RectI {
+        RectI::new(0, top, 200, height)
+    }
+
+    fn pages_of(plan: &Plan) -> Vec<usize> {
+        plan.jobs.iter().map(|j| j.page).collect()
+    }
+
     #[test]
     fn what_shows_comes_first_then_where_the_view_is_going() {
         let t = table(10);
         let plan = |top, direction| {
-            plan(&t, top, 150, direction, |_| None)
-                .iter()
-                .map(|j| j.page)
-                .collect::<Vec<_>>()
+            pages_of(&plan(
+                &t,
+                view(top, 150),
+                direction,
+                LOTS,
+                nothing(),
+                &mut HashMap::new(),
+            ))
         };
         // From 300 to 450 it shows 100 rows of page 3, which starts at 340, and 30 of page 2.
         assert_eq!(plan(300, Direction::Down), [3, 2, 4, 5, 1]);
@@ -292,19 +534,39 @@ mod tests {
     #[test]
     fn a_picture_at_the_right_size_is_not_drawn_again() {
         let t = table(3);
-        let jobs = plan(&t, 0, 50, Direction::Down, |page| {
-            (page == 0).then_some((100, 100))
-        });
-        assert_eq!(jobs[0].page, 1);
+        let jobs = |size: fn(usize) -> Option<(u32, u32)>| {
+            pages_of(&plan(
+                &t,
+                view(0, 50),
+                Direction::Down,
+                LOTS,
+                Have {
+                    whole: size,
+                    part: |_| None,
+                    gave_up: |_| false,
+                },
+                &mut HashMap::new(),
+            ))
+        };
+        assert_eq!(jobs(|page| (page == 0).then_some((100, 100)))[0], 1);
         // Any other size is a reason to draw it.
-        let jobs = plan(&t, 0, 50, Direction::Down, |_| Some((50, 50)));
-        assert_eq!(jobs[0].page, 0);
+        assert_eq!(jobs(|_| Some((50, 50)))[0], 0);
     }
 
     #[test]
     fn nothing_is_wanted_of_a_viewport_with_no_height() {
-        assert!(plan(&table(3), 0, 0, Direction::Down, |_| None).is_empty());
-        assert!(plan(&PageTable::default(), 0, 100, Direction::Down, |_| None).is_empty());
+        let plan_of = |t: &PageTable, height| {
+            plan(
+                t,
+                view(0, height),
+                Direction::Down,
+                LOTS,
+                nothing(),
+                &mut HashMap::new(),
+            )
+        };
+        assert_eq!(plan_of(&table(3), 0), Plan::default());
+        assert_eq!(plan_of(&PageTable::default(), 100), Plan::default());
     }
 
     #[test]
@@ -317,11 +579,260 @@ mod tests {
     }
 
     #[test]
+    fn a_stretched_picture_a_pixel_off_is_not_drawn_again() {
+        let (w, h) = picture_size((11424, 16166));
+        assert!(is_right_size((11424, 16166), (w + 1, h - 1)));
+        assert!(!is_right_size((11424, 16166), (w / 2, h / 2)));
+        // One that isn't stretched has to meet the screen exactly.
+        assert!(!is_right_size((1429, 2021), (1430, 2021)));
+    }
+
+    /// A page much bigger than a picture of all of it can be, of which 2000 by 1500 show.
+    fn big() -> PageTable {
+        PageTable::new(&[(10000.0, 20000.0), (10000.0, 20000.0)], 1.0, 0, 2000)
+    }
+
+    const BIG_VIEW: RectI = RectI::new(4000, 8000, 2000, 1500);
+
+    #[test]
+    fn a_page_too_big_for_one_picture_gets_one_of_what_shows_and_around_it() {
+        let t = big();
+        let mut goals = HashMap::new();
+        let plan = plan(&t, BIG_VIEW, Direction::Down, LOTS, nothing(), &mut goals);
+        // The stretched one comes first, then the part, with half of the view around what shows.
+        assert_eq!(plan.jobs[0].area, None);
+        assert_eq!(plan.jobs[1].area, Some(RectI::new(3000, 7250, 4000, 3000)));
+        assert_eq!((plan.jobs[1].width, plan.jobs[1].height), (10000, 20000));
+        assert_eq!(goals[&0], plan.jobs[1]);
+    }
+
+    #[test]
+    fn a_page_that_fits_gets_no_part() {
+        let t = table(1);
+        let plan = plan(
+            &t,
+            view(0, 50),
+            Direction::Down,
+            LOTS,
+            nothing(),
+            &mut HashMap::new(),
+        );
+        assert!(plan.jobs.iter().all(|j| j.area.is_none()));
+    }
+
+    #[test]
+    fn a_big_screen_gets_less_around_it_rather_than_too_many_pixels() {
+        let (x, y) = margins((3840, 2160));
+        let (w, h) = ((3840 + 2 * x) as f64, (2160 + 2 * y) as f64);
+        assert!(w * h <= 16_100_000.0, "{w} by {h}");
+        assert!(x > 0 && y > 0);
+        // One bigger than that much still has what shows.
+        assert_eq!(margins((8000, 4000)), (0, 0));
+    }
+
+    #[test]
+    fn a_part_is_asked_for_once_while_scrolling_stays_within_its_margin() {
+        let t = big();
+        let mut goals = HashMap::new();
+        let first = plan(&t, BIG_VIEW, Direction::Down, LOTS, nothing(), &mut goals).jobs[1];
+        // A quarter of the view is half of the margin, which is still enough.
+        let near = BIG_VIEW.translate(0, 375);
+        let again = plan(&t, near, Direction::Down, LOTS, nothing(), &mut goals);
+        assert_eq!(again.jobs[1], first);
+        // Past that it needs another, centered on what shows then.
+        let far = BIG_VIEW.translate(0, 376);
+        let next = plan(&t, far, Direction::Down, LOTS, nothing(), &mut goals);
+        assert_eq!(next.jobs[1].area, Some(RectI::new(3000, 7626, 4000, 3000)));
+    }
+
+    #[test]
+    fn a_part_that_is_there_and_enough_is_not_drawn_again() {
+        let t = big();
+        let mut goals = HashMap::new();
+        let part = plan(&t, BIG_VIEW, Direction::Down, LOTS, nothing(), &mut goals).jobs[1];
+        let have = Have {
+            whole: |_| Some(picture_size((10000, 20000))),
+            part: |page| (page == 0).then_some(part),
+            gave_up: |_| false,
+        };
+        let plan = plan(&t, BIG_VIEW, Direction::Down, LOTS, have, &mut goals);
+        assert!(plan.jobs.iter().all(|j| j.page != 0), "{:?}", plan.jobs);
+    }
+
+    #[test]
+    fn a_part_is_not_asked_for_again_after_it_failed() {
+        let t = big();
+        let have = Have {
+            whole: |_| None,
+            part: |_| None,
+            gave_up: |page| page == 0,
+        };
+        let plan = plan(
+            &t,
+            BIG_VIEW,
+            Direction::Down,
+            LOTS,
+            have,
+            &mut HashMap::new(),
+        );
+        assert!(plan.jobs.iter().all(|j| j.area.is_none()));
+    }
+
+    #[test]
+    fn a_part_for_a_page_going_out_of_view_is_forgotten() {
+        let t = big();
+        let mut goals = HashMap::new();
+        plan(&t, BIG_VIEW, Direction::Down, LOTS, nothing(), &mut goals);
+        assert!(goals.contains_key(&0));
+        let lower = RectI::new(4000, 25000, 2000, 1500);
+        plan(&t, lower, Direction::Down, LOTS, nothing(), &mut goals);
+        assert!(!goals.contains_key(&0));
+        assert!(goals.contains_key(&1));
+    }
+
+    #[test]
+    fn a_part_goes_once_nothing_of_it_shows_or_it_is_not_needed() {
+        let t = big();
+        let job = plan(
+            &t,
+            BIG_VIEW,
+            Direction::Down,
+            LOTS,
+            nothing(),
+            &mut HashMap::new(),
+        )
+        .jobs[1];
+        assert!(part_is_of_use(&t, &job, BIG_VIEW));
+        assert!(!part_is_of_use(&t, &job, BIG_VIEW.translate(0, 5000)));
+        assert!(!part_is_of_use(
+            &t,
+            &job,
+            RectI::new(4000, 25000, 2000, 1500)
+        ));
+        // Everything fits in one picture at this zoom.
+        let small = PageTable::new(&[(1000.0, 2000.0), (1000.0, 2000.0)], 1.0, 0, 2000);
+        assert!(!part_is_of_use(&small, &job, BIG_VIEW));
+    }
+
+    fn part(area: RectI) -> Job {
+        Job {
+            page: 0,
+            width: 1000,
+            height: 1000,
+            area: Some(area),
+        }
+    }
+
+    #[test]
+    fn a_part_keeps_its_place_on_the_page_at_another_zoom() {
+        let job = part(RectI::new(100, 200, 300, 400));
+        assert_eq!(job.area_at((2000, 2000)), RectI::new(200, 400, 600, 800));
+        assert_eq!(job.area_at((1000, 1000)), RectI::new(100, 200, 300, 400));
+    }
+
+    #[test]
+    fn a_part_that_came_goes_in_unless_it_is_late() {
+        let size = (1000, 1000);
+        let shown = RectI::new(100, 100, 100, 100);
+        let good = part(RectI::new(0, 0, 300, 300));
+        let off = part(RectI::new(150, 150, 300, 300));
+        assert!(takes_over(&good, None, size, shown));
+        assert!(takes_over(&good, Some(&off), size, shown));
+        // What is there has more of what shows.
+        assert!(!takes_over(&off, Some(&good), size, shown));
+        // The zoom has changed while it was being drawn.
+        assert!(!takes_over(&good, None, (2000, 2000), shown));
+        // One at the old zoom gives way to one at the new.
+        let old = Job {
+            width: 500,
+            height: 500,
+            ..good
+        };
+        assert!(takes_over(&off, Some(&old), size, shown));
+    }
+
+    fn held(page: usize, right_size: bool) -> Held {
+        Held {
+            page,
+            bytes: 10,
+            right_size,
+        }
+    }
+
+    #[test]
     fn eviction_goes_from_the_furthest_and_spares_what_shows() {
-        let pictures = [(0, 10), (1, 10), (2, 10), (3, 10), (9, 10)];
-        assert_eq!(evict(pictures, &(2..4), 2, 50), Vec::<usize>::new());
-        assert_eq!(evict(pictures, &(2..4), 2, 30), [9, 0]);
+        let pictures = || [0, 1, 2, 3, 9].map(|page| held(page, true));
+        let drop = |visible: Range<usize>, budget| evict(pictures(), &visible, &[], 2, budget);
+        assert_eq!(drop(2..4, 50), Vec::<usize>::new());
+        assert_eq!(drop(2..4, 30), [9, 0]);
         // What shows stays, even over the budget.
-        assert_eq!(evict(pictures, &(0..10), 2, 0), Vec::<usize>::new());
+        assert_eq!(drop(0..10, 0), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn what_is_wanted_stays_unless_it_is_at_the_wrong_size() {
+        // Page 9 is furthest, but it is where the view is going.
+        let pictures = [held(2, true), held(0, true), held(9, true)];
+        assert_eq!(evict(pictures, &(2..3), &[2, 9], 2, 20), [0]);
+        let pictures = [held(2, true), held(0, true), held(9, true)];
+        assert_eq!(
+            evict(pictures, &(2..3), &[2, 0, 9], 2, 0),
+            Vec::<usize>::new()
+        );
+        // What was drawn before the zoom changed goes after what isn't wanted at all.
+        let pictures = [held(2, true), held(3, false), held(9, true)];
+        assert_eq!(evict(pictures, &(2..3), &[2, 3], 2, 20), [9]);
+        let pictures = [held(2, true), held(3, false), held(9, true)];
+        assert_eq!(evict(pictures, &(2..3), &[2, 3], 2, 10), [9, 3]);
+    }
+
+    /// As the viewer does it: what is drawn goes in and what is over the budget goes out, until
+    /// nothing more is wanted. This must end with whatever budget it has.
+    fn run_to_the_end(budget: usize) -> usize {
+        let t = table(10);
+        let mut there = HashMap::<usize, usize>::new();
+        let mut goals = HashMap::new();
+        let v = view(300, 150);
+        let (visible, center) = (t.visible(300, 150), t.page_at_middle(300, 150));
+        for rounds in 0.. {
+            let plan = plan(
+                &t,
+                v,
+                Direction::Down,
+                budget,
+                Have {
+                    whole: |page| there.get(&page).map(|_| (100, 100)),
+                    part: |_| None,
+                    gave_up: |_| false,
+                },
+                &mut goals,
+            );
+            let Some(job) = plan.jobs.first() else {
+                return rounds;
+            };
+            there.insert(job.page, job.bytes());
+            let held = there.iter().map(|(&page, &bytes)| Held {
+                page,
+                bytes,
+                right_size: true,
+            });
+            for page in evict(held, &visible, &plan.keep, center, budget) {
+                there.remove(&page);
+            }
+            assert!(rounds < 100, "it never ends with a budget of {budget}");
+        }
+        unreachable!()
+    }
+
+    #[test]
+    fn a_small_budget_does_not_draw_the_same_page_forever() {
+        // Each picture takes 40000 bytes, and two show.
+        for pages in 0..8 {
+            let drawn = run_to_the_end(pages * 40_000);
+            assert!((2..=5).contains(&drawn), "{pages}: {drawn}");
+        }
+        assert_eq!(run_to_the_end(LOTS), 5);
+        assert_eq!(run_to_the_end(0), 2);
+        assert_eq!(run_to_the_end(3 * 40_000), 3);
     }
 }

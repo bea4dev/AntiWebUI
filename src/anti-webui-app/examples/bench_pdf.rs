@@ -1,14 +1,14 @@
 //! How long a PDF takes on the screen and what scrolling it does, without a window:
-//! `bench_pdf <file.pdf> [--dump first.png] [--speed screens-per-second] [--seconds n]`. What it
-//! prints is one line of JSON, for `src/anti-webui-pdf/tools/compare.py`, which gets the same numbers
+//! `bench_pdf <file.pdf> [--dump first.png] [--speed screens-per-second] [--seconds n]
+//! [--zoom percent] [--slow-frames]`. What it prints is one line of JSON, for `src/anti-webui-pdf/tools/compare.py`, which gets the same numbers
 //! from PDF.js. See `docs/design/26-pdf.md`.
 
 use anti_webui_core::Ui;
 use anti_webui_core::event::{Modifiers, ScrollPhase, ScrollSource, WindowEvent};
-use anti_webui_core::geometry::{PointF, Scale, SizeI};
+use anti_webui_core::geometry::{PointF, RectI, Scale, SizeI};
 use anti_webui_core::prelude::*;
 use anti_webui_core::scene::{Primitive, Scene};
-use anti_webui_pdf::{PdfState, PdfViewer, pdf_view, pdf_viewer};
+use anti_webui_pdf::{PdfState, PdfViewer, PdfZoom, pdf_view, pdf_viewer};
 use anti_webui_wgpu::{Gpu, Offscreen, Renderer, wgpu};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -53,6 +53,33 @@ fn blank_rows(scene: &Scene) -> usize {
     rows.iter().filter(|r| !**r).count()
 }
 
+/// How many pixels of the window show a picture one to one.
+fn sharp_pixels(scene: &Scene, at: (i32, i32)) -> i64 {
+    let window = RectI::new(0, 0, WIDTH as i32, HEIGHT as i32);
+    let mut pixels = 0;
+    for p in &scene.primitives {
+        match p {
+            Primitive::Image(d) => {
+                if (d.rect.width as u32, d.rect.height as u32)
+                    == (d.bitmap.width(), d.bitmap.height())
+                {
+                    pixels += d.rect.translate(at.0, at.1).intersect(&window).area();
+                }
+            }
+            Primitive::Layer(l) => {
+                pixels += sharp_pixels(&l.content, (at.0 + l.origin.x, at.1 + l.origin.y));
+            }
+            _ => {}
+        }
+    }
+    pixels
+}
+
+/// How much of the window is sharp, of the part that shows pages: what is left is the gaps.
+fn sharp_share(scene: &Scene) -> f64 {
+    sharp_pixels(scene, (0, 0)) as f64 / (WIDTH as f64 * HEIGHT as f64)
+}
+
 fn percentile(values: &mut [f64], p: f64) -> f64 {
     values.sort_by(f64::total_cmp);
     values
@@ -71,10 +98,13 @@ fn main() {
     let path = args[1].clone();
     let speed: f32 = value("--speed").map_or(1.0, |v| v.parse().unwrap());
     let seconds: f32 = value("--seconds").map_or(5.0, |v| v.parse().unwrap());
+    let zoom: Option<f32> = value("--zoom").map(|v| v.parse::<f32>().unwrap() / 100.0);
+    let slow_frames = args.iter().any(|a| a == "--slow-frames");
     let format = wgpu::TextureFormat::Rgba8Unorm;
     let gpu = Gpu::headless().unwrap();
     let target = Offscreen::new(&gpu, format, WIDTH, HEIGHT);
     let mut renderer = Renderer::new(&gpu.device, format);
+    renderer.set_release_picture_pixels(true);
 
     let handed: Rc<std::cell::Cell<Option<PdfViewer>>> = Rc::default();
     let start = Instant::now();
@@ -83,6 +113,9 @@ fn main() {
         Ui::new(move || {
             let viewer = pdf_viewer();
             handed.set(Some(viewer));
+            if let Some(zoom) = zoom {
+                viewer.set_zoom(PdfZoom::Percent(zoom));
+            }
             pdf_view(path).viewer(viewer).w_full().h_full()
         })
     };
@@ -120,12 +153,30 @@ fn main() {
         std::thread::sleep(Duration::from_micros(200));
     }
 
+    // Until what shows is sharp, which is when there is a picture of it one to one: most of a
+    // window, since the gaps never are.
+    let sharp_at;
+    loop {
+        ui.animate(Instant::now());
+        ui.update();
+        let scene = ui.paint(Instant::now());
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        renderer.render(&gpu.device, &gpu.queue, &mut encoder, &target.view, &scene);
+        gpu.queue.submit([encoder.finish()]);
+        if sharp_share(&scene) >= 0.9 || start.elapsed() > Duration::from_secs(60) {
+            sharp_at = start.elapsed();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
     // Scrolling at a steady speed, a frame every 8.3 ms, as long as the document lasts.
     let middle = PointF::new(WIDTH as f32 / 2.0, HEIGHT as f32 / 2.0);
     let step = HEIGHT as f32 * speed * FRAME.as_secs_f32();
     let mut frames = Vec::new();
     let mut blank_frames = 0usize;
     let mut blank_row_frames = 0usize;
+    let mut sharp_sum = 0.0;
     let began = Instant::now();
     let mut next = began;
     let mut time = 0u32;
@@ -146,7 +197,9 @@ fn main() {
         time += 8;
         ui.animate(Instant::now());
         ui.update();
+        let updated = t.elapsed();
         let scene = ui.paint(Instant::now());
+        let painted = t.elapsed();
         let blank = blank_rows(&scene);
         // The gaps between pages are small: more than that is a page with nothing on it yet.
         if blank > 64 {
@@ -154,9 +207,22 @@ fn main() {
             blank_row_frames += blank;
         }
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        sharp_sum += sharp_share(&scene);
+        let counted = t.elapsed();
         renderer.render(&gpu.device, &gpu.queue, &mut encoder, &target.view, &scene);
+        let rendered = t.elapsed();
         gpu.queue.submit([encoder.finish()]);
         frames.push(t.elapsed().as_secs_f64() * 1e3);
+        if slow_frames && t.elapsed() > Duration::from_micros(1500) {
+            eprintln!(
+                "frame {} slow: update {:.2} paint {:.2} render {:.2} submit {:.2}",
+                frames.len(),
+                updated.as_secs_f64() * 1e3,
+                (painted - updated).as_secs_f64() * 1e3,
+                (rendered - counted).as_secs_f64() * 1e3,
+                (t.elapsed() - rendered).as_secs_f64() * 1e3,
+            );
+        }
         next += FRAME;
         let now = Instant::now();
         if now < next {
@@ -167,10 +233,12 @@ fn main() {
     }
     let count = frames.len();
     println!(
-        "{{\"opened_ms\":{:.1},\"shown_submitted_ms\":{:.1},\"shown_gpu_ms\":{:.1},\"pages\":{},\"frames\":{count},\"late\":{late},\"frame_p50_ms\":{:.2},\"frame_p95_ms\":{:.2},\"frame_max_ms\":{:.2},\"blank_frames\":{blank_frames},\"blank_screens_share\":{:.4},\"page_reached\":{},\"peak_mib\":{}}}",
+        "{{\"opened_ms\":{:.1},\"shown_submitted_ms\":{:.1},\"shown_gpu_ms\":{:.1},\"sharp_ms\":{:.1},\"sharp_share\":{:.4},\"pages\":{},\"frames\":{count},\"late\":{late},\"frame_p50_ms\":{:.2},\"frame_p95_ms\":{:.2},\"frame_max_ms\":{:.2},\"blank_frames\":{blank_frames},\"blank_screens_share\":{:.4},\"page_reached\":{},\"peak_mib\":{}}}",
         opened.unwrap_or_default().as_secs_f64() * 1e3,
         shown.0.as_secs_f64() * 1e3,
         shown.1.as_secs_f64() * 1e3,
+        sharp_at.as_secs_f64() * 1e3,
+        sharp_sum / count.max(1) as f64,
         untrack(|| viewer.page_count()),
         percentile(&mut frames, 0.5),
         percentile(&mut frames, 0.95),

@@ -2311,9 +2311,14 @@ impl Renderer {
                 write(0, (bitmap.width(), bitmap.height()), pixels);
                 continue;
             }
+            let levels = bitmap.level_count();
             bitmap.with_levels(|level, size, pixels| {
                 if level >= first {
                     write(level - first, size, pixels);
+                } else if levels == 1 {
+                    // It has no level that fits, and something coarse beats nothing.
+                    let (w, h) = ((size.0 >> first).max(1), (size.1 >> first).max(1));
+                    write(0, (w, h), &every_nth_pixel(pixels, size, first));
                 }
             });
             if self.release_pixels {
@@ -2889,6 +2894,20 @@ impl Renderer {
 }
 
 /// Identifies a shader: its source lives in a `static`.
+/// What is left of pixels when only each `2^skip`-th one of each `2^skip`-th row stays. It is as
+/// fast as it gets, which is what a picture too big for the GPU needs.
+fn every_nth_pixel(pixels: &[u8], (w, h): (u32, u32), skip: u32) -> Vec<u8> {
+    let (kept_w, kept_h) = ((w >> skip).max(1) as usize, (h >> skip).max(1) as usize);
+    let (w, step) = (w as usize, 1usize << skip);
+    let mut out = Vec::with_capacity(kept_w * kept_h * 4);
+    for row in pixels.chunks_exact(w * 4).step_by(step).take(kept_h) {
+        for pixel in row.chunks_exact(4).step_by(step).take(kept_w) {
+            out.extend_from_slice(pixel);
+        }
+    }
+    out
+}
+
 fn shader_key(source: &'static ShaderSource) -> usize {
     std::ptr::from_ref(source) as usize
 }
@@ -3103,6 +3122,15 @@ fn push_batch(batches: &mut Vec<Batch>, kind: BatchKind, end: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_picture_too_big_for_the_gpu_keeps_every_nth_pixel() {
+        let pixels: Vec<u8> = (0..4 * 3 * 4).map(|i| i as u8).collect();
+        // Half of 4 by 3 is 2 by 1, which is every other pixel of the first row.
+        let kept = every_nth_pixel(&pixels, (4, 3), 1);
+        assert_eq!(kept, [0, 1, 2, 3, 8, 9, 10, 11]);
+        assert_eq!(every_nth_pixel(&pixels, (4, 3), 3), &pixels[..4]);
+    }
 
     fn quad(rect: RectI, border: [i32; 4], radii: [f32; 4], bg: f32) -> Quad {
         Quad {

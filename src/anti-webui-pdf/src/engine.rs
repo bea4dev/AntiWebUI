@@ -8,10 +8,15 @@ use anti_webui_core::channel::{UiSender, UiWork};
 use anti_webui_core::images::Bitmap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long a worker with nothing to do stays, with what it has cached.
 const IDLE: Duration = Duration::from_secs(10);
+/// How long all of the workers can be stuck drawing what nobody wants any more before another one
+/// starts on what is wanted.
+const STUCK: Duration = Duration::from_millis(200);
+/// How many workers there can be with those that started because the others were stuck.
+const MAX_STUCK_WORKERS: usize = 8;
 
 /// A document that has been opened.
 pub(crate) trait Document: Send + Sync + 'static {
@@ -35,12 +40,21 @@ pub(crate) enum Event {
     NotDrawn(Job),
 }
 
+/// A job a worker is on.
+struct Running {
+    job: Job,
+    /// Since when it hasn't been wanted.
+    unwanted: Option<Instant>,
+}
+
 struct State {
     doc: Option<Arc<dyn Document>>,
     wanted: Vec<Job>,
-    running: Vec<Job>,
+    running: Vec<Running>,
     workers: usize,
     idle: usize,
+    /// One is waiting to see if the others stay stuck.
+    standing_by: bool,
     stopped: bool,
     /// Tells those who wait for pictures that some are coming.
     work: Option<UiWork>,
@@ -81,6 +95,67 @@ impl Shared {
         }
     }
 
+    /// Since when every worker has been on something nobody wants, with something else wanted.
+    fn stuck_since(state: &State) -> Option<Instant> {
+        if state.wanted.is_empty() || state.idle > 0 || state.running.len() < state.workers {
+            return None;
+        }
+        let mut latest = None;
+        for running in &state.running {
+            latest = latest.max(Some(running.unwanted?));
+        }
+        latest
+    }
+
+    /// Gets ready to start another worker if the others stay stuck. It is gone again after a job.
+    fn stand_by(self: &Arc<Self>, state: &mut State) {
+        let most = self.max_workers.max(MAX_STUCK_WORKERS);
+        if state.standing_by || state.workers >= most || Self::stuck_since(state).is_none() {
+            return;
+        }
+        let Some(doc) = state.doc.clone() else {
+            return;
+        };
+        state.standing_by = true;
+        let shared = self.clone();
+        let started = std::thread::Builder::new()
+            .name("pdf".into())
+            .spawn(move || {
+                if shared.wait_until_stuck() {
+                    work(&shared, &*doc);
+                }
+            });
+        if let Err(e) = started {
+            log::warn!("can't start a thread to draw PDF pages: {e}");
+            state.standing_by = false;
+        }
+    }
+
+    /// Whether the workers have stayed stuck for long enough, which makes this one of them.
+    fn wait_until_stuck(&self) -> bool {
+        let mut state = self.lock();
+        loop {
+            let since = (!state.stopped)
+                .then(|| Self::stuck_since(&state))
+                .flatten();
+            let Some(since) = since else {
+                state.standing_by = false;
+                return false;
+            };
+            let waited = since.elapsed();
+            if waited >= STUCK {
+                state.standing_by = false;
+                state.workers += 1;
+                return true;
+            }
+            state = self
+                .changed
+                .wait_timeout(state, STUCK - waited)
+                .expect("no panics with the lock held")
+                .0;
+        }
+    }
+
     fn settle(&self, state: &mut State) {
         if state.wanted.is_empty() && state.running.is_empty() {
             state.work = None;
@@ -103,26 +178,33 @@ fn work(shared: &Shared, doc: &dyn Document) {
         };
         shared.out.send(Event::NotDrawn(job));
         let mut state = shared.lock();
-        state.running.retain(|j| *j != job);
+        state.running.retain(|r| r.job != job);
         shared.settle(&mut state);
     }
-    let mut state = shared.lock();
-    state.workers -= 1;
 }
 
 /// Draws until there has been nothing to do for a while.
 fn session(shared: &Shared, doc: &dyn Document, current: &mut Option<Job>) {
     let mut session = doc.session();
+    let mut first = true;
     loop {
         let job = {
             let mut state = shared.lock();
             loop {
-                if state.stopped {
+                // One more than asked for is only there for one job. Leaving counts here, under the
+                // lock, so that nobody counts on a worker that is on its way out.
+                let extra = state.workers > shared.max_workers;
+                if state.stopped || (extra && (!first || state.wanted.is_empty())) {
+                    state.workers -= 1;
                     return;
                 }
                 if !state.wanted.is_empty() {
                     let job = state.wanted.remove(0);
-                    state.running.push(job);
+                    state.running.push(Running {
+                        job,
+                        unwanted: None,
+                    });
+                    first = false;
                     break job;
                 }
                 state.idle += 1;
@@ -133,6 +215,7 @@ fn session(shared: &Shared, doc: &dyn Document, current: &mut Option<Job>) {
                 state = next;
                 state.idle -= 1;
                 if timeout.timed_out() && state.wanted.is_empty() {
+                    state.workers -= 1;
                     return;
                 }
             }
@@ -142,7 +225,7 @@ fn session(shared: &Shared, doc: &dyn Document, current: &mut Option<Job>) {
         *current = None;
         shared.out.send(Event::Drawn(job, Arc::new(bitmap)));
         let mut state = shared.lock();
-        state.running.retain(|j| *j != job);
+        state.running.retain(|r| r.job != job);
         shared.settle(&mut state);
     }
 }
@@ -167,6 +250,7 @@ impl Engine {
                 running: Vec::new(),
                 workers: 0,
                 idle: 0,
+                standing_by: false,
                 stopped: false,
                 work: None,
             }),
@@ -205,13 +289,23 @@ impl Engine {
     /// Says what is wanted, most urgent first, instead of what was wanted before.
     pub fn want(&self, jobs: Vec<Job>) {
         let mut state = self.shared.lock();
+        let now = Instant::now();
+        for running in &mut state.running {
+            if jobs.contains(&running.job) {
+                running.unwanted = None;
+            } else {
+                running.unwanted.get_or_insert(now);
+            }
+        }
         let mut wanted = jobs;
-        wanted.retain(|job| !state.running.contains(job));
+        wanted.retain(|job| !state.running.iter().any(|r| r.job == *job));
         if state.wanted == wanted {
+            self.shared.stand_by(&mut state);
             return;
         }
         state.wanted = wanted;
         self.shared.hire(&mut state);
+        self.shared.stand_by(&mut state);
         self.shared.settle(&mut state);
         drop(state);
         self.shared.changed.notify_all();
@@ -244,6 +338,8 @@ mod tests {
     /// Draws one pixel, and waits for a turn when told to.
     struct Fake {
         gate: Option<Arc<(Mutex<usize>, Condvar)>>,
+        /// The only page that waits for a turn, if any is given here.
+        stuck_on: Option<usize>,
         sessions: AtomicUsize,
         panics_on: Option<usize>,
     }
@@ -259,7 +355,8 @@ mod tests {
 
     impl Session for FakeSession<'_> {
         fn draw(&mut self, job: Job) -> Bitmap {
-            if let Some(gate) = &self.0.gate {
+            let waits = self.0.stuck_on.is_none_or(|page| page == job.page);
+            if let Some(gate) = self.0.gate.as_ref().filter(|_| waits) {
                 let (turns, moved) = &**gate;
                 let mut turns = turns.lock().unwrap();
                 while *turns == 0 {
@@ -277,6 +374,7 @@ mod tests {
             page,
             width: 1,
             height: 1,
+            area: None,
         }
     }
 
@@ -322,6 +420,7 @@ mod tests {
     fn fake() -> Fake {
         Fake {
             gate: None,
+            stuck_on: None,
             sessions: AtomicUsize::new(0),
             panics_on: None,
         }
@@ -388,6 +487,58 @@ mod tests {
         );
         rig.engine.want(vec![job(1), job(2), job(3)]);
         assert_eq!(rig.drawn(3), [1, 2, 3]);
+    }
+
+    #[test]
+    fn another_worker_takes_over_when_all_are_stuck_on_what_is_not_wanted() {
+        let gate = Arc::new((Mutex::new(0), Condvar::new()));
+        let rig = Rig::new(
+            Fake {
+                gate: Some(gate.clone()),
+                stuck_on: Some(1),
+                ..fake()
+            },
+            1,
+        );
+        rig.engine.want(vec![job(1)]);
+        while rig.engine.shared.lock().running.is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        rig.engine.want(vec![job(2)]);
+        // Page 1 doesn't finish until told to, and page 2 gets drawn anyway.
+        assert_eq!(rig.drawn(1), [2]);
+        *gate.0.lock().unwrap() = 1;
+        gate.1.notify_all();
+        assert_eq!(rig.drawn(1), [1]);
+        // Back to as many as it was told to have, when it has nothing to do.
+        let end = std::time::Instant::now() + Duration::from_secs(20);
+        while rig.engine.shared.lock().workers > 1 {
+            assert!(std::time::Instant::now() < end);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn nobody_is_stuck_on_what_is_still_wanted() {
+        let gate = Arc::new((Mutex::new(0), Condvar::new()));
+        let rig = Rig::new(
+            Fake {
+                gate: Some(gate.clone()),
+                stuck_on: Some(1),
+                ..fake()
+            },
+            1,
+        );
+        rig.engine.want(vec![job(1)]);
+        while rig.engine.shared.lock().running.is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        rig.engine.want(vec![job(1), job(2)]);
+        std::thread::sleep(STUCK * 2);
+        assert_eq!(rig.engine.shared.lock().workers, 1);
+        *gate.0.lock().unwrap() = 1;
+        gate.1.notify_all();
+        assert_eq!(rig.drawn(2), [1, 2]);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
     cargo build --release -p anti-webui-app --example bench_pdf
     src/anti-webui-pdf/tools/compare.py --fetch WORK_DIR
-    src/anti-webui-pdf/tools/compare.py WORK_DIR [more.pdf ...]
+    src/anti-webui-pdf/tools/compare.py WORK_DIR [--zoom PERCENT] [more.pdf ...]
 
 The samples and PDF.js go in WORK_DIR, which shouldn't be in the repository: the licenses of the
 samples are their own. Chromium is only here to compare with. See `docs/design/26-pdf.md`.
@@ -108,11 +108,12 @@ def serve(work, results, finished):
     return server
 
 
-def pdfjs(work, file, speed, seconds):
+def pdfjs(work, file, speed, seconds, zoom):
     results, finished = [], threading.Event()
     server = serve(work, results, finished)
     profile = tempfile.mkdtemp()
-    query = urllib.parse.urlencode({"file": file, "speed": speed, "seconds": seconds})
+    query = urllib.parse.urlencode({"file": file, "speed": speed, "seconds": seconds,
+                                    "zoom": zoom / 100 if zoom else 0})
     chromium = subprocess.Popen(
         ["chromium", "--headless=new", "--no-sandbox", "--enable-gpu-rasterization",
          "--ignore-gpu-blocklist", "--use-angle=gl-egl", "--no-first-run",
@@ -120,7 +121,7 @@ def pdfjs(work, file, speed, seconds):
          f"--user-data-dir={profile}",
          f"http://127.0.0.1:{server.server_address[1]}/page.html?{query}"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    peak, end = 0, time.time() + seconds + 60
+    peak, end = 0, time.time() + seconds + 120
     while not finished.is_set() and time.time() < end:
         peak = max(peak, pss_of_tree(chromium.pid))
         time.sleep(0.1)
@@ -133,9 +134,10 @@ def pdfjs(work, file, speed, seconds):
     return result
 
 
-def ours(file, speed, seconds):
-    out = subprocess.run([BENCH, file, "--speed", str(speed), "--seconds", str(seconds)],
-                         capture_output=True, text=True, timeout=seconds + 60).stdout
+def ours(file, speed, seconds, zoom):
+    zoomed = ["--zoom", str(zoom)] if zoom else []
+    out = subprocess.run([BENCH, file, "--speed", str(speed), "--seconds", str(seconds), *zoomed],
+                         capture_output=True, text=True, timeout=seconds + 120).stdout
     return json.loads(out.splitlines()[-1])
 
 
@@ -144,16 +146,19 @@ def main():
     if args and args[0] == "--fetch":
         fetch(args[1])
         return
-    work, more = args[0], args[1:]
+    work, more, zoom = args[0], args[1:], 0
+    if more[:1] == ["--zoom"]:
+        zoom, more = int(more[1]), more[2:]
     samples = os.path.join(work, "samples")
     files = [os.path.join(samples, f) for f in sorted(os.listdir(samples))] + more
     rounds = 2
     seconds = 5
-    print(f"{'':30}{'':8}{'shown':>9}{'opened':>9}{'blank':>8}{'p95':>8}{'max':>8}{'peak':>8}  page")
+    print(f"{'':30}{'':8}{'shown':>9}{'sharp':>9}{'sharp%':>8}{'opened':>9}{'blank':>8}{'p95':>8}"
+          f"{'max':>8}{'peak':>8}  page")
     for file in files:
         for speed in (1, 5):
-            for name, run in (("hayro", lambda: ours(file, speed, seconds)),
-                              ("pdfjs", lambda: pdfjs(work, file, speed, seconds))):
+            for name, run in (("hayro", lambda: ours(file, speed, seconds, zoom)),
+                              ("pdfjs", lambda: pdfjs(work, file, speed, seconds, zoom))):
                 got = [run() for _ in range(rounds)]
                 bad = [g for g in got if "error" in g]
                 if bad:
@@ -161,7 +166,9 @@ def main():
                     continue
                 best = lambda key: min(g[key] for g in got)
                 print(f"{os.path.basename(file)[:26] + ' x' + str(speed):30}{name:8}"
-                      f"{best('shown_gpu_ms'):9.0f}{best('opened_ms'):9.0f}"
+                      f"{best('shown_gpu_ms'):9.0f}{best('sharp_ms'):9.0f}"
+                      f"{statistics.mean(g['sharp_share'] for g in got) * 100:7.1f}%"
+                      f"{best('opened_ms'):9.0f}"
                       f"{statistics.mean(g['blank_screens_share'] for g in got) * 100:7.1f}%"
                       f"{best('frame_p95_ms'):8.1f}{best('frame_max_ms'):8.1f}"
                       f"{max(g['peak_mib'] for g in got):8.0f}  {got[0]['page_reached']}", flush=True)
