@@ -30,6 +30,7 @@ AntiWebUI は WebView に頼らず、wgpu による自前描画とネイティ�
 | 23 | [drag-and-drop](23-drag-and-drop.md) | つかみ（`on_grab`）、型付きのアプリ内 DnD、`wl_data_device` の OS DnD、並べ替え、選択した文字のドラッグ |
 | 24 | [video](24-video.md) | `video` 要素、実行時に読む FFmpeg とライセンス、ゼロコピーの取り込み、音声、フレームの割り振り、Chromium との比較 |
 | 25 | [svg](25-svg.md) | パス描画の方式、`svg` と形のノード、SVG ファイルの読み込み（Mermaid の `foreignObject` を含む）、Chromium との画素と速度の比較 |
+| 26 | [pdf](26-pdf.md) | PDF ビュワー、`hayro` の評価と PDF.js との比較、優先度つきのワーカー、全体の絵と部分の絵、フォント解決、文字の抽出と選択 |
 
 ## 用語
 

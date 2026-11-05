@@ -52,6 +52,7 @@ pub struct Bitmap {
     height: u32,
     opaque: bool,
     bytes: usize,
+    level_count: u32,
     /// Let go of once the GPU has them.
     levels: Mutex<Option<Vec<Vec<u8>>>>,
     frames: Vec<Vec<u8>>,
@@ -70,16 +71,44 @@ impl Bitmap {
         let delays = d.frames.iter().map(|f| f.1).collect();
         let frames: Vec<Vec<u8>> = d.frames.into_iter().map(|f| f.0).collect();
         let bytes = d.levels.iter().chain(&frames).map(Vec::len).sum();
+        let level_count = if frames.is_empty() {
+            32 - d.size.0.max(d.size.1).leading_zeros()
+        } else {
+            1
+        };
         let bitmap = Self {
             id: NEXT_BITMAP.fetch_add(1, Ordering::Relaxed),
             width: d.size.0,
             height: d.size.1,
             opaque: d.opaque,
             bytes,
+            level_count,
             levels: Mutex::new(Some(d.levels)),
             frames,
         };
         (bitmap, delays, d.loops)
+    }
+
+    /// Pixels made by the program, for [`bitmap_view`](crate::view::bitmap_view): four bytes each,
+    /// row by row, with premultiplied alpha. It has no smaller levels, so it looks coarse when drawn
+    /// much smaller.
+    ///
+    /// # Panics
+    ///
+    /// If there aren't `width * height * 4` bytes.
+    pub fn from_premultiplied(width: u32, height: u32, pixels: Vec<u8>, opaque: bool) -> Self {
+        assert_eq!(pixels.len(), width as usize * height as usize * 4);
+        let bytes = pixels.len();
+        Self {
+            id: NEXT_BITMAP.fetch_add(1, Ordering::Relaxed),
+            width,
+            height,
+            opaque,
+            bytes,
+            level_count: 1,
+            levels: Mutex::new(Some(vec![pixels])),
+            frames: Vec::new(),
+        }
     }
 
     /// Identifies the pixels.
@@ -102,11 +131,7 @@ impl Bitmap {
 
     /// How many levels the texture needs.
     pub fn level_count(&self) -> u32 {
-        if self.frames.is_empty() {
-            32 - self.width.max(self.height).leading_zeros()
-        } else {
-            1
-        }
+        self.level_count
     }
 
     /// A frame of an animation, or `None` for a still.

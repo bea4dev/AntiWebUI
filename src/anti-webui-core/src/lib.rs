@@ -2,6 +2,7 @@
 //! resolution, layout, text, selection, editing and input handling.
 
 pub mod animation;
+pub mod channel;
 pub mod damage;
 pub mod drag;
 pub mod event;
@@ -31,6 +32,7 @@ pub mod prelude {
     pub use crate::animation::{
         Animatable, Animated, Spring, Timeout, animated, request_frame, set_timeout,
     };
+    pub use crate::channel::{UiSender, UiWork, ui_channel};
     pub use crate::drag::{
         DragData, DraggedText, DropEvent, ExternalDrag, GrabEvent, GrabPhase, dragged,
     };
@@ -52,9 +54,10 @@ pub mod prelude {
         video_player,
     };
     pub use crate::view::{
-        Div, ForEach, Img, IntoImageSource, IntoTextSource, IntoVideoSource, IntoView, NodeRef,
-        Popup, Show, Text, TextInput, Video, View, div, dyn_view, for_each, fragment, img,
-        node_ref, popup, portal, shader, show, text, text_area, text_input, video, window_scale,
+        BitmapView, Div, ForEach, Img, IntoImageSource, IntoTextSource, IntoVideoSource, IntoView,
+        NodeRef, Popup, Show, Text, TextInput, Video, View, bitmap_view, div, dyn_view, for_each,
+        fragment, img, node_ref, popup, portal, shader, show, text, text_area, text_input, video,
+        window_scale,
     };
     pub use anti_webui_style::*;
 }

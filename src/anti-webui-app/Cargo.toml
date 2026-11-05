@@ -18,6 +18,7 @@ png.workspace = true
 [dev-dependencies]
 anti-webui-core = { workspace = true, features = ["svg", "svg-text"] }
 anti-webui-video.workspace = true
+anti-webui-pdf.workspace = true
 image.workspace = true
 moxcms.workspace = true
 

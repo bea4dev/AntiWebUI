@@ -3,6 +3,8 @@
 
 pub use anti_webui_app as app;
 pub use anti_webui_core as core;
+#[cfg(feature = "pdf")]
+pub use anti_webui_pdf as pdf;
 pub use anti_webui_style as style;
 pub use anti_webui_wgpu as wgpu;
 pub use anti_webui_widgets as widgets;
@@ -13,5 +15,9 @@ pub mod prelude {
     pub use anti_webui_app::App;
     pub use anti_webui_core::prelude::*;
     pub use anti_webui_macros::ShaderParams;
+    #[cfg(feature = "pdf")]
+    pub use anti_webui_pdf::{
+        PdfError, PdfState, PdfView, PdfViewer, PdfZoom, pdf_view, pdf_viewer,
+    };
     pub use anti_webui_widgets::*;
 }

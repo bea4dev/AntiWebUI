@@ -1,0 +1,16 @@
+[package]
+name = "anti-webui-pdf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "A fast PDF viewer for AntiWebUI, on hayro"
+
+[dependencies]
+anti-webui-core.workspace = true
+hayro.workspace = true
+fontique.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+anti-webui-core = { workspace = true, features = ["svg"] }

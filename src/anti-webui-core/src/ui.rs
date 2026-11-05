@@ -260,6 +260,20 @@ impl Ui {
                 for id in std::mem::take(&mut doc.pending_scroll) {
                     scroll_into_view(doc, id);
                 }
+                for (id, to) in std::mem::take(&mut doc.pending_scroll_to) {
+                    let Some(n) = doc.get_mut(id) else {
+                        continue;
+                    };
+                    let pad = n.padding_abs();
+                    let to = PointI::new(
+                        to.x.clamp(0, (n.content_size.width - pad.width).max(0)),
+                        to.y.clamp(0, (n.content_size.height - pad.height).max(0)),
+                    );
+                    if n.scroll != to {
+                        n.scroll = to;
+                        doc.mark_scrolled(id);
+                    }
+                }
                 changed
             })
         })
@@ -290,6 +304,7 @@ impl Ui {
             || d.dirty.carets
             || d.stacking_dirty
             || !d.pending_scroll.is_empty()
+            || !d.pending_scroll_to.is_empty()
             || !d.reposition.is_empty()
     }
 
@@ -313,16 +328,15 @@ impl Ui {
     pub fn poll_images(&mut self) {
         let tells = with_doc(crate::images::poll);
         let video_tells = with_doc(|d| crate::video::poll(d, Instant::now()));
-        if !tells.is_empty() || !video_tells.is_empty() {
-            batch(|| {
-                for tell in tells {
-                    tell.run();
-                }
-                for tell in video_tells {
-                    tell();
-                }
-            });
-        }
+        batch(|| {
+            for tell in tells {
+                tell.run();
+            }
+            for tell in video_tells {
+                tell();
+            }
+            crate::channel::drain();
+        });
     }
 
     /// What is known about the refreshes of the screen, for showing video frames evenly. See
@@ -348,6 +362,7 @@ impl Ui {
 
     /// Called from another thread when there are pictures for [`Ui::poll_images`].
     pub fn set_image_waker(&mut self, waker: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        crate::channel::set_waker(waker.clone());
         with_doc(|d| {
             d.videos.get_mut().set_waker(waker.clone());
             d.images.get_mut().set_waker(waker);
@@ -361,7 +376,10 @@ impl Ui {
         loop {
             self.poll_images();
             self.update();
-            if with_doc(|d| d.images.get_mut().is_empty() && d.videos.get_mut().is_empty()) {
+            let others = crate::channel::working();
+            if !others
+                && with_doc(|d| d.images.get_mut().is_empty() && d.videos.get_mut().is_empty())
+            {
                 return false;
             }
             // Painting is what asks for the pixels.
@@ -374,7 +392,7 @@ impl Ui {
                 }
                 busy
             });
-            if videos {
+            if videos || others {
                 let left = end.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     return true;

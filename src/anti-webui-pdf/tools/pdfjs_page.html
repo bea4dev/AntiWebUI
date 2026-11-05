@@ -1,0 +1,92 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>bench</title>
+<link rel="stylesheet" href="/pdfjs/web/pdf_viewer.css">
+<style>
+  html, body { margin: 0; height: 100%; background: #1e1f22; }
+  #container { position: absolute; inset: 0; overflow: auto; }
+</style>
+<div id="container"><div id="viewer" class="pdfViewer"></div></div>
+<script type="module">
+// The viewer component of PDF.js with what its own app gives it, at the zoom `bench_pdf` starts at.
+import * as pdfjsLib from '/pdfjs/build/pdf.mjs';
+globalThis.pdfjsLib = pdfjsLib;
+const { PDFViewer, EventBus, PDFLinkService } = await import('/pdfjs/web/pdf_viewer.mjs');
+pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdfjs/build/pdf.worker.mjs';
+pdfjsLib.GlobalWorkerOptions.rendererSrc = '/pdfjs/build/pdf.renderer.mjs';
+const q = new URLSearchParams(location.search);
+const post = (path, body) => fetch(path, { method: 'POST', body });
+const speed = Number(q.get('speed'));
+const seconds = Number(q.get('seconds'));
+const container = document.getElementById('container');
+const eventBus = new EventBus();
+const linkService = new PDFLinkService({ eventBus });
+const FINISHED = 3;
+try {
+  const data = await (await fetch('/file?p=' + encodeURIComponent(q.get('file')))).arrayBuffer();
+  await new Promise(r => setTimeout(r, 200));
+  const viewer = new PDFViewer({ container, eventBus, linkService });
+  linkService.setViewer(viewer);
+  const start = performance.now();
+  let opened = 0;
+  const first = new Promise(resolve => eventBus.on('pagerendered', resolve, { once: true }));
+  eventBus.on('pagesinit', () => { viewer.currentScaleValue = 'page-width'; });
+  const doc = await pdfjsLib.getDocument({
+    data,
+    cMapUrl: '/pdfjs/cmaps/',
+    cMapPacked: true,
+    standardFontDataUrl: '/pdfjs/standard_fonts/',
+    wasmUrl: '/pdfjs/wasm/',
+    iccUrl: '/pdfjs/iccs/',
+    enableHWA: true,
+    enableWebGPU: true,
+  }).promise;
+  opened = performance.now() - start;
+  viewer.setDocument(doc);
+  linkService.setDocument(doc);
+  await first;
+  // The browser has to get it on the screen after that.
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const shown = performance.now() - start;
+
+  const frames = [];
+  let blank = 0, blankShare = 0;
+  const began = performance.now();
+  let last = began, y = container.scrollTop;
+  const screen = container.clientHeight;
+  await new Promise(resolve => {
+    const tick = now => {
+      frames.push(now - last);
+      y += screen * speed * (now - last) / 1000;
+      last = now;
+      container.scrollTop = y;
+      const views = viewer._getVisiblePages().views;
+      let missing = 0;
+      for (const v of views) {
+        if (v.view.renderingState !== FINISHED) missing += v.percent * v.view.div.clientHeight / 100;
+      }
+      if (missing > 32) { blank += 1; blankShare += missing / screen; }
+      if (now - began < seconds * 1000) requestAnimationFrame(tick);
+      else resolve();
+    };
+    requestAnimationFrame(tick);
+  });
+  const sorted = frames.slice().sort((a, b) => a - b);
+  const at = p => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))];
+  await post('/result', JSON.stringify({
+    opened_ms: opened,
+    shown_gpu_ms: shown,
+    pages: doc.numPages,
+    frames: frames.length,
+    frame_p50_ms: at(0.5),
+    frame_p95_ms: at(0.95),
+    frame_max_ms: at(1),
+    blank_frames: blank,
+    blank_screens_share: blankShare / frames.length,
+    page_reached: viewer.currentPageNumber - 1,
+  }));
+} catch (e) {
+  await post('/result', JSON.stringify({ error: String(e) }));
+}
+await post('/done', '');
+</script>

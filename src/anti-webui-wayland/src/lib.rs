@@ -107,6 +107,9 @@ impl<H: WaylandHandler> WaylandHandler for &mut H {
     fn may_render_ahead(&mut self, ctx: &mut Ctx<'_>) -> bool {
         (**self).may_render_ahead(ctx)
     }
+    fn woken(&mut self, ctx: &mut Ctx<'_>) {
+        (**self).woken(ctx)
+    }
 }
 
 /// What handlers may ask of the platform.

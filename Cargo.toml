@@ -14,6 +14,7 @@ members = [
     "src/anti-webui-app",
     "src/anti-webui-wgpu",
     "src/anti-webui-video",
+    "src/anti-webui-pdf",
     "src/anti-webui-wayland",
     "src/anti-webui-x11",
     "src/anti-webui-windows",
@@ -38,6 +39,7 @@ anti-webui-macros = { path = "src/anti-webui-macros", version = "0.1.0" }
 anti-webui-app = { path = "src/anti-webui-app", version = "0.1.0" }
 anti-webui-wgpu = { path = "src/anti-webui-wgpu", version = "0.1.0" }
 anti-webui-video = { path = "src/anti-webui-video", version = "0.1.0" }
+anti-webui-pdf = { path = "src/anti-webui-pdf", version = "0.1.0" }
 anti-webui-wayland = { path = "src/anti-webui-wayland", version = "0.1.0" }
 anti-webui-symbols-outlined = { path = "src/anti-webui-symbols-outlined", version = "0.1.0" }
 
@@ -68,3 +70,5 @@ read-fonts = { version = "0.41", default-features = false, features = ["std"] }
 ash = "0.38"
 libc = "0.2"
 libloading = "0.8"
+hayro = "=0.9.0"
+fontique = "0.12"

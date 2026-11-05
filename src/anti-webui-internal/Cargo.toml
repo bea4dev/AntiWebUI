@@ -10,6 +10,7 @@ default = ["svg", "svg-text"]
 svg = ["anti-webui-core/svg"]
 svg-text = ["anti-webui-core/svg-text"]
 video = ["anti-webui-app/video"]
+pdf = ["dep:anti-webui-pdf"]
 
 [dependencies]
 anti-webui-core.workspace = true
@@ -18,3 +19,4 @@ anti-webui-widgets.workspace = true
 anti-webui-app.workspace = true
 anti-webui-wgpu.workspace = true
 anti-webui-macros.workspace = true
+anti-webui-pdf = { workspace = true, optional = true }

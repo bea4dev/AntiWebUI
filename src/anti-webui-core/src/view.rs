@@ -8,6 +8,7 @@ use crate::drag::{DragData, DropConfig, DropEvent, GestureConfig, GrabEvent};
 use crate::event::DragResult;
 use crate::event::{KeyboardEvent, PointerEvent, ScrollEvent};
 use crate::geometry::{PointF, PointI, RectI, Scale};
+use crate::images::Bitmap;
 use crate::platform::{ImePurpose, Placement, PopupKind};
 use crate::reactive::{
     Owner, Signal, create_child_owner, create_root, effect, memo, on_cleanup, signal, untrack,
@@ -27,6 +28,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::hash::Hash;
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// The root node of a built piece of UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +120,17 @@ impl NodeRef {
                 d.mark_scrolled(id);
             }
         });
+    }
+
+    /// Scrolls a scrolling node to this offset in physical pixels, after the next layout, so that
+    /// content changing size in the same frame moves along with it.
+    pub fn scroll_to_after_layout(&self, x: i32, y: i32) {
+        if let Some(id) = self.0.get_untracked() {
+            with_doc(|d| {
+                d.pending_scroll_to.push((id, PointI::new(x, y)));
+                d.dirty.paint = true;
+            });
+        }
     }
 
     pub fn focus(&self) {
@@ -782,6 +795,55 @@ impl IntoView for Img {
         effect(move || {
             let source = source();
             with_doc(|d| d.set_image_source(id, source));
+        });
+        View(id)
+    }
+}
+
+/// Pixels the program made itself, filling the content box. See [`bitmap_view`].
+pub struct BitmapView {
+    cfg: ElementConfig,
+    bitmap: Box<dyn Fn() -> Option<Arc<Bitmap>>>,
+}
+
+/// Shows pixels the program made, as they are, without decoding, scaling or caching anything: no
+/// bitmap shows nothing. `bitmap` runs again when the signals it reads change, and a new bitmap
+/// shows from the next frame. The size of the box is up to the style.
+pub fn bitmap_view(bitmap: impl Fn() -> Option<Arc<Bitmap>> + 'static) -> BitmapView {
+    BitmapView {
+        cfg: ElementConfig::default(),
+        bitmap: Box::new(bitmap),
+    }
+}
+
+impl Styled for BitmapView {
+    fn style_mut(&mut self) -> &mut Style {
+        &mut self.cfg.style
+    }
+}
+
+impl BitmapView {
+    element_methods!();
+    box_paint_methods!();
+}
+
+impl IntoView for BitmapView {
+    fn into_view(self) -> View {
+        let id = self.cfg.build(Node::new(NodeKind::Image(Box::new(
+            crate::tree::ImageData {
+                density: 1.0,
+                ..Default::default()
+            },
+        ))));
+        let bitmap = self.bitmap;
+        effect(move || {
+            let bitmap = bitmap();
+            with_doc(|d| {
+                if let Some(NodeKind::Image(data)) = d.get_mut(id).map(|n| &mut n.kind) {
+                    data.fallback = bitmap;
+                    d.mark_paint();
+                }
+            });
         });
         View(id)
     }

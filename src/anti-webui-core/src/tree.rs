@@ -542,6 +542,8 @@ pub struct Document {
     pub(crate) drag: Option<crate::paint::DragVisual>,
     /// Nodes to bring into view after the next layout.
     pub pending_scroll: Vec<NodeId>,
+    /// Scrolling nodes to move after the next layout, and where to.
+    pub(crate) pending_scroll_to: Vec<(NodeId, PointI)>,
     /// Nodes that scrolled and have someone waiting to hear about it.
     pub scrolled: Vec<NodeId>,
     /// Nodes that got another size and have someone waiting to hear about it.
@@ -587,6 +589,7 @@ thread_local! {
         popups: Vec::new(),
         drag: None,
         pending_scroll: Vec::new(),
+        pending_scroll_to: Vec::new(),
         scrolled: Vec::new(),
         resized: Vec::new(),
         images: RefCell::default(),
