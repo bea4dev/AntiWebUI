@@ -112,3 +112,7 @@ struct EditState {
 - カーソル矩形は論理座標に変換して送る（[01](01-pixel-model.md) R7）。
 
 core は IME 状態を `ImeRequest { enabled, surrounding, cursor_rect, content_type }` として出力し、プラットフォーム層がプロトコルに変換する。
+
+## フォントの代役
+
+`font-family` のリストにある Arial、Helvetica、Times New Roman、Times、Courier New、Courier、Calibri、Cambria には、同じメトリクスのフォント（Liberation、Arimo、Tinos、Cousine、Carlito、Caladea）を直後に足す。fontconfig が Chromium に与える別名と同じ考え方である（[25](25-svg.md)）。

@@ -16,10 +16,10 @@ use icu_properties::{CodePointMapData, PropertyNamesShort};
 use parley::fontique::{Blob, FallbackKey, FontInfoOverride, Script};
 use parley::{
     Alignment, AlignmentOptions, FontContext, FontFamilyName, FontVariation, FontVariations,
-    Layout, LayoutContext, StyleProperty, TextWrapMode,
+    Layout, LayoutContext, PositionedLayoutItem, StyleProperty, TextWrapMode,
 };
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub use parley::{Affinity, Cursor, Selection as LayoutSelection};
@@ -27,6 +27,18 @@ pub use parley::{Affinity, Cursor, Selection as LayoutSelection};
 /// The brush stored in parley layouts. It is a span index, so color changes never require
 /// reshaping: the actual color is looked up at paint time.
 pub type Brush = u32;
+
+/// Fonts of the same metrics, from what fontconfig has in `30-metric-aliases.conf`.
+const STAND_INS: &[(&str, &str)] = &[
+    ("arial", "\"Liberation Sans\",Arimo"),
+    ("helvetica", "\"Liberation Sans\",Arimo"),
+    ("times new roman", "\"Liberation Serif\",Tinos"),
+    ("times", "\"Liberation Serif\",Tinos"),
+    ("courier new", "\"Liberation Mono\",Cousine"),
+    ("courier", "\"Liberation Mono\",Cousine"),
+    ("calibri", "Carlito"),
+    ("cambria", "Caladea"),
+];
 
 pub struct TextSystem {
     pub fcx: FontContext,
@@ -40,6 +52,8 @@ pub struct TextSystem {
     asked_lists: HashSet<FontFamily>,
     /// The names in those lists, in lower case, as fontique compares them.
     asked_names: HashSet<String>,
+    with_stand_ins: HashMap<FontFamily, Arc<str>>,
+    centrals: HashMap<(FontFamily, u32, FontWeight), (f32, f32)>,
 }
 
 impl TextSystem {
@@ -61,7 +75,33 @@ impl TextSystem {
             fonts_generation: 0,
             asked_lists: HashSet::new(),
             asked_names: HashSet::new(),
+            with_stand_ins: HashMap::new(),
+            centrals: HashMap::new(),
         }
+    }
+
+    /// A `font-family` list with fonts of the same metrics after the names that need them, like the
+    /// aliases fontconfig gives Chromium. Otherwise "Arial" where it isn't installed goes on to what
+    /// is next in the list, usually the default sans-serif, which can look quite different.
+    fn list_with_stand_ins(&mut self, family: &FontFamily) -> Arc<str> {
+        if let Some(list) = self.with_stand_ins.get(family) {
+            return list.clone();
+        }
+        let mut out = String::new();
+        for name in family.0.split(',') {
+            if !out.is_empty() {
+                out.push(',');
+            }
+            out.push_str(name);
+            let bare = name.trim().trim_matches(['"', '\'']).to_lowercase();
+            if let Some((_, stand_ins)) = STAND_INS.iter().find(|(n, _)| *n == bare) {
+                out.push(',');
+                out.push_str(stand_ins);
+            }
+        }
+        let list: Arc<str> = out.into();
+        self.with_stand_ins.insert(family.clone(), list.clone());
+        list
     }
 
     fn note_asked(&mut self, family: &FontFamily) {
@@ -272,6 +312,32 @@ pub struct ShapeStyle {
     pub wrap: bool,
 }
 
+/// How far below `dominant-baseline: central` and `middle` the baseline of a font is. It goes by the
+/// first font of the list even if the text is in a fallback one, as browsers do, which keeps text
+/// from moving by what script it is in.
+pub(crate) fn baselines_of(ts: &mut TextSystem, style: &ShapeStyle) -> (f32, f32) {
+    let key = (style.family.clone(), style.size.to_bits(), style.weight);
+    if let Some(v) = ts.centrals.get(&key) {
+        return *v;
+    }
+    let mut layout = TextLayout::default();
+    layout.shape(ts, "x", 1, style);
+    layout.break_lines(None);
+    let mut out = (0.0, 0.0);
+    if let Some(line) = layout.layout.lines().next() {
+        for item in line.items() {
+            if let PositionedLayoutItem::GlyphRun(run) = item {
+                let m = run.run().font_metrics();
+                let x_height = m.x_height.unwrap_or(m.ascent * 0.5);
+                out = ((m.ascent - m.descent) * 0.5, x_height * 0.5);
+                break;
+            }
+        }
+    }
+    ts.centrals.insert(key, out);
+    out
+}
+
 impl ShapeStyle {
     /// Makes it bigger, as what is around text in an `svg` does.
     pub(crate) fn zoomed(mut self, zoom: f32) -> Self {
@@ -345,9 +411,10 @@ impl TextLayout {
         ts.prepare_fallbacks(text);
         let variations = ts.variations(style);
         let locale = ts.locale;
+        let stand_ins = ts.list_with_stand_ins(&style.family);
         let mut builder = ts.lcx.ranged_builder(&mut ts.fcx, text, 1.0, true);
         builder.push_default(StyleProperty::FontFamily(parley::FontFamily::Source(
-            style.family.0.as_ref().to_owned().into(),
+            stand_ins.as_ref().to_owned().into(),
         )));
         builder.push_default(StyleProperty::FontSize(style.size));
         builder.push_default(StyleProperty::FontWeight(parley::FontWeight::new(

@@ -11,11 +11,17 @@ const SVG_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/svg");
 fn dump() {
     let out = std::env::var("SVG_DUMP").unwrap();
     let scale: f64 = std::env::var("SVG_SCALE").map_or(1.0, |s| s.parse().unwrap());
-    for entry in std::fs::read_dir(SVG_DIR).unwrap() {
+    let dir = std::env::var("SVG_SOURCE").unwrap_or(SVG_DIR.to_owned());
+    let size = std::env::var("SVG_SIZE").unwrap_or("400x300".to_owned());
+    let (w, h) = size.split_once('x').unwrap();
+    let (w, h): (u32, u32) = (w.parse().unwrap(), h.parse().unwrap());
+    for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "svg") {
+            continue;
+        }
         let name = path.file_stem().unwrap().to_str().unwrap().to_owned();
         let data = std::fs::read(&path).unwrap();
-        let (w, h) = (400u32, 300u32);
         let pixels = std::thread::spawn(move || {
             render_rgba(
                 (w as f64 * scale) as u32,

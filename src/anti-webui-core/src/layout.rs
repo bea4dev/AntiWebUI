@@ -1449,10 +1449,16 @@ impl Engine<'_> {
             inner.1 as f64,
             scale.as_f64(),
         ));
-        self.layout_shapes(id, world, size);
+        self.layout_shapes(id, world, size, None);
     }
 
-    fn layout_shapes(&mut self, id: NodeId, world: Affine, size: SizeI) {
+    fn layout_shapes(
+        &mut self,
+        id: NodeId,
+        world: Affine,
+        size: SizeI,
+        clips: Option<&std::sync::Arc<[crate::scene::ClipQuad]>>,
+    ) {
         let scale = self.scale;
         let children = self.doc.nodes[id].children.clone();
         let whole = RectI::new(0, 0, size.width, size.height);
@@ -1469,19 +1475,28 @@ impl Engine<'_> {
             match &mut node.kind {
                 NodeKind::Fragment => {
                     node.rect = whole;
-                    self.layout_shapes(c, world, size);
+                    self.layout_shapes(c, world, size, clips);
                 }
                 NodeKind::SvgShape(data) => {
                     let inner = world.then_apply(&data.transform);
                     data.world = inner;
+                    data.clips = clips.cloned();
                     match &data.geometry {
                         Some(g) => {
                             node.rect =
                                 crate::svg::shape_rect(g, &inner, &node.computed, scale.as_f64());
                         }
                         None => {
+                            let more = data.clip.map(|quad| {
+                                let quad = quad.map(|(x, y)| inner.apply(x, y));
+                                clips
+                                    .into_iter()
+                                    .flat_map(|c| c.iter().copied())
+                                    .chain([quad])
+                                    .collect::<std::sync::Arc<[_]>>()
+                            });
                             node.rect = whole;
-                            self.layout_shapes(c, inner, size);
+                            self.layout_shapes(c, inner, size, more.as_ref().or(clips));
                         }
                     }
                 }
@@ -1523,7 +1538,11 @@ impl Engine<'_> {
             None => world,
         };
         let (x, y) = world.apply(data.x as f64, data.y as f64);
-        let zoom = (world.a * world.d - world.b * world.c).abs().sqrt() / self.scale.as_f64();
+        let world_scale = (world.a * world.d - world.b * world.c).abs().sqrt();
+        let zoom = world_scale / self.scale.as_f64();
+        let wrap_at = data
+            .max_width
+            .map(|w| (w as f64 * world_scale).ceil() as i32);
         for c in self.doc.nodes[id].children.clone() {
             let Some(node) = self.doc.nodes.get_mut(c) else {
                 continue;
@@ -1537,14 +1556,25 @@ impl Engine<'_> {
                 node.last_perform = None;
             }
             let base = (Some(size.width), Some(size.height));
-            let s = self.compute(c, (None, None), None, base, false);
+            let s = self.compute(c, (None, None), wrap_at, base, false);
             let node = &mut self.doc.nodes[c];
-            let down = match (&node.kind, data.baseline) {
-                (NodeKind::Text(t), crate::svg::TextBaseline::Alphabetic) => {
-                    t.layout.first_baseline()
+            // The baseline lands on a whole pixel: where it is said to be, rounded.
+            let scale = self.scale;
+            let (baseline, below) = match &node.kind {
+                NodeKind::Text(t) => {
+                    let style = ShapeStyle::from_computed(&node.computed, scale).zoomed(t.zoom);
+                    (
+                        t.layout.first_baseline().round() as f64,
+                        crate::text::baselines_of(self.ts, &style),
+                    )
                 }
-                (_, crate::svg::TextBaseline::Middle) => s.height as f32 * 0.5,
-                _ => 0.0,
+                _ => (0.0, (0.0, 0.0)),
+            };
+            let top = match data.baseline {
+                crate::svg::TextBaseline::Alphabetic => y.round() - baseline,
+                crate::svg::TextBaseline::Central => (y + below.0 as f64).round() - baseline,
+                crate::svg::TextBaseline::Middle => (y + below.1 as f64).round() - baseline,
+                crate::svg::TextBaseline::Hanging => y.round(),
             };
             let across = match data.anchor {
                 crate::svg::TextAnchor::Start => 0.0,
@@ -1552,7 +1582,7 @@ impl Engine<'_> {
                 crate::svg::TextAnchor::End => s.width as f64,
             };
             node.rect.x = (x - across).round() as i32;
-            node.rect.y = (y - down as f64).round() as i32;
+            node.rect.y = top as i32;
             self.compute(
                 c,
                 (Some(s.width), Some(s.height)),

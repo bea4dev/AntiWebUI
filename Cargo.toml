@@ -60,6 +60,8 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 moxcms = "0.8"
 resvg = { version = "0.49", default-features = false, features = ["raster-images"] }
 kurbo = "0.13"
+simplecss = "0.2"
+svgtypes = "0.16"
 bytemuck = { version = "1.25", features = ["derive"] }
 log = "0.4"
 read-fonts = { version = "0.41", default-features = false, features = ["std"] }

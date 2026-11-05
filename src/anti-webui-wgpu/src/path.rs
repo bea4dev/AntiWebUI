@@ -324,34 +324,109 @@ fn strips_of(cells: Vec<Cell>, band: i32, rule: FillRule) -> Strips {
     out
 }
 
-/// What is covered by what `path` goes along, through `m`. `region` is what to make of it.
-fn rasterize(path: &BezPath, m: kurbo::Affine, region: [f32; 4], rule: FillRule) -> Strips {
+/// What of a closed outline is on the inner side of a line from `a` to `b`. An outline that isn't
+/// convex gets edges along the line, whose coverage comes to nothing.
+fn cut_by_edge(points: &mut Vec<Point>, spare: &mut Vec<Point>, a: Point, b: Point, sign: f64) {
+    spare.clear();
+    let side = |p: Point| sign * ((b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x));
+    let Some(&last) = points.last() else {
+        return;
+    };
+    let mut previous = last;
+    let mut previous_side = side(previous);
+    for &p in points.iter() {
+        let this_side = side(p);
+        if (this_side >= 0.0) != (previous_side >= 0.0) {
+            let t = previous_side / (previous_side - this_side);
+            spare.push(previous.lerp(p, t));
+        }
+        if this_side >= 0.0 {
+            spare.push(p);
+        }
+        previous = p;
+        previous_side = this_side;
+    }
+    std::mem::swap(points, spare);
+}
+
+/// Sends a closed outline on, after cutting it to `quads`.
+fn cut_outline(cells: &mut Cells, points: &mut Vec<Point>, quads: &[LocalQuad]) {
+    let mut spare = Vec::new();
+    for quad in quads {
+        let area: f64 = (0..4)
+            .map(|i| {
+                let (p, q) = (quad[i], quad[(i + 1) % 4]);
+                p.x * q.y - q.x * p.y
+            })
+            .sum();
+        let sign = area.signum();
+        for i in 0..4 {
+            cut_by_edge(points, &mut spare, quad[i], quad[(i + 1) % 4], sign);
+        }
+    }
+    let mut at = points.last().copied();
+    for &p in points.iter() {
+        if let Some(from) = at {
+            cells.line(from, p);
+        }
+        at = Some(p);
+    }
+    points.clear();
+}
+
+type LocalQuad = [Point; 4];
+
+/// What is covered by what `path` goes along, through `m`. `region` is what to make of it. `quads`
+/// are in the same coordinates as what comes out, and cut it.
+fn rasterize(
+    path: &BezPath,
+    m: kurbo::Affine,
+    region: [f32; 4],
+    rule: FillRule,
+    quads: &[LocalQuad],
+) -> Strips {
     let mut cells = Cells::new(region);
     let mut start = Point::ZERO;
     let mut at = Point::ZERO;
     let mut open = false;
+    let mut points: Vec<Point> = Vec::new();
     let transformed = path.elements().iter().map(|e| m * *e);
+    let cut = !quads.is_empty();
     kurbo::flatten(transformed, FLATTENING, |el| match el {
         PathEl::MoveTo(p) => {
-            if open {
-                cells.line(at, start);
+            if cut {
+                cut_outline(&mut cells, &mut points, quads);
+                points.push(p);
+            } else {
+                if open {
+                    cells.line(at, start);
+                }
+                start = p;
+                at = p;
+                open = true;
             }
-            start = p;
-            at = p;
-            open = true;
         }
         PathEl::LineTo(p) => {
-            cells.line(at, p);
-            at = p;
+            if cut {
+                points.push(p);
+            } else {
+                cells.line(at, p);
+                at = p;
+            }
         }
-        PathEl::ClosePath => {
+        PathEl::ClosePath if !cut => {
             cells.line(at, start);
             at = start;
         }
         _ => {}
     });
-    if open {
+    if cut {
+        cut_outline(&mut cells, &mut points, quads);
+    } else if open {
         cells.line(at, start);
+    }
+    if cells.cells.is_empty() {
+        return Strips::default();
     }
     let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
     for c in &cells.cells {
@@ -369,7 +444,7 @@ fn rasterize(path: &BezPath, m: kurbo::Affine, region: [f32; 4], rule: FillRule)
 }
 
 /// What `d` covers through `local`, as far as `area`.
-fn make_strips(d: &PathDraw, local: kurbo::Affine, area: RectI) -> Strips {
+fn make_strips(d: &PathDraw, local: kurbo::Affine, area: RectI, quads: &[LocalQuad]) -> Strips {
     let area = [
         area.x as f32,
         area.y as f32,
@@ -380,9 +455,9 @@ fn make_strips(d: &PathDraw, local: kurbo::Affine, area: RectI) -> Strips {
         Some(stroke) => {
             let scale = local.determinant().abs().sqrt();
             let path = outline(d.geometry.path(), stroke, scale);
-            rasterize(&path, local, area, FillRule::NonZero)
+            rasterize(&path, local, area, FillRule::NonZero, quads)
         }
-        None => rasterize(d.geometry.path(), local, area, d.rule),
+        None => rasterize(d.geometry.path(), local, area, d.rule, quads),
     }
 }
 
@@ -419,6 +494,8 @@ struct Key {
     matrix: [u32; 6],
     /// A hash of how the outline goes.
     stroke: u64,
+    /// A hash of what it is cut to.
+    cut: u64,
     region: Option<[i32; 4]>,
 }
 
@@ -447,6 +524,27 @@ fn stroke_key(stroke: &StrokeStyle) -> u64 {
     }
     // Never what a shape without an outline has.
     h.finish() | 1
+}
+
+/// What `d` is cut to in the coordinates of what is made of it: placed by `k`, `dx` and `dy`, less
+/// the whole pixels `ox` and `oy` it is kept without. And a hash of them.
+fn local_quads(d: &PathDraw, k: i32, dx: i32, dy: i32, ox: f64, oy: f64) -> (Vec<LocalQuad>, u64) {
+    let Some(quads) = &d.quads else {
+        return (Vec::new(), 0);
+    };
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let local: Vec<LocalQuad> = quads
+        .iter()
+        .map(|q| {
+            q.map(|(x, y)| {
+                let p = Point::new(x * k as f64 + dx as f64 - ox, y * k as f64 + dy as f64 - oy);
+                (p.x as f32).to_bits().hash(&mut h);
+                (p.y as f32).to_bits().hash(&mut h);
+                p
+            })
+        })
+        .collect();
+    (local, h.finish() | 1)
 }
 
 fn to_kurbo(m: Affine) -> kurbo::Affine {
@@ -504,6 +602,9 @@ fn gradient_rows(g: &Gradient, geometry: &PathGeometry, m: Affine) -> Option<([f
         }
     }
 }
+
+/// A shape to make.
+type Job<'a> = (Key, &'a PathDraw, kurbo::Affine, RectI, Vec<LocalQuad>);
 
 pub struct PathPass {
     globals_layout: wgpu::BindGroupLayout,
@@ -687,29 +788,21 @@ impl PathPass {
         // What is too big to make all of is made as far as it shows, which depends on where it is.
         let region = (bounds.width as f64 > WHOLE_LIMIT || bounds.height as f64 > WHOLE_LIMIT)
             .then_some(shows.translate(-ox as i32, -oy as i32).outset(64));
+        let (quads, cut) = local_quads(d, k, dx, dy, ox, oy);
         let key = Key {
             geometry: d.geometry.id(),
             rule: d.rule,
             matrix: local.as_coeffs().map(|v| (v as f32).to_bits()),
             stroke: d.stroke.as_deref().map_or(0, stroke_key),
+            cut,
             region: region.map(|r| [r.x, r.y, r.width, r.height]),
         };
         if !self.entries.contains_key(&key) {
             let area = match region {
-                Some(r) => [r.x as f32, r.y as f32, r.right() as f32, r.bottom() as f32],
-                None => {
-                    let b = bounds.translate(-ox as i32, -oy as i32).outset(2);
-                    [b.x as f32, b.y as f32, b.right() as f32, b.bottom() as f32]
-                }
+                Some(r) => r,
+                None => bounds.translate(-ox as i32, -oy as i32).outset(2),
             };
-            let strips = match &d.stroke {
-                Some(stroke) => {
-                    let scale = (local.determinant().abs()).sqrt();
-                    let path = outline(d.geometry.path(), stroke, scale);
-                    rasterize(&path, local, area, FillRule::NonZero)
-                }
-                None => rasterize(d.geometry.path(), local, area, d.rule),
-            };
+            let strips = make_strips(d, local, area, &quads);
             if !self.store_strips(key, strips) {
                 if self.gave_up {
                     return Some(false);
@@ -786,7 +879,7 @@ impl PathPass {
     /// Makes at once, on all CPUs, the shapes of a scene that aren't there yet. It is only worth it
     /// for many: when something big comes up or changes size.
     pub fn prepare_many(&mut self, device: &wgpu::Device, primitives: &[Primitive]) {
-        let mut jobs: Vec<(Key, &PathDraw, kurbo::Affine, RectI)> = Vec::new();
+        let mut jobs: Vec<Job<'_>> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         self.collect_jobs(primitives, &mut jobs, &mut seen);
         if jobs.len() < MANY_SHAPES {
@@ -804,10 +897,10 @@ impl PathPass {
                         let mut out = Vec::new();
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some((_, d, local, area)) = jobs.get(i) else {
+                            let Some((_, d, local, area, quads)) = jobs.get(i) else {
                                 return out;
                             };
-                            out.push((i, make_strips(d, *local, *area)));
+                            out.push((i, make_strips(d, *local, *area, quads)));
                         }
                     })
                 })
@@ -833,7 +926,7 @@ impl PathPass {
     fn collect_jobs<'a>(
         &self,
         primitives: &'a [Primitive],
-        jobs: &mut Vec<(Key, &'a PathDraw, kurbo::Affine, RectI)>,
+        jobs: &mut Vec<Job<'a>>,
         seen: &mut std::collections::HashSet<Key>,
     ) {
         for p in primitives {
@@ -845,16 +938,18 @@ impl PathPass {
                     if d.bounds.width as f64 > WHOLE_LIMIT || d.bounds.height as f64 > WHOLE_LIMIT {
                         continue;
                     }
+                    let (quads, cut) = local_quads(d, 1, 0, 0, ox, oy);
                     let key = Key {
                         geometry: d.geometry.id(),
                         rule: d.rule,
                         matrix: local.as_coeffs().map(|v| (v as f32).to_bits()),
                         stroke: d.stroke.as_deref().map_or(0, stroke_key),
+                        cut,
                         region: None,
                     };
                     if !self.entries.contains_key(&key) && seen.insert(key) {
                         let area = d.bounds.translate(-ox as i32, -oy as i32).outset(2);
-                        jobs.push((key, d, local, area));
+                        jobs.push((key, d, local, area, quads));
                     }
                 }
                 Primitive::Layer(layer) => {
@@ -1128,6 +1223,7 @@ mod tests {
             kurbo::Affine::IDENTITY,
             [-10.0, -10.0, 4000.0, 4000.0],
             rule,
+            &[],
         )
     }
 
@@ -1235,10 +1331,88 @@ mod tests {
             kurbo::Affine::IDENTITY,
             [0.0, 0.0, 100.0, 10.0],
             FillRule::NonZero,
+            &[],
         );
         assert_eq!(coverage_at(&s, 50, 5), 255);
         assert_eq!(coverage_at(&s, 0, 5), 255);
         assert_eq!(coverage_at(&s, 99, 5), 255);
+    }
+
+    #[test]
+    fn a_shape_is_cut_to_a_rectangle_at_any_angle() {
+        let square = |x0: f64, y0: f64, x1: f64, y1: f64| {
+            [
+                Point::new(x0, y0),
+                Point::new(x1, y0),
+                Point::new(x1, y1),
+                Point::new(x0, y1),
+            ]
+        };
+        let path = rect(0.0, 0.0, 100.0, 100.0);
+        let area = [-10.0, -10.0, 200.0, 200.0];
+        let cut = rasterize(
+            &path,
+            kurbo::Affine::IDENTITY,
+            area,
+            FillRule::NonZero,
+            &[square(10.0, 20.0, 30.0, 40.0)],
+        );
+        assert_eq!(coverage_at(&cut, 15, 25), 255);
+        assert_eq!(coverage_at(&cut, 5, 25), 0);
+        assert_eq!(coverage_at(&cut, 15, 45), 0);
+        // The other way around makes no difference.
+        let mut reversed = square(10.0, 20.0, 30.0, 40.0);
+        reversed.reverse();
+        let same = rasterize(
+            &path,
+            kurbo::Affine::IDENTITY,
+            area,
+            FillRule::NonZero,
+            &[reversed],
+        );
+        assert_eq!(cut, same);
+        // A diamond: half of the pixels on its edge.
+        let diamond = [
+            Point::new(50.0, 10.0),
+            Point::new(90.0, 50.0),
+            Point::new(50.0, 90.0),
+            Point::new(10.0, 50.0),
+        ];
+        let cut = rasterize(
+            &path,
+            kurbo::Affine::IDENTITY,
+            area,
+            FillRule::NonZero,
+            &[diamond],
+        );
+        assert_eq!(coverage_at(&cut, 50, 50), 255);
+        assert_eq!(coverage_at(&cut, 12, 12), 0);
+        let mut total = 0.0;
+        for y in 0..100 {
+            for x in 0..100 {
+                total += coverage_at(&cut, x, y) as f64 / 255.0;
+            }
+        }
+        assert!((total - 3200.0).abs() < 4.0, "{total}");
+    }
+
+    #[test]
+    fn what_covers_nothing_makes_nothing() {
+        assert_eq!(made(&BezPath::new(), FillRule::NonZero), Strips::default());
+        let outside = [
+            Point::new(50.0, 50.0),
+            Point::new(60.0, 50.0),
+            Point::new(60.0, 60.0),
+            Point::new(50.0, 60.0),
+        ];
+        let cut = rasterize(
+            &rect(0.0, 0.0, 10.0, 10.0),
+            kurbo::Affine::IDENTITY,
+            [-10.0, -10.0, 100.0, 100.0],
+            FillRule::NonZero,
+            &[outside],
+        );
+        assert_eq!(cut, Strips::default());
     }
 
     #[test]

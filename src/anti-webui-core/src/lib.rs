@@ -16,6 +16,8 @@ mod scroll;
 pub mod settings;
 pub mod shader;
 pub mod svg;
+#[cfg(feature = "svg")]
+mod svg_file;
 pub mod text;
 pub mod tree;
 pub mod ui;

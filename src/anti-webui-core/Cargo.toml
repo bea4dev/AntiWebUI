@@ -8,7 +8,7 @@ license.workspace = true
 [features]
 default = ["svg", "svg-text"]
 ## Pictures in SVG.
-svg = ["dep:resvg"]
+svg = ["dep:resvg", "dep:simplecss", "dep:svgtypes"]
 ## Text in SVG, which reads the fonts of the system when it comes up and adds 1.6 MiB.
 svg-text = ["svg", "resvg/text", "resvg/system-fonts"]
 
@@ -16,6 +16,8 @@ svg-text = ["svg", "resvg/text", "resvg/system-fonts"]
 image.workspace = true
 moxcms.workspace = true
 resvg = { workspace = true, optional = true }
+simplecss = { workspace = true, optional = true }
+svgtypes = { workspace = true, optional = true }
 kurbo.workspace = true
 log.workspace = true
 anti-webui-style.workspace = true

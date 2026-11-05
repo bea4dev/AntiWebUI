@@ -474,3 +474,158 @@ fn text_can_be_measured_up_front() {
     let rect = r.rect().unwrap();
     assert_eq!((w as i32, h as i32), (rect.width, rect.height));
 }
+
+fn texts(ui: &mut Ui) -> Vec<(anti_webui_core::scene::GlyphRun, usize)> {
+    ui.paint(Instant::now())
+        .primitives
+        .iter()
+        .filter_map(|p| match p {
+            Primitive::Glyphs(g) => Some((g.clone(), g.glyphs.len())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What Mermaid writes: HTML in a `foreignObject`, styled by a sheet with `!important` and classes.
+#[test]
+fn html_labels_become_text() {
+    let data = br##"<svg id="m" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100">
+        <style>#m{color:#112233}#m .box{color:#ff0000}#m p{margin:0}</style>
+        <g transform="translate(10 20)">
+            <foreignObject width="100" height="24">
+                <div xmlns="http://www.w3.org/1999/xhtml" class="box" style="line-height:1.5;text-align:center">
+                    <span><p>Label</p></span>
+                </div>
+            </foreignObject>
+        </g>
+    </svg>"##;
+    let mut ui = mount((800, 600), ONE, || {
+        svg::parse(data).unwrap().w(200.0).h(100.0)
+    });
+    let runs = texts(&mut ui);
+    assert_eq!(runs.len(), 1, "the text is there");
+    assert_eq!(runs[0].1, 5);
+    assert_eq!(runs[0].0.color, Color::from_rgb(0xff0000));
+    // In the middle of its box, moved along with what is around it.
+    let middle = runs[0].0.glyphs.first().unwrap().x;
+    assert!(middle > 20.0 && middle < 60.0, "{middle}");
+}
+
+#[test]
+fn backgrounds_of_html_labels_are_painted_and_empty_ones_leave_nothing() {
+    let data = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100">
+        <foreignObject width="100" height="24">
+            <div xmlns="http://www.w3.org/1999/xhtml" style="background-color:rgba(10,20,30,0.5)">Hi</div>
+        </foreignObject>
+        <foreignObject width="50" height="24"><div xmlns="http://www.w3.org/1999/xhtml"><p></p></div></foreignObject>
+        <foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml">Gone</div></foreignObject>
+    </svg>"##;
+    let mut ui = mount((800, 600), ONE, || {
+        svg::parse(data).unwrap().w(200.0).h(100.0)
+    });
+    assert_eq!(paths(&mut ui).len(), 1, "the one background");
+    assert_eq!(texts(&mut ui).len(), 1, "one label has text");
+}
+
+#[test]
+fn a_line_break_in_html_makes_two_lines() {
+    let data = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100">
+        <foreignObject width="200" height="50">
+            <div xmlns="http://www.w3.org/1999/xhtml"><p>one<br/>two</p><p>three</p></div>
+        </foreignObject>
+    </svg>"##;
+    let mut ui = mount((800, 600), ONE, || {
+        svg::parse(data).unwrap().w(200.0).h(100.0)
+    });
+    let runs = texts(&mut ui);
+    assert_eq!(runs.len(), 3, "a run for each line");
+    assert!(runs[0].0.glyphs[0].y < runs[1].0.glyphs[0].y);
+    assert!(runs[1].0.glyphs[0].y < runs[2].0.glyphs[0].y);
+}
+
+/// `<text>` goes through the same fonts as other text, rather than being outlines.
+#[test]
+fn text_in_a_file_is_text() {
+    let data = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100">
+        <text x="100" y="50" text-anchor="middle" dominant-baseline="central" style="font-size:16px" fill="#0000ff"><tspan x="100" dy="0">Hello</tspan><tspan x="100" dy="20">World</tspan></text>
+    </svg>"##;
+    let mut ui = mount((800, 600), ONE, || {
+        svg::parse(data).unwrap().w(200.0).h(100.0)
+    });
+    assert_eq!(paths(&mut ui).len(), 0, "no outlines");
+    let runs = texts(&mut ui);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].0.color, Color::from_rgb(0x0000ff));
+    assert!(runs[1].0.glyphs[0].y > runs[0].0.glyphs[0].y + 10.0);
+}
+
+/// What has its letters turned one by one stays as outlines, which get that right.
+#[test]
+fn text_with_letters_on_their_own_is_outlines() {
+    let data = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100">
+        <text x="10" y="50" rotate="10" font-size="16">abc</text>
+    </svg>"##;
+    let mut ui = mount((800, 600), ONE, || {
+        svg::parse(data).unwrap().w(200.0).h(100.0)
+    });
+    assert!(!paths(&mut ui).is_empty());
+    assert_eq!(texts(&mut ui).len(), 0);
+}
+
+/// What every Mermaid diagram has: an arrow in a marker, whose box clips it but cuts nothing off.
+#[test]
+fn a_marker_does_not_make_it_a_picture() {
+    let data = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100">
+        <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 Z"/></marker></defs>
+        <path d="M10 10 L100 80" fill="none" stroke="#000" marker-end="url(#a)"/>
+    </svg>"##;
+    let mut ui = mount((800, 600), ONE, || {
+        svg::parse(data).unwrap().w(200.0).h(100.0)
+    });
+    let d = paths(&mut ui);
+    assert_eq!(d.len(), 2, "the line and the arrow");
+    assert!(d[1].quads.is_some(), "its box still cuts it");
+}
+
+#[test]
+fn a_clip_path_that_is_not_a_rectangle_makes_it_a_picture() {
+    let data = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100">
+        <clipPath id="c"><circle cx="50" cy="50" r="40"/></clipPath>
+        <rect width="100" height="100" clip-path="url(#c)"/>
+    </svg>"##;
+    let mut ui = mount((800, 600), ONE, || {
+        svg::parse(data).unwrap().w(200.0).h(100.0)
+    });
+    assert_eq!(paths(&mut ui).len(), 0);
+}
+
+/// What can't be shapes is one picture, with the labels still over it.
+#[test]
+fn labels_stay_when_it_is_a_picture() {
+    let data = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100">
+        <filter id="f"><feGaussianBlur stdDeviation="1"/></filter>
+        <rect width="10" height="10" fill="#ff0000" filter="url(#f)"/>
+        <g transform="translate(5 5)"><foreignObject width="100" height="24"><div xmlns="http://www.w3.org/1999/xhtml">Hi</div></foreignObject></g>
+    </svg>"##;
+    let mut ui = mount((800, 600), ONE, || {
+        svg::parse(data).unwrap().w(200.0).h(100.0)
+    });
+    assert_eq!(texts(&mut ui).len(), 1);
+}
+
+/// What a sheet says of `rect` isn't for the label, which `usvg` sees as one.
+#[test]
+fn a_sheet_about_rectangles_leaves_labels_alone() {
+    let data = br##"<svg id="m" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100">
+        <style>#m .edge rect{opacity:0.5;fill:#f00}</style>
+        <g class="edge"><foreignObject width="100" height="24">
+            <div xmlns="http://www.w3.org/1999/xhtml" style="color:#000">Label</div>
+        </foreignObject></g>
+    </svg>"##;
+    let mut ui = mount((800, 600), ONE, || {
+        svg::parse(data).unwrap().w(200.0).h(100.0)
+    });
+    let runs = texts(&mut ui);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].0.color, Color::BLACK, "not faded");
+}

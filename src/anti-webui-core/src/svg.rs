@@ -5,7 +5,7 @@
 use crate::drag::{DragData, DropEvent, GrabEvent};
 use crate::event::{DragResult, KeyboardEvent, PointerEvent, ScrollEvent};
 use crate::geometry::{Affine, PointF, RectI};
-use crate::scene::{PathDraw, PathGeometry, PathPaint, StrokeStyle};
+use crate::scene::{ClipQuad, PathDraw, PathGeometry, PathPaint, StrokeStyle};
 use crate::shader::IntoImage;
 use crate::tree::{Node, NodeKind, with_doc};
 use crate::view::{
@@ -16,6 +16,9 @@ use anti_webui_style::{ComputedStyle, LineCap, LineJoin, Sheet, Style, Styled, S
 use kurbo::{BezPath, ParamCurveNearest, Point, Shape as _};
 use std::rc::Rc;
 use std::sync::Arc;
+
+#[cfg(feature = "svg")]
+pub use crate::svg_file::parse;
 
 pub use crate::geometry::Affine as Transform;
 pub use kurbo;
@@ -91,6 +94,10 @@ pub struct ShapeData {
     pub transform: Affine,
     /// From its coordinates to the box of the `svg`, in physical pixels.
     pub world: Affine,
+    /// A group cuts what is in it to this, in its coordinates.
+    pub clip: Option<ClipQuad>,
+    /// What it is cut to by the groups around it, in the coordinates of the box of the `svg`.
+    pub clips: Option<Arc<[ClipQuad]>>,
 }
 
 impl Default for ShapeData {
@@ -99,6 +106,8 @@ impl Default for ShapeData {
             geometry: None,
             transform: Affine::IDENTITY,
             world: Affine::IDENTITY,
+            clip: None,
+            clips: None,
         }
     }
 }
@@ -117,7 +126,11 @@ pub enum TextAnchor {
 pub enum TextBaseline {
     #[default]
     Alphabetic,
+    /// Half of the height of an `x` above the baseline.
     Middle,
+    /// Half way between the ascent and the descent of the font.
+    Central,
+    /// The top of its line box.
     Hanging,
 }
 
@@ -128,6 +141,8 @@ pub struct SvgTextData {
     pub anchor: TextAnchor,
     pub baseline: TextBaseline,
     pub transform: Option<Affine>,
+    /// How wide it can get before it wraps, in its coordinates. Without one it stays on its lines.
+    pub max_width: Option<f32>,
 }
 
 /// The inner box around an outline, for what can stick out of the curves.
@@ -229,11 +244,17 @@ pub(crate) fn shape_draws(
         return;
     };
     let c = &node.computed;
-    let transform = Affine::translation(
+    let (ox, oy) = (
         (node.abs.x - node.rect.x) as f64,
         (node.abs.y - node.rect.y) as f64,
-    )
-    .then_apply(&data.world);
+    );
+    let transform = Affine::translation(ox, oy).then_apply(&data.world);
+    let quads: Option<Arc<[ClipQuad]>> = data.clips.as_ref().map(|clips| {
+        clips
+            .iter()
+            .map(|q| q.map(|(x, y)| (x + ox, y + oy)))
+            .collect()
+    });
     let draw = |paint, stroke, opacity: f32| PathDraw {
         geometry: geometry.clone(),
         stroke,
@@ -243,6 +264,7 @@ pub(crate) fn shape_draws(
         transform,
         bounds: node.abs,
         clip: node.clip_shape(),
+        quads: quads.clone(),
     };
     let paint_of = |paint: &SvgPaint| match paint {
         SvgPaint::None => None,
@@ -441,6 +463,7 @@ pub struct Shape {
 /// A group of shapes, like `<g>`: what is set on it goes down to them.
 pub struct Group {
     cfg: ElementConfig,
+    clip: Option<ClipQuad>,
     transform: Affine,
     dyn_transform: Option<Box<dyn Fn() -> Affine>>,
     children: Vec<View>,
@@ -449,6 +472,7 @@ pub struct Group {
 pub fn group() -> Group {
     Group {
         cfg: ElementConfig::default(),
+        clip: None,
         transform: Affine::IDENTITY,
         dyn_transform: None,
         children: Vec::new(),
@@ -542,6 +566,21 @@ impl Shape {
 impl Group {
     crate::view::element_methods!();
 
+    /// Cuts the shapes in it to a rectangle, in its coordinates. Text isn't cut.
+    pub fn clip_rect(self, x: f64, y: f64, width: f64, height: f64) -> Self {
+        self.clip_quad([
+            (x, y),
+            (x + width, y),
+            (x + width, y + height),
+            (x, y + height),
+        ])
+    }
+
+    pub(crate) fn clip_quad(mut self, quad: ClipQuad) -> Self {
+        self.clip = Some(quad);
+        self
+    }
+
     /// Where its coordinates are in those around it, like the `transform` of SVG.
     pub fn transform(mut self, transform: Affine) -> Self {
         self.transform = transform;
@@ -593,7 +632,7 @@ impl IntoView for Shape {
         let data = ShapeData {
             geometry: Some(geometry),
             transform: self.transform,
-            world: Affine::IDENTITY,
+            ..ShapeData::default()
         };
         let id = self
             .cfg
@@ -619,9 +658,9 @@ impl IntoView for Shape {
 impl IntoView for Group {
     fn into_view(self) -> View {
         let data = ShapeData {
-            geometry: None,
             transform: self.transform,
-            world: Affine::IDENTITY,
+            clip: self.clip,
+            ..ShapeData::default()
         };
         let id = self
             .cfg
@@ -679,6 +718,12 @@ impl SvgText {
         self.data.transform = Some(transform);
         self
     }
+
+    /// Wraps at this width, in its coordinates.
+    pub fn max_width(mut self, width: f32) -> Self {
+        self.data.max_width = Some(width);
+        self
+    }
 }
 
 impl IntoView for SvgText {
@@ -697,203 +742,4 @@ impl IntoView for SvgText {
         });
         View(id)
     }
-}
-
-/// Makes shapes out of an SVG file, which then go like shapes made by hand: they follow the scale
-/// and take no room in the picture cache. What this can't draw (patterns, masks, filters, pictures,
-/// blending and clip paths) makes all of it one picture instead, as `img` shows it.
-#[cfg(feature = "svg")]
-pub fn parse(data: &[u8]) -> Result<Svg, String> {
-    use resvg::usvg;
-    #[allow(unused_mut)]
-    let mut options = usvg::Options::default();
-    // Reading the fonts of the system takes a while, and few pictures have text.
-    #[cfg(feature = "svg-text")]
-    if data.windows(5).any(|w| w == b"<text") {
-        options.fontdb_mut().load_system_fonts();
-    }
-    let tree = usvg::Tree::from_data(data, &options).map_err(|e| e.to_string())?;
-    let size = tree.size();
-    let (width, height) = (size.width(), size.height());
-    let root = svg()
-        .view_box(0.0, 0.0, width, height)
-        .w(anti_webui_style::Length::Px(width))
-        .h(anti_webui_style::Length::Px(height));
-    Ok(if drawable(tree.root()) {
-        root.children(tree.root().children().iter().filter_map(parsed_node))
-    } else {
-        root.child(
-            crate::view::img(data.to_vec())
-                .w(anti_webui_style::Length::Percent(100.0))
-                .h(anti_webui_style::Length::Percent(100.0)),
-        )
-    })
-}
-
-#[cfg(feature = "svg")]
-fn drawable(g: &resvg::usvg::Group) -> bool {
-    use resvg::usvg::{self, Node as N};
-    let paint = |p: &usvg::Paint| !matches!(p, usvg::Paint::Pattern(_));
-    g.clip_path().is_none()
-        && g.mask().is_none()
-        && g.filters().is_empty()
-        && g.blend_mode() == usvg::BlendMode::Normal
-        && g.children().iter().all(|n| match n {
-            N::Group(g) => drawable(g),
-            N::Path(p) => {
-                p.fill().is_none_or(|f| paint(f.paint()))
-                    && p.stroke().is_none_or(|s| paint(s.paint()))
-            }
-            N::Image(_) => false,
-            N::Text(t) => drawable(t.flattened()),
-        })
-}
-
-#[cfg(feature = "svg")]
-fn parsed_transform(t: resvg::usvg::Transform) -> Affine {
-    Affine {
-        a: t.sx as f64,
-        b: t.ky as f64,
-        c: t.kx as f64,
-        d: t.sy as f64,
-        e: t.tx as f64,
-        f: t.ty as f64,
-    }
-}
-
-#[cfg(feature = "svg")]
-fn parsed_paint(paint: &resvg::usvg::Paint) -> SvgPaint {
-    use anti_webui_style::{Color, Gradient, GradientSpread, GradientUnits};
-    use resvg::usvg;
-    let color = |c: usvg::Color, a: f32| {
-        Color::new(
-            c.red as f32 / 255.0,
-            c.green as f32 / 255.0,
-            c.blue as f32 / 255.0,
-            a,
-        )
-    };
-    let finish = |mut g: Gradient, base: &usvg::BaseGradient| {
-        for stop in base.stops() {
-            g = g.stop(
-                stop.offset().get(),
-                color(stop.color(), stop.opacity().get()),
-            );
-        }
-        let t = base.transform();
-        SvgPaint::from(
-            g.units(GradientUnits::UserSpace)
-                .spread(match base.spread_method() {
-                    usvg::SpreadMethod::Pad => GradientSpread::Pad,
-                    usvg::SpreadMethod::Reflect => GradientSpread::Reflect,
-                    usvg::SpreadMethod::Repeat => GradientSpread::Repeat,
-                })
-                .transform([
-                    t.sx as f64,
-                    t.ky as f64,
-                    t.kx as f64,
-                    t.sy as f64,
-                    t.tx as f64,
-                    t.ty as f64,
-                ]),
-        )
-    };
-    match paint {
-        usvg::Paint::Color(c) => SvgPaint::Color(color(*c, 1.0)),
-        usvg::Paint::LinearGradient(g) => {
-            finish(Gradient::linear(g.x1(), g.y1(), g.x2(), g.y2()), g)
-        }
-        usvg::Paint::RadialGradient(g) => {
-            let mut radial = Gradient::radial(g.cx(), g.cy(), g.r().get());
-            radial.shape = anti_webui_style::GradientShape::Radial {
-                cx: g.cx(),
-                cy: g.cy(),
-                r: g.r().get(),
-                fx: g.fx(),
-                fy: g.fy(),
-            };
-            finish(radial, g)
-        }
-        usvg::Paint::Pattern(_) => SvgPaint::None,
-    }
-}
-
-#[cfg(feature = "svg")]
-fn parsed_node(node: &resvg::usvg::Node) -> Option<View> {
-    use resvg::usvg::{self, Node as N};
-    Some(match node {
-        N::Group(g) => parsed_group(g).into_view(),
-        N::Text(t) => parsed_group(t.flattened()).into_view(),
-        N::Image(_) => return None,
-        N::Path(p) if !p.is_visible() => return None,
-        N::Path(p) => {
-            let mut curves = BezPath::new();
-            for segment in p.data().segments() {
-                match segment {
-                    usvg::tiny_skia_path::PathSegment::MoveTo(a) => {
-                        curves.move_to((a.x as f64, a.y as f64))
-                    }
-                    usvg::tiny_skia_path::PathSegment::LineTo(a) => {
-                        curves.line_to((a.x as f64, a.y as f64))
-                    }
-                    usvg::tiny_skia_path::PathSegment::QuadTo(a, b) => {
-                        curves.quad_to((a.x as f64, a.y as f64), (b.x as f64, b.y as f64))
-                    }
-                    usvg::tiny_skia_path::PathSegment::CubicTo(a, b, c) => curves.curve_to(
-                        (a.x as f64, a.y as f64),
-                        (b.x as f64, b.y as f64),
-                        (c.x as f64, c.y as f64),
-                    ),
-                    usvg::tiny_skia_path::PathSegment::Close => curves.close_path(),
-                }
-            }
-            let mut shape = path(curves);
-            shape = match p.fill() {
-                Some(f) => shape
-                    .fill(parsed_paint(f.paint()))
-                    .fill_opacity(f.opacity().get())
-                    .fill_rule(match f.rule() {
-                        usvg::FillRule::NonZero => anti_webui_style::FillRule::NonZero,
-                        usvg::FillRule::EvenOdd => anti_webui_style::FillRule::EvenOdd,
-                    }),
-                None => shape.fill_none(),
-            };
-            if let Some(s) = p.stroke() {
-                shape = shape
-                    .stroke(parsed_paint(s.paint()))
-                    .stroke_opacity(s.opacity().get())
-                    .stroke_width(s.width().get())
-                    .miter_limit(s.miterlimit().get())
-                    .line_cap(match s.linecap() {
-                        usvg::LineCap::Butt => LineCap::Butt,
-                        usvg::LineCap::Round => LineCap::Round,
-                        usvg::LineCap::Square => LineCap::Square,
-                    })
-                    .line_join(match s.linejoin() {
-                        usvg::LineJoin::Miter | usvg::LineJoin::MiterClip => LineJoin::Miter,
-                        usvg::LineJoin::Round => LineJoin::Round,
-                        usvg::LineJoin::Bevel => LineJoin::Bevel,
-                    })
-                    .dash_offset(s.dashoffset());
-                if let Some(dashes) = s.dasharray() {
-                    shape = shape.dash_array(dashes.iter().copied());
-                }
-            } else {
-                shape = shape.stroke(SvgPaint::None);
-            }
-            shape.into_view()
-        }
-    })
-}
-
-#[cfg(feature = "svg")]
-fn parsed_group(g: &resvg::usvg::Group) -> Group {
-    let mut out = group()
-        .transform(parsed_transform(g.transform()))
-        .children(g.children().iter().filter_map(parsed_node));
-    let opacity = g.opacity().get();
-    if opacity < 1.0 {
-        out = out.opacity(opacity);
-    }
-    out
 }

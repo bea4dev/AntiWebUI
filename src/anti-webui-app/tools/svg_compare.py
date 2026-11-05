@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Compares what the files in tests/data/svg come out as with what Chromium makes of them.
 
-    python3 tools/svg_compare.py [scale]
+    python3 tools/svg_compare.py [scale] [directory] [WIDTHxHEIGHT]
+
+With a directory, the pictures go to `compare_out` under the working directory: Chromium's and these.
 
 Takes Chromium with GPU raster, and the `dump` test of tests/svg.rs. Prints for each file the mean of
 the largest channel difference (0-255) over the pixels, and the largest difference.
 """
-import os, re, subprocess, sys, tempfile, zlib, struct
+import os, re, shutil, subprocess, sys, tempfile, zlib, struct
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DIR = os.path.join(HERE, "..", "tests", "data", "svg")
-W, H = 400, 300
 
 
 def read_png(path):
@@ -56,8 +57,11 @@ def read_png(path):
 
 def main():
     scale = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
+    source = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else DIR
+    size = sys.argv[3] if len(sys.argv) > 3 else "400x300"
+    W, H = map(int, size.split("x"))
     with tempfile.TemporaryDirectory() as tmp:
-        env = dict(os.environ, SVG_DUMP=tmp, SVG_SCALE=str(scale))
+        env = dict(os.environ, SVG_DUMP=tmp, SVG_SCALE=str(scale), SVG_SOURCE=source, SVG_SIZE=size)
         for key in ("CARGO_INCREMENTAL", "CARGO_PROFILE_TEST_DEBUG", "CARGO_PROFILE_DEV_DEBUG"):
             env[key] = "0"
         subprocess.run(
@@ -68,12 +72,12 @@ def main():
             cwd=os.path.join(HERE, ".."),
         )
         rows = []
-        for name in sorted(os.listdir(DIR)):
+        for name in sorted(os.listdir(source)):
             if not name.endswith(".svg"):
                 continue
             stem = name[:-4]
             page = os.path.join(tmp, stem + ".html")
-            svg = open(os.path.join(DIR, name)).read()
+            svg = open(os.path.join(source, name)).read()
             open(page, "w").write(
                 "<!doctype html><html><style>html,body{margin:0;background:#fff}svg{display:block}</style><body>"
                 + svg
@@ -91,6 +95,10 @@ def main():
                 timeout=60,
             )
             w, h, ch, png = read_png(shot)
+            if source != DIR:
+                os.makedirs("compare_out", exist_ok=True)
+                shutil.copy(shot, f"compare_out/{stem}.chromium.png")
+                shutil.copy(os.path.join(tmp, stem + ".rgba"), f"compare_out/{stem}.rgba")
             ours = open(os.path.join(tmp, stem + ".rgba"), "rb").read()
             pw = int(W * scale)
             total = 0

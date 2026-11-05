@@ -486,7 +486,12 @@ pub struct PathDraw {
     /// A rectangle containing what it can touch.
     pub bounds: RectI,
     pub clip: Clip,
+    /// What it is cut to besides `clip`, where it shows: rectangles that can be at any angle.
+    pub quads: Option<Arc<[ClipQuad]>>,
 }
+
+/// The corners of a rectangle, in turn.
+pub type ClipQuad = [(f64, f64); 4];
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Primitive {

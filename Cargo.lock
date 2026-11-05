@@ -58,7 +58,9 @@ dependencies = [
  "parley",
  "read-fonts",
  "resvg",
+ "simplecss",
  "slotmap",
+ "svgtypes",
  "unicode-segmentation",
 ]
 
