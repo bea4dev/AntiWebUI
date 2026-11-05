@@ -127,6 +127,11 @@ pub enum Prop {
     Inset,
     Gap,
     BorderWidth,
+    SvgFill,
+    SvgStroke,
+    StrokeWidth,
+    FillOpacity,
+    StrokeOpacity,
 }
 
 /// The value of an animatable property.
@@ -138,6 +143,7 @@ pub enum AnimatedValue {
     Shadows(Vec<BoxShadow>),
     Weight(FontWeight),
     Axes(FontAxes),
+    Paint(SvgPaint),
 }
 
 impl AnimatedValue {
@@ -146,7 +152,8 @@ impl AnimatedValue {
     pub fn distance(&self, other: &AnimatedValue) -> f32 {
         match (self, other) {
             (Self::Number(a), Self::Number(b)) => (a - b).abs(),
-            (Self::Color(a), Self::Color(b)) => {
+            (Self::Paint(SvgPaint::Color(a)), Self::Paint(SvgPaint::Color(b)))
+            | (Self::Color(a), Self::Color(b)) => {
                 let (a, b) = (a.premultiplied(), b.premultiplied());
                 a.iter().zip(b).map(|(a, b)| (a - b).abs()).sum()
             }
@@ -172,6 +179,10 @@ impl AnimatedValue {
         Some(match (self, to) {
             (Self::Number(a), Self::Number(b)) => Self::Number(number(*a, *b)),
             (Self::Color(a), Self::Color(b)) => Self::Color(mix_premultiplied(*a, *b, t)),
+            // Only colors have anything in between.
+            (Self::Paint(SvgPaint::Color(a)), Self::Paint(SvgPaint::Color(b))) => {
+                Self::Paint(SvgPaint::Color(mix_premultiplied(*a, *b, t)))
+            }
             (Self::Length(Length::Px(a)), Self::Length(Length::Px(b))) => {
                 Self::Length(Length::Px(number(*a, *b)))
             }
@@ -282,6 +293,11 @@ animated_fields! {
     Inset: inset_top as Length, inset_right as Length,
         inset_bottom as Length, inset_left as Length;
     Gap: row_gap as Number, column_gap as Number;
+    SvgFill: fill_paint as Paint;
+    SvgStroke: stroke_paint as Paint;
+    StrokeWidth: stroke_width as Number;
+    FillOpacity: fill_opacity as Number;
+    StrokeOpacity: stroke_opacity as Number;
     BorderWidth: border_top_width as Number, border_right_width as Number,
         border_bottom_width as Number, border_left_width as Number;
 }

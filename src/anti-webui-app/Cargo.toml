@@ -2,15 +2,22 @@
 name = "anti-webui-app"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+
+[features]
+## Plays videos with an FFmpeg found at run time.
+video = ["dep:anti-webui-video"]
 
 [dependencies]
 anti-webui-core.workspace = true
 anti-webui-wgpu.workspace = true
+anti-webui-video = { workspace = true, optional = true }
 png.workspace = true
 
 [dev-dependencies]
 anti-webui-core = { workspace = true, features = ["svg", "svg-text"] }
+anti-webui-video.workspace = true
 image.workspace = true
 moxcms.workspace = true
 

@@ -33,6 +33,9 @@
 - [x] 標準の部品の一式、`Sheet`、テーマ、見えている行だけ作るリストとテーブル（[21](21-widgets.md)）
 - [x] つかみ、アプリ内と OS の DnD、並べ替え（[23](23-drag-and-drop.md)）
 - [x] 選択した文字のドラッグとテキスト入力へのドロップ（[23](23-drag-and-drop.md)）
+- [x] 動画（`video`、FFmpeg は実行時に読み込む）（[24](24-video.md)）
+- [x] `flex-wrap`、`align-content`（[03](03-layout.md)）
+- [x] パス描画、`svg` と形のノード、SVG ファイルの読み込み（[25](25-svg.md)）
 
 ### M1 の既知の制限
 
@@ -47,7 +50,7 @@
 - カスタム影（[14](14-shaders.md)）、ウィンドウの後ろのぼかし（`ext-background-effect-v1`）
 - MD3E の入力モード（日付、時刻）、ロケール（[20](20-md3e-components.md)）
 - CSS サブセット（スタイルシート・クラス・ホットリロード）
-- `flex-wrap`、Grid
+- Grid
 - CSD（クライアント側装飾）、複数ウィンドウ
 - AccessKit によるアクセシビリティ
 - 要素インスペクタ
@@ -59,4 +62,6 @@
 
 ## M4: おまけ機能
 
-- 動画再生（外部テクスチャ）、WebRTC、画面キャプチャ、通知
+- PDF の表示（`hayro` を土台に、PDF.js 以上の速度を目標。SVG の次に検討する）
+
+- WebRTC、画面キャプチャ、通知

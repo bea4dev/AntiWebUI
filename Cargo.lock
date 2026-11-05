@@ -37,6 +37,7 @@ name = "anti-webui-app"
 version = "0.1.0"
 dependencies = [
  "anti-webui-core",
+ "anti-webui-video",
  "anti-webui-wayland",
  "anti-webui-wgpu",
  "image",
@@ -51,6 +52,8 @@ dependencies = [
  "anti-webui-style",
  "icu_properties",
  "image",
+ "kurbo",
+ "log",
  "moxcms",
  "parley",
  "read-fonts",
@@ -111,6 +114,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "anti-webui-video"
+version = "0.1.0"
+dependencies = [
+ "anti-webui-core",
+ "libc",
+ "libloading",
+]
+
+[[package]]
 name = "anti-webui-wayland"
 version = "0.1.0"
 dependencies = [
@@ -131,7 +143,9 @@ dependencies = [
  "anti-webui-core",
  "ash",
  "bytemuck",
+ "kurbo",
  "libc",
+ "log",
  "naga",
  "pollster",
  "raw-window-handle",

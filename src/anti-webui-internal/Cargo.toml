@@ -2,12 +2,14 @@
 name = "anti-webui-internal"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 
 [features]
 default = ["svg", "svg-text"]
 svg = ["anti-webui-core/svg"]
 svg-text = ["anti-webui-core/svg-text"]
+video = ["anti-webui-app/video"]
 
 [dependencies]
 anti-webui-core.workspace = true

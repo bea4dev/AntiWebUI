@@ -134,7 +134,7 @@ impl NodeRef {
 type StyleFn = Box<dyn Fn(Style) -> Style>;
 
 /// Keeps the node's dynamic style layers in sync with their closures.
-fn bind_dynamic_styles(id: NodeId, layers: Vec<StyleFn>) {
+pub(crate) fn bind_dynamic_styles(id: NodeId, layers: Vec<StyleFn>) {
     with_doc(|d| {
         if let Some(n) = d.get_mut(id) {
             n.style.dynamic = vec![Style::default(); layers.len()];
@@ -197,7 +197,10 @@ fn bind_filter(id: NodeId, f: ImageFn) {
 
 /// Adds a listener to those a node already has: what builds an element and what uses it can each
 /// listen without knowing of the other.
-fn also<E: 'static>(old: Option<Handler<E>>, f: impl Fn(&E) + 'static) -> Option<Handler<E>> {
+pub(crate) fn also<E: 'static>(
+    old: Option<Handler<E>>,
+    f: impl Fn(&E) + 'static,
+) -> Option<Handler<E>> {
     Some(match old {
         Some(old) => Rc::new(move |e| {
             old(e);
@@ -208,7 +211,7 @@ fn also<E: 'static>(old: Option<Handler<E>>, f: impl Fn(&E) + 'static) -> Option
 }
 
 /// The same for listeners that are told whether something is so.
-fn also_bool(
+pub(crate) fn also_bool(
     old: Option<Rc<dyn Fn(bool)>>,
     f: impl Fn(bool) + 'static,
 ) -> Option<Rc<dyn Fn(bool)>> {
@@ -249,28 +252,28 @@ type SheetFn = Box<dyn Fn() -> Rc<Sheet>>;
 
 /// Common element configuration shared by `div` and `text_input`.
 #[derive(Default)]
-struct ElementConfig {
-    sheet: Option<SheetFn>,
-    style: Style,
-    hover: Option<Style>,
-    focus: Option<Style>,
-    active: Option<Style>,
-    dragging: Option<Style>,
-    drag_over: Option<Style>,
-    gesture: GestureConfig,
-    drop: DropConfig,
-    dynamic: Vec<StyleFn>,
-    fill: Option<PaintFn>,
-    overlay: Option<PaintFn>,
-    filter: Option<ImageFn>,
-    listeners: Listeners,
-    focusable: bool,
-    disabled: Option<Box<dyn Fn() -> bool>>,
-    node_ref: Vec<NodeRef>,
+pub(crate) struct ElementConfig {
+    pub(crate) sheet: Option<SheetFn>,
+    pub(crate) style: Style,
+    pub(crate) hover: Option<Style>,
+    pub(crate) focus: Option<Style>,
+    pub(crate) active: Option<Style>,
+    pub(crate) dragging: Option<Style>,
+    pub(crate) drag_over: Option<Style>,
+    pub(crate) gesture: GestureConfig,
+    pub(crate) drop: DropConfig,
+    pub(crate) dynamic: Vec<StyleFn>,
+    pub(crate) fill: Option<PaintFn>,
+    pub(crate) overlay: Option<PaintFn>,
+    pub(crate) filter: Option<ImageFn>,
+    pub(crate) listeners: Listeners,
+    pub(crate) focusable: bool,
+    pub(crate) disabled: Option<Box<dyn Fn() -> bool>>,
+    pub(crate) node_ref: Vec<NodeRef>,
 }
 
 impl ElementConfig {
-    fn build(self, mut node: Node) -> NodeId {
+    pub(crate) fn build(self, mut node: Node) -> NodeId {
         node.style.base = self.style;
         node.style.hover = self.hover;
         node.style.focus = self.focus;
@@ -542,21 +545,6 @@ macro_rules! element_methods {
             self
         }
 
-        /// Paints the box with a shader, above its outer shadows and below its background, cut to
-        /// its rounded shape. `f` runs again whenever the signals it reads change. See
-        /// `docs/design/14-shaders.md`.
-        pub fn fill<P: IntoPaint>(mut self, f: impl Fn() -> P + 'static) -> Self {
-            self.cfg.fill = Some(Box::new(move || f().into_paint()));
-            self
-        }
-
-        /// Paints the box with a shader, above its background and border and below its children,
-        /// cut to its rounded shape. Returning `None` paints nothing and costs nothing.
-        pub fn overlay<P: IntoPaint>(mut self, f: impl Fn() -> P + 'static) -> Self {
-            self.cfg.overlay = Some(Box::new(move || f().into_paint()));
-            self
-        }
-
         /// Shows a picture made of what the node and its children paint instead of that as it is.
         /// `f` runs again whenever the signals it reads change, without painting them again. See
         /// `docs/design/16-filters.md`.
@@ -600,6 +588,28 @@ macro_rules! element_methods {
     };
 }
 
+/// What is for boxes: a shape in an `svg` has `fill` for something else.
+macro_rules! box_paint_methods {
+    () => {
+        /// Paints the box with a shader, above its outer shadows and below its background, cut to
+        /// its rounded shape. `f` runs again whenever the signals it reads change. See
+        /// `docs/design/14-shaders.md`.
+        pub fn fill<P: IntoPaint>(mut self, f: impl Fn() -> P + 'static) -> Self {
+            self.cfg.fill = Some(Box::new(move || f().into_paint()));
+            self
+        }
+
+        /// Paints the box with a shader, above its background and border and below its children,
+        /// cut to its rounded shape. Returning `None` paints nothing and costs nothing.
+        pub fn overlay<P: IntoPaint>(mut self, f: impl Fn() -> P + 'static) -> Self {
+            self.cfg.overlay = Some(Box::new(move || f().into_paint()));
+            self
+        }
+    };
+}
+
+pub(crate) use element_methods;
+
 /// A generic box element.
 #[derive(Default)]
 pub struct Div {
@@ -624,6 +634,7 @@ impl Styled for Div {
 
 impl Div {
     element_methods!();
+    box_paint_methods!();
 
     pub fn child(mut self, child: impl IntoView) -> Self {
         self.children.push(child.into_view());
@@ -720,6 +731,7 @@ impl Styled for Img {
 
 impl Img {
     element_methods!();
+    box_paint_methods!();
 
     /// How many pixels of the picture make a logical pixel, for a picture made for screens with
     /// more pixels (`srcset="a.png 2x"`). The box gets smaller, and the picture sharper.
@@ -770,6 +782,183 @@ impl IntoView for Img {
         effect(move || {
             let source = source();
             with_doc(|d| d.set_image_source(id, source));
+        });
+        View(id)
+    }
+}
+
+/// A moving picture in a box, like `<video>`. See `docs/design/24-video.md`.
+pub struct Video {
+    cfg: ElementConfig,
+    source: Box<dyn Fn() -> String>,
+    data: crate::video::VideoData,
+    autoplay: bool,
+    muted: bool,
+    children: Vec<View>,
+}
+
+/// What a [`video`] plays: a path, a URL, or a closure saying which.
+pub trait IntoVideoSource {
+    fn into_video_source(self) -> Box<dyn Fn() -> String>;
+}
+
+impl IntoVideoSource for &str {
+    fn into_video_source(self) -> Box<dyn Fn() -> String> {
+        let source = self.to_owned();
+        Box::new(move || source.clone())
+    }
+}
+
+impl IntoVideoSource for String {
+    fn into_video_source(self) -> Box<dyn Fn() -> String> {
+        Box::new(move || self.clone())
+    }
+}
+
+impl IntoVideoSource for &std::path::Path {
+    fn into_video_source(self) -> Box<dyn Fn() -> String> {
+        self.to_string_lossy().into_owned().into_video_source()
+    }
+}
+
+impl IntoVideoSource for std::path::PathBuf {
+    fn into_video_source(self) -> Box<dyn Fn() -> String> {
+        self.to_string_lossy().into_owned().into_video_source()
+    }
+}
+
+impl<F, S> IntoVideoSource for F
+where
+    F: Fn() -> S + 'static,
+    S: Into<String>,
+{
+    fn into_video_source(self) -> Box<dyn Fn() -> String> {
+        Box::new(move || self().into())
+    }
+}
+
+/// A video from a file or a URL. It shows its first frame until told to play. When a closure says
+/// something else, it starts over with that.
+pub fn video(source: impl IntoVideoSource) -> Video {
+    Video {
+        cfg: ElementConfig::default(),
+        source: source.into_video_source(),
+        data: crate::video::VideoData::default(),
+        autoplay: false,
+        muted: false,
+        children: Vec::new(),
+    }
+}
+
+impl Styled for Video {
+    fn style_mut(&mut self) -> &mut Style {
+        &mut self.cfg.style
+    }
+}
+
+impl Video {
+    element_methods!();
+    box_paint_methods!();
+
+    /// What tells it what to do, and says how far it has come.
+    pub fn player(mut self, player: crate::video::VideoPlayer) -> Self {
+        self.data.player = Some(player);
+        self
+    }
+
+    /// Starts playing as soon as it can.
+    pub fn autoplay(mut self, autoplay: bool) -> Self {
+        self.autoplay = autoplay;
+        self
+    }
+
+    /// Starts over when it ends.
+    pub fn looped(mut self, looped: bool) -> Self {
+        self.data.looped = looped;
+        self
+    }
+
+    pub fn muted(mut self, muted: bool) -> Self {
+        self.muted = muted;
+        self
+    }
+
+    /// Called when its size and length are known: the width and the height in logical pixels, and
+    /// the seconds, or `NaN` for what has no known end.
+    pub fn on_load(mut self, f: impl Fn(f32, f32, f64) + 'static) -> Self {
+        self.data.on_load = Some(Rc::new(f));
+        self
+    }
+
+    /// Called when it has played to the end.
+    pub fn on_ended(mut self, f: impl Fn() + 'static) -> Self {
+        self.data.on_ended = Some(Rc::new(f));
+        self
+    }
+
+    /// Called when it can't be shown, and with why.
+    pub fn on_error(mut self, f: impl Fn(&crate::video::VideoError) + 'static) -> Self {
+        self.data.on_error = Some(Rc::new(f));
+        self
+    }
+
+    /// Lays something over the video, in its content box, like controls. It has no say in the size
+    /// of the box.
+    pub fn child(mut self, child: impl IntoView) -> Self {
+        self.children.push(child.into_view());
+        self
+    }
+
+    pub fn children<V: IntoView>(mut self, children: impl IntoIterator<Item = V>) -> Self {
+        self.children
+            .extend(children.into_iter().map(IntoView::into_view));
+        self
+    }
+}
+
+impl IntoView for Video {
+    fn into_view(mut self) -> View {
+        // Without one given there is still one to play and to pause by.
+        let player = *self
+            .data
+            .player
+            .get_or_insert_with(crate::video::video_player);
+        if self.autoplay {
+            player.playing.set(true);
+        }
+        if self.muted {
+            player.muted.set(true);
+        }
+        let id = self
+            .cfg
+            .build(Node::new(NodeKind::Video(Box::new(self.data))));
+        let children: Vec<NodeId> = self.children.into_iter().map(|v| v.0).collect();
+        with_doc(|d| d.set_children(id, children));
+        let source = self.source;
+        effect(move || {
+            let source = source();
+            player.ended.set(false);
+            player.time.set(0.0);
+            player.duration.set(f64::NAN);
+            with_doc(|d| crate::video::set_source(d, id, source));
+        });
+        effect(move || {
+            let playing = player.playing.get();
+            crate::video::control(id, |s| s.set_playing(playing));
+        });
+        effect(move || {
+            let muted = player.muted.get();
+            crate::video::control(id, |s| s.set_muted(muted));
+        });
+        effect(move || {
+            let volume = player.volume.get();
+            crate::video::control(id, |s| s.set_volume(volume));
+        });
+        effect(move || {
+            let (seconds, asked) = player.seek.get();
+            if asked > 0 {
+                crate::video::control(id, |s| s.seek(seconds));
+            }
         });
         View(id)
     }
@@ -847,6 +1036,8 @@ impl IntoView for Text {
             text: initial,
             version: 0,
             layout: TextLayout::default(),
+            zoom: 1.0,
+            in_svg: false,
         }));
         node.style.base = self.style;
         let id = create_node(node);
@@ -1608,6 +1799,7 @@ impl Styled for TextInput {
 
 impl TextInput {
     element_methods!();
+    box_paint_methods!();
 
     /// Two-way binds the text to a signal.
     pub fn value(mut self, value: Signal<String>) -> Self {

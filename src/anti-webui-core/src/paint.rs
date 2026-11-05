@@ -7,7 +7,7 @@ use crate::layout::{child_clip, mark_outer_layers_stale};
 use crate::platform::PopupId;
 use crate::scene::{
     BackdropDraw, ChunkKey, Clip, Glyph, GlyphRun, ImageDraw, Layer, LayerFilter, Primitive, Quad,
-    Scene, ShaderDraw, Shadow,
+    Scene, ShaderDraw, Shadow, VideoDraw,
 };
 use crate::shader::{Image, ShaderPaint};
 use crate::text::selection::{node_range, selectable_text_nodes};
@@ -15,7 +15,7 @@ use crate::text::{Brush, TextLayout};
 use crate::tree::{Document, LayerMemo, Node, NodeId, NodeKind, popup_id};
 use anti_webui_style::{
     BackgroundRepeat, BackgroundSize, Color, ComputedStyle, ImageRendering, Length, ObjectFit,
-    Overflow,
+    Overflow, SvgPaint,
 };
 use parley::PositionedLayoutItem;
 use slotmap::{Key, KeyData};
@@ -460,6 +460,20 @@ fn snapped_opacity(opacity: f32) -> f32 {
     (opacity * 255.0).round() / 255.0
 }
 
+/// The color of text in an `svg`: glyphs have one color, so a gradient gives them its last one.
+fn text_fill(c: &ComputedStyle) -> Color {
+    let (color, opacity) = (
+        match &c.fill_paint {
+            SvgPaint::None => Color::TRANSPARENT,
+            SvgPaint::Color(color) => *color,
+            SvgPaint::CurrentColor => c.color,
+            SvgPaint::Gradient(g) => g.stops.last().map_or(Color::TRANSPARENT, |s| s.color),
+        },
+        c.fill_opacity,
+    );
+    fade(color, opacity)
+}
+
 /// Whether what a subtree paints can overlap, so that fading each thing on its own would show one
 /// through the other. Decided from the tree alone, so that culling has no say in it.
 fn paints_overlapping(doc: &Document, id: NodeId) -> bool {
@@ -476,8 +490,14 @@ fn paints_overlapping(doc: &Document, id: NodeId) -> bool {
                 return;
             }
             NodeKind::Edit(_) => *things += 2,
-            NodeKind::Fragment => {}
-            NodeKind::Image(_) => {
+            NodeKind::Fragment | NodeKind::SvgText(_) => {}
+            NodeKind::SvgShape(shape) => {
+                if shape.geometry.is_some() {
+                    *things += u32::from(!matches!(c.fill_paint, SvgPaint::None));
+                    *things += u32::from(!matches!(c.stroke_paint, SvgPaint::None));
+                }
+            }
+            NodeKind::Image(_) | NodeKind::Video(_) => {
                 *things += 1 + u32::from(!c.background.is_transparent());
                 *things += u32::from(c.background_image.is_some());
                 *things += c.shadows.len() as u32;
@@ -536,6 +556,19 @@ fn nested_layers(scene: &Scene) -> Vec<NodeId> {
             _ => None,
         })
         .collect()
+}
+
+/// The radii of the content edge: what the border and the padding leave of the corners of a box.
+fn content_radii(node: &Node, scale: crate::geometry::Scale) -> [f32; 4] {
+    let b = &node.resolved.border;
+    let p = &node.resolved.padding;
+    let r = physical_radii(node, scale);
+    [
+        (r[0] - (b.left + p.left).max(b.top + p.top) as f32).max(0.0),
+        (r[1] - (b.right + p.right).max(b.top + p.top) as f32).max(0.0),
+        (r[2] - (b.right + p.right).max(b.bottom + p.bottom) as f32).max(0.0),
+        (r[3] - (b.left + p.left).max(b.bottom + p.bottom) as f32).max(0.0),
+    ]
 }
 
 fn physical_radii(node: &Node, scale: crate::geometry::Scale) -> [f32; 4] {
@@ -1104,6 +1137,20 @@ impl Painter<'_> {
                 return;
             }
             NodeKind::Popup(_) => return,
+            NodeKind::SvgText(_) => {
+                self.contents(id, opacity, cull);
+                return;
+            }
+            NodeKind::SvgShape(shape) => {
+                self.chunk(id, part::CONTENT);
+                let logical = doc.scale.as_f64();
+                let scene = &mut self.scene;
+                crate::svg::shape_draws(node, shape, opacity, logical, |d| {
+                    scene.primitives.push(Primitive::Path(d));
+                });
+                self.contents(id, opacity, cull);
+                return;
+            }
             NodeKind::Text(t) => {
                 if let Some(sel) = &doc.state.selection
                     && let Some((a, b)) = node_range(doc, sel, id)
@@ -1115,10 +1162,11 @@ impl Painter<'_> {
                     }
                 }
                 self.chunk(id, part::CONTENT);
+                let color = if t.in_svg { text_fill(c) } else { c.color };
                 self.text_layout(
                     &t.layout,
                     node.abs.origin(),
-                    fade(c.color, opacity),
+                    fade(color, opacity),
                     node.clip_shape(),
                     c.underline,
                     c.strikethrough,
@@ -1137,6 +1185,10 @@ impl Painter<'_> {
         if let NodeKind::Image(_) = &node.kind {
             self.chunk(id, part::PICTURE);
             self.picture(id, opacity);
+        }
+        if let NodeKind::Video(_) = &node.kind {
+            self.chunk(id, part::PICTURE);
+            self.video(id, opacity);
         }
 
         if node.scroll_root {
@@ -1313,16 +1365,7 @@ impl Painter<'_> {
             (None, None) => return,
         };
         self.pictures += 1;
-        let b = &node.resolved.border;
-        let p = &node.resolved.padding;
-        let r = physical_radii(node, scale);
-        // Radii of the content edge: what the border and the padding leave of them.
-        let radii = [
-            (r[0] - (b.left + p.left).max(b.top + p.top) as f32).max(0.0),
-            (r[1] - (b.right + p.right).max(b.top + p.top) as f32).max(0.0),
-            (r[2] - (b.right + p.right).max(b.bottom + p.bottom) as f32).max(0.0),
-            (r[3] - (b.left + p.left).max(b.bottom + p.bottom) as f32).max(0.0),
-        ];
+        let radii = content_radii(node, scale);
         self.scene.primitives.push(Primitive::Image(ImageDraw {
             bitmap,
             frame,
@@ -1336,6 +1379,36 @@ impl Painter<'_> {
             clip: node.clip_shape(),
             opacity: snapped_opacity(opacity * c.image_opacity),
             pixelated,
+        }));
+    }
+
+    /// The frame of a `video` that is due, in its content box.
+    fn video(&mut self, id: NodeId, opacity: f32) {
+        let doc = self.doc;
+        let node = &doc.nodes[id];
+        let Some(data) = node.video() else {
+            return;
+        };
+        let c = &node.computed;
+        let scale = doc.scale;
+        let content = node.content_abs();
+        if content.is_empty() {
+            return;
+        }
+        let natural = data.natural.map(|(w, h)| (scale.pxf(w), scale.pxf(h)));
+        let rect = fitted_rect(content, natural, c.object_fit, c.object_position, scale);
+        let Some(frame) = doc.videos.borrow_mut().frame(id, self.now) else {
+            return;
+        };
+        self.scene.primitives.push(Primitive::Video(VideoDraw {
+            frame,
+            rect,
+            shape: Clip {
+                rect: content,
+                radii: content_radii(node, scale),
+            },
+            clip: node.clip_shape(),
+            opacity: snapped_opacity(opacity * c.image_opacity),
         }));
     }
 

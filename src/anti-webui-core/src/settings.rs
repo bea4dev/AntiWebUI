@@ -8,6 +8,7 @@ pub struct Settings {
     pub scroll: ScrollSettings,
     pub rendering: RenderingSettings,
     pub images: ImageSettings,
+    pub video: crate::video::VideoSettings,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -89,6 +90,7 @@ impl Default for Settings {
             images: ImageSettings {
                 cache_bytes: 256 << 20,
             },
+            video: Default::default(),
         }
     }
 }

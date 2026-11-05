@@ -2,6 +2,7 @@
 name = "anti-webui-core"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 
 [features]
@@ -15,6 +16,8 @@ svg-text = ["svg", "resvg/text", "resvg/system-fonts"]
 image.workspace = true
 moxcms.workspace = true
 resvg = { workspace = true, optional = true }
+kurbo.workspace = true
+log.workspace = true
 anti-webui-style.workspace = true
 parley.workspace = true
 icu_properties.workspace = true

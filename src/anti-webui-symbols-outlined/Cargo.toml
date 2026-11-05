@@ -2,6 +2,7 @@
 name = "anti-webui-symbols-outlined"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license = "Apache-2.0"
 description = "The Outlined style of Material Symbols, one small font per icon"
 

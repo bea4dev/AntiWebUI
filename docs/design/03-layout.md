@@ -7,14 +7,14 @@ taffy の丸め（`round_layout`）は辺をスナップする B 方式であり
 | 項目 | 内容 |
 |---|---|
 | display | `Flex`, `Block`（= 縦積み・幅いっぱい）, `None`, `Contents`（Fragment 用） |
-| flex | `direction`（row/column）, `justify_content`, `align_items`, `align_self`, `gap`, `grow`, `shrink`, `basis` |
+| flex | `direction`（row/column）, `wrap`, `justify_content`, `align_content`, `align_items`, `align_self`, `gap`, `grow`, `shrink`, `basis` |
 | サイズ | `width/height/min/max`（`Px` / `Percent` / `Auto`） |
 | 余白 | `margin`, `padding`, `border` |
 | position | `Relative`, `Absolute`（`inset`、親のパディングボックス基準） |
 | z_index | 重なり順。レイアウトには影響しない（[09](09-shadows-stacking-popups.md)） |
 | overflow | `Visible`, `Hidden`, `Scroll`（スクロールオフセットは物理 px 整数） |
 
-未対応（後回し）: `flex-wrap`, Grid, `aspect-ratio`, `order`。
+未対応（後回し）: Grid, `order`。
 
 ## アルゴリズム概要（Flex）
 
@@ -23,6 +23,27 @@ taffy の丸め（`round_layout`）は辺をスナップする B 方式であり
 3. `free > 0` かつ grow 合計 > 0 なら伸長、`free < 0` かつ shrink があれば縮小。いずれも **整数分配** と min/max の **凍結ループ** を行う。
 4. 交差軸: `stretch` なら内側交差サイズ、そうでなければ内容サイズ。`align` で配置。
 5. 余った主軸空間を `justify_content` で配置（space-between 等の隙間も整数分配）。
+
+## 折り返し（`flex-wrap`）
+
+`anti-webui-core/tests/data/flex_wrap.txt` の 82 ケースを Chromium の結果と比べている（`tools/chrome_layout.py` が書く）。Chromium が小数になるところは 1 px までの差を認める。
+
+- **行分け:** 仮サイズと `gap` を足していき、主軸に収まらなくなったら次の行へ。行ごとに伸縮と `justify_content` を行う。
+- **最小サイズ:** `flex-basis` を指定した項目は、内容の最小サイズ（`min-width: auto`）まで含めて行を決める。内容から決まる basis はそれより小さくならないので、測らない。
+- **`align_content`:** 交差軸に余りがあれば行に配る。既定の `Stretch` は余りを行に等分する。1 行だけでも折り返しのある容器は複数行として扱う。
+- **`wrap-reverse`:** 行と項目を交差軸で反転する。マージンは物理的な辺に付いたまま。
+- **高さが決まっていない縦の容器:** 折り返さない。`max-height` があればそこで折り返し、高さは列の高さになる。
+
+### `fit-content`
+
+幅が決まっていない横の容器（`items_start` の親の中など）は、収まらないとき、使える幅を取る。
+
+| 容器 | 幅 |
+|---|---|
+| 折り返しあり | 使える幅と、最大の項目の広い方 |
+| 折り返しなし | 使える幅と、項目の min-content の合計の広い方。そこから縮む |
+
+あわせて、横の項目の基準サイズを max-content にした。以前は使える幅で頭打ちにしていて、`flex-shrink: 0` のときや、基準サイズに比例して縮むときの結果が CSS と違っていた。逆順の方向では、マージンが逆の辺に付いていた問題も直した。
 
 ## 整数分配
 

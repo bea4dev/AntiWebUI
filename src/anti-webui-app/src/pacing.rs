@@ -292,6 +292,8 @@ pub(crate) struct Pacing {
     ui_done: i64,
     /// Going by the last frame shown.
     refresh: Option<Duration>,
+    /// When the last frame was shown, on the clock of `linux_sync::monotonic_ns`.
+    shown_ns: Option<i64>,
 }
 
 /// The first refresh after `now`, of those that `last` was the start of one of.
@@ -330,6 +332,7 @@ impl Pacing {
             callback: None,
             ui_done: 0,
             refresh: None,
+            shown_ns: None,
         }
     }
 
@@ -365,6 +368,19 @@ impl Pacing {
             token: self.next_token,
             ..Default::default()
         }
+    }
+
+    /// How often the screen refreshes, going by the last frame shown.
+    pub fn refresh(&self) -> Option<Duration> {
+        self.refresh
+    }
+
+    /// When a refresh was, going by the last frame shown. This has none of the wobble of when a
+    /// frame callback gets here.
+    pub fn last_refresh(&self) -> Option<Instant> {
+        let ago = linux_sync::monotonic_ns() - self.shown_ns?;
+        let ago = Duration::from_nanos(ago.max(0) as u64);
+        Instant::now().checked_sub(ago)
     }
 
     /// How long until the frame callback that would come if something had been committed, going
@@ -453,6 +469,9 @@ impl Pacing {
             self.refresh = Some(Duration::from_nanos(s.refresh_ns as u64));
         }
         let offset = self.presentation_offset.unwrap_or(0);
+        if let Some(s) = p.shown {
+            self.shown_ns = Some(s.time_ns + offset);
+        }
         let Some(f) = self.flying.iter_mut().find(|f| f.record.token == p.token) else {
             return;
         };

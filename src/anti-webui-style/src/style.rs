@@ -73,7 +73,25 @@ macro_rules! define_style {
 define_style! {
     display: Display = Display::Block, local;
     position: Position = Position::Relative, local;
+    /// What the inside of a shape in an `svg` is painted with.
+    fill_paint: SvgPaint = SvgPaint::Color(Color::BLACK), inherited;
+    /// What the outline of a shape in an `svg` is painted with.
+    stroke_paint: SvgPaint = SvgPaint::None, inherited;
+    /// In the coordinates of the shape.
+    stroke_width: f32 = 1.0, inherited;
+    fill_opacity: f32 = 1.0, inherited;
+    stroke_opacity: f32 = 1.0, inherited;
+    fill_rule: FillRule = FillRule::NonZero, inherited;
+    line_cap: LineCap = LineCap::Butt, inherited;
+    line_join: LineJoin = LineJoin::Miter, inherited;
+    miter_limit: f32 = 4.0, inherited;
+    dash_array: Option<std::sync::Arc<[f32]>> = None, inherited;
+    dash_offset: f32 = 0.0, inherited;
+    /// The width of the outline is in pixels of the screen, whatever the shape is scaled by.
+    non_scaling_stroke: bool = false, local;
     flex_direction: FlexDirection = FlexDirection::Row, local;
+    flex_wrap: FlexWrap = FlexWrap::NoWrap, local;
+    align_content: AlignContent = AlignContent::Stretch, local;
     justify_content: JustifyContent = JustifyContent::Start, local;
     align_items: AlignItems = AlignItems::Stretch, local;
     /// `None` means `auto` (use the parent's `align_items`).

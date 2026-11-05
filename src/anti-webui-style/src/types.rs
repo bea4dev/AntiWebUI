@@ -298,6 +298,42 @@ impl FlexDirection {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FlexWrap {
+    #[default]
+    NoWrap,
+    Wrap,
+    /// Lines go the other way along the cross axis.
+    WrapReverse,
+}
+
+/// How the lines of a wrapping flex container share its cross axis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AlignContent {
+    #[default]
+    Stretch,
+    Start,
+    End,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+}
+
+impl AlignContent {
+    /// The same way of spacing things out, for what isn't stretched.
+    pub fn as_justify(self) -> JustifyContent {
+        match self {
+            AlignContent::Stretch | AlignContent::Start => JustifyContent::Start,
+            AlignContent::End => JustifyContent::End,
+            AlignContent::Center => JustifyContent::Center,
+            AlignContent::SpaceBetween => JustifyContent::SpaceBetween,
+            AlignContent::SpaceAround => JustifyContent::SpaceAround,
+            AlignContent::SpaceEvenly => JustifyContent::SpaceEvenly,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum JustifyContent {
     #[default]
     Start,
@@ -683,5 +719,156 @@ mod tests {
     fn a_tag_comes_from_four_bytes() {
         assert_eq!(FontAxis::from(b"GRAD"), GRAD);
         assert_eq!(format!("{GRAD:?}"), "GRAD");
+    }
+}
+
+/// What the inside or the outline of a shape in an `svg` is painted with.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum SvgPaint {
+    #[default]
+    None,
+    Color(Color),
+    /// The color text has here.
+    CurrentColor,
+    Gradient(std::sync::Arc<Gradient>),
+}
+
+impl From<Color> for SvgPaint {
+    fn from(color: Color) -> Self {
+        SvgPaint::Color(color)
+    }
+}
+
+impl From<Gradient> for SvgPaint {
+    fn from(gradient: Gradient) -> Self {
+        SvgPaint::Gradient(std::sync::Arc::new(gradient))
+    }
+}
+
+/// Which side of an outline is inside.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FillRule {
+    #[default]
+    NonZero,
+    EvenOdd,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LineCap {
+    #[default]
+    Butt,
+    Round,
+    Square,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LineJoin {
+    #[default]
+    Miter,
+    Round,
+    Bevel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GradientStop {
+    /// From 0 to 1.
+    pub offset: f32,
+    pub color: Color,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GradientShape {
+    Linear {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+    },
+    /// The circle of the last stop, and where the first stop is.
+    Radial {
+        cx: f32,
+        cy: f32,
+        r: f32,
+        fx: f32,
+        fy: f32,
+    },
+}
+
+/// What is beyond the first and the last stop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum GradientSpread {
+    #[default]
+    Pad,
+    Reflect,
+    Repeat,
+}
+
+/// What the numbers of a gradient are relative to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum GradientUnits {
+    /// The box of the shape, from 0 to 1.
+    #[default]
+    ObjectBoundingBox,
+    /// The coordinates the shape is in.
+    UserSpace,
+}
+
+/// An SVG gradient.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gradient {
+    pub shape: GradientShape,
+    pub stops: Vec<GradientStop>,
+    pub spread: GradientSpread,
+    pub units: GradientUnits,
+    /// `gradientTransform`: `a b c d e f`.
+    pub transform: [f64; 6],
+}
+
+impl Gradient {
+    fn new(shape: GradientShape) -> Self {
+        Self {
+            shape,
+            stops: Vec::new(),
+            spread: GradientSpread::Pad,
+            units: GradientUnits::ObjectBoundingBox,
+            transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        }
+    }
+
+    pub fn linear(x1: f32, y1: f32, x2: f32, y2: f32) -> Self {
+        Self::new(GradientShape::Linear { x1, y1, x2, y2 })
+    }
+
+    pub fn radial(cx: f32, cy: f32, r: f32) -> Self {
+        Self::new(GradientShape::Radial {
+            cx,
+            cy,
+            r,
+            fx: cx,
+            fy: cy,
+        })
+    }
+
+    pub fn stop(mut self, offset: f32, color: impl Into<Color>) -> Self {
+        self.stops.push(GradientStop {
+            offset,
+            color: color.into(),
+        });
+        self
+    }
+
+    pub fn spread(mut self, spread: GradientSpread) -> Self {
+        self.spread = spread;
+        self
+    }
+
+    pub fn units(mut self, units: GradientUnits) -> Self {
+        self.units = units;
+        self
+    }
+
+    pub fn transform(mut self, transform: [f64; 6]) -> Self {
+        self.transform = transform;
+        self
     }
 }

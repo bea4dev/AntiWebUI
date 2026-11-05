@@ -9,7 +9,7 @@
 use crate::{Gpu, GpuError};
 use ash::{ext, khr, vk};
 use std::ffi::CStr;
-use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::time::Duration;
 use wgpu::hal::api::Vulkan;
@@ -128,6 +128,7 @@ impl Gpu {
                     open,
                     &wgpu::DeviceDescriptor {
                         label: Some("anti-webui"),
+                        required_features: crate::video_features(&adapter),
                         required_limits: limits,
                         ..Default::default()
                     },
@@ -188,7 +189,7 @@ unsafe fn open_for_dmabuf(
     // SAFETY: the extensions were checked above; no features are removed.
     let open = unsafe {
         hal.open_with_callback(
-            wgpu::Features::empty(),
+            crate::video_features(adapter),
             &limits,
             &wgpu::MemoryHints::default(),
             Some(callback),
@@ -853,4 +854,398 @@ fn find_device_node(dev: u64) -> Option<PathBuf> {
         .flatten()
         .map(|e| e.path())
         .find(|p| std::fs::metadata(p).is_ok_and(|m| m.rdev() == dev))
+}
+
+/// How many frames can be on their way to being read at the same time, which there is no point in
+/// having many of: reading them comes right after.
+const VIDEO_ACQUIRES: usize = 8;
+
+/// Reads frames of videos where the decoder left them, which is in dmabufs. See
+/// `docs/design/24-video.md`.
+pub struct VideoImporter {
+    instance: ash::Instance,
+    device: ash::Device,
+    physical_device: vk::PhysicalDevice,
+    queue: vk::Queue,
+    queue_family: u32,
+    memory_fd: khr::external_memory_fd::Device,
+    pool: vk::CommandPool,
+    /// What takes frames over from the decoder, used in turns.
+    acquires: Vec<(vk::CommandBuffer, vk::Fence)>,
+    next: usize,
+}
+
+/// The textures of one picture of the decoder's pool, which is used over and over.
+pub struct ImportedFrame {
+    pub bind: wgpu::BindGroup,
+    images: Vec<vk::Image>,
+    _textures: Vec<wgpu::Texture>,
+}
+
+impl DmabufContext {
+    /// Something that can read what a decoder on this GPU leaves behind.
+    pub fn video_importer(&self) -> Result<VideoImporter, GpuError> {
+        let device = self.device.clone();
+        // SAFETY: valid device and queue family.
+        let pool = unsafe {
+            device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(self.queue_family)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )
+        }
+        .map_err(vk_err("command pool"))?;
+        // SAFETY: from a valid pool.
+        let buffers = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(VIDEO_ACQUIRES as u32),
+            )
+        }
+        .map_err(vk_err("command buffers"))?;
+        let mut acquires = Vec::with_capacity(VIDEO_ACQUIRES);
+        for buffer in buffers {
+            // SAFETY: valid device. Signaled, since nothing was submitted that it has to wait for.
+            let fence = unsafe {
+                device.create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )
+            }
+            .map_err(vk_err("fence"))?;
+            acquires.push((buffer, fence));
+        }
+        Ok(VideoImporter {
+            instance: self.instance.clone(),
+            memory_fd: self.memory_fd.clone(),
+            device,
+            physical_device: self.physical_device,
+            queue: self.queue,
+            queue_family: self.queue_family,
+            pool,
+            acquires,
+            next: 0,
+        })
+    }
+}
+
+impl VideoImporter {
+    /// What tells a picture of the pool from the others, which is the dmabuf it is in.
+    pub fn key_of(planes: &[anti_webui_core::video::DmabufPlane]) -> Option<(u64, u64)> {
+        let first = planes.first()?;
+        // SAFETY: an open descriptor, and an out parameter of the right type.
+        let inode = unsafe {
+            let mut stat = std::mem::zeroed::<libc::stat>();
+            (libc::fstat(first.fd, &mut stat) == 0).then_some(stat.st_ino as u64)
+        }?;
+        Some((inode, first.offset))
+    }
+
+    fn formats(format: anti_webui_core::video::PlaneFormat) -> (vk::Format, wgpu::TextureFormat) {
+        use anti_webui_core::video::PlaneFormat as P;
+        match format {
+            P::R8 => (vk::Format::R8_UNORM, wgpu::TextureFormat::R8Unorm),
+            P::Rg8 => (vk::Format::R8G8_UNORM, wgpu::TextureFormat::Rg8Unorm),
+            P::R16 => (vk::Format::R16_UNORM, wgpu::TextureFormat::R16Unorm),
+            P::Rg16 => (vk::Format::R16G16_UNORM, wgpu::TextureFormat::Rg16Unorm),
+        }
+    }
+
+    /// Whether the driver says this can be read with this modifier.
+    fn can_import(&self, format: vk::Format, modifier: u64) -> bool {
+        let mut drm = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let info = vk::PhysicalDeviceImageFormatInfo2::default()
+            .format(format)
+            .ty(vk::ImageType::TYPE_2D)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::SAMPLED)
+            .push_next(&mut drm)
+            .push_next(&mut external);
+        let mut external_props = vk::ExternalImageFormatProperties::default();
+        let mut props = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+        // SAFETY: valid physical device and structures.
+        let done = unsafe {
+            self.instance.get_physical_device_image_format_properties2(
+                self.physical_device,
+                &info,
+                &mut props,
+            )
+        };
+        done.is_ok()
+            && external_props
+                .external_memory_properties
+                .external_memory_features
+                .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+    }
+
+    fn import_plane(
+        &self,
+        device: &wgpu::Device,
+        plane: &anti_webui_core::video::DmabufPlane,
+    ) -> Result<(wgpu::Texture, vk::Image), GpuError> {
+        let (format, wgpu_format) = Self::formats(plane.format);
+        if !device
+            .features()
+            .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+            && matches!(
+                plane.format,
+                anti_webui_core::video::PlaneFormat::R16
+                    | anti_webui_core::video::PlaneFormat::Rg16
+            )
+        {
+            return Err(GpuError::Dmabuf("no textures of 16 bits".into()));
+        }
+        if !self.can_import(format, plane.modifier) {
+            return Err(GpuError::Dmabuf(format!(
+                "can't read {format:?} with modifier {:#x}",
+                plane.modifier
+            )));
+        }
+        let layouts = [vk::SubresourceLayout::default()
+            .offset(plane.offset)
+            .row_pitch(plane.stride)];
+        let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(plane.modifier)
+            .plane_layouts(&layouts);
+        let mut external = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: plane.size.0,
+                height: plane.size.1,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut explicit)
+            .push_next(&mut external);
+        // SAFETY: valid device and structures.
+        let image = unsafe { self.device.create_image(&info, None) }
+            .map_err(vk_err("creating a video image"))?;
+        // SAFETY: the descriptor is open while the frame is alive, which is now.
+        let fd = unsafe { libc::dup(plane.fd) };
+        let free_image = || {
+            // SAFETY: nothing else has it yet.
+            unsafe { self.device.destroy_image(image, None) };
+        };
+        if fd < 0 {
+            free_image();
+            return Err(GpuError::Dmabuf("can't duplicate a dmabuf".into()));
+        }
+        // SAFETY: a new descriptor that belongs to this until it is handed over below.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+        // SAFETY: valid image, descriptor and output.
+        let (requirements, known) = unsafe {
+            let requirements = self.device.get_image_memory_requirements(image);
+            let known = self.memory_fd.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                owned.as_raw_fd(),
+                &mut fd_props,
+            );
+            (requirements, known)
+        };
+        let bits = requirements.memory_type_bits & fd_props.memory_type_bits;
+        if known.is_err() || bits == 0 {
+            free_image();
+            return Err(GpuError::Dmabuf("no memory type for a dmabuf".into()));
+        }
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let raw = owned.into_raw_fd();
+        let mut import = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(raw);
+        let allocate = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(bits.trailing_zeros())
+            .push_next(&mut dedicated)
+            .push_next(&mut import);
+        // SAFETY: valid structures. On success the driver owns the descriptor.
+        let memory = match unsafe { self.device.allocate_memory(&allocate, None) } {
+            Ok(memory) => memory,
+            Err(e) => {
+                // SAFETY: the import failed, so it is still ours.
+                drop(unsafe { OwnedFd::from_raw_fd(raw) });
+                free_image();
+                return Err(vk_err("importing a video image")(e));
+            }
+        };
+        // SAFETY: both are new, and made for each other.
+        if let Err(e) = unsafe { self.device.bind_image_memory(image, memory, 0) } {
+            // SAFETY: nothing else has them.
+            unsafe { self.device.free_memory(memory, None) };
+            free_image();
+            return Err(vk_err("binding a video image")(e));
+        }
+        let size = wgpu::Extent3d {
+            width: plane.size.0,
+            height: plane.size.1,
+            depth_or_array_layers: 1,
+        };
+        // SAFETY: the image was created as this says, and is new. wgpu owns it and its memory from
+        // here on, and frees them when it is through with them.
+        let texture = unsafe {
+            let hal = device.as_hal::<Vulkan>().expect("Vulkan device");
+            let hal_texture = hal.texture_from_raw(
+                image,
+                &wgpu::hal::TextureDescriptor {
+                    label: Some("video"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu_format,
+                    usage: wgpu::TextureUses::RESOURCE,
+                    memory_flags: wgpu::hal::MemoryFlags::empty(),
+                    view_formats: vec![],
+                },
+                None,
+                wgpu::hal::vulkan::TextureMemory::Dedicated(memory),
+            );
+            drop(hal);
+            // `acquire` has it in this state before anything reads it. wgpu doing that itself would
+            // start from "whatever was in there doesn't matter".
+            device.create_texture_from_hal::<Vulkan>(
+                hal_texture,
+                &wgpu::TextureDescriptor {
+                    label: Some("video"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu_format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                },
+                wgpu::TextureUses::RESOURCE,
+            )
+        };
+        Ok((texture, image))
+    }
+
+    /// Makes textures of the planes of a picture.
+    pub fn import(
+        &mut self,
+        device: &wgpu::Device,
+        planes: &[anti_webui_core::video::DmabufPlane],
+        bind: impl FnOnce(&[wgpu::TextureView]) -> wgpu::BindGroup,
+    ) -> Result<ImportedFrame, GpuError> {
+        let mut textures = Vec::with_capacity(planes.len());
+        let mut images = Vec::with_capacity(planes.len());
+        for plane in planes {
+            let (texture, image) = self.import_plane(device, plane)?;
+            textures.push(texture);
+            images.push(image);
+        }
+        let views: Vec<wgpu::TextureView> = textures
+            .iter()
+            .map(|t| t.create_view(&Default::default()))
+            .collect();
+        Ok(ImportedFrame {
+            bind: bind(&views),
+            images,
+            _textures: textures,
+        })
+    }
+
+    /// Takes a picture over from the decoder, which has finished it by the time it gets here. Call
+    /// before the `queue.submit` that reads it.
+    pub fn acquire(&mut self, frame: &ImportedFrame) -> Result<(), GpuError> {
+        let (buffer, fence) = self.acquires[self.next];
+        self.next = (self.next + 1) % self.acquires.len();
+        let barriers: Vec<vk::ImageMemoryBarrier> = frame
+            .images
+            .iter()
+            .map(|&image| {
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                    .dst_queue_family_index(self.queue_family)
+                    .image(image)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+            })
+            .collect();
+        let cmds = [buffer];
+        // SAFETY: the fence says when the buffer is free. The queue is only used from this thread,
+        // and this goes in before what reads the images.
+        unsafe {
+            let device = &self.device;
+            device
+                .wait_for_fences(&[fence], true, Duration::from_secs(1).as_nanos() as u64)
+                .map_err(vk_err("waiting for an acquire"))?;
+            device
+                .reset_fences(&[fence])
+                .map_err(vk_err("resetting a fence"))?;
+            device
+                .reset_command_buffer(buffer, vk::CommandBufferResetFlags::empty())
+                .map_err(vk_err("resetting a command buffer"))?;
+            device
+                .begin_command_buffer(
+                    buffer,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(vk_err("recording an acquire"))?;
+            device.cmd_pipeline_barrier(
+                buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barriers,
+            );
+            device
+                .end_command_buffer(buffer)
+                .map_err(vk_err("recording an acquire"))?;
+            device
+                .queue_submit(
+                    self.queue,
+                    &[vk::SubmitInfo::default().command_buffers(&cmds)],
+                    fence,
+                )
+                .map_err(vk_err("submitting an acquire"))
+        }
+    }
+}
+
+impl Drop for VideoImporter {
+    fn drop(&mut self) {
+        let fences: Vec<vk::Fence> = self.acquires.iter().map(|(_, f)| *f).collect();
+        // SAFETY: waits until nothing uses these, and nothing else has them.
+        unsafe {
+            let _ = self.device.wait_for_fences(
+                &fences,
+                true,
+                Duration::from_secs(1).as_nanos() as u64,
+            );
+            for fence in fences {
+                self.device.destroy_fence(fence, None);
+            }
+            self.device.destroy_command_pool(self.pool, None);
+        }
+    }
 }

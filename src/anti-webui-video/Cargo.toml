@@ -1,0 +1,12 @@
+[package]
+name = "anti-webui-video"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Decodes videos for AntiWebUI with an FFmpeg found at run time, which it doesn't contain"
+
+[dependencies]
+anti-webui-core.workspace = true
+libloading.workspace = true
+libc.workspace = true

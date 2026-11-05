@@ -154,6 +154,23 @@ impl Presenter {
         &self.gpu
     }
 
+    /// The GPU that draws, if what decodes video can hand frames over on it.
+    pub fn video_render_node(&self) -> Option<std::path::PathBuf> {
+        Some(self.dmabuf.as_ref()?.ctx.render_node()?.to_owned())
+    }
+
+    /// Something for another renderer to read frames of videos on the GPU with.
+    pub fn video_importer(&self) -> Option<anti_webui_wgpu::dmabuf::VideoImporter> {
+        self.dmabuf.as_ref()?.ctx.video_importer().ok()
+    }
+
+    /// A frame of a video couldn't be read on the GPU, since this was last asked.
+    pub fn take_video_import_failed(&mut self) -> bool {
+        self.dmabuf
+            .as_mut()
+            .is_some_and(|d| d.renderer.take_video_import_failed())
+    }
+
     /// The scene of the last presented frame of a surface.
     pub fn last_scene(&self, surface: SurfaceId) -> Option<&Scene> {
         self.targets.get(&surface)?.prev.as_ref()
@@ -501,7 +518,10 @@ impl DmabufPresenter {
                 Sync::Implicit
             }
         };
-        let renderer = Renderer::new(&gpu.device, wgpu::TextureFormat::Bgra8Unorm);
+        let mut renderer = Renderer::new(&gpu.device, wgpu::TextureFormat::Bgra8Unorm);
+        if let Ok(importer) = dctx.video_importer() {
+            renderer.set_video_importer(importer);
+        }
         Ok((
             gpu,
             Self {

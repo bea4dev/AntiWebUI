@@ -28,6 +28,8 @@ AntiWebUI は WebView に頼らず、wgpu による自前描画とネイティ�
 | 21 | [widgets](21-widgets.md) | 標準の部品の一式、`Sheet`、テーマ、CSS との対応、見えている行だけ作るリスト |
 | 22 | [images](22-images.md) | `img` と `background-image`、形式、ワーカーでのデコード、表示の大きさに合わせたメモリ、Chrome との比較 |
 | 23 | [drag-and-drop](23-drag-and-drop.md) | つかみ（`on_grab`）、型付きのアプリ内 DnD、`wl_data_device` の OS DnD、並べ替え、選択した文字のドラッグ |
+| 24 | [video](24-video.md) | `video` 要素、実行時に読む FFmpeg とライセンス、ゼロコピーの取り込み、音声、フレームの割り振り、Chromium との比較 |
+| 25 | [svg](25-svg.md) | パス描画の方式、`svg` と形のノード、SVG ファイルの読み込み、Chromium との画素と速度の比較 |
 
 ## 用語
 

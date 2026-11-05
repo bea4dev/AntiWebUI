@@ -312,18 +312,46 @@ impl Ui {
     /// frames do it anyway. See `docs/design/22-images.md`.
     pub fn poll_images(&mut self) {
         let tells = with_doc(crate::images::poll);
-        if !tells.is_empty() {
+        let video_tells = with_doc(|d| crate::video::poll(d, Instant::now()));
+        if !tells.is_empty() || !video_tells.is_empty() {
             batch(|| {
                 for tell in tells {
                     tell.run();
+                }
+                for tell in video_tells {
+                    tell();
                 }
             });
         }
     }
 
+    /// What is known about the refreshes of the screen, for showing video frames evenly. See
+    /// `docs/design/24-video.md`.
+    pub fn set_video_timing(&mut self, timing: Option<crate::video::VideoTiming>) {
+        with_doc(|d| d.videos.get_mut().set_timing(timing));
+    }
+
+    /// The GPU that draws, for decoders to work on. Only videos opened after this use it.
+    pub fn set_video_render_node(&mut self, node: Option<std::path::PathBuf>) {
+        with_doc(|d| d.videos.get_mut().set_render_node(node));
+    }
+
+    /// The renderer can't read what the decoders leave behind: frames come in memory from now on.
+    pub fn video_use_memory(&mut self) {
+        with_doc(|d| d.videos.get_mut().use_memory());
+    }
+
+    /// How many videos there are, and frames waiting to be shown, for tests.
+    pub fn video_counts(&mut self) -> (usize, usize) {
+        with_doc(|d| d.videos.get_mut().counts())
+    }
+
     /// Called from another thread when there are pictures for [`Ui::poll_images`].
     pub fn set_image_waker(&mut self, waker: std::sync::Arc<dyn Fn() + Send + Sync>) {
-        with_doc(|d| d.images.get_mut().set_waker(waker));
+        with_doc(|d| {
+            d.videos.get_mut().set_waker(waker.clone());
+            d.images.get_mut().set_waker(waker);
+        });
     }
 
     /// Waits for all the pictures that are wanted to arrive, for tests and screenshots: a window
@@ -333,12 +361,27 @@ impl Ui {
         loop {
             self.poll_images();
             self.update();
-            if with_doc(|d| d.images.get_mut().is_empty()) {
+            if with_doc(|d| d.images.get_mut().is_empty() && d.videos.get_mut().is_empty()) {
                 return false;
             }
             // Painting is what asks for the pixels.
             self.paint_frame(Instant::now());
             self.poll_images();
+            let videos = with_doc(|d| {
+                let busy = d.videos.get_mut().busy();
+                if busy {
+                    crate::video::mark_all(d);
+                }
+                busy
+            });
+            if videos {
+                let left = end.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                continue;
+            }
             let waiting = with_doc(|d| d.images.get_mut().busy());
             if !waiting && !with_doc(|d| d.dirty.paint || Self::needs_update(d)) {
                 self.update();
@@ -495,7 +538,8 @@ impl Ui {
             Some(edit.caret_epoch + CARET_BLINK * periods as u32)
         });
         let picture = with_doc(|d| d.images.get_mut().next_frame());
-        [caret, animation::next_timer(), picture]
+        let video = with_doc(|d| crate::video::next_deadline(d, Instant::now()));
+        [caret, animation::next_timer(), picture, video]
             .into_iter()
             .flatten()
             .min()
@@ -504,6 +548,14 @@ impl Ui {
     /// Call when a deadline from [`Ui::next_deadline`] passes.
     pub fn tick(&mut self, now: Instant) {
         animation::run_timers(now);
+        let tells = with_doc(|d| crate::video::advance(d, now));
+        if !tells.is_empty() {
+            batch(|| {
+                for tell in tells {
+                    tell();
+                }
+            });
+        }
         with_doc(|d| {
             crate::images::advance(d, now, true);
             if d.state
@@ -1830,8 +1882,13 @@ fn hit(doc: &Document, id: NodeId, p: PointF) -> Option<NodeId> {
             return Some(h);
         }
     }
-    if matches!(node.kind, NodeKind::Fragment) || !node.computed.pointer_events {
+    if matches!(node.kind, NodeKind::Fragment | NodeKind::SvgText(_))
+        || !node.computed.pointer_events
+    {
         return None;
+    }
+    if let NodeKind::SvgShape(shape) = &node.kind {
+        return crate::svg::shape_contains(node, shape, p).then_some(id);
     }
     node.abs.contains(p).then_some(id)
 }

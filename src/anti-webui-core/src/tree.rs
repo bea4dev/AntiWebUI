@@ -73,6 +73,10 @@ pub struct TextData {
     pub text: String,
     pub version: u64,
     pub layout: TextLayout,
+    /// How much bigger it is than it says, from what is around it in an `svg`.
+    pub zoom: f32,
+    /// It is in an `svg`, where text is painted with `fill`.
+    pub in_svg: bool,
 }
 
 /// What a popup's surface needs to hold its box and what sticks out of it.
@@ -166,6 +170,14 @@ pub enum NodeKind {
     Edit(Box<EditData>),
     /// A picture in its box: `img`. See `docs/design/22-images.md`.
     Image(Box<ImageData>),
+    /// A moving picture in its box: `video`. See `docs/design/24-video.md`.
+    Video(Box<crate::video::VideoData>),
+    /// A box with coordinates of its own for shapes: `svg`. See `docs/design/25-svg.md`.
+    Svg(Box<crate::svg::SvgData>),
+    /// A shape in an `svg`, or a group of them.
+    SvgShape(Box<crate::svg::ShapeData>),
+    /// What puts a text at a point in an `svg`.
+    SvgText(Box<crate::svg::SvgTextData>),
     /// Generates no box; children take part in the parent's layout.
     Fragment,
     /// The root of what is shown in a surface of its own. It stays in the tree for its lifetime,
@@ -298,6 +310,30 @@ impl Node {
     pub fn image(&self) -> Option<&ImageData> {
         match &self.kind {
             NodeKind::Image(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    pub fn video(&self) -> Option<&crate::video::VideoData> {
+        match &self.kind {
+            NodeKind::Video(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    pub fn video_mut(&mut self) -> Option<&mut crate::video::VideoData> {
+        match &mut self.kind {
+            NodeKind::Video(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// How big what it holds is, if it has the size of what it holds: a picture or a video. The
+    /// second part says how many pixels of it make a logical pixel.
+    pub fn replaced(&self) -> Option<(Option<(f32, f32)>, f32)> {
+        match &self.kind {
+            NodeKind::Image(d) => Some((d.natural, d.density)),
+            NodeKind::Video(d) => Some((d.natural, 1.0)),
             _ => None,
         }
     }
@@ -512,6 +548,9 @@ pub struct Document {
     pub resized: Vec<NodeId>,
     /// Painting asks for pictures while the rest of the document stays as it is.
     pub images: RefCell<crate::images::ImageStore>,
+    pub videos: RefCell<crate::video::VideoStore>,
+    /// Errors to tell of when the document isn't borrowed any more.
+    pub(crate) videos_failed: Vec<(crate::video::VideoErrorListener, crate::video::VideoError)>,
 }
 
 /// What a stacking context paints above its own background, besides its children in tree order.
@@ -551,6 +590,8 @@ thread_local! {
         scrolled: Vec::new(),
         resized: Vec::new(),
         images: RefCell::default(),
+        videos: RefCell::default(),
+        videos_failed: Vec::new(),
     });
 }
 
@@ -925,6 +966,9 @@ impl Document {
         if let Some(node) = self.nodes.remove(id) {
             if let Some(source) = node.image().and_then(|d| d.source.as_ref()) {
                 self.images.get_mut().release(id, source);
+            }
+            if node.video().is_some() {
+                crate::video::remove(self, id);
             }
             if let Some(popup) = node.popup() {
                 self.popups.retain(|p| *p != id);

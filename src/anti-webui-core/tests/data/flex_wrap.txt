@@ -1,0 +1,779 @@
+# Flex layout against Chromium. `tools/chrome_layout.py` writes the `=` lines.
+
+case three-lines
+box display:flex;flex-wrap:wrap;width:250px
+item width:100px;height:30px
+item width:100px;height:40px
+item width:100px;height:20px
+item width:100px;height:20px
+item width:100px;height:50px
+= 0 0 250 110
+= 0 0 100 30
+= 100 0 100 40
+= 0 40 100 20
+= 100 40 100 20
+= 0 60 100 50
+
+case exact-fit
+box display:flex;flex-wrap:wrap;width:300px
+item width:100px;height:30px
+item width:100px;height:30px
+item width:100px;height:30px
+item width:1px;height:30px
+= 0 0 300 60
+= 0 0 100 30
+= 100 0 100 30
+= 200 0 100 30
+= 0 30 1 30
+
+case gaps
+box display:flex;flex-wrap:wrap;width:250px;row-gap:7px;column-gap:13px
+item width:100px;height:30px
+item width:100px;height:30px
+item width:100px;height:30px
+item width:100px;height:30px
+= 0 0 250 67
+= 0 0 100 30
+= 113 0 100 30
+= 0 37 100 30
+= 113 37 100 30
+
+case gap-decides-the-line
+box display:flex;flex-wrap:wrap;width:210px;column-gap:11px
+item width:100px;height:30px
+item width:100px;height:30px
+= 0 0 210 60
+= 0 0 100 30
+= 0 30 100 30
+
+case margins
+box display:flex;flex-wrap:wrap;width:250px
+item width:100px;height:30px;margin-left:5px;margin-right:10px;margin-top:3px;margin-bottom:9px
+item width:100px;height:30px;margin-left:5px;margin-right:10px
+item width:100px;height:30px;margin-top:6px
+= 0 0 250 78
+= 5 3 100 30
+= 120 0 100 30
+= 0 48 100 30
+
+case padding-border
+box display:flex;flex-wrap:wrap;width:250px;padding:10px;border:3px solid
+item width:100px;height:30px
+item width:100px;height:30px
+item width:100px;height:30px
+= 0 0 250 86
+= 13 13 100 30
+= 113 13 100 30
+= 13 43 100 30
+
+case grow-per-line
+box display:flex;flex-wrap:wrap;width:250px
+item width:100px;height:30px;flex-grow:1
+item width:100px;height:30px;flex-grow:3
+item width:100px;height:30px;flex-grow:1
+= 0 0 250 60
+= 0 0 112.5 30
+= 112.5 0 137.5 30
+= 0 30 250 30
+
+case grow-with-max
+box display:flex;flex-wrap:wrap;width:250px
+item width:100px;height:30px;flex-grow:1;max-width:110px
+item width:100px;height:30px;flex-grow:1
+item width:100px;height:30px
+= 0 0 250 60
+= 0 0 110 30
+= 110 0 140 30
+= 0 30 100 30
+
+case single-item-too-wide-shrinks
+box display:flex;flex-wrap:wrap;width:250px
+item width:300px;height:30px
+item width:100px;height:30px
+= 0 0 250 60
+= 0 0 250 30
+= 0 30 100 30
+
+case too-wide-does-not-shrink
+box display:flex;flex-wrap:wrap;width:250px
+item width:300px;height:30px;flex-shrink:0
+item width:100px;height:30px
+= 0 0 250 60
+= 0 0 300 30
+= 0 30 100 30
+
+case too-wide-stopped-by-min
+box display:flex;flex-wrap:wrap;width:250px
+item width:300px;height:30px;min-width:280px
+item width:100px;height:30px
+= 0 0 250 60
+= 0 0 280 30
+= 0 30 100 30
+
+case basis-zero-uses-content-min
+box display:flex;flex-wrap:wrap;width:250px
+item flex-basis:0;flex-grow:1;height:30px > width:150px;height:10px
+item flex-basis:0;flex-grow:1;height:30px > width:150px;height:10px
+item flex-basis:0;flex-grow:1;height:30px > width:50px;height:10px
+= 0 0 250 60
+= 0 0 250 30
+= 0 30 150 30
+= 150 30 100 30
+
+case basis-beats-width
+box display:flex;flex-wrap:wrap;width:250px
+item flex-basis:200px;width:50px;height:30px
+item flex-basis:100px;width:50px;height:30px
+= 0 0 250 60
+= 0 0 200 30
+= 0 30 100 30
+
+case percent-widths
+box display:flex;flex-wrap:wrap;width:300px
+item width:50%;height:30px
+item width:50%;height:30px
+item width:33%;height:30px
+item width:70%;height:30px
+= 0 0 300 90
+= 0 0 150 30
+= 150 0 150 30
+= 0 30 99 30
+= 0 60 210 30
+
+case stretch-in-lines
+box display:flex;flex-wrap:wrap;width:250px
+item width:100px;height:30px
+item width:100px
+item width:100px;height:50px
+item width:100px
+= 0 0 250 80
+= 0 0 100 30
+= 100 0 100 30
+= 0 30 100 50
+= 100 30 100 50
+
+case stretch-respects-max
+box display:flex;flex-wrap:wrap;width:250px
+item width:100px;height:50px
+item width:100px;max-height:20px
+= 0 0 250 50
+= 0 0 100 50
+= 100 0 100 20
+
+case stretch-respects-min
+box display:flex;flex-wrap:wrap;width:250px
+item width:100px;height:10px
+item width:100px;min-height:30px
+= 0 0 250 30
+= 0 0 100 10
+= 100 0 100 30
+
+case align-items-center
+box display:flex;flex-wrap:wrap;width:250px;align-items:center
+item width:100px;height:30px
+item width:100px;height:10px
+item width:100px;height:21px
+item width:100px;height:50px
+= 0 0 250 80
+= 0 0 100 30
+= 100 10 100 10
+= 0 44.5 100 21
+= 100 30 100 50
+
+case align-items-end
+box display:flex;flex-wrap:wrap;width:250px;align-items:flex-end
+item width:100px;height:30px
+item width:100px;height:10px
+item width:100px;height:20px
+item width:100px;height:50px
+= 0 0 250 80
+= 0 0 100 30
+= 100 20 100 10
+= 0 60 100 20
+= 100 30 100 50
+
+case align-self
+box display:flex;flex-wrap:wrap;width:350px
+item width:100px;height:50px
+item width:100px;height:10px;align-self:center
+item width:100px;height:10px;align-self:flex-end
+item width:100px;height:10px;align-self:flex-start
+= 0 0 350 60
+= 0 0 100 50
+= 100 20 100 10
+= 200 40 100 10
+= 0 50 100 10
+
+case align-with-margins
+box display:flex;flex-wrap:wrap;width:250px;align-items:flex-end
+item width:100px;height:50px
+item width:100px;height:10px;margin-bottom:7px;margin-top:3px
+= 0 0 250 50
+= 0 0 100 50
+= 100 33 100 10
+
+case stretch-lines-with-room
+box display:flex;flex-wrap:wrap;width:250px;height:200px
+item width:100px;height:30px
+item width:100px;height:40px
+item width:100px
+item width:100px;height:20px
+= 0 0 250 200
+= 0 0 100 30
+= 100 0 100 40
+= 0 110 100 90
+= 100 110 100 20
+
+case stretch-lines-uneven
+box display:flex;flex-wrap:wrap;width:150px;height:101px
+item width:100px;height:30px
+item width:100px;height:20px
+item width:100px;height:10px
+= 0 0 150 101
+= 0 0 100 30
+= 0 43.671875 100 20
+= 0 77.328125 100 10
+
+case stretch-one-line
+box display:flex;flex-wrap:wrap;width:250px;height:200px
+item width:100px
+item width:100px;height:30px
+= 0 0 250 200
+= 0 0 100 200
+= 100 0 100 30
+
+case stretch-with-gap
+box display:flex;flex-wrap:wrap;width:250px;height:200px;row-gap:10px
+item width:100px;height:30px
+item width:100px;height:40px
+item width:100px
+item width:100px;height:20px
+= 0 0 250 200
+= 0 0 100 30
+= 100 0 100 40
+= 0 115 100 85
+= 100 115 100 20
+
+case content-start
+box display:flex;flex-wrap:wrap;width:150px;height:200px;align-content:flex-start
+item width:100px;height:30px
+item width:100px;height:40px
+item width:100px;height:20px
+= 0 0 150 200
+= 0 0 100 30
+= 0 30 100 40
+= 0 70 100 20
+
+case content-start-one-line
+box display:flex;flex-wrap:wrap;width:250px;height:200px;align-content:flex-start
+item width:100px
+item width:100px;height:30px
+= 0 0 250 200
+= 0 0 100 30
+= 100 0 100 30
+
+case content-end
+box display:flex;flex-wrap:wrap;width:150px;height:200px;align-content:flex-end
+item width:100px;height:30px
+item width:100px;height:40px
+item width:100px;height:20px
+= 0 0 150 200
+= 0 110 100 30
+= 0 140 100 40
+= 0 180 100 20
+
+case content-center
+box display:flex;flex-wrap:wrap;width:150px;height:201px;align-content:center
+item width:100px;height:30px
+item width:100px;height:40px
+item width:100px;height:20px
+= 0 0 150 201
+= 0 55.5 100 30
+= 0 85.5 100 40
+= 0 125.5 100 20
+
+case content-between
+box display:flex;flex-wrap:wrap;width:150px;height:201px;align-content:space-between
+item width:100px;height:30px
+item width:100px;height:40px
+item width:100px;height:20px
+= 0 0 150 201
+= 0 0 100 30
+= 0 85.5 100 40
+= 0 181 100 20
+
+case content-around
+box display:flex;flex-wrap:wrap;width:150px;height:210px;align-content:space-around
+item width:100px;height:30px
+item width:100px;height:40px
+item width:100px;height:20px
+= 0 0 150 210
+= 0 20 100 30
+= 0 90 100 40
+= 0 170 100 20
+
+case content-evenly
+box display:flex;flex-wrap:wrap;width:150px;height:210px;align-content:space-evenly
+item width:100px;height:30px
+item width:100px;height:40px
+item width:100px;height:20px
+= 0 0 150 210
+= 0 30 100 30
+= 0 90 100 40
+= 0 160 100 20
+
+case content-overflow-end
+box display:flex;flex-wrap:wrap;width:150px;height:50px;align-content:flex-end
+item width:100px;height:30px
+item width:100px;height:40px
+= 0 0 150 50
+= 0 -20 100 30
+= 0 10 100 40
+
+case content-overflow-center
+box display:flex;flex-wrap:wrap;width:150px;height:50px;align-content:center
+item width:100px;height:30px
+item width:100px;height:40px
+= 0 0 150 50
+= 0 -10 100 30
+= 0 20 100 40
+
+case content-overflow-between
+box display:flex;flex-wrap:wrap;width:150px;height:50px;align-content:space-between
+item width:100px;height:30px
+item width:100px;height:40px
+= 0 0 150 50
+= 0 0 100 30
+= 0 30 100 40
+
+case content-overflow-around
+box display:flex;flex-wrap:wrap;width:150px;height:50px;align-content:space-around
+item width:100px;height:30px
+item width:100px;height:40px
+= 0 0 150 50
+= 0 0 100 30
+= 0 30 100 40
+
+case content-overflow-evenly
+box display:flex;flex-wrap:wrap;width:150px;height:50px;align-content:space-evenly
+item width:100px;height:30px
+item width:100px;height:40px
+= 0 0 150 50
+= 0 0 100 30
+= 0 30 100 40
+
+case overflow-stretch-does-nothing
+box display:flex;flex-wrap:wrap;width:150px;height:50px
+item width:100px;height:30px
+item width:100px;height:40px
+= 0 0 150 50
+= 0 0 100 30
+= 0 30 100 40
+
+case wrap-reverse-auto-height
+box display:flex;flex-wrap:wrap-reverse;width:250px
+item width:100px;height:30px
+item width:100px;height:40px
+item width:100px;height:20px
+= 0 0 250 60
+= 0 30 100 30
+= 100 20 100 40
+= 0 0 100 20
+
+case wrap-reverse-definite
+box display:flex;flex-wrap:wrap-reverse;width:250px;height:200px;align-content:flex-start
+item width:100px;height:30px
+item width:100px;height:40px
+item width:100px;height:20px
+= 0 0 250 200
+= 0 170 100 30
+= 100 160 100 40
+= 0 140 100 20
+
+case wrap-reverse-stretch
+box display:flex;flex-wrap:wrap-reverse;width:250px;height:200px
+item width:100px;height:30px
+item width:100px
+item width:100px;height:20px
+= 0 0 250 200
+= 0 170 100 30
+= 100 95 100 105
+= 0 75 100 20
+
+case wrap-reverse-align
+box display:flex;flex-wrap:wrap-reverse;width:250px;align-items:flex-end
+item width:100px;height:30px
+item width:100px;height:10px
+item width:100px;height:20px
+= 0 0 250 50
+= 0 20 100 30
+= 100 20 100 10
+= 0 0 100 20
+
+case wrap-reverse-center
+box display:flex;flex-wrap:wrap-reverse;width:250px;align-items:center
+item width:100px;height:30px
+item width:100px;height:11px
+= 0 0 250 30
+= 0 0 100 30
+= 100 9.5 100 11
+
+case wrap-reverse-margins
+box display:flex;flex-wrap:wrap-reverse;width:250px
+item width:100px;height:30px;margin-top:3px;margin-bottom:9px
+item width:100px;height:10px;margin-top:5px
+item width:100px;height:20px;margin-bottom:5px
+= 0 0 250 67
+= 0 28 100 30
+= 100 57 100 10
+= 0 0 100 20
+
+case row-reverse-wrap
+box display:flex;flex-direction:row-reverse;flex-wrap:wrap;width:250px
+item width:100px;height:30px
+item width:100px;height:40px
+item width:100px;height:20px
+= 0 0 250 60
+= 150 0 100 30
+= 50 0 100 40
+= 150 40 100 20
+
+case row-reverse-margins
+box display:flex;flex-direction:row-reverse;width:350px
+item width:100px;height:30px;margin-left:5px;margin-right:20px
+item width:100px;height:30px;margin-left:7px;margin-right:2px
+= 0 0 350 30
+= 230 0 100 30
+= 123 0 100 30
+
+case row-reverse-justify-end
+box display:flex;flex-direction:row-reverse;justify-content:flex-end;width:350px
+item width:100px;height:30px;margin-left:5px
+item width:100px;height:30px
+= 0 0 350 30
+= 105 0 100 30
+= 0 0 100 30
+
+case column-wrap
+box display:flex;flex-direction:column;flex-wrap:wrap;height:100px;width:300px
+item width:50px;height:60px
+item width:70px;height:60px
+item width:30px;height:30px
+= 0 0 300 100
+= 0 0 50 60
+= 140 0 70 60
+= 140 60 30 30
+
+case column-wrap-grow
+box display:flex;flex-direction:column;flex-wrap:wrap;height:100px;width:300px;align-content:flex-start
+item width:50px;height:60px;flex-grow:1
+item width:70px;height:60px;flex-grow:1
+item width:30px;height:30px
+= 0 0 300 100
+= 0 0 50 100
+= 50 0 70 70
+= 50 70 30 30
+
+case column-wrap-stretch
+box display:flex;flex-direction:column;flex-wrap:wrap;height:100px;width:300px
+item height:60px
+item height:60px
+= 0 0 300 100
+= 0 0 150 60
+= 150 0 150 60
+
+case column-wrap-gap
+box display:flex;flex-direction:column;flex-wrap:wrap;height:100px;width:300px;row-gap:5px;column-gap:9px;align-content:flex-start
+item width:50px;height:50px
+item width:50px;height:50px
+item width:50px;height:50px
+= 0 0 300 100
+= 0 0 50 50
+= 59 0 50 50
+= 118 0 50 50
+
+case column-wrap-reverse
+box display:flex;flex-direction:column;flex-wrap:wrap-reverse;height:100px;width:300px;align-content:flex-start
+item width:50px;height:60px
+item width:70px;height:60px
+= 0 0 300 100
+= 250 0 50 60
+= 180 0 70 60
+
+case column-reverse-wrap
+box display:flex;flex-direction:column-reverse;flex-wrap:wrap;height:100px;width:300px
+item width:50px;height:60px;margin-top:2px;margin-bottom:5px
+item width:70px;height:20px
+item width:70px;height:60px
+= 0 0 300 100
+= 0 35 50 60
+= 0 13 70 20
+= 150 40 70 60
+
+case column-wrap-auto-height-stays-one-line
+box display:flex;flex-direction:column;flex-wrap:wrap;width:300px
+item width:50px;height:60px
+item width:70px;height:60px
+= 0 0 300 120
+= 0 0 50 60
+= 0 60 70 60
+
+case column-wrap-max-height-wraps-not
+box display:flex;flex-direction:column;flex-wrap:wrap;width:300px;max-height:100px
+item width:50px;height:60px
+item width:70px;height:60px
+= 0 0 300 60
+= 0 0 50 60
+= 140 0 70 60
+
+case column-wrap-fits-to-content
+parent display:flex;flex-direction:column;align-items:flex-start;width:400px;height:300px
+box display:flex;flex-direction:column;flex-wrap:wrap;height:100px
+item width:50px;height:60px
+item width:70px;height:60px
+= 0 0 120 100
+= 0 0 50 60
+= 50 0 70 60
+
+case justify-end-per-line
+box display:flex;flex-wrap:wrap;width:250px;justify-content:flex-end
+item width:100px;height:30px
+item width:100px;height:30px
+item width:100px;height:30px
+= 0 0 250 60
+= 50 0 100 30
+= 150 0 100 30
+= 150 30 100 30
+
+case justify-center-per-line
+box display:flex;flex-wrap:wrap;width:251px;justify-content:center
+item width:100px;height:30px
+item width:100px;height:30px
+item width:100px;height:30px
+= 0 0 251 60
+= 25.5 0 100 30
+= 125.5 0 100 30
+= 75.5 30 100 30
+
+case justify-between-per-line
+box display:flex;flex-wrap:wrap;width:320px;justify-content:space-between
+item width:100px;height:30px
+item width:100px;height:30px
+item width:100px;height:30px
+item width:100px;height:30px
+= 0 0 320 60
+= 0 0 100 30
+= 110 0 100 30
+= 220 0 100 30
+= 0 30 100 30
+
+case justify-around-per-line
+box display:flex;flex-wrap:wrap;width:320px;justify-content:space-around
+item width:100px;height:30px
+item width:100px;height:30px
+item width:100px;height:30px
+item width:100px;height:30px
+= 0 0 320 60
+= 3.328125 0 100 30
+= 110 0 100 30
+= 216.65625 0 100 30
+= 110 30 100 30
+
+case justify-evenly-per-line
+box display:flex;flex-wrap:wrap;width:320px;justify-content:space-evenly
+item width:100px;height:30px
+item width:100px;height:30px
+item width:100px;height:30px
+item width:100px;height:30px
+= 0 0 320 60
+= 5 0 100 30
+= 110 0 100 30
+= 215 0 100 30
+= 110 30 100 30
+
+case overflow-justify-end
+box display:flex;justify-content:flex-end;width:100px
+item width:150px;height:30px;flex-shrink:0
+= 0 0 100 30
+= -50 0 150 30
+
+case overflow-justify-center
+box display:flex;justify-content:center;width:100px
+item width:150px;height:30px;flex-shrink:0
+= 0 0 100 30
+= -25 0 150 30
+
+case overflow-justify-between
+box display:flex;justify-content:space-between;width:100px
+item width:80px;height:30px;flex-shrink:0
+item width:80px;height:30px;flex-shrink:0
+= 0 0 100 30
+= 0 0 80 30
+= 80 0 80 30
+
+case overflow-justify-around
+box display:flex;justify-content:space-around;width:100px
+item width:80px;height:30px;flex-shrink:0
+item width:80px;height:30px;flex-shrink:0
+= 0 0 100 30
+= 0 0 80 30
+= 80 0 80 30
+
+case overflow-justify-evenly
+box display:flex;justify-content:space-evenly;width:100px
+item width:80px;height:30px;flex-shrink:0
+item width:80px;height:30px;flex-shrink:0
+= 0 0 100 30
+= 0 0 80 30
+= 80 0 80 30
+
+case fit-content-fits
+parent display:flex;flex-direction:column;align-items:flex-start;width:400px;height:300px
+box display:flex;flex-wrap:wrap
+item width:100px;height:30px
+item width:100px;height:30px
+= 0 0 200 30
+= 0 0 100 30
+= 100 0 100 30
+
+case fit-content-wraps-takes-the-room
+parent display:flex;flex-direction:column;align-items:flex-start;width:400px;height:300px
+box display:flex;flex-wrap:wrap
+item width:150px;height:30px
+item width:150px;height:30px
+item width:150px;height:30px
+= 0 0 400 60
+= 0 0 150 30
+= 150 0 150 30
+= 0 30 150 30
+
+case fit-content-grows-after-wrapping
+parent display:flex;flex-direction:column;align-items:flex-start;width:400px;height:300px
+box display:flex;flex-wrap:wrap
+item width:150px;height:30px;flex-grow:1
+item width:150px;height:30px
+item width:150px;height:30px;flex-grow:1
+= 0 0 400 60
+= 0 0 250 30
+= 250 0 150 30
+= 0 30 400 30
+
+case fit-content-wider-than-parent
+parent display:flex;flex-direction:column;align-items:flex-start;width:100px;height:300px
+box display:flex;flex-wrap:wrap
+item width:150px;height:30px;flex-shrink:0
+item width:50px;height:30px
+= 0 0 150 60
+= 0 0 150 30
+= 0 30 50 30
+
+case absolute-wraps
+parent display:block;position:relative;width:250px;height:300px
+box display:flex;flex-wrap:wrap;position:absolute;left:0px;top:0px
+item width:100px;height:30px
+item width:100px;height:30px
+item width:100px;height:30px
+= 0 0 250 60
+= 0 0 100 30
+= 100 0 100 30
+= 0 30 100 30
+
+case in-a-row-is-max-content
+parent display:flex;width:250px;height:300px;align-items:flex-start
+box display:flex;flex-wrap:wrap
+item width:100px;height:30px
+item width:100px;height:30px
+item width:100px;height:30px
+= 0 0 250 60
+= 0 0 100 30
+= 100 0 100 30
+= 0 30 100 30
+
+case in-a-row-does-not-shrink
+parent display:flex;width:250px;height:300px;align-items:flex-start
+box display:flex;flex-wrap:wrap;flex-shrink:0
+item width:100px;height:30px
+item width:100px;height:30px
+item width:100px;height:30px
+= 0 0 300 30
+= 0 0 100 30
+= 100 0 100 30
+= 200 0 100 30
+
+case stretched-by-column-parent
+parent display:flex;flex-direction:column;width:250px;height:300px
+box display:flex;flex-wrap:wrap
+item width:100px;height:30px
+item width:100px;height:30px
+item width:100px;height:30px
+= 0 0 250 60
+= 0 0 100 30
+= 100 0 100 30
+= 0 30 100 30
+
+case stretched-by-row-parent
+parent display:flex;width:250px;height:300px
+box display:flex;flex-wrap:wrap;width:150px
+item width:100px;height:30px
+item width:100px;height:30px
+= 0 0 150 300
+= 0 0 100 30
+= 0 150 100 30
+
+case empty
+box display:flex;flex-wrap:wrap;width:250px;height:100px
+= 0 0 250 100
+
+case hidden-items-take-no-line
+box display:flex;flex-wrap:wrap;width:150px
+item width:100px;height:30px
+item width:100px;height:30px;display:none
+item width:40px;height:30px
+= 0 0 150 30
+= 0 0 100 30
+= 0 -22800 0 0
+= 100 0 40 30
+
+case fit-content-nowrap-shrinks
+parent display:flex;flex-direction:column;align-items:flex-start;width:150px;height:300px
+box display:flex
+item width:100px;height:30px
+item width:100px;height:30px
+= 0 0 200 30
+= 0 0 100 30
+= 100 0 100 30
+
+case fit-content-nowrap-stopped-by-min
+parent display:flex;flex-direction:column;align-items:flex-start;width:150px;height:300px
+box display:flex
+item width:100px;height:30px;min-width:90px
+item width:100px;height:30px;min-width:80px
+= 0 0 200 30
+= 0 0 100 30
+= 100 0 100 30
+
+case nowrap-shrink-goes-by-basis
+box display:flex;width:300px
+item height:30px > width:1000px;height:10px;flex-shrink:0
+item width:100px;height:30px
+= 0 0 300 30
+= 0 0 1000 30
+= 1000 0 0 30
+
+case row-in-row-basis-is-max-content
+parent display:flex;width:150px;height:100px
+box display:flex;flex-shrink:0
+item width:100px;height:30px
+item width:100px;height:30px
+= 0 0 200 100
+= 0 0 100 30
+= 100 0 100 30
+
+case min-content-of-a-row
+parent display:flex;width:50px;height:100px
+box display:flex
+item width:100px;height:30px;flex-shrink:0
+item height:30px > width:70px;height:10px
+= 0 0 170 100
+= 0 0 100 30
+= 100 0 70 30

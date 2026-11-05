@@ -2,6 +2,7 @@
 name = "anti-webui-macros"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 description = "Derive macros for AntiWebUI"
 

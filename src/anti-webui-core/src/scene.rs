@@ -3,7 +3,7 @@
 use crate::geometry::{Affine, PointI, RectI};
 use crate::images::Bitmap;
 use crate::shader::{Image, ShaderPaint};
-use anti_webui_style::Color;
+use anti_webui_style::{Color, FillRule, Gradient, LineCap, LineJoin};
 pub use parley::FontData;
 use std::sync::Arc;
 
@@ -375,9 +375,124 @@ impl PartialEq for ImageDraw {
     }
 }
 
+/// A frame of a video. See `docs/design/24-video.md`.
+#[derive(Clone, Debug)]
+pub struct VideoDraw {
+    pub frame: Arc<crate::video::VideoFrame>,
+    /// Where all of the frame goes.
+    pub rect: RectI,
+    /// What it is cut to, which can be rounded.
+    pub shape: Clip,
+    pub clip: Clip,
+    pub opacity: f32,
+}
+
+impl VideoDraw {
+    /// What it can touch.
+    pub fn area(&self) -> RectI {
+        self.rect
+            .intersect(&self.shape.rect)
+            .intersect(&self.clip.rect)
+    }
+}
+
+impl PartialEq for VideoDraw {
+    fn eq(&self, other: &Self) -> bool {
+        self.frame.id == other.frame.id
+            && self.rect == other.rect
+            && self.shape == other.shape
+            && self.clip == other.clip
+            && self.opacity == other.opacity
+    }
+}
+
+/// Curves in their own coordinates, shared by what draws them. Two of them are the same only if they
+/// are one and the same, which is what the renderer goes by to keep what it made of them.
+pub struct PathGeometry {
+    id: u64,
+    path: kurbo::BezPath,
+    bounds: kurbo::Rect,
+}
+
+impl PathGeometry {
+    pub fn new(path: kurbo::BezPath) -> Arc<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let bounds = kurbo::Shape::bounding_box(&path);
+        Arc::new(Self {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            path,
+            bounds,
+        })
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn path(&self) -> &kurbo::BezPath {
+        &self.path
+    }
+
+    /// The box around the curves.
+    pub fn bounds(&self) -> kurbo::Rect {
+        self.bounds
+    }
+}
+
+impl std::fmt::Debug for PathGeometry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PathGeometry")
+            .field("id", &self.id)
+            .field("bounds", &self.bounds)
+            .finish()
+    }
+}
+
+impl PartialEq for PathGeometry {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+/// How the outline of a shape goes, in the coordinates of the shape.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StrokeStyle {
+    pub width: f32,
+    pub cap: LineCap,
+    pub join: LineJoin,
+    pub miter_limit: f32,
+    pub dashes: Option<Arc<[f32]>>,
+    pub dash_offset: f32,
+}
+
+/// What a shape is painted with.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PathPaint {
+    Color(Color),
+    Gradient(Arc<Gradient>),
+}
+
+/// The inside or the outline of a shape. See `docs/design/25-svg.md`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PathDraw {
+    pub geometry: Arc<PathGeometry>,
+    /// Draws the outline rather than the inside.
+    pub stroke: Option<Box<StrokeStyle>>,
+    pub rule: FillRule,
+    pub paint: PathPaint,
+    pub opacity: f32,
+    /// From the coordinates of the shape to where it shows.
+    pub transform: Affine,
+    /// A rectangle containing what it can touch.
+    pub bounds: RectI,
+    pub clip: Clip,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Primitive {
     Image(ImageDraw),
+    Video(VideoDraw),
+    Path(PathDraw),
     Shadow(Shadow),
     Quad(Quad),
     Glyphs(GlyphRun),

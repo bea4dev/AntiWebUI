@@ -2,6 +2,7 @@
 name = "anti-webui"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 description = "A lightweight native UI framework rendered with wgpu"
 
@@ -11,6 +12,8 @@ default = ["svg", "svg-text"]
 svg = ["anti-webui-internal/svg"]
 ## Text in pictures in SVG, which adds 1.6 MiB.
 svg-text = ["anti-webui-internal/svg-text"]
+## Videos, with an FFmpeg found at run time. See `docs/design/24-video.md`.
+video = ["anti-webui-internal/video"]
 ## Link AntiWebUI dynamically for faster incremental builds (development only).
 dynamic_linking = ["dep:anti-webui-dylib"]
 
@@ -20,3 +23,11 @@ anti-webui-dylib = { workspace = true, optional = true }
 
 [dev-dependencies]
 image.workspace = true
+
+[[example]]
+name = "video"
+required-features = ["video"]
+
+[[example]]
+name = "bench_video"
+required-features = ["video"]

@@ -273,6 +273,18 @@ pub struct ShapeStyle {
 }
 
 impl ShapeStyle {
+    /// Makes it bigger, as what is around text in an `svg` does.
+    pub(crate) fn zoomed(mut self, zoom: f32) -> Self {
+        if zoom != 1.0 {
+            self.size *= zoom;
+            self.letter_spacing *= zoom;
+            self.line_height = self
+                .line_height
+                .map(|h| (h as f32 * zoom).round().max(1.0) as i32);
+        }
+        self
+    }
+
     pub fn from_computed(style: &ComputedStyle, scale: Scale) -> Self {
         let size = scale.pxf(style.font_size);
         let line_height = match style.line_height {
@@ -428,6 +440,14 @@ impl TextLayout {
 
     pub fn max_content_width(&self) -> i32 {
         self.layout.calculate_content_widths().max.ceil() as i32
+    }
+
+    /// How far down the first baseline is.
+    pub fn first_baseline(&self) -> f32 {
+        self.layout
+            .lines()
+            .next()
+            .map_or(0.0, |line| line.metrics().baseline)
     }
 
     /// Height of an empty line in this style (for empty text and carets).

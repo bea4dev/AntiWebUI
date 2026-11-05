@@ -13,6 +13,7 @@ members = [
     "src/anti-webui-symbols-outlined",
     "src/anti-webui-app",
     "src/anti-webui-wgpu",
+    "src/anti-webui-video",
     "src/anti-webui-wayland",
     "src/anti-webui-x11",
     "src/anti-webui-windows",
@@ -23,6 +24,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+authors = ["bea4dev"]
 repository = "https://github.com/bea4dev/AntiWebUI"
 
 [workspace.dependencies]
@@ -35,6 +37,7 @@ anti-webui-widgets = { path = "src/anti-webui-widgets", version = "0.1.0" }
 anti-webui-macros = { path = "src/anti-webui-macros", version = "0.1.0" }
 anti-webui-app = { path = "src/anti-webui-app", version = "0.1.0" }
 anti-webui-wgpu = { path = "src/anti-webui-wgpu", version = "0.1.0" }
+anti-webui-video = { path = "src/anti-webui-video", version = "0.1.0" }
 anti-webui-wayland = { path = "src/anti-webui-wayland", version = "0.1.0" }
 anti-webui-symbols-outlined = { path = "src/anti-webui-symbols-outlined", version = "0.1.0" }
 
@@ -56,8 +59,10 @@ png = "0.18"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 moxcms = "0.8"
 resvg = { version = "0.49", default-features = false, features = ["raster-images"] }
+kurbo = "0.13"
 bytemuck = { version = "1.25", features = ["derive"] }
 log = "0.4"
 read-fonts = { version = "0.41", default-features = false, features = ["std"] }
 ash = "0.38"
 libc = "0.2"
+libloading = "0.8"

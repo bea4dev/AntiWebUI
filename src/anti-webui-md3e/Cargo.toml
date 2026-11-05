@@ -2,6 +2,7 @@
 name = "anti-webui-md3e"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 description = "Material 3 Expressive components for AntiWebUI"
 

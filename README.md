@@ -41,9 +41,16 @@ cargo run -p anti-webui --example showcase --features dynamic_linking
 | `anti-webui-style` | スタイル型と `Styled` ビルダートレイト |
 | `anti-webui-widgets` | ボタン、入力、メニュー、ダイアログ、テーブルなどの標準の部品とテーマ |
 | `anti-webui-wgpu` | レンダラ |
+| `anti-webui-video` | 動画のデコードと音声。実行時に読み込む FFmpeg を使い、FFmpeg のコードは含まない（`video` feature） |
 | `anti-webui-wayland` | Wayland バックエンド |
 | `anti-webui-app` | 上記の結線、オフスクリーン描画 |
 
 ## 状態
 
 M1（Wayland 上の基本 UI）が動作する段階です。対応 OS は現在 Linux (Wayland) のみです。ロードマップは [07-roadmap](docs/design/07-roadmap.md) を参照してください。
+
+## ライセンス
+
+MIT License または Apache License 2.0 のどちらかを選べます（[LICENSE-MIT](LICENSE-MIT)、[LICENSE-APACHE](LICENSE-APACHE)）。作者は bea4dev です。
+
+`anti-webui-symbols-outlined` は、同梱するフォントに合わせて Apache License 2.0 のみです。動画は FFmpeg を実行時に読み込むだけで、FFmpeg のコードは含みません（[24-video](docs/design/24-video.md)）。

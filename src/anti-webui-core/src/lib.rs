@@ -15,9 +15,11 @@ pub mod scene;
 mod scroll;
 pub mod settings;
 pub mod shader;
+pub mod svg;
 pub mod text;
 pub mod tree;
 pub mod ui;
+pub mod video;
 pub mod view;
 
 pub use anti_webui_style as style;
@@ -41,11 +43,16 @@ pub mod prelude {
     };
     pub use crate::settings::{FrameAdvance, ImageSettings, Settings, settings, update_settings};
     pub use crate::shader::{Image, IntoImage, IntoPaint, Shader, ShaderPaint, ShaderParams};
+    pub use crate::svg::{self, Svg, svg};
     pub use crate::text::{NotAFont, register_font, register_font_as};
+    pub use crate::video::{
+        VideoError, VideoLibraries, VideoPlayer, VideoSettings, can_play_video, video_availability,
+        video_player,
+    };
     pub use crate::view::{
-        Div, ForEach, Img, IntoImageSource, IntoTextSource, IntoView, NodeRef, Popup, Show, Text,
-        TextInput, View, div, dyn_view, for_each, fragment, img, node_ref, popup, portal, shader,
-        show, text, text_area, text_input, window_scale,
+        Div, ForEach, Img, IntoImageSource, IntoTextSource, IntoVideoSource, IntoView, NodeRef,
+        Popup, Show, Text, TextInput, Video, View, div, dyn_view, for_each, fragment, img,
+        node_ref, popup, portal, shader, show, text, text_area, text_input, video, window_scale,
     };
     pub use anti_webui_style::*;
 }

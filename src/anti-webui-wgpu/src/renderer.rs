@@ -6,12 +6,16 @@ use crate::effects::{
     PoolContext, Slot, Source, Step, UNIFORM_STRIDE,
 };
 use crate::glyph_cache::{GlyphCache, PlacedGlyph};
+use crate::path::{PathInstance, PathPass, TableRow};
+use crate::video::{VideoInstance, VideoPass};
 use anti_webui_core::damage::{
     Damage, backdrop_read, diff_content, expand_for_backdrops, primitive_bounds,
 };
 use anti_webui_core::geometry::{Affine, RectI};
 use anti_webui_core::images::Bitmap;
-use anti_webui_core::scene::{Clip, ImageDraw, Layer, LayerFilter, Primitive, Quad, Scene};
+use anti_webui_core::scene::{
+    Clip, ImageDraw, Layer, LayerFilter, Primitive, Quad, Scene, VideoDraw,
+};
 use anti_webui_core::shader::{ShaderSource, preloads_from};
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
@@ -112,6 +116,8 @@ enum Batch {
     /// Solid instances of opaque colors, replacing what is there.
     Opaque(Range<u32>),
     Glyphs(Range<u32>),
+    /// Rectangles of shapes.
+    Paths(Range<u32>),
     /// Layer instances that sample the texture of the layer with this key.
     Layer {
         key: u64,
@@ -139,6 +145,11 @@ enum Batch {
         id: u64,
         sampler: u8,
         opaque: bool,
+        range: Range<u32>,
+    },
+    /// Instances of the current frame of the stream with this id.
+    Video {
+        stream: u64,
         range: Range<u32>,
     },
 }
@@ -243,6 +254,9 @@ struct Instances {
     shaders: Vec<ShaderInstance>,
     backdrops: Vec<BackdropInstance>,
     pictures: Vec<PictureInstance>,
+    videos: Vec<VideoInstance>,
+    paths: Vec<PathInstance>,
+    path_table: Vec<TableRow>,
 }
 
 /// Where content goes in the texture being drawn: `k` times bigger, then moved.
@@ -528,6 +542,10 @@ pub struct Renderer {
     shader_buffer: InstanceBuffer,
     backdrop_buffer: InstanceBuffer,
     picture_buffer: InstanceBuffer,
+    video: VideoPass,
+    video_buffer: InstanceBuffer,
+    paths: PathPass,
+    path_buffer: InstanceBuffer,
     /// Shaders written by users, by the address of their source.
     shaders: HashMap<usize, CompiledShader>,
     /// What the frame being prepared needs and isn't compiled yet.
@@ -996,6 +1014,14 @@ impl Renderer {
             release_pixels: false,
             globals,
             globals_bind,
+            paths: PathPass::new(
+                globals_layout.clone(),
+                format,
+                blend,
+                shader.clone(),
+                device.limits().max_texture_dimension_2d,
+            ),
+            video: VideoPass::new(globals_layout.clone(), format, blend, shader.clone()),
             globals_layout,
             atlas_layout,
             atlas,
@@ -1010,6 +1036,8 @@ impl Renderer {
             shader_buffer: InstanceBuffer::new(device, "shaders"),
             backdrop_buffer: InstanceBuffer::new(device, "backdrops"),
             picture_buffer: InstanceBuffer::new(device, "pictures"),
+            video_buffer: InstanceBuffer::new(device, "videos"),
+            path_buffer: InstanceBuffer::new(device, "paths"),
             shaders: HashMap::new(),
             missing_shader: None,
             preloaded: 0,
@@ -1050,6 +1078,28 @@ impl Renderer {
     /// the only renderer that draws them. They are decoded again if anything needs them.
     pub fn set_release_picture_pixels(&mut self, on: bool) {
         self.release_pixels = on;
+    }
+
+    /// Lets frames of videos be read where the decoder left them.
+    #[cfg(target_os = "linux")]
+    pub fn set_video_importer(&mut self, importer: crate::dmabuf::VideoImporter) {
+        self.video.set_importer(importer);
+    }
+
+    /// How much the edges of shapes take, in bytes.
+    pub fn path_store_used(&self) -> u32 {
+        self.paths.store_used()
+    }
+
+    /// A frame of a video couldn't be read where it is, since this was last asked. Frames have to
+    /// come in memory then: see [`anti_webui_core::Ui::video_use_memory`].
+    pub fn take_video_import_failed(&mut self) -> bool {
+        self.video.take_import_failed()
+    }
+
+    /// How many videos are on the GPU, and how many frames were read where they are, for tests.
+    pub fn video_counts(&self) -> (usize, u64) {
+        self.video.counts()
     }
 
     /// How many pictures are on the GPU, and what their textures take, for tests.
@@ -1402,12 +1452,17 @@ impl Renderer {
             self.compile_shader(device, source);
         }
         let mut cleared = false;
+        let mut paths_cleared = false;
         loop {
             match self.try_prepare(device, scene, damage, plans) {
                 Some(r) => return r,
                 None => {
                     if let Some(source) = self.missing_shader.take() {
                         self.compile_shader(device, source);
+                        continue;
+                    }
+                    if self.paths.take_full(paths_cleared) {
+                        paths_cleared = true;
                         continue;
                     }
                     if std::mem::take(&mut self.missing_effects) {
@@ -1845,9 +1900,26 @@ impl Renderer {
             shaders: shader_instances,
             backdrops,
             pictures,
+            videos,
+            paths,
+            path_table,
         } = instances;
         match prim {
             Primitive::Image(d) => self.push_picture(device, d, at, target, pictures, batches),
+            Primitive::Video(d) => self.push_video(device, d, at, target, videos, batches),
+            Primitive::Path(d) => {
+                let clip = gpu_clip(&d.clip.scaled(k).translated(dx, dy), target);
+                let before = paths.len() as u32;
+                self.paths
+                    .push(device, d, k, dx, dy, target, clip, paths, path_table)?;
+                let end = paths.len() as u32;
+                if end > before {
+                    match batches.last_mut() {
+                        Some(Batch::Paths(r)) => r.end = end,
+                        _ => batches.push(Batch::Paths(before..end)),
+                    }
+                }
+            }
             Primitive::Quad(q) => {
                 let scaled;
                 let q = if k == 1 {
@@ -2124,6 +2196,50 @@ impl Renderer {
         }
     }
 
+    /// Adds what shows a frame of a video, and makes sure the GPU is going to have it.
+    fn push_video(
+        &mut self,
+        device: &wgpu::Device,
+        d: &VideoDraw,
+        at: Placement,
+        target: RectI,
+        videos: &mut Vec<VideoInstance>,
+        batches: &mut Vec<Batch>,
+    ) {
+        let Placement { k, dx, dy } = at;
+        let rect = d.rect.scaled(k).translate(dx, dy);
+        let shape = d.shape.scaled(k).translated(dx, dy);
+        let clip = d.clip.scaled(k).translated(dx, dy);
+        let area = rect
+            .intersect(&shape.rect)
+            .intersect(&clip.rect)
+            .intersect(&target);
+        if area.is_empty() || rect.is_empty() {
+            return;
+        }
+        self.video.prepare(device, &d.frame);
+        let (clip_rect, clip_radii) = gpu_clip(&clip, target);
+        videos.push(VideoPass::instance(
+            d,
+            rect4(area),
+            rect4(rect),
+            (rect4(shape.rect), shape.radii),
+            (clip_rect, clip_radii),
+        ));
+        let end = videos.len() as u32;
+        let stream = d.frame.stream;
+        match batches.last_mut() {
+            Some(Batch::Video {
+                stream: last,
+                range,
+            }) if *last == stream => range.end = end,
+            _ => batches.push(Batch::Video {
+                stream,
+                range: end - 1..end,
+            }),
+        }
+    }
+
     fn create_picture(&self, device: &wgpu::Device, bitmap: &Arc<Bitmap>) -> Option<GpuPicture> {
         let (w, h) = (bitmap.width(), bitmap.height());
         let mut first = 0;
@@ -2283,6 +2399,9 @@ impl Renderer {
             self.canvases.remove(&self.target);
         }
         self.pictures.retain(|_, p| p.bitmap.strong_count() > 0);
+        self.video.begin_frame(queue);
+        self.paths.begin_frame();
+        self.paths.prepare_many(device, &scene.primitives);
         let plans = self.plan_layers(device, scene, damage);
         let Prepared {
             instances,
@@ -2291,6 +2410,8 @@ impl Renderer {
             rasters,
         } = self.prepare(device, scene, damage, &plans);
         self.upload_pictures(queue);
+        self.video.upload(device, queue);
+        self.paths.upload(device, queue, &instances.path_table);
         for (g, pixels) in self.glyphs.uploads.drain(..) {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -2336,6 +2457,14 @@ impl Renderer {
             .upload(device, queue, bytemuck::cast_slice(&instances.backdrops));
         self.picture_buffer
             .upload(device, queue, bytemuck::cast_slice(&instances.pictures));
+        if !instances.paths.is_empty() {
+            self.path_buffer
+                .upload(device, queue, bytemuck::cast_slice(&instances.paths));
+        }
+        if !instances.videos.is_empty() {
+            self.video_buffer
+                .upload(device, queue, bytemuck::cast_slice(&instances.videos));
+        }
         if !instances.shaders.is_empty() {
             self.shader_buffer
                 .upload(device, queue, bytemuck::cast_slice(&instances.shaders));
@@ -2710,6 +2839,24 @@ impl Renderer {
                     pass.set_bind_group(1, &picture.bind, &[]);
                     pass.set_bind_group(2, &self.picture_samplers[*sampler as usize], &[]);
                     pass.set_vertex_buffer(0, self.picture_buffer.buffer.slice(..));
+                    pass.draw(0..4, range.clone());
+                }
+                Batch::Paths(range) => {
+                    let Some((pipeline, bind)) = self.paths.draw_state() else {
+                        continue;
+                    };
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(1, bind, &[]);
+                    pass.set_vertex_buffer(0, self.path_buffer.buffer.slice(..));
+                    pass.draw(0..4, range.clone());
+                }
+                Batch::Video { stream, range } => {
+                    let Some((pipeline, bind)) = self.video.draw_state(*stream) else {
+                        continue;
+                    };
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(1, bind, &[]);
+                    pass.set_vertex_buffer(0, self.video_buffer.buffer.slice(..));
                     pass.draw(0..4, range.clone());
                 }
                 Batch::Shader {

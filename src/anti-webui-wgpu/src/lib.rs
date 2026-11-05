@@ -7,7 +7,9 @@ mod effects;
 mod glyph_cache;
 #[cfg(target_os = "linux")]
 pub mod linux_sync;
+mod path;
 mod renderer;
+mod video;
 
 use anti_webui_core::scene::Scene;
 pub use custom_shader::check_shader;
@@ -61,6 +63,11 @@ impl HasDisplayHandle for Display {
 static HEADLESS: std::sync::OnceLock<
     Result<(wgpu::Instance, wgpu::Adapter), wgpu::RequestAdapterError>,
 > = std::sync::OnceLock::new();
+
+/// What is good to have for video frames of more than 8 bits, if it is there.
+pub(crate) fn video_features(adapter: &wgpu::Adapter) -> wgpu::Features {
+    adapter.features() & wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+}
 
 /// Shared GPU objects.
 pub struct Gpu {
@@ -140,6 +147,7 @@ impl Gpu {
         };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("anti-webui"),
+            required_features: video_features(&adapter),
             required_limits:
                 wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
             ..Default::default()
@@ -192,9 +200,11 @@ impl Gpu {
             })
             .clone()
             .map_err(GpuError::Adapter)?;
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .map_err(GpuError::Device)?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: video_features(&adapter),
+            ..Default::default()
+        }))
+        .map_err(GpuError::Device)?;
         Ok(Gpu {
             instance,
             adapter,

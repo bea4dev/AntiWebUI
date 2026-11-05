@@ -4,13 +4,13 @@
 //! See `docs/design/03-layout.md`.
 
 use crate::animation::RunningTransition;
-use crate::geometry::{PointI, RectI, Scale, SizeI};
+use crate::geometry::{Affine, PointI, RectI, Scale, SizeI};
 use crate::scene::Clip;
 use crate::text::{ShapeStyle, TextSystem};
 use crate::tree::{Document, Node, NodeId, NodeKind, PopupSurface};
 use anti_webui_style::{
-    ANIMATED_FIELDS, AlignItems, ComputedStyle, Display, Edges, JustifyContent, Length, Overflow,
-    Position, Sheet, WhiteSpace,
+    ANIMATED_FIELDS, AlignContent, AlignItems, ComputedStyle, Display, Edges, FlexWrap,
+    JustifyContent, Length, Overflow, Position, Sheet, WhiteSpace,
 };
 use std::collections::BinaryHeap;
 use std::time::Instant;
@@ -267,6 +267,9 @@ fn same_layout(a: &ComputedStyle, b: &ComputedStyle) -> bool {
     a.display == b.display
         && a.position == b.position
         && a.flex_direction == b.flex_direction
+        && a.flex_wrap == b.flex_wrap
+        && same_outline(a, b)
+        && a.align_content == b.align_content
         && a.justify_content == b.justify_content
         && a.align_items == b.align_items
         && a.align_self == b.align_self
@@ -283,6 +286,12 @@ fn same_layout(a: &ComputedStyle, b: &ComputedStyle) -> bool {
         && a.letter_spacing == b.letter_spacing
         && a.text_align == b.text_align
         && a.white_space == b.white_space
+}
+
+/// Whether what a shape's outline can touch is the same.
+fn same_outline(a: &ComputedStyle, b: &ComputedStyle) -> bool {
+    crate::svg::stroke_reach(a) == crate::svg::stroke_reach(b)
+        && a.non_scaling_stroke == b.non_scaling_stroke
 }
 
 /// Resolves the styles that may have changed, invalidating the layout of the nodes whose
@@ -787,7 +796,12 @@ fn grown_by_filter(bounds: RectI, node: &Node, scale: Scale) -> RectI {
 
 /// What the node itself paints, in the same coordinates as `abs`.
 fn own_bounds(node: &Node, scale: Scale) -> RectI {
-    if matches!(node.kind, NodeKind::Fragment) {
+    if matches!(node.kind, NodeKind::Fragment | NodeKind::SvgText(_)) {
+        return RectI::default();
+    }
+    if let NodeKind::SvgShape(s) = &node.kind
+        && s.geometry.is_none()
+    {
         return RectI::default();
     }
     if let NodeKind::Text(t) = &node.kind {
@@ -1145,6 +1159,32 @@ struct Item {
     cross: i32,
 }
 
+/// Where the first of `k` things goes, and what goes between them, given the room left over. Room
+/// that is missing sticks out where CSS says: at the start of `end`, on both sides of `center`.
+fn space_out(mode: JustifyContent, leftover: i32, k: usize) -> (i32, Vec<i32>) {
+    let none = |lead| (lead, vec![0; k.saturating_sub(1)]);
+    let room = leftover.max(0);
+    match mode {
+        JustifyContent::Start => none(0),
+        JustifyContent::End => none(leftover),
+        JustifyContent::Center => none(leftover.div_euclid(2)),
+        JustifyContent::SpaceBetween if k > 1 => (0, distribute(room, &vec![1.0; k - 1])),
+        JustifyContent::SpaceBetween => none(0),
+        JustifyContent::SpaceAround if k > 0 => {
+            let mut weights = vec![2.0; k + 1];
+            weights[0] = 1.0;
+            weights[k] = 1.0;
+            let shares = distribute(room, &weights);
+            (shares[0], shares[1..k].to_vec())
+        }
+        JustifyContent::SpaceEvenly if k > 0 => {
+            let shares = distribute(room, &vec![1.0; k + 1]);
+            (shares[0], shares[1..k].to_vec())
+        }
+        _ => none(0),
+    }
+}
+
 fn clamp_opt(v: i32, min: Option<i32>, max: Option<i32>) -> i32 {
     let mut v = v;
     if let Some(max) = max {
@@ -1279,11 +1319,45 @@ impl Engine<'_> {
             return self.compute_text(id, w, avail_w, perform);
         }
 
-        if let NodeKind::Image(data) = &node.kind {
-            let natural = data.natural.map(|(nw, nh)| {
-                let d = data.density;
-                (self.scale.px(nw / d), self.scale.px(nh / d))
-            });
+        if let NodeKind::Svg(data) = &node.kind {
+            let ratio = r.aspect_ratio.or(data.ratio());
+            let (default_w, default_h) = (self.scale.px(300.0), self.scale.px(150.0));
+            let (w, h) = match (w, h, ratio) {
+                (Some(w), Some(h), _) => (w, h),
+                (Some(w), None, Some(k)) => {
+                    let h = ((w - pb_h).max(0) as f32 / k).round() as i32 + pb_v;
+                    (w, clamp_opt(h, min_h, max_h))
+                }
+                (None, Some(h), Some(k)) => {
+                    let w = ((h - pb_v).max(0) as f32 * k).round() as i32 + pb_h;
+                    (clamp_opt(w, min_w, max_w), h)
+                }
+                (Some(w), None, None) => (w, clamp_opt(default_h + pb_v, min_h, max_h)),
+                (None, Some(h), None) => (clamp_opt(default_w + pb_h, min_w, max_w), h),
+                // With no size of its own it takes the room it has, if it knows what it is to do
+                // with the other side.
+                (None, None, Some(k)) => {
+                    let w = clamp_opt(avail_w.unwrap_or(default_w + pb_h), min_w, max_w);
+                    let h = ((w - pb_h).max(0) as f32 / k).round() as i32 + pb_v;
+                    (w, clamp_opt(h, min_h, max_h))
+                }
+                (None, None, None) => (
+                    clamp_opt(default_w + pb_h, min_w, max_w),
+                    clamp_opt(default_h + pb_v, min_h, max_h),
+                ),
+            };
+            if perform {
+                self.doc.nodes[id].rect.width = w;
+                self.doc.nodes[id].rect.height = h;
+                self.layout_svg(id, SizeI::new(w, h));
+                self.doc.nodes[id].content_size = SizeI::default();
+            }
+            return SizeI::new(w, h);
+        }
+
+        if let Some((natural, density)) = node.replaced() {
+            let natural =
+                natural.map(|(nw, nh)| (self.scale.px(nw / density), self.scale.px(nh / density)));
             let (w, h) = replaced_size(
                 natural,
                 r.aspect_ratio,
@@ -1357,6 +1431,138 @@ impl Engine<'_> {
         size
     }
 
+    /// Puts what is in an `svg` where its coordinates say.
+    fn layout_svg(&mut self, id: NodeId, size: SizeI) {
+        let scale = self.scale;
+        let node = &self.doc.nodes[id];
+        let NodeKind::Svg(data) = &node.kind else {
+            return;
+        };
+        let r = &node.resolved;
+        let (left, top) = (r.border.left + r.padding.left, r.border.top + r.padding.top);
+        let inner = (
+            (size.width - left - r.border.right - r.padding.right).max(0),
+            (size.height - top - r.border.bottom - r.padding.bottom).max(0),
+        );
+        let world = Affine::translation(left as f64, top as f64).then_apply(&data.to_box(
+            inner.0 as f64,
+            inner.1 as f64,
+            scale.as_f64(),
+        ));
+        self.layout_shapes(id, world, size);
+    }
+
+    fn layout_shapes(&mut self, id: NodeId, world: Affine, size: SizeI) {
+        let scale = self.scale;
+        let children = self.doc.nodes[id].children.clone();
+        let whole = RectI::new(0, 0, size.width, size.height);
+        for c in children {
+            let Some(node) = self.doc.nodes.get_mut(c) else {
+                continue;
+            };
+            if node.computed.display == Display::None {
+                node.rect = RectI::default();
+                continue;
+            }
+            node.layout_dirty = false;
+            node.position_dirty = true;
+            match &mut node.kind {
+                NodeKind::Fragment => {
+                    node.rect = whole;
+                    self.layout_shapes(c, world, size);
+                }
+                NodeKind::SvgShape(data) => {
+                    let inner = world.then_apply(&data.transform);
+                    data.world = inner;
+                    match &data.geometry {
+                        Some(g) => {
+                            node.rect =
+                                crate::svg::shape_rect(g, &inner, &node.computed, scale.as_f64());
+                        }
+                        None => {
+                            node.rect = whole;
+                            self.layout_shapes(c, inner, size);
+                        }
+                    }
+                }
+                NodeKind::SvgText(data) => {
+                    let data = (**data).clone();
+                    node.rect = whole;
+                    self.layout_svg_text(c, &data, world, size);
+                }
+                _ => {
+                    // Anything else goes where it would go on its own, at the start of the box.
+                    let known = (None, None);
+                    let base = (Some(size.width), Some(size.height));
+                    let s = self.compute(c, known, Some(size.width), base, false);
+                    let node = &mut self.doc.nodes[c];
+                    node.rect.x = 0;
+                    node.rect.y = 0;
+                    self.compute(
+                        c,
+                        (Some(s.width), Some(s.height)),
+                        Some(s.width),
+                        base,
+                        true,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Puts a text at its point, at the size what is around it makes it.
+    fn layout_svg_text(
+        &mut self,
+        id: NodeId,
+        data: &crate::svg::SvgTextData,
+        world: Affine,
+        size: SizeI,
+    ) {
+        let world = match &data.transform {
+            Some(t) => world.then_apply(t),
+            None => world,
+        };
+        let (x, y) = world.apply(data.x as f64, data.y as f64);
+        let zoom = (world.a * world.d - world.b * world.c).abs().sqrt() / self.scale.as_f64();
+        for c in self.doc.nodes[id].children.clone() {
+            let Some(node) = self.doc.nodes.get_mut(c) else {
+                continue;
+            };
+            if let NodeKind::Text(t) = &mut node.kind
+                && t.zoom != zoom as f32
+            {
+                t.zoom = zoom as f32;
+                node.layout_dirty = true;
+                node.measure_cache.clear();
+                node.last_perform = None;
+            }
+            let base = (Some(size.width), Some(size.height));
+            let s = self.compute(c, (None, None), None, base, false);
+            let node = &mut self.doc.nodes[c];
+            let down = match (&node.kind, data.baseline) {
+                (NodeKind::Text(t), crate::svg::TextBaseline::Alphabetic) => {
+                    t.layout.first_baseline()
+                }
+                (_, crate::svg::TextBaseline::Middle) => s.height as f32 * 0.5,
+                _ => 0.0,
+            };
+            let across = match data.anchor {
+                crate::svg::TextAnchor::Start => 0.0,
+                crate::svg::TextAnchor::Middle => s.width as f64 * 0.5,
+                crate::svg::TextAnchor::End => s.width as f64,
+            };
+            node.rect.x = (x - across).round() as i32;
+            node.rect.y = (y - down as f64).round() as i32;
+            self.compute(
+                c,
+                (Some(s.width), Some(s.height)),
+                Some(s.width),
+                base,
+                true,
+            );
+        }
+    }
+
     fn compute_text(
         &mut self,
         id: NodeId,
@@ -1372,6 +1578,7 @@ impl Engine<'_> {
         let NodeKind::Text(data) = &mut node.kind else {
             unreachable!()
         };
+        let style = style.zoomed(data.zoom);
         data.layout.shape(self.ts, &data.text, data.version, &style);
         let width = match w {
             Some(w) => w,
@@ -1470,7 +1677,12 @@ impl Engine<'_> {
             // A picture is as wide as it is rather than as wide as there is room.
             let child_w = match (explicit_w, inner_w) {
                 (Some(_), _) => None,
-                (None, _) if self.doc.nodes[c].image().is_some() => None,
+                (None, _)
+                    if self.doc.nodes[c].replaced().is_some()
+                        || matches!(self.doc.nodes[c].kind, NodeKind::Svg(_)) =>
+                {
+                    None
+                }
                 (None, Some(iw)) => Some((iw - mx).max(0)),
                 (None, None) => None,
             };
@@ -1503,6 +1715,9 @@ impl Engine<'_> {
         let dir = node.computed.flex_direction;
         let justify = node.computed.justify_content;
         let align_items = node.computed.align_items;
+        let wrap = node.computed.flex_wrap;
+        let align_content = node.computed.align_content;
+        let multi_line = wrap != FlexWrap::NoWrap;
         let row = dir.is_row();
         let base = (inner_w, inner_h);
         let (main_inner, cross_inner) = if row {
@@ -1510,7 +1725,11 @@ impl Engine<'_> {
         } else {
             (inner_h, inner_w)
         };
-        let gap = if row { r.column_gap } else { r.row_gap };
+        let (gap, cross_gap) = if row {
+            (r.column_gap, r.row_gap)
+        } else {
+            (r.row_gap, r.column_gap)
+        };
         let wh =
             |main: Option<i32>, cross: Option<i32>| if row { (main, cross) } else { (cross, main) };
 
@@ -1544,9 +1763,10 @@ impl Engine<'_> {
             let grow = n.computed.flex_grow.max(0.0);
             let shrink = n.computed.flex_shrink.max(0.0);
 
-            // Cross size known up-front when stretching into a definite line.
+            // Cross size known up-front when stretching into a definite line. The lines of a
+            // wrapping container aren't known yet.
             let cross_known = cross_style.resolve(cross_base).or_else(|| {
-                (align == AlignItems::Stretch)
+                (align == AlignItems::Stretch && !multi_line)
                     .then_some(cross_inner)
                     .flatten()
                     .map(|ci| (ci - margin_cross.0 - margin_cross.1).max(0))
@@ -1559,10 +1779,16 @@ impl Engine<'_> {
             {
                 Some(b) => b,
                 None => {
+                    // The base of what goes along a row is its max-content size, and shrinking
+                    // does the rest. Asked for a min-content size, it is that one.
                     let avail = if row {
-                        main_inner
-                            .or(inner_avail)
-                            .map(|a| (a - margin_main.0 - margin_main.1).max(0))
+                        // Other than for an `svg` with no size but proportions, which only has the
+                        // size of the room there is.
+                        if matches!(n.kind, NodeKind::Svg(_)) {
+                            main_inner.or(inner_avail)
+                        } else {
+                            inner_avail.filter(|a| *a == 0 && main_inner.is_none())
+                        }
                     } else {
                         cross_known
                             .or(inner_avail.map(|a| (a - margin_cross.0 - margin_cross.1).max(0)))
@@ -1572,8 +1798,23 @@ impl Engine<'_> {
                     if row { s.width } else { s.height }
                 }
             };
-            let min_main = min_s.resolve(main_base);
+            let mut min_main = min_s.resolve(main_base);
             let max_main = max_s.resolve(main_base);
+            // Lines are decided by what an item can't go below, which a basis of its own can be
+            // under. A basis from the content can't be, so that one saves the measuring.
+            if multi_line && min_main.is_none() && !cr.flex_basis.is_auto() {
+                let visible = if row {
+                    self.doc.nodes[c].computed.overflow_x == Overflow::Visible
+                } else {
+                    self.doc.nodes[c].computed.overflow_y == Overflow::Visible
+                };
+                if visible {
+                    let content_min = self.content_min(c, row, cross_known, inner_avail, base);
+                    let specified = main_style.resolve(main_base);
+                    let auto_min = specified.map_or(content_min, |s| s.min(content_min));
+                    min_main = Some(auto_min.min(max_main.unwrap_or(i32::MAX)));
+                }
+            }
             let hypo = clamp_opt(basis, min_main, max_main);
             items.push(Item {
                 id: c,
@@ -1593,203 +1834,155 @@ impl Engine<'_> {
             });
         }
 
-        let n = items.len() as i32;
-        let gaps = gap * (n - 1).max(0);
-        let outer_hypo: i32 = items
-            .iter()
-            .map(|it| it.hypo + it.margin_main.0 + it.margin_main.1)
-            .sum();
+        // Lines. Without a limit everything stays on one, as in a max-content size.
+        let limit = main_inner.or(if row {
+            inner_avail
+        } else {
+            match r.max_height {
+                RLen::Px(max) => Some(
+                    (max - r.padding.top - r.padding.bottom - r.border.top - r.border.bottom)
+                        .max(0),
+                ),
+                _ => None,
+            }
+        });
+        let mut lines: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut first = 0;
+        let mut used = 0;
+        let mut widest = 0;
+        for (i, it) in items.iter().enumerate() {
+            let outer = it.hypo + it.margin_main.0 + it.margin_main.1;
+            widest = widest.max(outer);
+            if multi_line && i > first && limit.is_some_and(|limit| used + gap + outer > limit) {
+                lines.push(first..i);
+                first = i;
+                used = 0;
+            }
+            used += outer + if i > first { gap } else { 0 };
+        }
+        if !items.is_empty() {
+            lines.push(first..items.len());
+        }
+        // A row too long for the room there is takes that room (`fit-content`), and from there it
+        // wraps or shrinks, as far as what is in it can. Measuring its min-content size, it is
+        // already as small as it goes.
+        let main_inner = match limit {
+            Some(limit) if main_inner.is_none() && row && limit > 0 => {
+                if multi_line && lines.len() > 1 {
+                    Some(limit.max(widest))
+                } else if !multi_line && used > limit {
+                    let mut least = gap * (items.len() as i32 - 1).max(0);
+                    for it in &items {
+                        let cross = if row { it.r.height } else { it.r.width }.resolve(inner_h);
+                        let s = self.compute(it.id, (None, cross), Some(0), base, false);
+                        least += s.width + it.margin_main.0 + it.margin_main.1;
+                    }
+                    Some(limit.max(least))
+                } else {
+                    None
+                }
+            }
+            _ => main_inner,
+        };
 
         // 2–3. Resolve flexible lengths with integer distribution.
         if let Some(main_inner) = main_inner {
-            let free = main_inner - outer_hypo - gaps;
-            let growing = free > 0;
-            if free < 0 {
-                // Automatic minimum size: flex items with visible overflow do not shrink
-                // below their min-content size.
-                let candidates: Vec<usize> = (0..items.len())
-                    .filter(|&i| {
-                        let it = &items[i];
-                        let c = &self.doc.nodes[it.id].computed;
-                        let visible = if row {
-                            c.overflow_x == Overflow::Visible
-                        } else {
-                            c.overflow_y == Overflow::Visible
-                        };
-                        it.min_main.is_none() && visible && it.shrink > 0.0
-                    })
-                    .collect();
-                for i in candidates {
-                    let it = &items[i];
-                    let c = it.id;
-                    let cross_style = if row { it.r.height } else { it.r.width };
-                    let cross_known = cross_style
-                        .resolve(if row { inner_h } else { inner_w })
-                        .or_else(|| {
-                            (it.align == AlignItems::Stretch)
-                                .then_some(cross_inner)
-                                .flatten()
-                                .map(|ci| (ci - it.margin_cross.0 - it.margin_cross.1).max(0))
-                        });
-                    let content_min = self.content_min(c, row, cross_known, inner_avail, base);
-                    let it = &items[i];
-                    let specified = if row { it.r.width } else { it.r.height }.resolve(if row {
-                        inner_w
-                    } else {
-                        inner_h
-                    });
-                    let auto_min = specified.map_or(content_min, |s| s.min(content_min));
-                    let auto_min = auto_min.min(it.max_main.unwrap_or(i32::MAX));
-                    items[i].min_main = Some(auto_min);
-                }
-            }
-
-            for it in &mut items {
-                let factor = if growing { it.grow } else { it.shrink };
-                if free == 0
-                    || factor == 0.0
-                    || (growing && it.base > it.hypo)
-                    || (!growing && it.base < it.hypo)
-                {
-                    it.frozen = true;
-                    it.target = it.hypo;
-                }
-            }
-            loop {
-                let unfrozen: Vec<usize> = (0..items.len()).filter(|&i| !items[i].frozen).collect();
-                if unfrozen.is_empty() {
-                    break;
-                }
-                let used: i32 = items
-                    .iter()
-                    .map(|it| {
-                        let size = if it.frozen { it.target } else { it.base };
-                        size + it.margin_main.0 + it.margin_main.1
-                    })
-                    .sum();
-                let mut space = main_inner - used - gaps;
-                let weights: Vec<f32> = unfrozen
-                    .iter()
-                    .map(|&i| {
-                        let it = &items[i];
-                        if growing {
-                            it.grow
-                        } else {
-                            it.shrink * it.base as f32
-                        }
-                    })
-                    .collect();
-                if growing {
-                    let sum: f32 = weights.iter().sum();
-                    if sum < 1.0 {
-                        space = (space as f64 * sum as f64).round() as i32;
-                    }
-                }
-                let shares = distribute(space, &weights);
-                let mut violation = 0;
-                let mut clamped = Vec::with_capacity(unfrozen.len());
-                for (j, &i) in unfrozen.iter().enumerate() {
-                    let it = &items[i];
-                    let candidate = it.base + shares[j];
-                    let c = clamp_opt(candidate, it.min_main, it.max_main);
-                    violation += c - candidate;
-                    clamped.push((i, candidate, c));
-                }
-                if violation == 0 {
-                    for (i, _, c) in clamped {
-                        items[i].target = c;
-                        items[i].frozen = true;
-                    }
-                    break;
-                }
-                for (i, candidate, c) in clamped {
-                    let freeze = if violation > 0 {
-                        c > candidate
-                    } else {
-                        c < candidate
-                    };
-                    if freeze {
-                        items[i].target = c;
-                        items[i].frozen = true;
-                    }
-                }
+            for line in &lines {
+                self.resolve_flexible(
+                    &mut items[line.clone()],
+                    main_inner,
+                    gap,
+                    row,
+                    (inner_w, inner_h),
+                    cross_inner.filter(|_| !multi_line),
+                    inner_avail,
+                );
             }
         }
 
         // 4. Cross sizes.
-        let mut line_cross = 0;
-        for it in &mut items {
-            let cross_style = if row { it.r.height } else { it.r.width };
-            let cross_base = if row { inner_h } else { inner_w };
-            let explicit = cross_style.resolve(cross_base);
-            let content_cross = match explicit {
-                Some(v) => v,
-                None => {
-                    let (kw, kh) = wh(Some(it.target), None);
-                    let avail = if row {
-                        Some(it.target)
-                    } else {
-                        inner_avail.map(|a| (a - it.margin_cross.0 - it.margin_cross.1).max(0))
-                    };
-                    let s = self.compute(it.id, (kw, kh), avail, base, false);
-                    if row { s.height } else { s.width }
-                }
-            };
-            it.cross = content_cross;
-            line_cross = line_cross.max(content_cross + it.margin_cross.0 + it.margin_cross.1);
-        }
-        let line_cross = cross_inner.unwrap_or(line_cross);
-        for it in &mut items {
-            let cross_style = if row { it.r.height } else { it.r.width };
-            let (min_c, max_c) = if row {
-                (it.r.min_height, it.r.max_height)
-            } else {
-                (it.r.min_width, it.r.max_width)
-            };
-            let cross_base = if row { inner_h } else { inner_w };
-            if it.align == AlignItems::Stretch && cross_style.is_auto() {
-                it.cross = (line_cross - it.margin_cross.0 - it.margin_cross.1).max(0);
-            }
-            it.cross = clamp_opt(
-                it.cross,
-                min_c.resolve(cross_base),
-                max_c.resolve(cross_base),
-            );
-        }
-
-        let used_main: i32 = items
-            .iter()
-            .map(|it| it.target + it.margin_main.0 + it.margin_main.1)
-            .sum::<i32>()
-            + gaps;
-
-        // 5. Main-axis placement.
-        if perform {
-            let leftover = main_inner.map(|m| m - used_main).unwrap_or(0).max(0);
-            let k = items.len();
-            let (lead, between): (i32, Vec<i32>) = match justify {
-                JustifyContent::Start => (0, vec![0; k.saturating_sub(1)]),
-                JustifyContent::End => (leftover, vec![0; k.saturating_sub(1)]),
-                JustifyContent::Center => (leftover / 2, vec![0; k.saturating_sub(1)]),
-                JustifyContent::SpaceBetween => {
-                    if k > 1 {
-                        (0, distribute(leftover, &vec![1.0; k - 1]))
-                    } else {
-                        (0, vec![])
+        let mut line_cross = vec![0; lines.len()];
+        for (line, cross) in lines.iter().zip(&mut line_cross) {
+            for it in &mut items[line.clone()] {
+                let cross_style = if row { it.r.height } else { it.r.width };
+                let cross_base = if row { inner_h } else { inner_w };
+                let explicit = cross_style.resolve(cross_base);
+                let content_cross = match explicit {
+                    Some(v) => v,
+                    None => {
+                        let (kw, kh) = wh(Some(it.target), None);
+                        let avail = if row {
+                            Some(it.target)
+                        } else {
+                            inner_avail.map(|a| (a - it.margin_cross.0 - it.margin_cross.1).max(0))
+                        };
+                        let s = self.compute(it.id, (kw, kh), avail, base, false);
+                        if row { s.height } else { s.width }
                     }
+                };
+                it.cross = content_cross;
+                *cross = (*cross).max(content_cross + it.margin_cross.0 + it.margin_cross.1);
+            }
+        }
+        let content_cross =
+            line_cross.iter().sum::<i32>() + cross_gap * (line_cross.len() as i32 - 1).max(0);
+        // How the lines share the cross axis. One that doesn't wrap has the whole of it.
+        let (mut cross_lead, mut cross_between) = (0, vec![0; lines.len().saturating_sub(1)]);
+        match cross_inner {
+            Some(ci) if !multi_line => {
+                line_cross.iter_mut().for_each(|c| *c = ci);
+            }
+            Some(ci) => {
+                let leftover = ci - content_cross;
+                if align_content == AlignContent::Stretch {
+                    if leftover > 0 {
+                        let shares = distribute(leftover, &vec![1.0; lines.len()]);
+                        for (c, share) in line_cross.iter_mut().zip(shares) {
+                            *c += share;
+                        }
+                    }
+                } else {
+                    (cross_lead, cross_between) =
+                        space_out(align_content.as_justify(), leftover, lines.len());
                 }
-                JustifyContent::SpaceAround => {
-                    let mut w = vec![2.0; k + 1];
-                    w[0] = 1.0;
-                    w[k] = 1.0;
-                    let d = distribute(leftover, &w);
-                    (d[0], d[1..k].to_vec())
+            }
+            None => {}
+        }
+        for (line, &cross) in lines.iter().zip(&line_cross) {
+            for it in &mut items[line.clone()] {
+                let cross_style = if row { it.r.height } else { it.r.width };
+                let (min_c, max_c) = if row {
+                    (it.r.min_height, it.r.max_height)
+                } else {
+                    (it.r.min_width, it.r.max_width)
+                };
+                let cross_base = if row { inner_h } else { inner_w };
+                if it.align == AlignItems::Stretch && cross_style.is_auto() {
+                    it.cross = (cross - it.margin_cross.0 - it.margin_cross.1).max(0);
                 }
-                JustifyContent::SpaceEvenly => {
-                    let d = distribute(leftover, &vec![1.0; k + 1]);
-                    (d[0], d[1..k].to_vec())
-                }
-            };
+                it.cross = clamp_opt(
+                    it.cross,
+                    min_c.resolve(cross_base),
+                    max_c.resolve(cross_base),
+                );
+            }
+        }
+
+        let line_main = |line: &std::ops::Range<usize>, items: &[Item]| {
+            items[line.clone()]
+                .iter()
+                .map(|it| it.target + it.margin_main.0 + it.margin_main.1)
+                .sum::<i32>()
+                + gap * (line.len() as i32 - 1).max(0)
+        };
+        let used_main = lines
+            .iter()
+            .map(|line| line_main(line, &items))
+            .max()
+            .unwrap_or(0);
+
+        // 5. Placement.
+        if perform {
             let main_start = if row {
                 r.border.left + r.padding.left
             } else {
@@ -1801,51 +1994,202 @@ impl Engine<'_> {
                 r.border.left + r.padding.left
             };
             let container_main = main_inner.unwrap_or(used_main);
-            let mut pos = lead;
-            let order: Vec<usize> = (0..k).collect();
-            for (j, &i) in order.iter().enumerate() {
-                let it = &items[i];
-                let main_pos = pos + it.margin_main.0;
-                let main_pos = if dir.is_reverse() {
-                    container_main - main_pos - it.target
-                } else {
-                    main_pos
-                };
-                let free_cross = line_cross - it.cross - it.margin_cross.0 - it.margin_cross.1;
-                let cross_off = match it.align {
-                    AlignItems::Start | AlignItems::Stretch => 0,
-                    AlignItems::End => free_cross,
-                    AlignItems::Center => free_cross.div_euclid(2),
-                };
-                let cross_pos = cross_off + it.margin_cross.0;
-                let (x, y) = if row {
-                    (main_start + main_pos, cross_start + cross_pos)
-                } else {
-                    (cross_start + cross_pos, main_start + main_pos)
-                };
-                let (w, h) = wh(Some(it.target), Some(it.cross));
-                let child = &mut self.doc.nodes[it.id];
-                child.rect.x = x;
-                child.rect.y = y;
-                let avail = w;
-                self.compute(it.id, (w, h), avail, base, true);
-                pos += it.margin_main.0 + it.target + it.margin_main.1;
-                if j + 1 < k {
-                    pos += gap + between[j];
+            let container_cross = cross_inner.unwrap_or(content_cross);
+            let reverse_cross = wrap == FlexWrap::WrapReverse;
+            let mut line_pos = cross_lead;
+            for (l, line) in lines.iter().enumerate() {
+                let cross = line_cross[l];
+                let leftover = main_inner.map_or(0, |m| m - line_main(line, &items));
+                let (lead, between) = space_out(justify, leftover, line.len());
+                let mut pos = lead;
+                for (j, i) in line.clone().enumerate() {
+                    let it = &items[i];
+                    // Each margin stays on its own side of the item, whichever way things run.
+                    let main_pos = if dir.is_reverse() {
+                        container_main - pos - it.margin_main.1 - it.target
+                    } else {
+                        pos + it.margin_main.0
+                    };
+                    let outer_cross = it.cross + it.margin_cross.0 + it.margin_cross.1;
+                    let free_cross = cross - outer_cross;
+                    let cross_off = match it.align {
+                        AlignItems::Start | AlignItems::Stretch => 0,
+                        AlignItems::End => free_cross,
+                        AlignItems::Center => free_cross.div_euclid(2),
+                    };
+                    let outer_pos = line_pos + cross_off;
+                    let cross_pos = if reverse_cross {
+                        container_cross - outer_pos - outer_cross + it.margin_cross.0
+                    } else {
+                        outer_pos + it.margin_cross.0
+                    };
+                    let (x, y) = if row {
+                        (main_start + main_pos, cross_start + cross_pos)
+                    } else {
+                        (cross_start + cross_pos, main_start + main_pos)
+                    };
+                    let (w, h) = wh(Some(it.target), Some(it.cross));
+                    let child = &mut self.doc.nodes[it.id];
+                    child.rect.x = x;
+                    child.rect.y = y;
+                    let avail = w;
+                    self.compute(it.id, (w, h), avail, base, true);
+                    pos += it.margin_main.0 + it.target + it.margin_main.1;
+                    if j + 1 < line.len() {
+                        pos += gap + between[j];
+                    }
+                }
+                line_pos += cross;
+                if l + 1 < lines.len() {
+                    line_pos += cross_gap + cross_between[l];
                 }
             }
         }
 
-        let line_cross_content = items
-            .iter()
-            .map(|it| it.cross + it.margin_cross.0 + it.margin_cross.1)
-            .max()
-            .unwrap_or(0);
-        let cross = cross_inner.unwrap_or(line_cross_content);
+        // A row that wrapped keeps the room it took, but what can't shrink further sticks out of
+        // one that didn't.
+        let used_main = if multi_line && row {
+            main_inner.unwrap_or(used_main)
+        } else {
+            used_main
+        };
+        let cross = cross_inner.unwrap_or(content_cross);
         if row {
             SizeI::new(used_main, cross)
         } else {
             SizeI::new(cross, used_main)
+        }
+    }
+
+    /// Resolves the flexible lengths of one line, so the sizes come out whole and add up.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_flexible(
+        &mut self,
+        items: &mut [Item],
+        main_inner: i32,
+        gap: i32,
+        row: bool,
+        (inner_w, inner_h): (Option<i32>, Option<i32>),
+        cross_inner: Option<i32>,
+        inner_avail: Option<i32>,
+    ) {
+        let base = (inner_w, inner_h);
+        let gaps = gap * (items.len() as i32 - 1).max(0);
+        let outer_hypo: i32 = items
+            .iter()
+            .map(|it| it.hypo + it.margin_main.0 + it.margin_main.1)
+            .sum();
+        let free = main_inner - outer_hypo - gaps;
+        let growing = free > 0;
+        if free < 0 {
+            // Automatic minimum size: flex items with visible overflow do not shrink
+            // below their min-content size.
+            let candidates: Vec<usize> = (0..items.len())
+                .filter(|&i| {
+                    let it = &items[i];
+                    let c = &self.doc.nodes[it.id].computed;
+                    let visible = if row {
+                        c.overflow_x == Overflow::Visible
+                    } else {
+                        c.overflow_y == Overflow::Visible
+                    };
+                    it.min_main.is_none() && visible && it.shrink > 0.0
+                })
+                .collect();
+            for i in candidates {
+                let it = &items[i];
+                let c = it.id;
+                let cross_style = if row { it.r.height } else { it.r.width };
+                let cross_known = cross_style
+                    .resolve(if row { inner_h } else { inner_w })
+                    .or_else(|| {
+                        (it.align == AlignItems::Stretch)
+                            .then_some(cross_inner)
+                            .flatten()
+                            .map(|ci| (ci - it.margin_cross.0 - it.margin_cross.1).max(0))
+                    });
+                let content_min = self.content_min(c, row, cross_known, inner_avail, base);
+                let it = &items[i];
+                let specified = if row { it.r.width } else { it.r.height }.resolve(if row {
+                    inner_w
+                } else {
+                    inner_h
+                });
+                let auto_min = specified.map_or(content_min, |s| s.min(content_min));
+                let auto_min = auto_min.min(it.max_main.unwrap_or(i32::MAX));
+                items[i].min_main = Some(auto_min);
+            }
+        }
+
+        for it in items.iter_mut() {
+            let factor = if growing { it.grow } else { it.shrink };
+            if free == 0
+                || factor == 0.0
+                || (growing && it.base > it.hypo)
+                || (!growing && it.base < it.hypo)
+            {
+                it.frozen = true;
+                it.target = it.hypo;
+            }
+        }
+        loop {
+            let unfrozen: Vec<usize> = (0..items.len()).filter(|&i| !items[i].frozen).collect();
+            if unfrozen.is_empty() {
+                break;
+            }
+            let used: i32 = items
+                .iter()
+                .map(|it| {
+                    let size = if it.frozen { it.target } else { it.base };
+                    size + it.margin_main.0 + it.margin_main.1
+                })
+                .sum();
+            let mut space = main_inner - used - gaps;
+            let weights: Vec<f32> = unfrozen
+                .iter()
+                .map(|&i| {
+                    let it = &items[i];
+                    if growing {
+                        it.grow
+                    } else {
+                        it.shrink * it.base as f32
+                    }
+                })
+                .collect();
+            if growing {
+                let sum: f32 = weights.iter().sum();
+                if sum < 1.0 {
+                    space = (space as f64 * sum as f64).round() as i32;
+                }
+            }
+            let shares = distribute(space, &weights);
+            let mut violation = 0;
+            let mut clamped = Vec::with_capacity(unfrozen.len());
+            for (j, &i) in unfrozen.iter().enumerate() {
+                let it = &items[i];
+                let candidate = it.base + shares[j];
+                let c = clamp_opt(candidate, it.min_main, it.max_main);
+                violation += c - candidate;
+                clamped.push((i, candidate, c));
+            }
+            if violation == 0 {
+                for (i, _, c) in clamped {
+                    items[i].target = c;
+                    items[i].frozen = true;
+                }
+                break;
+            }
+            for (i, candidate, c) in clamped {
+                let freeze = if violation > 0 {
+                    c > candidate
+                } else {
+                    c < candidate
+                };
+                if freeze {
+                    items[i].target = c;
+                    items[i].frozen = true;
+                }
+            }
         }
     }
 

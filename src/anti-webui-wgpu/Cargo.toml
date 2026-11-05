@@ -2,9 +2,12 @@
 name = "anti-webui-wgpu"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 
 [dependencies]
+kurbo.workspace = true
+log.workspace = true
 anti-webui-core.workspace = true
 wgpu.workspace = true
 naga.workspace = true

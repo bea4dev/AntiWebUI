@@ -123,6 +123,7 @@ mod wayland {
     use anti_webui_core::Ui;
     use anti_webui_core::event::WindowEvent;
     use anti_webui_core::platform::{PlatformRequest, PopupId};
+    use anti_webui_core::video::VideoTiming;
     use anti_webui_core::view::IntoView;
     use anti_webui_wayland::{Ctx, SurfaceId, WaylandHandler, WindowOptions};
     use std::time::Instant;
@@ -208,10 +209,13 @@ mod wayland {
             if self.dump.is_none()
                 && let Ok(path) = std::env::var("ANTIWEBUI_DUMP_FRAME")
             {
-                let r = anti_webui_wgpu::Renderer::new(
+                let mut r = anti_webui_wgpu::Renderer::new(
                     &presenter.gpu().device,
                     anti_webui_wgpu::wgpu::TextureFormat::Rgba8Unorm,
                 );
+                if let Some(importer) = presenter.video_importer() {
+                    r.set_video_importer(importer);
+                }
                 self.dump = Some((path, r));
             }
             if let Some((path, renderer)) = &mut self.dump {
@@ -255,6 +259,7 @@ mod wayland {
                     Ok(mut p) => {
                         // What writes frames to files draws them again, with its own renderer.
                         p.keep_picture_pixels(std::env::var_os("ANTIWEBUI_DUMP_FRAME").is_some());
+                        self.ui.set_video_render_node(p.video_render_node());
                         self.presenter = Some(p);
                     }
                     Err(e) => {
@@ -271,6 +276,11 @@ mod wayland {
                 }
             });
             let now = Instant::now();
+            self.ui
+                .set_video_timing(self.pacing.refresh().map(|refresh| VideoTiming {
+                    refresh,
+                    vsync: self.pacing.last_refresh(),
+                }));
             self.ui.animate(now);
             self.ui.update();
             // Not `process`: the frame painted below is the redraw it would ask for.
@@ -279,6 +289,9 @@ mod wayland {
             let presenter = self.presenter.as_mut().unwrap();
             presenter.trace_next(self.pacing.trace());
             let window = presenter.present(ctx, SurfaceId::Window, frame.window);
+            if presenter.take_video_import_failed() {
+                self.ui.video_use_memory();
+            }
             let mut results = vec![(SurfaceId::Window, window)];
             for (id, scene) in frame.popups {
                 let surface = SurfaceId::Popup(id);
@@ -366,6 +379,8 @@ mod wayland {
         app: App,
         root: impl FnOnce() -> V,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(feature = "video")]
+        anti_webui_video::install();
         let runner = Runner {
             ui: Ui::new(root),
             presenter: None,

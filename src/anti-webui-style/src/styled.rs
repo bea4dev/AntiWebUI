@@ -131,6 +131,18 @@ pub trait Styled: Sized {
         outline_offset => outline_offset: f32;
         outline_color => outline_color: Color;
 
+        /// What the inside of a shape in an `svg` is painted with. It goes down to what is in it.
+        fill => fill_paint: SvgPaint;
+        /// What the outline of a shape in an `svg` is painted with.
+        stroke => stroke_paint: SvgPaint;
+        stroke_width => stroke_width: f32;
+        fill_opacity => fill_opacity: f32;
+        stroke_opacity => stroke_opacity: f32;
+        fill_rule => fill_rule: FillRule;
+        line_cap => line_cap: LineCap;
+        line_join => line_join: LineJoin;
+        miter_limit => miter_limit: f32;
+        dash_offset => dash_offset: f32;
         bg => background: Color;
         bg_size => background_size: BackgroundSize;
         bg_repeat => background_repeat: BackgroundRepeat;
@@ -169,6 +181,9 @@ pub trait Styled: Sized {
         flex_col => flex_direction = FlexDirection::Column;
         flex_row_reverse => flex_direction = FlexDirection::RowReverse;
         flex_col_reverse => flex_direction = FlexDirection::ColumnReverse;
+        flex_wrap => flex_wrap = FlexWrap::Wrap;
+        flex_wrap_reverse => flex_wrap = FlexWrap::WrapReverse;
+        flex_nowrap => flex_wrap = FlexWrap::NoWrap;
         /// `flex: 1 1 0`
         flex_1 => flex_grow = 1.0;
         flex_none => flex_shrink = 0.0;
@@ -180,6 +195,13 @@ pub trait Styled: Sized {
         self_end => align_self = Some(AlignItems::End);
         self_center => align_self = Some(AlignItems::Center);
         self_stretch => align_self = Some(AlignItems::Stretch);
+        content_stretch => align_content = AlignContent::Stretch;
+        content_start => align_content = AlignContent::Start;
+        content_end => align_content = AlignContent::End;
+        content_center => align_content = AlignContent::Center;
+        content_between => align_content = AlignContent::SpaceBetween;
+        content_around => align_content = AlignContent::SpaceAround;
+        content_evenly => align_content = AlignContent::SpaceEvenly;
         justify_start => justify_content = JustifyContent::Start;
         justify_end => justify_content = JustifyContent::End;
         justify_center => justify_content = JustifyContent::Center;
@@ -200,6 +222,29 @@ pub trait Styled: Sized {
         select_text => user_select = UserSelect::Text;
         pointer_events_none => pointer_events = false;
         pointer_events_auto => pointer_events = true;
+    }
+
+    /// Dashes and gaps along the outline of a shape in an `svg`, in turns.
+    fn dash_array(mut self, dashes: impl IntoIterator<Item = f32>) -> Self {
+        let dashes: Vec<f32> = dashes.into_iter().collect();
+        self.style_mut().dash_array = Some((!dashes.is_empty()).then(|| dashes.into()));
+        self
+    }
+
+    /// The inside of a shape in an `svg` isn't painted.
+    fn fill_none(self) -> Self {
+        self.fill(SvgPaint::None)
+    }
+
+    /// The inside of a shape in an `svg` has the color of text.
+    fn fill_current(self) -> Self {
+        self.fill(SvgPaint::CurrentColor)
+    }
+
+    /// The width of the outline is in pixels of the screen, whatever the shape is scaled by.
+    fn non_scaling_stroke(mut self) -> Self {
+        self.style_mut().non_scaling_stroke = Some(true);
+        self
     }
 
     /// The color of the parts of controls here and below that show the accent: the box of a
