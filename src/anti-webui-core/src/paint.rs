@@ -2,7 +2,7 @@
 
 use crate::damage::primitive_bounds;
 use crate::geometry::Affine;
-use crate::geometry::{PointI, RectI, SizeI};
+use crate::geometry::{PointF, PointI, RectI, SizeI};
 use crate::layout::{child_clip, mark_outer_layers_stale};
 use crate::platform::PopupId;
 use crate::scene::{
@@ -10,11 +10,12 @@ use crate::scene::{
     Scene, ShaderDraw, Shadow,
 };
 use crate::shader::{Image, ShaderPaint};
-use crate::text::selection::node_range;
+use crate::text::selection::{node_range, selectable_text_nodes};
 use crate::text::{Brush, TextLayout};
 use crate::tree::{Document, LayerMemo, Node, NodeId, NodeKind, popup_id};
 use anti_webui_style::{
-    BackgroundRepeat, BackgroundSize, Color, ImageRendering, Length, ObjectFit, Overflow,
+    BackgroundRepeat, BackgroundSize, Color, ComputedStyle, ImageRendering, Length, ObjectFit,
+    Overflow,
 };
 use parley::PositionedLayoutItem;
 use slotmap::{Key, KeyData};
@@ -132,6 +133,131 @@ pub(crate) fn paint_snapshot(doc: &Document, id: NodeId, now: Instant) -> Option
     painter.node_contents(id, 1.0, RectI::INFINITE);
     let touched = what_it_touches(&scene);
     Some((Arc::new(rekeyed(scene)), touched, b))
+}
+
+/// Part of a layout with its coordinates at `origin`: the clusters in the byte range.
+fn selected_runs(
+    scene: &mut Scene,
+    layout: &TextLayout,
+    origin: PointI,
+    (a, b): (usize, usize),
+    style: &ComputedStyle,
+    clip: Clip,
+) {
+    let color = style.color;
+    let (ox, oy) = (origin.x as f32, origin.y as f32);
+    for line in layout.layout.lines() {
+        for item in line.items() {
+            let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                continue;
+            };
+            let run = glyph_run.run();
+            let baseline = oy + glyph_run.baseline();
+            let reach = run.font_size() * 2.0;
+            if baseline + reach < clip.rect.y as f32 || baseline - reach > clip.rect.bottom() as f32
+            {
+                continue;
+            }
+            let mut x = glyph_run.offset();
+            let mut glyphs = Vec::new();
+            let (mut left, mut right) = (f32::MAX, f32::MIN);
+            for cluster in run.visual_clusters() {
+                let range = cluster.text_range();
+                let keep = range.start < b && range.end > a;
+                for g in cluster.glyphs() {
+                    if keep {
+                        glyphs.push(Glyph {
+                            id: g.id,
+                            x: ox + x + g.x,
+                            y: (baseline + g.y).round(),
+                        });
+                        left = left.min(ox + x);
+                        right = right.max(ox + x + g.advance);
+                    }
+                    x += g.advance;
+                }
+            }
+            if glyphs.is_empty() {
+                continue;
+            }
+            let synthesis = run.synthesis();
+            scene.primitives.push(Primitive::Glyphs(GlyphRun {
+                font: run.font().clone(),
+                size: run.font_size(),
+                normalized_coords: rounded_coords(
+                    run.normalized_coords().iter().map(|c| c.to_bits()),
+                ),
+                embolden: synthesis.embolden(),
+                skew: synthesis.skew(),
+                color,
+                glyphs,
+                clip,
+            }));
+            let m = run.font_metrics();
+            let (x0, x1) = (left.round() as i32, right.round() as i32);
+            let line_y = baseline.round() as i32;
+            if style.underline {
+                let t = m.underline_size.round().max(1.0) as i32;
+                let y = line_y - m.underline_offset.round() as i32;
+                scene.fill(RectI::new(x0, y, x1 - x0, t), color, clip);
+            }
+            if style.strikethrough {
+                let t = m.strikethrough_size.round().max(1.0) as i32;
+                let y = line_y - m.strikethrough_offset.round() as i32;
+                scene.fill(RectI::new(x0, y, x1 - x0, t), color, clip);
+            }
+        }
+    }
+}
+
+/// The selected text and nothing else: what Blink paints with `kSelectionDragImageOnly`, in window
+/// coordinates. `edit` says it is the selection in that input rather than the document's.
+pub(crate) fn paint_selected_text(doc: &Document, edit: Option<NodeId>) -> Option<DragPainted> {
+    let screen = RectI::new(0, 0, doc.viewport.width, doc.viewport.height);
+    let mut scene = Scene::default();
+    let mut boxes = RectI::default();
+    let mut add =
+        |id: NodeId, layout: &TextLayout, origin: PointI, range: (usize, usize), inner| {
+            let n = &doc.nodes[id];
+            let visible = doc.visible_part(n, inner).intersect(&screen);
+            if visible.is_empty() {
+                return;
+            }
+            let there = doc.to_window(n, PointF::new(origin.x as f32, origin.y as f32));
+            let at = PointI::new(there.x.round() as i32, there.y.round() as i32);
+            let clip = Clip {
+                rect: visible,
+                radii: [0.0; 4],
+            };
+            selected_runs(&mut scene, layout, at, range, &n.computed, clip);
+            for r in layout.range_rects(range.0, range.1, at.x, at.y) {
+                boxes = boxes.union(&r.intersect(&visible));
+            }
+        };
+    match edit {
+        Some(id) => {
+            let n = doc.get(id)?;
+            let e = n.edit()?;
+            let inner = child_clip(n, doc.scale, n.clip_shape()).rect;
+            let origin = edit_text_origin(doc, id);
+            add(id, &e.layout, origin, e.selection_range(), inner);
+        }
+        None => {
+            let sel = doc.state.selection.as_ref()?;
+            for id in selectable_text_nodes(doc) {
+                let n = &doc.nodes[id];
+                if let (Some(range), NodeKind::Text(t)) = (node_range(doc, sel, id), &n.kind) {
+                    add(id, &t.layout, n.abs.origin(), range, n.abs);
+                }
+            }
+        }
+    }
+    if boxes.is_empty() {
+        return None;
+    }
+    // What hangs out of its line stays in, and the pointer is always on it.
+    let touched = what_it_touches(&scene).union(&boxes);
+    Some((Arc::new(scene), touched, boxes))
 }
 
 /// Paints what shows for what is dragged again, if it can change.
@@ -564,6 +690,11 @@ pub fn paint_everything(doc: &Document, now: Instant) -> Scene {
     };
     if let Some(root) = doc.root {
         painter.node(root, 1.0, RectI::INFINITE);
+    }
+    if let Some(drag) = doc.drag.as_ref().filter(|d| !d.icon)
+        && let Some(layer) = drag.layer(drag.position)
+    {
+        scene.primitives.push(Primitive::Layer(layer));
     }
     scene
 }
@@ -1445,7 +1576,13 @@ impl Painter<'_> {
             }
         }
 
-        if focused && doc.state.window_focused && !edit.read_only {
+        if let Some(at) = edit.drop_caret {
+            self.chunk(id, part::CARET);
+            let caret = edit
+                .drop_caret_rect(at, caret_width(doc))
+                .translate(origin.x, origin.y);
+            self.scene.fill(caret, fade(c.caret_color, opacity), clip);
+        } else if focused && doc.state.window_focused && !edit.read_only {
             let elapsed = self.now.saturating_duration_since(edit.caret_epoch);
             let on = (elapsed.as_millis() / CARET_BLINK.as_millis()).is_multiple_of(2);
             if on || edit.preedit.is_some() {

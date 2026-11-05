@@ -32,6 +32,7 @@
 - [x] MD3E の残りの部品、`portal`、`set_timeout`、ショーケース（[20](20-md3e-components.md)）
 - [x] 標準の部品の一式、`Sheet`、テーマ、見えている行だけ作るリストとテーブル（[21](21-widgets.md)）
 - [x] つかみ、アプリ内と OS の DnD、並べ替え（[23](23-drag-and-drop.md)）
+- [x] 選択した文字のドラッグとテキスト入力へのドロップ（[23](23-drag-and-drop.md)）
 
 ### M1 の既知の制限
 

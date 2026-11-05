@@ -1,7 +1,7 @@
 //! The per-window UI state machine: input handling, selection, editing, focus and frames.
 
 use crate::animation;
-use crate::drag::{DragSession, EdgeScroll, Gesture};
+use crate::drag::{DragSession, EdgeScroll, Gesture, TextOrigin, pressed_selection};
 use crate::event::*;
 use crate::geometry::PointI;
 use crate::geometry::{PointF, RectI, Scale, SizeI};
@@ -41,6 +41,8 @@ pub(crate) enum Drag {
     Edit(NodeId),
     /// Dragging a scrollbar thumb: node, vertical?, pointer offset into the content.
     Scrollbar(NodeId, bool, f32),
+    /// Pressed on selected text, which goes along if it moves. Where it was pressed.
+    SelectedText(TextOrigin, PointF),
 }
 
 pub(crate) struct Press {
@@ -738,6 +740,11 @@ impl Ui {
             self.update_hover(p);
         }
         let drag = self.press.as_ref().map(|pr| pr.drag).unwrap_or(Drag::None);
+        if let Drag::SelectedText(origin, start) = drag
+            && self.text_drag_moved(origin, start, p)
+        {
+            return;
+        }
         match drag {
             Drag::Select => with_doc(|d| {
                 if let Some(sel) = d.state.selection
@@ -758,7 +765,7 @@ impl Ui {
             Drag::Scrollbar(id, vertical, grab) => {
                 with_doc(|d| scrollbar_drag(d, id, vertical, grab, p))
             }
-            Drag::None => {}
+            Drag::SelectedText(..) | Drag::None => {}
         }
         if drag == Drag::Select {
             self.update_selection_edge(p);
@@ -831,6 +838,19 @@ impl Ui {
                 with_doc(|d| target.and_then(|t| scrollbar_hit(d, t, p)))
             {
                 drag = Drag::Scrollbar(id, vertical, grab);
+            } else if let Some(origin) = target
+                .filter(|_| clicks == 1 && !self.modifiers.shift)
+                .and_then(|t| with_doc(|d| pressed_selection(d, t, p)))
+            {
+                drag = Drag::SelectedText(origin, p);
+                // There is one selection to be seen, as when pressing an input anywhere else.
+                if matches!(origin, TextOrigin::Edit(_)) {
+                    with_doc(|d| {
+                        if d.state.selection.take().is_some() {
+                            d.mark_paint();
+                        }
+                    });
+                }
             } else if let Some(edit) =
                 target.filter(|t| with_doc(|d| d.get(*t).is_some_and(Node::is_edit)))
             {
@@ -952,6 +972,22 @@ impl Ui {
                         });
                     }
                 }
+            }),
+            Drag::SelectedText(origin, _) => with_doc(|d| {
+                // It was a click on the selection, which goes away.
+                match origin {
+                    TextOrigin::Document => {
+                        d.state.selection = selection::begin(d, p, Granularity::Char)
+                    }
+                    TextOrigin::Edit(id) => {
+                        let at = edit_point(d, id, p);
+                        if let Some(e) = d.get_mut(id).and_then(Node::edit_mut) {
+                            e.pointer_down(at.x, at.y, 1, false);
+                            e.drag = None;
+                        }
+                    }
+                }
+                d.mark_paint();
             }),
             _ => {}
         }
@@ -1200,7 +1236,7 @@ impl Ui {
         }
     }
 
-    fn set_focus(&mut self, next: Option<NodeId>) {
+    pub(crate) fn set_focus(&mut self, next: Option<NodeId>) {
         let keyboard = self.focus_by_keyboard;
         let (prev, handlers) = with_doc(|d| {
             let prev = d.state.focused;
@@ -1609,7 +1645,7 @@ impl Ui {
     }
 
     /// Propagates an edit to the bound signal and the input handler.
-    fn after_edit(&mut self, id: NodeId, outcome: EditOutcome) {
+    pub(crate) fn after_edit(&mut self, id: NodeId, outcome: EditOutcome) {
         if !outcome.changed {
             return;
         }
@@ -1738,7 +1774,7 @@ impl Document {
 }
 
 /// A point in window coordinates relative to an edit node's text origin.
-fn edit_point(doc: &Document, id: NodeId, p: PointF) -> PointF {
+pub(crate) fn edit_point(doc: &Document, id: NodeId, p: PointF) -> PointF {
     let origin = edit_text_origin(doc, id);
     let p = doc.get(id).and_then(|n| doc.from_window(n, p)).unwrap_or(p);
     PointF::new(p.x - origin.x as f32, p.y - origin.y as f32)

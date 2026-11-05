@@ -5,7 +5,7 @@
 
 use anti_webui::core::Ui;
 use anti_webui::core::damage;
-use anti_webui::core::event::{Modifiers, PointerButton, WindowEvent};
+use anti_webui::core::event::{Key, KeyEvent, Modifiers, PointerButton, WindowEvent};
 use anti_webui::core::geometry::{PointF, Scale, SizeI};
 use anti_webui::prelude::*;
 use anti_webui::wgpu::{Gpu, Offscreen, Renderer, wgpu};
@@ -149,9 +149,71 @@ fn lots_of_cards(n: usize) -> Div {
         }))
 }
 
+/// What it takes to start dragging all of a long text, and then to carry it.
+fn selected_text(gpu: &Gpu) {
+    for (paragraphs, lines) in [(100, 10), (5_000, 10)] {
+        let words = "The quick brown fox jumps over the lazy dog. ".repeat(lines * 3);
+        let mut ui = mount(|| {
+            let mut page = div().flex().flex_col().gap(8.0).p(16.0);
+            for _ in 0..paragraphs {
+                page = page.child(text(words.clone()));
+            }
+            div()
+                .bg(Color::WHITE)
+                .h(pct(100.0))
+                .overflow_y_scroll()
+                .child(page)
+        });
+        ui.handle_event(WindowEvent::Key(KeyEvent {
+            key: Key::Character("a".into()),
+            text: None,
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+            pressed: true,
+            repeat: false,
+        }));
+        ui.update();
+        let (x, y) = (200.0, 80.0);
+        pointer(&mut ui, x, y);
+        button(&mut ui, x, y, true);
+        ui.update();
+        let started = Instant::now();
+        pointer(&mut ui, x + 20.0, y);
+        ui.update();
+        let scene = ui.paint(Instant::now());
+        let cost = started.elapsed();
+        let glyphs = scene
+            .primitives
+            .iter()
+            .filter_map(|p| match p {
+                anti_webui::core::scene::Primitive::Layer(l) if l.key == u64::MAX - 1 => {
+                    Some(l.content.primitives.len())
+                }
+                _ => None,
+            })
+            .sum::<usize>();
+        println!(
+            "start dragging {} KB of text selected in {paragraphs} paragraphs: {:.2} ms, {glyphs} runs in the picture",
+            words.len() * paragraphs / 1024,
+            cost.as_secs_f64() * 1000.0,
+        );
+        run(
+            &format!("carry {paragraphs} selected paragraphs"),
+            gpu,
+            &mut ui,
+            (x + 20.0, y),
+            (2200.0, 1500.0),
+        );
+    }
+}
+
 fn main() {
     let gpu = Gpu::headless().expect("a GPU");
     println!("{} ({:?})", gpu.adapter.get_info().name, SCREEN);
+
+    selected_text(&gpu);
 
     let mut ui = mount(|| lots_of_cards(600));
     run(

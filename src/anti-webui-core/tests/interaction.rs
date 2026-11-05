@@ -148,9 +148,12 @@ fn drag_selects_across_elements() {
     // Selecting backwards from the middle of the second paragraph into the first works too.
     let in_second = PointF::new(rb.x as f32 + 40.0, rb.y as f32 + rb.height as f32 / 2.0);
     let in_first = PointF::new(ra.x as f32 + 40.0, ra.y as f32 + ra.height as f32 / 2.0);
+    // Pressing the selection could drag it, so it's cleared first.
     press(&mut ui, in_second, 1000);
+    release(&mut ui, in_second, 1005);
+    press(&mut ui, in_second, 2000);
     move_to(&mut ui, in_first);
-    release(&mut ui, in_first, 1010);
+    release(&mut ui, in_first, 2010);
     let s = selected();
     let (first, second) = s.split_once('\n').expect("selection spans both paragraphs");
     assert!(

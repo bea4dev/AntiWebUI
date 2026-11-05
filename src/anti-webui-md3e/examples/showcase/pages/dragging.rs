@@ -4,7 +4,8 @@ use super::{photo, row, section};
 use anti_webui::prelude::*;
 use anti_webui_md3e::color_scheme;
 use anti_webui_md3e::components::{
-    avatar, card_media, elevated_card, icon, list_item, outlined_card, sortable_list, sortable_row,
+    TextFieldStyle, avatar, card_media, elevated_card, icon, list_item, outlined_card,
+    sortable_list, sortable_row, text_field,
 };
 use anti_webui_md3e::icons;
 use anti_webui_md3e::typography::TextStyle;
@@ -14,9 +15,31 @@ pub fn page() -> Div {
         .flex()
         .flex_col()
         .gap(24.0)
+        .child(selected_text())
         .child(list())
         .child(pictures())
         .child(boxes())
+}
+
+fn selected_text() -> Div {
+    let value = signal("Select me and drag me to the field below".to_string());
+    let other = signal(String::new());
+    section("Selected text").child(
+        div()
+            .flex()
+            .flex_col()
+            .gap(16.0)
+            .w(560.0)
+            .child(text(
+                "Select some of this and drag the selection: a picture of the text goes along. \
+                 Drop it on a field here or on another program.",
+            ))
+            .child(text_field(
+                value,
+                TextFieldStyle::new().label("Drag from here"),
+            ))
+            .child(text_field(other, TextFieldStyle::new().label("Drop here"))),
+    )
 }
 
 fn list() -> Div {

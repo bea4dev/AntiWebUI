@@ -2,12 +2,14 @@
 
 use crate::event::*;
 use crate::geometry::{PointF, PointI, RectI, SizeI};
-use crate::paint::{DragContent, DragVisual, paint_snapshot};
-use crate::platform::{CursorIcon, DragOffer, PlatformRequest};
+use crate::paint::{DragContent, DragVisual, paint_selected_text, paint_snapshot};
+use crate::platform::{CursorIcon, DragOffer, ImePurpose, PlatformRequest};
 use crate::reactive::{Owner, Signal, batch, create_root, signal, untrack};
 use crate::scroll::VelocityTracker;
-use crate::tree::{Document, NodeId, with_doc};
-use crate::ui::{Press, Ui, can_scroll, scroll_node, set_active};
+use crate::text::edit::EditOutcome;
+use crate::text::selection::{self, node_range};
+use crate::tree::{Document, Node, NodeId, NodeKind, with_doc};
+use crate::ui::{Drag, Press, Ui, can_scroll, edit_point, scroll_node, set_active};
 use crate::view::{IntoView, View, div, portal};
 use anti_webui_style::Styled;
 use std::any::{Any, TypeId};
@@ -99,6 +101,60 @@ impl ExternalDrag {
     pub fn has_text(&self) -> bool {
         self.mimes.iter().any(|m| TEXT_MIMES.contains(&m.as_str()))
     }
+}
+
+/// What selected text is dragged as: all of it, whatever of it shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DraggedText(pub String);
+
+/// Where selected text is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextOrigin {
+    Document,
+    Edit(NodeId),
+}
+
+/// Whether `p` is on selected text in `target`, which can be dragged. Goes by what is highlighted.
+pub(crate) fn pressed_selection(doc: &Document, target: NodeId, p: PointF) -> Option<TextOrigin> {
+    let n = doc.get(target).filter(|n| !n.is_disabled())?;
+    match &n.kind {
+        NodeKind::Text(t) => {
+            let (a, b) = node_range(doc, doc.state.selection.as_ref()?, target)?;
+            let q = doc.from_window(n, p)?;
+            t.layout
+                .range_rects(a, b, n.abs.x, n.abs.y)
+                .iter()
+                .any(|r| r.contains(q))
+                .then_some(TextOrigin::Document)
+        }
+        NodeKind::Edit(e) => {
+            if !e.has_selection() || e.preedit.is_some() || e.purpose == ImePurpose::Password {
+                return None;
+            }
+            let (a, b) = e.selection_range();
+            let q = edit_point(doc, target, p);
+            e.layout
+                .range_rects(a, b, 0, 0)
+                .iter()
+                .any(|r| r.contains(q))
+                .then_some(TextOrigin::Edit(target))
+        }
+        _ => None,
+    }
+}
+
+/// Where in the input something dropped at `p` would go.
+fn drop_offset(doc: &Document, id: NodeId, p: PointF) -> Option<usize> {
+    let at = edit_point(doc, id, p);
+    Some(doc.get(id)?.edit()?.hit(at.x, at.y).0)
+}
+
+/// The format an input takes from this, if it takes any.
+fn text_mime(mimes: &[String]) -> Option<String> {
+    TEXT_MIMES
+        .iter()
+        .find(|t| mimes.iter().any(|m| m == *t))
+        .map(|t| (*t).to_owned())
 }
 
 /// What a [`draggable`](crate::view::Div::draggable) carries: a value for this program, and with
@@ -366,11 +422,15 @@ enum Accept {
     Value,
     /// In this format.
     Mime(String),
+    /// As text put in an input, in this format.
+    Edit(String),
 }
 
 /// Something being dragged.
 pub(crate) struct DragSession {
     source: Option<NodeId>,
+    /// The input selected text was taken from. Moving it to an input of this window takes it out.
+    text_source: Option<NodeId>,
     value: Rc<dyn Any>,
     type_id: TypeId,
     items: Vec<(String, Arc<[u8]>)>,
@@ -384,7 +444,7 @@ pub(crate) struct DragSession {
     position: PointF,
     preview: Option<Owner>,
     /// External data is on its way to here.
-    awaiting: Option<(NodeId, DragAction, PointF)>,
+    awaiting: Option<(NodeId, Accept, DragAction, PointF)>,
     /// It has been dropped and the platform hasn't said it ended.
     dropped: bool,
 }
@@ -451,6 +511,22 @@ fn accepts(doc: &Document, id: NodeId, session: &DragSession) -> Option<(Rc<Drop
     let drop = n.listeners.drop.clone()?;
     let typed = drop.drops.iter().any(|(t, _)| *t == session.type_id);
     Some((drop, typed))
+}
+
+/// Whether an input can be given this as text. `None` says it doesn't come into it, and an inner
+/// `None` that it does, but can't be dropped there.
+fn edit_accepts(doc: &Document, id: NodeId, session: &DragSession) -> Option<Option<Accept>> {
+    let n = doc.get(id).filter(|n| !n.is_disabled())?;
+    let e = n.edit().filter(|e| !e.read_only)?;
+    let mime = text_mime(&session.mimes)?;
+    if session.text_source == Some(id) {
+        let (a, b) = e.selection_range();
+        let at = drop_offset(doc, id, session.position)?;
+        if (a..=b).contains(&at) {
+            return Some(None);
+        }
+    }
+    Some(Some(Accept::Edit(mime)))
 }
 
 fn acceptance(drop: &DropConfig, typed: bool, session: &DragSession) -> Option<Accept> {
@@ -691,11 +767,86 @@ impl Ui {
                 }
             }
         };
+        self.begin_drag(Some(node), None, data, visual, preview, p);
+    }
+
+    /// The pointer moved with selected text pressed. Returns whether it is being dragged now.
+    pub(crate) fn text_drag_moved(&mut self, origin: TextOrigin, start: PointF, p: PointF) -> bool {
+        // Per axis, like `DragThresholdExceeded` in Blink.
+        let slop = with_doc(|d| d.scale.pxf(THRESHOLD));
+        if (p.x - start.x).abs() < slop && (p.y - start.y).abs() < slop {
+            return false;
+        }
+        let edit = match origin {
+            TextOrigin::Edit(id) => Some(id),
+            TextOrigin::Document => None,
+        };
+        let found = with_doc(|d| {
+            let (text, moves) = match edit {
+                Some(id) => {
+                    let e = d.get(id)?.edit()?;
+                    (e.selected_text().to_owned(), !e.read_only)
+                }
+                None => (
+                    selection::selected_text(d, d.state.selection.as_ref()?),
+                    false,
+                ),
+            };
+            (!text.is_empty()).then_some((text, moves))
+        });
+        let Some((text, moves)) = found else {
+            // What was selected has gone, so this is nothing anymore.
+            if let Some(press) = &mut self.press {
+                press.drag = Drag::None;
+            }
+            return false;
+        };
+        let data = DragData::new(DraggedText(text.clone()))
+            .text(text)
+            .actions(if moves {
+                DragActions::Both
+            } else {
+                DragActions::Copy
+            });
+        self.ensure_layout();
+        let painted = with_doc(|d| paint_selected_text(d, edit));
+        let grip = painted.as_ref().map_or((0.0, 0.0), |(_, _, b)| {
+            (
+                ((start.x - b.x as f32) / b.width.max(1) as f32).clamp(0.0, 1.0),
+                ((start.y - b.y as f32) / b.height.max(1) as f32).clamp(0.0, 1.0),
+            )
+        });
+        let visual = DragVisual {
+            content: DragContent::Snapshot,
+            position: whole(p),
+            grip,
+            opacity: PREVIEW_OPACITY,
+            icon: self.platform_drag,
+            painted,
+        };
+        self.press = None;
+        self.begin_drag(None, edit, data, visual, None, p);
+        true
+    }
+
+    /// Something starts being dragged.
+    fn begin_drag(
+        &mut self,
+        source: Option<NodeId>,
+        text_source: Option<NodeId>,
+        data: DragData,
+        visual: DragVisual,
+        preview: Option<Owner>,
+        p: PointF,
+    ) {
+        let items = data.items.clone();
+        let wants_platform = self.platform_drag && !items.is_empty();
         let value = data.value.clone();
         let mimes: Vec<String> = items.iter().map(|(m, _)| m.clone()).collect();
         let allowed = data.allowed();
         self.drag = Some(DragSession {
-            source: Some(node),
+            source,
+            text_source,
             value: value.clone(),
             type_id: data.type_id,
             items: items.clone(),
@@ -715,8 +866,10 @@ impl Ui {
         });
         with_doc(|d| {
             d.drag = Some(visual);
-            d.state.dragging = Some(node);
-            if d.get(node).is_some_and(|n| n.style.dragging.is_some()) {
+            d.state.dragging = source;
+            if let Some(node) = source
+                && d.get(node).is_some_and(|n| n.style.dragging.is_some())
+            {
                 d.mark_style_of(node);
             }
             d.mark_paint();
@@ -783,13 +936,18 @@ impl Ui {
         let action = action.unwrap_or_else(|| action_for(session.allowed, self.modifiers));
         let (value, type_id) = (session.value.clone(), session.type_id);
         let bytes = match &accept {
-            Accept::Mime(mime) => session
+            Accept::Mime(mime) | Accept::Edit(mime) => session
                 .items
                 .iter()
                 .find(|(m, _)| m == mime)
                 .map(|(_, b)| b.clone()),
             Accept::Value => None,
         };
+        if matches!(accept, Accept::Edit(_)) {
+            let source = session.text_source;
+            self.drop_into_edit(node, &bytes?, p, action, source);
+            return Some(action);
+        }
         let modifiers = self.modifiers;
         let found = with_doc(|d| {
             let n = d.get(node)?;
@@ -810,8 +968,62 @@ impl Ui {
                     f(bytes, &event);
                 }
             }
+            Accept::Edit(_) => {}
         });
         Some(action)
+    }
+
+    /// Text was dropped on an input, like `ConcludeEditDrag` in Blink: it ends up selected there.
+    /// `source` is the input it came from, if any.
+    fn drop_into_edit(
+        &mut self,
+        id: NodeId,
+        bytes: &[u8],
+        p: PointF,
+        action: DragAction,
+        source: Option<NodeId>,
+    ) {
+        let text = String::from_utf8_lossy(bytes);
+        // Only if it's still what was taken: otherwise there is nothing to take out.
+        let source = source.filter(|s| {
+            action == DragAction::Move
+                && with_doc(|d| {
+                    d.get(*s)
+                        .and_then(Node::edit)
+                        .is_some_and(|e| !e.read_only && e.selected_text() == text)
+                })
+        });
+        let (taken, put) = with_doc(|d| {
+            let at = drop_offset(d, id, p).unwrap_or_default();
+            let mut edit_of =
+                |n: NodeId, f: &dyn Fn(&mut crate::text::edit::EditData) -> EditOutcome| {
+                    let out = d.get_mut(n).and_then(Node::edit_mut).map(f);
+                    if out.as_ref().is_some_and(|o| o.changed) {
+                        d.invalidate_layout(n);
+                    }
+                    out
+                };
+            let (taken, put) = if source == Some(id) {
+                (None, edit_of(id, &|e| e.move_selection(at)))
+            } else {
+                let put = edit_of(id, &|e| e.drop_text(at, &text));
+                let taken = source
+                    .filter(|_| put.as_ref().is_some_and(|o| o.changed))
+                    .and_then(|s| edit_of(s, &|e| e.delete(false, false)).map(|o| (s, o)));
+                (taken, put)
+            };
+            if d.state.selection.take().is_some() {
+                d.mark_paint();
+            }
+            (taken, put)
+        });
+        self.set_focus(Some(id));
+        if let Some((s, outcome)) = taken {
+            self.after_edit(s, outcome);
+        }
+        if let Some(outcome) = put {
+            self.after_edit(id, outcome);
+        }
     }
 
     /// Everything to do when a drag is over. `done` is what became of it, if it was dropped.
@@ -869,6 +1081,7 @@ impl Ui {
         }
         let tell = with_doc(|d| {
             d.state.drag_over = now;
+            set_drop_caret(d, was, None);
             let mut tell = Vec::new();
             for (id, on) in [(was, false), (now, true)] {
                 let Some(n) = id.and_then(|id| d.get(id)) else {
@@ -914,20 +1127,34 @@ impl Ui {
             .unwrap_or_default();
         let mut next = None;
         for id in chain {
-            let Some(found) = with_doc(|d| accepts(d, id, self.drag.as_ref().expect("checked")))
-            else {
-                continue;
-            };
             let session = self.drag.as_ref().expect("checked");
-            if let Some(how) = acceptance(&found.0, found.1, session) {
-                next = Some((id, how, found.0));
+            if let Some(found) = with_doc(|d| accepts(d, id, session))
+                && let Some(how) = acceptance(&found.0, found.1, session)
+            {
+                next = Some((id, how, Some(found.0)));
+                break;
+            }
+            if let Some(takes) = with_doc(|d| edit_accepts(d, id, session)) {
+                next = takes.map(|how| (id, how, None));
                 break;
             }
         }
         let over = next.as_ref().map(|(id, how, _)| (*id, how.clone()));
         self.set_over(over);
+        if let Some((id, Accept::Edit(_), _)) = &next {
+            with_doc(|d| {
+                let at = drop_offset(d, *id, p);
+                set_drop_caret(d, Some(*id), at);
+            });
+        }
         let session = self.drag.as_ref().expect("checked");
-        let action = action_for(session.allowed, self.modifiers);
+        // Blink takes text from elsewhere as a copy: moving it is the source's business.
+        let action =
+            if session.mode == Mode::External && matches!(next, Some((_, Accept::Edit(_), _))) {
+                DragAction::Copy
+            } else {
+                action_for(session.allowed, self.modifiers)
+            };
         if session.mode == Mode::Inside {
             let cursor = match (&next, action) {
                 (Some(_), DragAction::Copy) => CursorIcon::Copy,
@@ -938,7 +1165,7 @@ impl Ui {
             self.tell_platform_accept(action);
         }
         let session = self.drag.as_ref().expect("checked");
-        if moved && let Some((id, _, drop)) = &next {
+        if moved && let Some((id, _, Some(drop))) = &next {
             let handlers: Vec<_> = drop
                 .over
                 .iter()
@@ -964,7 +1191,7 @@ impl Ui {
         };
         let wanted = session.over.as_ref().and_then(|(_, how)| {
             let mime = match how {
-                Accept::Mime(m) => m.clone(),
+                Accept::Mime(m) | Accept::Edit(m) => m.clone(),
                 // Only so that it can be dropped here: nothing is read.
                 Accept::Value => session.mimes.first()?.clone(),
             };
@@ -995,6 +1222,7 @@ impl Ui {
                         });
                         self.drag = Some(DragSession {
                             source: None,
+                            text_source: None,
                             value: value.clone(),
                             type_id: TypeId::of::<ExternalDrag>(),
                             items: Vec::new(),
@@ -1044,8 +1272,11 @@ impl Ui {
                 };
                 session.position = position;
                 let external = session.mode == Mode::External;
-                if external && let Some((node, Accept::Mime(mime))) = session.over.clone() {
-                    session.awaiting = Some((node, action, position));
+                if external
+                    && let Some((node, how)) = session.over.clone()
+                    && let Accept::Mime(mime) | Accept::Edit(mime) = how.clone()
+                {
+                    session.awaiting = Some((node, how, action, position));
                     self.set_over(None);
                     with_doc(|d| d.request(PlatformRequest::ReceiveDrop(mime)));
                     return;
@@ -1060,7 +1291,11 @@ impl Ui {
             }
             WindowEvent::DropData { mime, bytes } => {
                 let awaiting = self.drag.as_mut().and_then(|s| s.awaiting.take());
-                if let Some((node, action, position)) = awaiting {
+                if let Some((node, Accept::Edit(_), action, position)) = awaiting {
+                    if !bytes.is_empty() {
+                        self.drop_into_edit(node, &bytes, position, action, None);
+                    }
+                } else if let Some((node, _, action, position)) = awaiting {
                     let found = with_doc(|d| {
                         let n = d.get(node)?;
                         Some((n.listeners.drop.clone()?, d.window_rect(node)?))
@@ -1209,6 +1444,17 @@ impl Ui {
     }
 }
 
+/// Says where what is dragged over an input would go, if anywhere.
+fn set_drop_caret(doc: &mut Document, id: Option<NodeId>, at: Option<usize>) {
+    if let Some(id) = id
+        && let Some(e) = doc.get_mut(id).and_then(Node::edit_mut)
+        && e.drop_caret != at
+    {
+        e.drop_caret = at;
+        doc.mark_paint();
+    }
+}
+
 fn whole(p: PointF) -> PointI {
     PointI::new(p.x.round() as i32, p.y.round() as i32)
 }
@@ -1266,7 +1512,7 @@ fn edge_speed(doc: &Document, id: NodeId, p: PointF, band: f32) -> Option<(f32, 
     } else {
         0.0
     };
-    let dy = if n.computed.overflow_y == Overflow::Scroll {
+    let dy = if n.computed.overflow_y == Overflow::Scroll || n.edit().is_some_and(|e| e.multiline) {
         along(p.y, rect.y as f32, rect.bottom() as f32)
     } else {
         0.0

@@ -27,7 +27,7 @@ AntiWebUI は WebView に頼らず、wgpu による自前描画とネイティ�
 | 20 | [md3e-components](20-md3e-components.md) | MD3E の残りの部品、`portal`、タイマー、ショーケース |
 | 21 | [widgets](21-widgets.md) | 標準の部品の一式、`Sheet`、テーマ、CSS との対応、見えている行だけ作るリスト |
 | 22 | [images](22-images.md) | `img` と `background-image`、形式、ワーカーでのデコード、表示の大きさに合わせたメモリ、Chrome との比較 |
-| 23 | [drag-and-drop](23-drag-and-drop.md) | つかみ（`on_grab`）、型付きのアプリ内 DnD、`wl_data_device` の OS DnD、並べ替え |
+| 23 | [drag-and-drop](23-drag-and-drop.md) | つかみ（`on_grab`）、型付きのアプリ内 DnD、`wl_data_device` の OS DnD、並べ替え、選択した文字のドラッグ |
 
 ## 用語
 

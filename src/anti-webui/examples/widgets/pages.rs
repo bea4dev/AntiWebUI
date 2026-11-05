@@ -484,7 +484,7 @@ fn people(count: u32) -> Vec<Person> {
             id,
             name: format!("Person {id}"),
             city: CITIES[(id as usize * 7) % CITIES.len()],
-            score: ((id * 2654435761u32.wrapping_mul(id + 1)) % 1000) as f32 / 10.0,
+            score: (id.wrapping_mul(2654435761u32.wrapping_mul(id + 1)) % 1000) as f32 / 10.0,
         })
         .collect()
 }
@@ -920,7 +920,36 @@ pub fn dragging() -> Div {
     let chips = signal(vec![1u32, 2, 3, 4, 5]);
     let dropped = signal(Vec::<String>::new());
     let told = signal("Nothing yet".to_string());
+    let one_line = signal("Select me and drag me below".to_string());
+    let many_lines = signal("Or drop text here\nfrom another program".to_string());
     sections()
+        .child(section(
+            "Selected text: select some, then drag it to a field or another program",
+            div()
+                .flex()
+                .flex_col()
+                .gap(12.0)
+                .child(text(
+                    "This paragraph can be selected. Press the selection and move: what is \
+                     selected goes along with a picture of itself. Other programs take it as \
+                     plain text, and from here it is always a copy.",
+                ))
+                .child(
+                    text_input()
+                        .value(one_line)
+                        .p(8.0)
+                        .rounded(6.0)
+                        .dyn_style(|s| s.bg(theme().surface_muted)),
+                )
+                .child(
+                    text_area()
+                        .value(many_lines)
+                        .rows(4)
+                        .p(8.0)
+                        .rounded(6.0)
+                        .dyn_style(|s| s.bg(theme().surface_muted)),
+                ),
+        ))
         .child(section(
             "on_grab: it follows the pointer, and Escape puts it back",
             div()

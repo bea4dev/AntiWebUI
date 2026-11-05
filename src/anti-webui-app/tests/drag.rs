@@ -218,3 +218,119 @@ fn the_surface_of_a_drag_has_it_at_its_corner() {
     assert_eq!(corner, end);
     assert_eq!(corner[3], 191, "see-through as it shows: {corner:?}");
 }
+
+fn selected_words() -> Div {
+    div()
+        .w(pct(100.0))
+        .h(pct(100.0))
+        .bg(rgb(0x00ff00))
+        .selection_color(rgb(0x0000ff))
+        .text_color(rgb(0xff0000))
+        .child(text("Selected words"))
+}
+
+fn select_all(ui: &mut Ui) {
+    ui.handle_event(WindowEvent::Key(anti_webui_core::event::KeyEvent {
+        key: anti_webui_core::event::Key::Character("a".into()),
+        text: None,
+        modifiers: Modifiers {
+            ctrl: true,
+            ..Default::default()
+        },
+        pressed: true,
+        repeat: false,
+    }));
+    ui.update();
+}
+
+#[test]
+fn the_surface_of_selected_text_has_only_the_text_on_nothing() {
+    let Some(gpu) = gpu() else {
+        return;
+    };
+    let mut ui = mount(400, 200, 1.8, selected_words);
+    ui.set_platform_drag(true);
+    select_all(&mut ui);
+    pressed(&mut ui, 20.0, 15.0);
+    moved(&mut ui, 60.0, 15.0);
+    let frame = ui.paint_frame(Instant::now());
+    let icon = frame.drag_icon.expect("a surface");
+    let (w, h) = (icon.scene.width, icon.scene.height);
+    let mut renderer = Renderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+    let p = gpu.render_to_rgba(&mut renderer, &icon.scene);
+
+    let (mut empty, mut strongest) = (0, 0u8);
+    for y in 0..h {
+        for x in 0..w {
+            let [r, g, b, a] = px(&p, w, x, y);
+            // Premultiplied red at most: no page, and no highlight.
+            assert_eq!((g, b), (0, 0), "{x},{y}");
+            assert!(r <= a, "{x},{y}");
+            empty += (a == 0) as u32;
+            strongest = strongest.max(a);
+        }
+    }
+    assert!(empty > w * h / 4, "{empty} of {}", w * h);
+    // The inside of a stroke, at the opacity of the picture.
+    assert!((strongest as i32 - 191).abs() <= 2, "{strongest}");
+    assert_eq!(px(&p, w, 0, 0)[3], 0);
+}
+
+#[test]
+fn a_caret_where_it_would_land_repaints_the_same_as_all_of_it() {
+    let Some(gpu) = gpu() else {
+        return;
+    };
+    let (w, h) = (300u32, 300u32);
+    let value = signal("0123456789 0123456789".to_string());
+    let mut ui = mount(w as i32, h as i32, 1.8, move || {
+        selected_words().child(
+            text_input()
+                .absolute()
+                .left(10.0)
+                .top(60.0)
+                .w(140.0)
+                .h(30.0)
+                .bg(Color::WHITE)
+                .caret_color(rgb(0x000000))
+                .value(value),
+        )
+    });
+    select_all(&mut ui);
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut partial = Renderer::new(&gpu.device, format);
+    let mut full = Renderer::new(&gpu.device, format);
+    let target = Offscreen::new(&gpu, format, w, h);
+    pressed(&mut ui, 20.0, 15.0);
+    moved(&mut ui, 40.0, 40.0);
+    let mut prev = ui.paint(Instant::now());
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    partial.render(&gpu.device, &gpu.queue, &mut encoder, &target.view, &prev);
+    gpu.queue.submit([encoder.finish()]);
+    for i in 0..30 {
+        let (x, y) = (30.0 + i as f32 * 7.3, 120.0 + (i % 3) as f32 * 40.0);
+        moved(&mut ui, x, y);
+        let scene = ui.paint(Instant::now());
+        let dmg = damage::diff(&prev, &scene);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        partial.render_damaged(
+            &gpu.device,
+            &gpu.queue,
+            &mut encoder,
+            &target.view,
+            &scene,
+            &dmg,
+        );
+        gpu.queue.submit([encoder.finish()]);
+        let got = target.read_rgba(&gpu);
+        full.clear_layer_caches();
+        let want = gpu.render_to_rgba(&mut full, &scene);
+        let differing = got
+            .chunks(4)
+            .zip(want.chunks(4))
+            .filter(|(x, y)| x != y)
+            .count();
+        assert_eq!(differing, 0, "step {i}");
+        prev = scene;
+    }
+}

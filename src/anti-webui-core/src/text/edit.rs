@@ -77,6 +77,8 @@ pub struct EditData {
     pub scroll_to_caret: bool,
     pub caret_epoch: Instant,
     pub drag: Option<(Granularity, usize, usize)>,
+    /// Where what is dragged over it would go.
+    pub drop_caret: Option<usize>,
 
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
@@ -143,6 +145,7 @@ impl EditData {
             scroll_to_caret: false,
             caret_epoch: Instant::now(),
             drag: None,
+            drop_caret: None,
             undo: Vec::new(),
             redo: Vec::new(),
             last_edit: EditKind::Other,
@@ -289,6 +292,15 @@ impl EditData {
         self.layout.caret_rect(index, self.affinity, width)
     }
 
+    /// Caret rectangle for what is dragged over it, relative to the text origin.
+    pub fn drop_caret_rect(&self, at: usize, width: i32) -> RectI {
+        if self.layout.layout.text_len() == 0 {
+            return self.caret_rect(width);
+        }
+        self.layout
+            .caret_rect(self.to_display(at), Affinity::Downstream, width)
+    }
+
     fn nav_selection(&mut self) -> LayoutSelection {
         if let Some((v, sel)) = &self.nav
             && *v == self.display_version
@@ -393,16 +405,21 @@ impl EditData {
         self.bump();
     }
 
+    /// What is put in becomes this: a single line has no line breaks.
+    fn cleaned(&self, s: &str) -> String {
+        if self.multiline {
+            s.replace("\r\n", "\n")
+        } else {
+            s.replace(['\r', '\n'], " ")
+        }
+    }
+
     /// Replaces the selection with `s`.
     pub fn insert(&mut self, s: &str) -> EditOutcome {
         if self.read_only {
             return EditOutcome::default();
         }
-        let s: String = if self.multiline {
-            s.replace("\r\n", "\n")
-        } else {
-            s.replace(['\r', '\n'], " ")
-        };
+        let s = self.cleaned(s);
         if s.is_empty() && !self.has_selection() {
             return EditOutcome::default();
         }
@@ -414,6 +431,49 @@ impl EditData {
         self.snapshot(kind);
         let (a, b) = self.selection_range();
         self.replace_range(a, b, &s);
+        EditOutcome {
+            changed: true,
+            moved: true,
+        }
+    }
+
+    /// Selects `len` bytes at `at`, after the text there changed.
+    fn select_changed(&mut self, at: usize, len: usize) {
+        self.anchor = at;
+        self.focus = at + len;
+        self.affinity = Affinity::Downstream;
+        self.preedit = None;
+        self.bump();
+    }
+
+    /// Puts what was dropped at `at`, and selects it.
+    pub fn drop_text(&mut self, at: usize, s: &str) -> EditOutcome {
+        let s = self.cleaned(s);
+        if self.read_only || s.is_empty() {
+            return EditOutcome::default();
+        }
+        self.snapshot(EditKind::Other);
+        let at = floor_char_boundary(&self.text, at);
+        self.text.insert_str(at, &s);
+        self.select_changed(at, s.len());
+        EditOutcome {
+            changed: true,
+            moved: true,
+        }
+    }
+
+    /// Moves the selection to `at`, in one step of undo, and keeps it selected.
+    pub fn move_selection(&mut self, at: usize) -> EditOutcome {
+        let (a, b) = self.selection_range();
+        if self.read_only || a == b || (a..=b).contains(&at) {
+            return EditOutcome::default();
+        }
+        self.snapshot(EditKind::Other);
+        let moved = self.text[a..b].to_owned();
+        self.text.replace_range(a..b, "");
+        let at = floor_char_boundary(&self.text, if at > b { at - moved.len() } else { at });
+        self.text.insert_str(at, &moved);
+        self.select_changed(at, moved.len());
         EditOutcome {
             changed: true,
             moved: true,
@@ -647,6 +707,70 @@ impl EditData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selecting(text: &str, a: usize, b: usize) -> EditData {
+        let mut e = EditData::new(true);
+        e.text = text.to_owned();
+        e.anchor = a;
+        e.focus = b;
+        e
+    }
+
+    #[test]
+    fn moving_the_selection_forward_goes_by_what_was_there() {
+        let mut e = selecting("alpha beta gamma", 0, 5);
+        assert!(e.move_selection(10).changed);
+        assert_eq!(e.text, " betaalpha gamma");
+        assert_eq!(e.selected_text(), "alpha");
+    }
+
+    #[test]
+    fn moving_the_selection_back_goes_by_what_was_there() {
+        let mut e = selecting("alpha beta gamma", 11, 16);
+        assert!(e.move_selection(6).changed);
+        assert_eq!(e.text, "alpha gammabeta ");
+        assert_eq!(e.selected_text(), "gamma");
+    }
+
+    #[test]
+    fn moving_it_is_one_step_of_undo_and_nothing_on_itself() {
+        let mut e = selecting("alpha beta", 0, 5);
+        for at in [0, 3, 5] {
+            assert!(!e.move_selection(at).changed);
+        }
+        assert_eq!(e.text, "alpha beta");
+        e.move_selection(10);
+        e.undo();
+        assert_eq!(e.text, "alpha beta");
+        assert_eq!(e.selected_text(), "alpha");
+    }
+
+    #[test]
+    fn moving_keeps_to_characters() {
+        let mut e = selecting("日本語テキスト", 0, 3);
+        e.move_selection(9);
+        assert_eq!(e.text, "本語日テキスト");
+        assert_eq!(e.selected_text(), "日");
+    }
+
+    #[test]
+    fn what_was_dropped_ends_up_selected_where_it_was_dropped() {
+        let mut e = selecting("abcdef", 1, 2);
+        assert!(e.drop_text(4, "XY").changed);
+        assert_eq!(e.text, "abcdXYef");
+        assert_eq!(e.selected_text(), "XY");
+        e.undo();
+        assert_eq!(e.text, "abcdef");
+    }
+
+    #[test]
+    fn read_only_text_takes_nothing() {
+        let mut e = selecting("abcdef", 1, 2);
+        e.read_only = true;
+        assert!(!e.drop_text(4, "XY").changed);
+        assert!(!e.move_selection(4).changed);
+        assert_eq!(e.text, "abcdef");
+    }
 
     #[test]
     fn grapheme_navigation() {
