@@ -8,6 +8,11 @@
 //! pages. PageUp, PageDown, Home and End move. Dragging selects text, a double click takes a word and
 //! a triple click a line, Ctrl + C copies it, and dragging what is selected takes it to another
 //! program. Ctrl + F goes to the search box, where Enter goes to the next one found.
+//!
+//! Fields can be filled in by clicking on them, and the buttons with colors mark up what is selected
+//! or draw on the page. Clicking on an annotation picks it, which can then be moved or removed with
+//! Delete. Ctrl + Z goes back, Ctrl + Y forward, and Ctrl + S writes `<name>-edited.pdf` next to the
+//! document.
 
 use anti_webui::prelude::*;
 
@@ -57,6 +62,32 @@ fn main() {
             let contents = signal(false);
             let thumbnails = signal(false);
             let search_box = node_ref();
+            let saved_as = {
+                let path = std::path::PathBuf::from(&path);
+                let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                path.with_file_name(format!("{stem}-edited.pdf"))
+            };
+            let save = {
+                let saved_as = saved_as.clone();
+                move || viewer.save(saved_as.clone())
+            };
+            let tool_button = move |name: &'static str, tool: PdfTool| {
+                button(name)
+                    .on_click(move |_| {
+                        viewer.set_tool(if viewer.tool() == tool {
+                            PdfTool::Select
+                        } else {
+                            tool
+                        })
+                    })
+                    .dyn_style(move |s| {
+                        if viewer.tool() == tool {
+                            s.outline(2.0).outline_color(Color::from_rgb(0x7cacf8))
+                        } else {
+                            s
+                        }
+                    })
+            };
             request_frame(move |_| viewer.focus());
             div()
                 .flex()
@@ -64,10 +95,17 @@ fn main() {
                 .w_full()
                 .h_full()
                 .bg(rgb(0x1e1f22))
-                .on_key_down(move |e| {
-                    if e.modifiers.ctrl && matches!(&e.key, Key::Character(c) if c == "f") {
-                        search_box.focus();
-                        e.stop_propagation();
+                .on_key_down({
+                    let save = save.clone();
+                    move |e| {
+                        if e.modifiers.ctrl && matches!(&e.key, Key::Character(c) if c == "f") {
+                            search_box.focus();
+                            e.stop_propagation();
+                        }
+                        if e.modifiers.ctrl && matches!(&e.key, Key::Character(c) if c == "s") {
+                            save();
+                            e.stop_propagation();
+                        }
                     }
                 })
                 .child(
@@ -107,6 +145,49 @@ fn main() {
                         .child(text(found))
                         .child(button("↑").on_click(move |_| viewer.find_previous()))
                         .child(button("↓").on_click(move |_| viewer.find_next())),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(8.0)
+                        .px(12.0)
+                        .pb(6.0)
+                        .bg(bar)
+                        .text_color(Color::WHITE)
+                        .select_none()
+                        .child(tool_button("蛍光ペン", PdfTool::Highlight))
+                        .child(tool_button("下線", PdfTool::Underline))
+                        .child(tool_button("取り消し線", PdfTool::StrikeOut))
+                        .child(tool_button("インク", PdfTool::Ink))
+                        .child(tool_button("テキスト", PdfTool::FreeText))
+                        .child(tool_button("付箋", PdfTool::Note))
+                        .child(button("消す").on_click(move |_| viewer.delete_annotation()))
+                        .child(button("元に戻す").on_click(move |_| viewer.undo()))
+                        .child(button("やり直す").on_click(move |_| viewer.redo()))
+                        .child(button("保存").on_click({
+                            let save = save.clone();
+                            move |_| save()
+                        }))
+                        .child(text(move || {
+                            let state = match viewer.editing() {
+                                PdfEditing::Yes | PdfEditing::NotYet => "",
+                                PdfEditing::Encrypted => "暗号化されているので編集できません",
+                                PdfEditing::Broken => "壊れているので編集できません",
+                            };
+                            let saving = match viewer.save_result() {
+                                Some(Ok(path)) => format!("{} に保存しました", path.display()),
+                                Some(Err(e)) => format!("保存できません: {e}"),
+                                None => String::new(),
+                            };
+                            let modified = if viewer.is_modified() {
+                                "変更あり"
+                            } else {
+                                ""
+                            };
+                            format!("{state} {modified} {saving}")
+                        })),
                 )
                 .child(
                     div()

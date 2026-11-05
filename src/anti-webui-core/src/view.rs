@@ -152,6 +152,18 @@ impl NodeRef {
     pub fn blur(&self) {
         with_doc(|d| d.pending_focus = Some(None));
     }
+
+    /// Puts the caret of a text input after what it has.
+    pub fn select_end(&self) {
+        if let Some(id) = self.0.get_untracked() {
+            with_doc(|d| {
+                if let Some(e) = d.get_mut(id).and_then(Node::edit_mut) {
+                    e.caret_to_end();
+                    d.mark_paint();
+                }
+            });
+        }
+    }
 }
 
 type StyleFn = Box<dyn Fn(Style) -> Style>;

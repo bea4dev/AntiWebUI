@@ -4,6 +4,7 @@
 
 use crate::engine::{CutOut, Engine};
 use crate::links::{LinkTarget, PdfTarget};
+use crate::marks::PdfAnnotationKind;
 use crate::plan::{Job, PageTable};
 use crate::text::{self, NEAR_TEXT, PageText};
 use crate::{PdfViewer, UrlListener};
@@ -149,7 +150,12 @@ enum CopyTo {
     Clipboard(ClipboardKind),
     /// What is dragged, which can't start without it.
     Drag,
+    /// An annotation on each page of it, which takes the boxes rather than the text.
+    Mark(PdfAnnotationKind),
 }
+
+/// Where what is selected goes to be marked: the boxes it takes on each page.
+pub(crate) type Marker = Rc<dyn Fn(PdfAnnotationKind, Vec<(usize, Vec<[f32; 4]>)>)>;
 
 /// Text that is on its way, as all of a selection may not have been read.
 struct Copying {
@@ -157,6 +163,8 @@ struct Copying {
     selection: Selection,
     /// What each page of the selection gets.
     parts: Vec<Option<String>>,
+    /// And the boxes it takes there.
+    boxes: Vec<Vec<[f32; 4]>>,
     /// All of the parts before this one are there.
     next: usize,
 }
@@ -192,6 +200,8 @@ pub(crate) enum BoxKind {
     Found,
     Current,
     Selected,
+    /// A field that can be filled in.
+    Field,
 }
 
 /// See the top of this file. A [`crate::PdfView`] has one.
@@ -237,6 +247,7 @@ pub(crate) struct Reader {
     cut_outs: Signal<Vec<(usize, RectI, Arc<Bitmap>)>>,
     /// All of that together, in the box.
     cut_bounds: Cell<RectI>,
+    marker: RefCell<Option<Marker>>,
 }
 
 impl Reader {
@@ -275,7 +286,52 @@ impl Reader {
             press_number: Cell::new(0),
             cut_outs: signal(Vec::new()),
             cut_bounds: Cell::new(RectI::default()),
+            marker: RefCell::new(None),
         })
+    }
+
+    pub fn set_marker(&self, marker: Marker) {
+        *self.marker.borrow_mut() = Some(marker);
+    }
+
+    /// Marks what is selected, as soon as all of it has been read.
+    pub fn mark_selection(self: &Rc<Self>, kind: PdfAnnotationKind) {
+        self.copy_to(CopyTo::Mark(kind));
+    }
+
+    /// Lets go of the text of pages that have changed, which then get read again when they are
+    /// needed. What is selected stays, as what was added comes after what the page has.
+    pub fn forget_text(self: &Rc<Self>, pages: &std::collections::BTreeSet<usize>) {
+        if pages.is_empty() {
+            return;
+        }
+        self.texts.update(|texts| {
+            for page in pages {
+                texts.remove(page);
+            }
+        });
+        self.arrived
+            .borrow_mut()
+            .retain(|page| !pages.contains(page));
+        let mut folded = self.folded.borrow_mut();
+        for page in pages {
+            folded.remove(page);
+        }
+        drop(folded);
+        let query = self.search.borrow().as_ref().map(|s| s.query.clone());
+        let query = query.or_else(|| {
+            let query = self.viewer.query.get_untracked();
+            (!query.is_empty()).then_some(query)
+        });
+        if let Some(query) = query {
+            // It stays where it is: this isn't someone looking for something.
+            let current = self.viewer.current_hit.get_untracked();
+            self.start_search(&query);
+            if let Some(search) = self.search.borrow_mut().as_mut() {
+                search.shown_first = true;
+            }
+            self.viewer.current_hit.set_if_changed(current);
+        }
     }
 
     fn text_of(&self, page: usize) -> Option<Arc<PageText>> {
@@ -357,7 +413,7 @@ impl Reader {
     }
 
     /// A point of the box as a page and a point on it, for the page nearest to it.
-    fn on_page(&self, local: PointF) -> Option<(usize, f32, f32)> {
+    pub fn on_page(&self, local: PointF) -> Option<(usize, f32, f32)> {
         let (v, table) = untrack(|| ((self.view)(), self.table.get()));
         let (x, y) = (v.x as f32 + local.x, v.y as f32 + local.y);
         if table.is_empty() {
@@ -378,11 +434,17 @@ impl Reader {
     }
 
     /// How big a page is as the document has it.
-    fn size_in_points(&self, page: usize) -> (f64, f64) {
+    pub fn size_in_points(&self, page: usize) -> (f64, f64) {
         let (w, h) = self
             .pages
             .with_untracked(|p| *p.get(page).unwrap_or(&(1.0, 1.0)));
         (w as f64, h as f64)
+    }
+
+    /// How big a page shows as it is turned, in points.
+    pub fn shown_size(&self, page: usize) -> (f64, f64) {
+        let turn = untrack(|| self.table.get()).turn;
+        turn.size(self.size_in_points(page))
     }
 
     pub fn pointer_down(self: &Rc<Self>, e: &PointerEvent) {
@@ -765,12 +827,14 @@ impl Reader {
             to: vec![to],
             selection,
             parts: vec![None; b.page - a.page + 1],
+            boxes: vec![Vec::new(); b.page - a.page + 1],
             next: 0,
         };
         for (i, part) in copying.parts.iter_mut().enumerate() {
             if let Some(text) = self.text_of(a.page + i) {
                 let (from, to) = selected_on(selection, a.page + i, text.len());
                 *part = Some(text.copied(from, to).to_owned());
+                copying.boxes[i] = text.boxes(from, to);
             }
         }
         self.copy_or_wait(copying);
@@ -790,10 +854,23 @@ impl Reader {
                 .join("\n");
             *self.copying.borrow_mut() = None;
             self.copy_wants.set_if_changed(Vec::new());
+            let start = copying.selection.0.page;
             for to in copying.to {
                 match to {
                     CopyTo::Clipboard(kind) => set_clipboard(kind, text.clone()),
                     CopyTo::Drag => self.start_dragging(text.clone()),
+                    CopyTo::Mark(kind) => {
+                        let marker = self.marker.borrow().clone();
+                        if let Some(marker) = marker {
+                            let pages = copying
+                                .boxes
+                                .iter()
+                                .enumerate()
+                                .map(|(i, boxes)| (start + i, boxes.clone()))
+                                .collect();
+                            marker(kind, pages);
+                        }
+                    }
                 }
             }
             return;
@@ -816,6 +893,7 @@ impl Reader {
         if page >= a.page && page <= b.page {
             let (from, to) = selected_on(copying.selection, page, text.len());
             copying.parts[page - a.page] = Some(text.copied(from, to).to_owned());
+            copying.boxes[page - a.page] = text.boxes(from, to);
         }
         self.copy_or_wait(copying);
     }
@@ -935,7 +1013,7 @@ impl Reader {
     }
 
     /// A box in the points of a page in its pixels.
-    fn to_pixels(&self, table: &PageTable, page: usize, area: &[f32; 4]) -> RectI {
+    pub fn to_pixels(&self, table: &PageTable, page: usize, area: &[f32; 4]) -> RectI {
         let (width, height) = table.size(page);
         let size = self.size_in_points(page);
         let (shown_width, shown_height) = table.turn.size(size);
@@ -956,7 +1034,7 @@ impl Reader {
         RectI::new(x0, y0, x1 - x0, y1 - y0)
     }
 
-    fn bring_into_view(&self, table: &PageTable, page: usize, area: RectI) {
+    pub fn bring_into_view(&self, table: &PageTable, page: usize, area: RectI) {
         let v = untrack(|| (self.view)());
         let (x, y) = (area.x + table.left(page), area.y + table.top(page));
         let inside_y = y >= v.y && y + area.height <= v.y + v.height;

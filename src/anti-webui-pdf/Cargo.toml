@@ -7,11 +7,14 @@ license.workspace = true
 description = "A fast PDF viewer for AntiWebUI, on hayro"
 
 [dependencies]
+kurbo.workspace = true
 libc.workspace = true
+read-fonts.workspace = true
 anti-webui-core.workspace = true
 hayro.workspace = true
 fontique.workspace = true
 log.workspace = true
+subsetter = { workspace = true }
 
 [dev-dependencies]
 anti-webui-core = { workspace = true, features = ["svg"] }

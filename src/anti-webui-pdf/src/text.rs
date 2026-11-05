@@ -548,6 +548,7 @@ impl PageText {
         if from >= to {
             return out;
         }
+        let mut was_down = None;
         let first_run = self
             .runs
             .partition_point(|r| r.first as usize <= from)
@@ -582,8 +583,10 @@ impl PageText {
                     r.bounds[3] + room,
                 ]
             };
+            let same = was_down == Some(r.down);
+            was_down = Some(r.down);
             match out.last_mut() {
-                Some(last) if on_same_line(last, &rect) => {
+                Some(last) if same && on_same_line(last, &rect, r.down) => {
                     last[0] = last[0].min(rect[0]);
                     last[1] = last[1].min(rect[1]);
                     last[2] = last[2].max(rect[2]);
@@ -652,7 +655,13 @@ impl PageText {
 }
 
 /// Whether two boxes are next to each other on a line.
-fn on_same_line(a: &[f32; 4], b: &[f32; 4]) -> bool {
+fn on_same_line(a: &[f32; 4], b: &[f32; 4], down: bool) -> bool {
+    // What goes down the page, as on one that is turned, has its lines next to each other.
+    let (a, b) = if down {
+        ([a[1], a[0], a[3], a[2]], [b[1], b[0], b[3], b[2]])
+    } else {
+        (*a, *b)
+    };
     let (ah, bh) = (a[3] - a[1], b[3] - b[1]);
     let overlap = a[3].min(b[3]) - a[1].max(b[1]);
     let gap = (b[0] - a[2]).max(a[0] - b[2]);

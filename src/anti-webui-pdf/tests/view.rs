@@ -9,8 +9,8 @@ use anti_webui_core::platform::{CursorIcon, PlatformRequest};
 use anti_webui_core::prelude::*;
 use anti_webui_core::scene::{ImageDraw, Primitive, Scene};
 use anti_webui_pdf::{
-    PdfError, PdfOutlineItem, PdfState, PdfTarget, PdfViewer, PdfZoom, pdf_thumbnails, pdf_view,
-    pdf_viewer,
+    PdfEditing, PdfError, PdfOutlineItem, PdfState, PdfTarget, PdfViewer, PdfZoom, pdf_thumbnails,
+    pdf_view, pdf_viewer,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -559,6 +559,17 @@ fn a_document_with_a_password_opens_with_it() {
     assert_eq!(viewer.page_count(), 1);
     let drawn = pictures(&mut ui);
     assert_eq!(pixel(&drawn[0], 100, 100), [255, 0, 0, 255]);
+}
+
+#[test]
+fn an_encrypted_document_shows_and_says_it_cannot_be_edited() {
+    let (mut ui, viewer, _) = encrypted_viewer();
+    settle(&mut ui);
+    viewer.unlock("hello");
+    settle(&mut ui);
+    assert_eq!(viewer.state(), PdfState::Ready);
+    assert_eq!(viewer.editing(), PdfEditing::Encrypted);
+    assert_eq!(viewer.edit_error(), None);
 }
 
 #[test]

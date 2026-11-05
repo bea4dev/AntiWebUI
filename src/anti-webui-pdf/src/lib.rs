@@ -2,22 +2,35 @@
 //! on other threads with `hayro`, and only those that show and come next. See
 //! `docs/design/26-pdf.md`.
 
+mod appearance;
 mod document;
+mod editor;
+mod edits;
+mod embed;
 mod engine;
 mod fonts;
 mod links;
+mod marks;
 mod plan;
 mod reading;
 mod text;
 mod thumbnails;
+mod writer;
 
 use anti_webui_core::channel::ui_channel;
 use anti_webui_core::event::{Key, KeyboardEvent, NamedKey, PinchPhase, ScrollEvent};
 use anti_webui_core::geometry::{PointF, RectI};
 use anti_webui_core::images::Bitmap;
 use anti_webui_core::prelude::*;
+use editor::Editor;
+pub use editor::{PdfFieldChange, PdfTool};
+use edits::Edits;
 use engine::{Engine, Event};
 pub use links::{PdfOutlineItem, PdfTarget};
+use marks::{Annot, Marks, Shape};
+pub use marks::{
+    PdfAnnotationId, PdfAnnotationKind, PdfEditing, PdfField, PdfFieldKind, PdfFieldValue,
+};
 use plan::{Direction, Have, Held, Job, PageTable, Turn};
 use reading::{BoxKind, HitPlace, Hits, Place, Reader, Selection};
 use std::cell::{Cell, RefCell};
@@ -38,6 +51,12 @@ const PINCH_RATIO: f64 = 2.0;
 const SELECTED: u32 = 0x0054b466;
 const FOUND: u32 = 0xffd60066;
 const CURRENT: u32 = 0xff8a0088;
+/// What shows on top of a field that can be filled in, as in PDF.js.
+const FIELD_TINT: u32 = 0x0036ff21;
+/// The colors of what gets added unless it is told otherwise.
+const HIGHLIGHT: u32 = 0xffd900;
+const LINE: u32 = 0xe02020;
+const TEXT: u32 = 0x000000;
 
 /// Why a document can't be shown.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,6 +151,9 @@ impl From<Arc<[u8]>> for PdfSource {
     }
 }
 
+/// How saving went: where it went, or why not.
+pub type SaveResult = Result<PathBuf, String>;
+
 /// The thumbnails there are, by page.
 type Thumbnails = HashMap<usize, (Job, Option<Arc<Bitmap>>)>;
 
@@ -166,6 +188,26 @@ pub struct PdfViewer {
     /// How many times it was asked to go to one, which shows it again even if it is the same one.
     hit_asked: Signal<u64>,
     search_done: Signal<bool>,
+    /// What the document has for filling in and marking up, once that has been read.
+    marks: Signal<Arc<Marks>>,
+    /// All that was changed, and what it was before and after each change.
+    edits: Signal<Arc<Edits>>,
+    undone: Signal<Vec<Arc<Edits>>>,
+    redone: Signal<Vec<Arc<Edits>>>,
+    /// What is in the file that was opened or saved last.
+    saved: Signal<Arc<Edits>>,
+    /// Several changes that count as one, with what it was before them.
+    next_annot: Signal<u64>,
+    tool: Signal<PdfTool>,
+    tool_color: Signal<Option<u32>>,
+    ink_width: Signal<f32>,
+    text_size: Signal<f32>,
+    selected: Signal<Option<PdfAnnotationId>>,
+    /// How many times it was asked to mark what is selected, and with what.
+    marking: Signal<(u64, PdfAnnotationKind)>,
+    save_to: Signal<Option<PathBuf>>,
+    save_result: Signal<Option<SaveResult>>,
+    edit_error: Signal<Option<String>>,
 }
 
 /// Makes what controls a [`pdf_view`], to hand it with [`PdfView::viewer`].
@@ -192,6 +234,21 @@ pub fn pdf_viewer() -> PdfViewer {
         current_hit: signal(None),
         hit_asked: signal(0),
         search_done: signal(true),
+        marks: signal(Arc::default()),
+        edits: signal(Arc::default()),
+        undone: signal(Vec::new()),
+        redone: signal(Vec::new()),
+        saved: signal(Arc::default()),
+        next_annot: signal(0),
+        tool: signal(PdfTool::Select),
+        tool_color: signal(None),
+        ink_width: signal(2.0),
+        text_size: signal(14.0),
+        selected: signal(None),
+        marking: signal((0, PdfAnnotationKind::Highlight)),
+        save_to: signal(None),
+        save_result: signal(None),
+        edit_error: signal(None),
     }
 }
 
@@ -353,11 +410,368 @@ impl PdfViewer {
     pub fn unlock(&self, password: impl Into<String>) {
         self.password.set(Some(password.into()));
     }
+
+    /// Whether the document can be edited, and otherwise why not. It shows either way.
+    pub fn editing(&self) -> PdfEditing {
+        self.marks.with(|m| m.editing)
+    }
+
+    /// Whether the document has signatures, which Acrobat says were followed by changes once it has
+    /// been edited.
+    pub fn is_signed(&self) -> bool {
+        self.marks.with(|m| m.signed)
+    }
+
+    /// The fields of its forms, in the order of the pages.
+    pub fn fields(&self) -> Vec<PdfField> {
+        self.marks
+            .with(|m| m.fields.iter().map(|f| f.info.clone()).collect())
+    }
+
+    /// What is in a field, by its whole name.
+    pub fn field_value(&self, name: &str) -> Option<PdfFieldValue> {
+        let _ = self.edits.get();
+        let at = self.field_named(name)?;
+        Some(self.field_value_at(at))
+    }
+
+    /// Fills in a field by its whole name. It says whether there is such a field. Being read only
+    /// doesn't stop this, as it is for what a person does.
+    pub fn set_field(&self, name: &str, value: PdfFieldValue) -> bool {
+        let Some(at) = self.field_named(name) else {
+            return false;
+        };
+        self.set_field_at(at, value);
+        true
+    }
+
+    /// Puts all of the fields back to what the document says they start with.
+    pub fn reset_fields(&self) {
+        let marks = self.marks.get_untracked();
+        self.batch_edits(|viewer| {
+            for (at, field) in marks.fields.iter().enumerate() {
+                viewer.set_field_at(at, field.default.clone());
+            }
+        });
+    }
+
+    fn field_named(&self, name: &str) -> Option<usize> {
+        self.marks
+            .with_untracked(|m| m.fields.iter().position(|f| f.info.name == name))
+    }
+
+    fn field_value_at(&self, at: usize) -> PdfFieldValue {
+        let edited = self.edits.with_untracked(|e| e.fields.get(&at).cloned());
+        edited.unwrap_or_else(|| self.marks.with_untracked(|m| m.fields[at].value.clone()))
+    }
+
+    /// Says what is in a field. It says whether that changed anything.
+    fn set_field_at(&self, at: usize, value: PdfFieldValue) -> bool {
+        if self.field_value_at(at) == value {
+            return false;
+        }
+        let same = self.marks.with_untracked(|m| m.fields[at].value == value);
+        self.change_edits(|edits| {
+            if same {
+                edits.fields.remove(&at);
+            } else {
+                edits.fields.insert(at, value);
+            }
+        });
+        true
+    }
+
+    /// Changes the list of edits as one thing to undo.
+    fn change_edits(&self, f: impl FnOnce(&mut Edits)) {
+        let now = self.edits.get_untracked();
+        let mut next = (*now).clone();
+        f(&mut next);
+        if next == *now {
+            return;
+        }
+        self.undone.update(|all| all.push(now));
+        self.redone.update(Vec::clear);
+        self.edits.set(Arc::new(next));
+    }
+
+    /// Makes all that a function changes one thing to undo.
+    fn batch_edits(&self, f: impl FnOnce(&Self)) {
+        let before = self.edits.get_untracked();
+        let depth = self.undone.with_untracked(Vec::len);
+        f(self);
+        if !Arc::ptr_eq(&before, &self.edits.get_untracked()) {
+            self.undone.update(|all| {
+                all.truncate(depth);
+                all.push(before);
+            });
+        }
+    }
+
+    /// Goes back on what was changed last.
+    pub fn undo(&self) {
+        let Some(last) = self.undone.with_untracked(|all| all.last().cloned()) else {
+            return;
+        };
+        self.undone.update(|all| {
+            all.pop();
+        });
+        let now = self.edits.get_untracked();
+        self.redone.update(|all| all.push(now));
+        self.selected.set_if_changed(None);
+        self.edits.set(last);
+    }
+
+    /// Goes forward again after [`Self::undo`].
+    pub fn redo(&self) {
+        let Some(last) = self.redone.with_untracked(|all| all.last().cloned()) else {
+            return;
+        };
+        self.redone.update(|all| {
+            all.pop();
+        });
+        let now = self.edits.get_untracked();
+        self.undone.update(|all| all.push(now));
+        self.selected.set_if_changed(None);
+        self.edits.set(last);
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.undone.with(|all| !all.is_empty())
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.redone.with(|all| !all.is_empty())
+    }
+
+    /// Whether anything was changed since it was opened or saved.
+    pub fn is_modified(&self) -> bool {
+        self.edits.get() != self.saved.get()
+    }
+
+    /// Writes the document as it is now to a file, on another thread: all of what it had and what
+    /// changed after that. Nothing happens to what is there if it doesn't work out.
+    /// [`Self::save_result`] says how it went.
+    pub fn save(&self, path: impl Into<PathBuf>) {
+        self.save_result.set(None);
+        self.save_to.set(Some(path.into()));
+    }
+
+    /// How the last [`Self::save`] went, once it is done.
+    pub fn save_result(&self) -> Option<SaveResult> {
+        self.save_result.get()
+    }
+
+    /// Why the last change couldn't be made, if it couldn't.
+    pub fn edit_error(&self) -> Option<String> {
+        self.edit_error.get()
+    }
+
+    pub fn tool(&self) -> PdfTool {
+        self.tool.get()
+    }
+
+    /// Says what pressing and dragging on a page does.
+    pub fn set_tool(&self, tool: PdfTool) {
+        self.tool.set_if_changed(tool);
+    }
+
+    /// The color of what gets added from here on, as `0xrrggbb`. What each kind has otherwise is
+    /// yellow for what marks text and notes, red for lines and black for text.
+    pub fn set_tool_color(&self, color: u32) {
+        self.tool_color.set(Some(color));
+    }
+
+    /// How wide the lines of [`PdfTool::Ink`] are, in points.
+    pub fn set_ink_width(&self, width: f32) {
+        self.ink_width.set(width);
+    }
+
+    /// How big the text of [`PdfTool::FreeText`] is, in points.
+    pub fn set_text_size(&self, size: f32) {
+        self.text_size.set(size);
+    }
+
+    /// Marks what is selected in yellow, or the color it was told. It takes a moment if not all of
+    /// it has been read.
+    pub fn highlight_selection(&self) {
+        self.mark_selection(PdfAnnotationKind::Highlight);
+    }
+
+    pub fn underline_selection(&self) {
+        self.mark_selection(PdfAnnotationKind::Underline);
+    }
+
+    pub fn strike_out_selection(&self) {
+        self.mark_selection(PdfAnnotationKind::StrikeOut);
+    }
+
+    fn mark_selection(&self, kind: PdfAnnotationKind) {
+        self.marking.update(|m| *m = (m.0 + 1, kind));
+    }
+
+    /// The annotation that was picked by clicking on it.
+    pub fn selected_annotation(&self) -> Option<PdfAnnotationId> {
+        self.selected.get()
+    }
+
+    /// Takes away what was picked.
+    pub fn delete_annotation(&self) {
+        let Some(id) = self.selected.get_untracked() else {
+            return;
+        };
+        self.selected.set(None);
+        self.remove_annotation(id);
+    }
+
+    /// Takes away an annotation.
+    pub fn remove_annotation(&self, id: PdfAnnotationId) {
+        let Some(mut annot) = self.annot(id) else {
+            return;
+        };
+        self.change_edits(|edits| match id {
+            PdfAnnotationId::New(_) => {
+                edits.annots.remove(&id);
+            }
+            PdfAnnotationId::Old(..) => {
+                annot.removed = true;
+                edits.annots.insert(id, annot);
+            }
+        });
+    }
+
+    /// The annotations of a page that can be picked: what it had, and what was added since.
+    pub fn annotations(&self, page: usize) -> Vec<(PdfAnnotationId, PdfAnnotationKind, String)> {
+        let _ = (self.edits.get(), self.marks.get());
+        self.annots_on(page)
+            .into_iter()
+            .map(|a| (a.id, a.kind, a.contents))
+            .collect()
+    }
+
+    fn annots_on(&self, page: usize) -> Vec<Annot> {
+        let marks = self.marks.get_untracked();
+        let edits = self.edits.get_untracked();
+        let old = marks.pages.get(page).map_or(&[][..], |p| &p.annots[..]);
+        let mut all: Vec<Annot> = old
+            .iter()
+            .map(|a| edits.annots.get(&a.id).unwrap_or(a).clone())
+            .collect();
+        all.extend(
+            edits
+                .annots
+                .values()
+                .filter(|a| a.page == page && matches!(a.id, PdfAnnotationId::New(_)))
+                .cloned(),
+        );
+        all.retain(|a| !a.removed);
+        all
+    }
+
+    fn annot(&self, id: PdfAnnotationId) -> Option<Annot> {
+        if let Some(annot) = self.edits.with_untracked(|e| e.annots.get(&id).cloned()) {
+            return (!annot.removed).then_some(annot);
+        }
+        let PdfAnnotationId::Old(page, _) = id else {
+            return None;
+        };
+        self.marks.with_untracked(|m| {
+            m.pages
+                .get(page)?
+                .annots
+                .iter()
+                .find(|a| a.id == id)
+                .cloned()
+        })
+    }
+
+    fn change_annot(&self, annot: Annot) {
+        let original = self.marks.with_untracked(|m| {
+            m.pages
+                .get(annot.page)
+                .and_then(|p| p.annots.iter().find(|a| a.id == annot.id).cloned())
+        });
+        self.change_edits(|edits| {
+            if original.as_ref() == Some(&annot) {
+                edits.annots.remove(&annot.id);
+            } else {
+                edits.annots.insert(annot.id, annot);
+            }
+        });
+    }
+
+    fn add_annot(
+        &self,
+        page: usize,
+        kind: PdfAnnotationKind,
+        rect: [f64; 4],
+        color: [f32; 3],
+        shape: Shape,
+        contents: String,
+    ) -> PdfAnnotationId {
+        let number = self.next_annot.get_untracked() + 1;
+        self.next_annot.set(number);
+        let id = PdfAnnotationId::New(number);
+        let annot = Annot {
+            id,
+            page,
+            kind,
+            rect,
+            contents,
+            color,
+            shape: Arc::new(shape),
+            removed: false,
+            date: pdf_date(std::time::SystemTime::now()),
+        };
+        self.change_edits(|edits| {
+            edits.annots.insert(id, annot);
+        });
+        id
+    }
+
+    /// The color something gets with a tool, as parts from 0 to 1.
+    fn color_for(&self, tool: PdfTool) -> [f32; 3] {
+        let color = self.tool_color.get_untracked().unwrap_or(match tool {
+            PdfTool::Highlight | PdfTool::Note | PdfTool::Select => HIGHLIGHT,
+            PdfTool::Underline | PdfTool::StrikeOut | PdfTool::Ink => LINE,
+            PdfTool::FreeText => TEXT,
+        });
+        [
+            ((color >> 16) & 0xff) as f32 / 255.0,
+            ((color >> 8) & 0xff) as f32 / 255.0,
+            (color & 0xff) as f32 / 255.0,
+        ]
+    }
+}
+
+/// A moment as a PDF writes it, in UTC.
+fn pdf_date(at: std::time::SystemTime) -> String {
+    let seconds = at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs()) as i64;
+    let days = seconds.div_euclid(86400);
+    let left = seconds.rem_euclid(86400);
+    // Days to a date in the calendar, as Howard Hinnant's `civil_from_days` has it.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    format!(
+        "D:{year:04}{month:02}{day:02}{:02}{:02}{:02}Z",
+        left / 3600,
+        left / 60 % 60,
+        left % 60
+    )
 }
 
 type ErrorListener = Rc<dyn Fn(&PdfError)>;
 type PageErrorListener = Rc<dyn Fn(usize)>;
 pub(crate) type UrlListener = Rc<dyn Fn(&str)>;
+pub(crate) type FieldListener = Rc<dyn Fn(&PdfFieldChange)>;
 
 /// A document in a box that scrolls. See [`pdf_view`].
 pub struct PdfView {
@@ -367,6 +781,8 @@ pub struct PdfView {
     on_error: Option<ErrorListener>,
     on_page_error: Option<PageErrorListener>,
     on_link: Option<UrlListener>,
+    on_field_change: Option<FieldListener>,
+    field_tint: Option<Color>,
     page_style: Option<Rc<dyn Fn(Style) -> Style>>,
     gap: f32,
     workers: usize,
@@ -393,6 +809,8 @@ pub fn pdf_view(source: impl Into<PdfSource>) -> PdfView {
         on_error: None,
         on_page_error: None,
         on_link: None,
+        on_field_change: None,
+        field_tint: Some(Color::from_rgba(FIELD_TINT)),
         page_style: None,
         gap: 8.0,
         workers: 2,
@@ -428,6 +846,20 @@ impl PdfView {
     /// it unless this does: documents can link to anything. Links within the document just go there.
     pub fn on_link(mut self, f: impl Fn(&str) + 'static) -> Self {
         self.on_link = Some(Rc::new(f));
+        self
+    }
+
+    /// Called when someone changes what is in a field. What is changed by [`PdfViewer::set_field`]
+    /// and by going back doesn't count.
+    pub fn on_field_change(mut self, f: impl Fn(&PdfFieldChange) + 'static) -> Self {
+        self.on_field_change = Some(Rc::new(f));
+        self
+    }
+
+    /// What shows on top of the fields that can be filled in, if anything: a light blue unless this
+    /// says otherwise.
+    pub fn field_tint(mut self, tint: Option<Color>) -> Self {
+        self.field_tint = tint;
         self
     }
 
@@ -467,6 +899,8 @@ impl IntoView for PdfView {
         let on_error = self.on_error;
         let on_page_error = self.on_page_error;
         let on_link = self.on_link;
+        let on_field_change = self.on_field_change;
+        let field_tint = self.field_tint;
 
         let pages = viewer.pages;
         let pinching = signal(false);
@@ -475,6 +909,10 @@ impl IntoView for PdfView {
         let parts = signal(HashMap::<usize, (Job, Arc<Bitmap>)>::new());
         let failed = signal(HashSet::<usize>::new());
         let failed_parts = signal(HashSet::<usize>::new());
+        // The pictures that show what a page was before it was changed, until the new ones come.
+        let stale = signal(HashSet::<usize>::new());
+        let stale_parts = signal(HashSet::<usize>::new());
+        let shown_edits = signal(Arc::<Edits>::default());
         // The pages the last plan wants to have a picture.
         let keep = Rc::new(RefCell::new(Vec::<usize>::new()));
         let viewport = signal((0.0f32, 0.0f32));
@@ -613,16 +1051,90 @@ impl IntoView for PdfView {
             on_link,
             engine.clone(),
         );
+        let editor = Editor::new(
+            viewer,
+            reader.clone(),
+            table,
+            on_field_change,
+            field_tint,
+            stale,
+            shown_edits,
+        );
+        {
+            // Not the editor itself, which already has the reader.
+            let editor = Rc::downgrade(&editor);
+            reader.set_marker(Rc::new(move |kind, pages| {
+                if let Some(editor) = editor.upgrade() {
+                    editor.mark(kind, pages);
+                }
+            }));
+        }
 
         // What comes back from the workers. A picture at another size than is wanted now only helps
         // a page that has nothing to show.
+        // What the file gets when it is saved.
+        let saving = signal(Arc::<Edits>::default());
         let out = {
             let on_error = on_error.clone();
             let keep = keep.clone();
             let reader = reader.clone();
+            let engine = engine.clone();
             ui_channel(move |event: Event| match event {
                 Event::Text(page, text) => reader.text_arrived(page, text),
                 Event::Outline(outline) => viewer.outline.set(Rc::new(outline)),
+                Event::Marks(marks) => {
+                    let needs_looks = marks.needs_looks() && marks.editing == PdfEditing::Yes;
+                    viewer.marks.set(marks);
+                    if needs_looks && let Some(engine) = &*engine.borrow() {
+                        engine.edit(viewer.edits.get_untracked());
+                    }
+                }
+                Event::Edited(edits) => {
+                    let marks = viewer.marks.get_untracked();
+                    let before = shown_edits.get_untracked();
+                    // What it made without being asked to shows on the pages that have it.
+                    let mut changed = edits.pages_changed_from(&before, &marks);
+                    if before.is_empty() && edits.is_empty() {
+                        changed.extend(
+                            marks
+                                .fields
+                                .iter()
+                                .filter(|f| f.needs_look)
+                                .flat_map(|f| f.widgets.iter().map(|w| w.0)),
+                        );
+                    }
+                    pictures.with_untracked(|all| {
+                        stale.update(|s| {
+                            s.extend(changed.iter().filter(|p| all.contains_key(p)).copied());
+                        });
+                    });
+                    parts.with_untracked(|all| {
+                        stale_parts.update(|s| {
+                            s.extend(changed.iter().filter(|p| all.contains_key(p)).copied());
+                        });
+                    });
+                    viewer.thumbnails.update(|all| {
+                        for page in &changed {
+                            all.remove(page);
+                        }
+                    });
+                    failed.update(|f| f.retain(|p| !changed.contains(p)));
+                    failed_parts.update(|f| f.retain(|p| !changed.contains(p)));
+                    reader.forget_text(&changed);
+                    shown_edits.set(edits);
+                }
+                Event::NotEdited(e) => {
+                    log::warn!("couldn't edit a PDF: {e}");
+                    viewer.edit_error.set(Some(e));
+                    // What was typed doesn't stay up for what won't come.
+                    shown_edits.set(viewer.edits.get_untracked());
+                }
+                Event::Saved(path, result) => {
+                    viewer.save_result.set(Some(result.map(|()| path)));
+                    if matches!(viewer.save_result.get_untracked(), Some(Ok(_))) {
+                        viewer.saved.set(saving.with_untracked(Clone::clone));
+                    }
+                }
                 Event::Opened(sizes) => {
                     viewer.count.set(sizes.len());
                     pages.set(Rc::new(sizes));
@@ -637,11 +1149,17 @@ impl IntoView for PdfView {
                 Event::NotDrawn(job) => {
                     log::warn!("couldn't draw page {} of a PDF", job.page + 1);
                     if job.area.is_some() {
+                        stale_parts.update(|s| {
+                            s.remove(&job.page);
+                        });
                         failed_parts.update(|f| {
                             f.insert(job.page);
                         });
                         return;
                     }
+                    stale.update(|s| {
+                        s.remove(&job.page);
+                    });
                     failed.update(|f| {
                         f.insert(job.page);
                     });
@@ -667,7 +1185,10 @@ impl IntoView for PdfView {
                     let size = t.size(job.page);
                     if job.area.is_some() {
                         let shown = t.shown(job.page, v);
-                        let current = parts.with_untracked(|all| all.get(&job.page).map(|p| p.0));
+                        // A picture of what the page was has nothing on one of what it is.
+                        let current = parts
+                            .with_untracked(|all| all.get(&job.page).map(|p| p.0))
+                            .filter(|_| !stale_parts.with_untracked(|s| s.contains(&job.page)));
                         if !plan::part_is_of_use(&t, &job, v)
                             || !plan::takes_over(&job, current.as_ref(), size, shown)
                         {
@@ -675,6 +1196,9 @@ impl IntoView for PdfView {
                         }
                         parts.update(|all| {
                             all.insert(job.page, (job, bitmap));
+                        });
+                        stale_parts.update(|s| {
+                            s.remove(&job.page);
                         });
                     } else {
                         let right = plan::is_right_size(size, job.size());
@@ -694,6 +1218,9 @@ impl IntoView for PdfView {
                         }
                         pictures.update(|all| {
                             all.insert(job.page, bitmap);
+                        });
+                        stale.update(|s| {
+                            s.remove(&job.page);
                         });
                     }
                     // The parts show, so only the rest of the budget is for the whole pictures.
@@ -748,6 +1275,47 @@ impl IntoView for PdfView {
         {
             let engine = engine.clone();
             on_cleanup(move || *engine.borrow_mut() = None);
+        }
+
+        // Whatever changes, the document gets made again with all of it.
+        {
+            let engine = engine.clone();
+            let asked = RefCell::new(viewer.edits.get_untracked());
+            effect(move || {
+                let edits = viewer.edits.get();
+                if Arc::ptr_eq(&edits, &asked.borrow()) {
+                    return;
+                }
+                *asked.borrow_mut() = edits.clone();
+                viewer.edit_error.set_if_changed(None);
+                if let Some(engine) = &*engine.borrow() {
+                    engine.edit(edits);
+                }
+            });
+        }
+        {
+            let engine = engine.clone();
+            effect(move || {
+                let Some(path) = viewer.save_to.get() else {
+                    return;
+                };
+                let edits = untrack(|| viewer.edits.get());
+                saving.set(edits.clone());
+                if let Some(engine) = &*engine.borrow() {
+                    engine.save(edits, path);
+                }
+                viewer.save_to.set(None);
+            });
+        }
+        {
+            let reader = reader.clone();
+            let asked = Cell::new(0);
+            effect(move || {
+                let (count, kind) = viewer.marking.get();
+                if asked.replace(count) != count {
+                    untrack(|| reader.mark_selection(kind));
+                }
+            });
         }
 
         // Pictures can't be used turned. As in Chromium and PDF.js, the pages are white until they
@@ -816,6 +1384,7 @@ impl IntoView for PdfView {
                 let t = table.get();
                 let v = view();
                 let pinching = pinching.get();
+                let (stale, stale_parts) = (stale.get(), stale_parts.get());
                 let plan = failed.with(|failed| {
                     failed_parts.with(|failed_parts| {
                         pictures.with(|have| {
@@ -829,6 +1398,9 @@ impl IntoView for PdfView {
                                         whole: |page| {
                                             if failed.contains(&page) {
                                                 return Some(plan::picture_size(t.size(page)));
+                                            }
+                                            if stale.contains(&page) {
+                                                return None;
                                             }
                                             let size =
                                                 have.get(&page).map(|b| (b.width(), b.height()));
@@ -844,7 +1416,12 @@ impl IntoView for PdfView {
                                                 size => size,
                                             }
                                         },
-                                        part: |page| parts.get(&page).map(|p| p.0),
+                                        part: |page| {
+                                            parts
+                                                .get(&page)
+                                                .map(|p| p.0)
+                                                .filter(|_| !stale_parts.contains(&page))
+                                        },
                                         gave_up: |page| pinching || failed_parts.contains(&page),
                                     },
                                     &mut goals.borrow_mut(),
@@ -901,59 +1478,68 @@ impl IntoView for PdfView {
             }
         };
 
-        let on_key = move |e: &KeyboardEvent| {
-            let scale = untrack(window_scale);
-            let at = scroller.scroll_offset();
-            let height = viewport.get_untracked().1;
-            let total = scale.to_logical(table.with(|t| t.height) as f32);
-            if e.modifiers.ctrl {
-                match &e.key {
-                    Key::Character(c) if c == "=" || c == "+" => viewer.zoom_by(1.25),
-                    Key::Character(c) if c == "-" => viewer.zoom_by(0.8),
-                    Key::Character(c) if c == "0" => viewer.set_zoom(PdfZoom::FitWidth),
-                    // As in Chromium's viewer.
-                    Key::Character(c) if c == "]" => viewer.rotate_clockwise(),
-                    Key::Character(c) if c == "[" => viewer.rotate_counterclockwise(),
-                    // Otherwise the text of the application would get these too.
-                    Key::Character(c)
-                        if c.eq_ignore_ascii_case("c")
-                            && viewer.selection.get_untracked().is_some() =>
-                    {
-                        viewer.copy();
-                        e.prevent_default();
-                    }
-                    Key::Character(c) if c.eq_ignore_ascii_case("a") => {
-                        viewer.select_all();
-                        e.prevent_default();
-                    }
-                    _ => return,
+        let on_key = {
+            let editor = editor.clone();
+            move |e: &KeyboardEvent| {
+                if editor.key(e) {
+                    return;
                 }
-                e.stop_propagation();
-                return;
-            }
-            let y = match &e.key {
-                Key::Named(NamedKey::PageDown) => at.y + height * 0.9,
-                Key::Named(NamedKey::PageUp) => at.y - height * 0.9,
-                Key::Named(NamedKey::ArrowDown) => at.y + 40.0,
-                Key::Named(NamedKey::ArrowUp) => at.y - 40.0,
-                Key::Named(NamedKey::Home) => 0.0,
-                Key::Named(NamedKey::End) => total,
-                Key::Named(NamedKey::Escape) if viewer.selection.get_untracked().is_some() => {
-                    viewer.clear_selection();
+                let scale = untrack(window_scale);
+                let at = scroller.scroll_offset();
+                let height = viewport.get_untracked().1;
+                let total = scale.to_logical(table.with(|t| t.height) as f32);
+                if e.modifiers.ctrl {
+                    match &e.key {
+                        Key::Character(c) if c == "=" || c == "+" => viewer.zoom_by(1.25),
+                        Key::Character(c) if c == "-" => viewer.zoom_by(0.8),
+                        Key::Character(c) if c == "0" => viewer.set_zoom(PdfZoom::FitWidth),
+                        // As in Chromium's viewer.
+                        Key::Character(c) if c == "]" => viewer.rotate_clockwise(),
+                        Key::Character(c) if c == "[" => viewer.rotate_counterclockwise(),
+                        // Otherwise the text of the application would get these too.
+                        Key::Character(c)
+                            if c.eq_ignore_ascii_case("c")
+                                && viewer.selection.get_untracked().is_some() =>
+                        {
+                            viewer.copy();
+                            e.prevent_default();
+                        }
+                        Key::Character(c) if c.eq_ignore_ascii_case("a") => {
+                            viewer.select_all();
+                            e.prevent_default();
+                        }
+                        _ => return,
+                    }
                     e.stop_propagation();
                     return;
                 }
-                _ => return,
-            };
-            scroller.scroll_to(at.x, y);
-            e.stop_propagation();
+                let y = match &e.key {
+                    Key::Named(NamedKey::PageDown) => at.y + height * 0.9,
+                    Key::Named(NamedKey::PageUp) => at.y - height * 0.9,
+                    Key::Named(NamedKey::ArrowDown) => at.y + 40.0,
+                    Key::Named(NamedKey::ArrowUp) => at.y - 40.0,
+                    Key::Named(NamedKey::Home) => 0.0,
+                    Key::Named(NamedKey::End) => total,
+                    Key::Named(NamedKey::Escape) if viewer.selection.get_untracked().is_some() => {
+                        viewer.clear_selection();
+                        e.stop_propagation();
+                        return;
+                    }
+                    _ => return,
+                };
+                scroller.scroll_to(at.x, y);
+                e.stop_propagation();
+            }
         };
 
         let page_view = {
             let reader = reader.clone();
+            let editor = editor.clone();
             move |page: usize| {
                 let page_style = page_style.clone();
                 let reader = reader.clone();
+                let editor = editor.clone();
+                let tint = editor.tint();
                 div()
                     .absolute()
                     // Pages go while the button is held when selecting past the edge of the box, and
@@ -1013,13 +1599,18 @@ impl IntoView for PdfView {
                         },
                     ))
                     .child(for_each(
-                        move || reader.boxes(page),
+                        move || {
+                            let mut boxes = editor.field_boxes(page);
+                            boxes.extend(reader.boxes(page));
+                            boxes
+                        },
                         |b| *b,
-                        |b| {
+                        move |b| {
                             let color = match b.kind {
-                                BoxKind::Selected => SELECTED,
-                                BoxKind::Found => FOUND,
-                                BoxKind::Current => CURRENT,
+                                BoxKind::Selected => Color::from_rgba(SELECTED),
+                                BoxKind::Found => Color::from_rgba(FOUND),
+                                BoxKind::Current => Color::from_rgba(CURRENT),
+                                BoxKind::Field => tint,
                             };
                             div()
                                 .absolute()
@@ -1027,7 +1618,7 @@ impl IntoView for PdfView {
                                 .top(Length::Device(b.y))
                                 .w(Length::Device(b.width))
                                 .h(Length::Device(b.height))
-                                .bg(Color::from_rgba(color))
+                                .bg(color)
                         },
                     ))
             }
@@ -1050,18 +1641,37 @@ impl IntoView for PdfView {
             })
             .on_pointer_down({
                 let reader = reader.clone();
-                move |e| reader.pointer_down(e)
+                let editor = editor.clone();
+                move |e| {
+                    if !editor.pointer_down(e) {
+                        reader.pointer_down(e);
+                    }
+                }
             })
             .on_pointer_up({
                 let reader = reader.clone();
-                move |e| reader.pointer_up(e)
+                let editor = editor.clone();
+                move |e| {
+                    let taken = editor.is_pressed();
+                    if !taken {
+                        reader.pointer_up(e);
+                    }
+                    editor.pointer_up(e);
+                }
             })
             .on_pointer_move({
                 let pointer = pointer.clone();
                 let reader = reader.clone();
+                let editor = editor.clone();
                 move |e| {
                     pointer.set(Some((e.local.x as i32, e.local.y as i32)));
+                    if editor.pointer_moved(e) {
+                        return;
+                    }
                     reader.pointer_moved(e);
+                    if let Some(cursor) = editor.cursor_at(e) {
+                        reader.cursor.set_if_changed(cursor);
+                    }
                 }
             })
             .on_hover(move |inside| {
@@ -1092,7 +1702,8 @@ impl IntoView for PdfView {
                         },
                         |page| *page,
                         page_view,
-                    )),
+                    ))
+                    .child(editor.layer()),
             )
             .into_view()
     }

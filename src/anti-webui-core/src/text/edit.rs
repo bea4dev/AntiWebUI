@@ -182,6 +182,13 @@ impl EditData {
         self.bump();
     }
 
+    /// Puts the caret after all of the text.
+    pub fn caret_to_end(&mut self) {
+        self.anchor = self.text.len();
+        self.focus = self.text.len();
+        self.scroll_to_caret = true;
+    }
+
     pub fn selection_range(&self) -> (usize, usize) {
         (self.anchor.min(self.focus), self.anchor.max(self.focus))
     }

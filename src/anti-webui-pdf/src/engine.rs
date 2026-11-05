@@ -3,7 +3,9 @@
 //! are dropped: nothing can stop a page that is being drawn. See `docs/design/26-pdf.md`.
 
 use crate::PdfError;
+use crate::edits::Edits;
 use crate::links::PdfOutlineItem;
+use crate::marks::Marks;
 use crate::plan::Job;
 use crate::text::PageText;
 use anti_webui_core::channel::{UiSender, UiWork};
@@ -11,6 +13,7 @@ use anti_webui_core::geometry::RectI;
 use anti_webui_core::images::Bitmap;
 use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -30,6 +33,21 @@ pub(crate) trait Document: Send + Sync + 'static {
     /// What it has for a table of contents. It is read once, after opening.
     fn outline(&self) -> Vec<PdfOutlineItem> {
         Vec::new()
+    }
+
+    /// The fields and the annotations it has. It is read once, after opening.
+    fn marks(&self) -> Arc<Marks> {
+        Arc::default()
+    }
+
+    /// The same document as it was opened with edits made to it.
+    fn edited(self: Arc<Self>, _: &Edits) -> Result<Arc<dyn Document>, String> {
+        Err("this document can't be edited".to_owned())
+    }
+
+    /// What a file of the document with edits made to it has in it.
+    fn saved(&self, _: &Edits) -> Result<Vec<u8>, String> {
+        Err("this document can't be saved".to_owned())
     }
 }
 
@@ -70,6 +88,13 @@ pub(crate) enum Event {
     /// The text of a page, which there is none of if reading it panicked.
     Text(usize, Arc<PageText>),
     Outline(Vec<PdfOutlineItem>),
+    Marks(Arc<Marks>),
+    /// From here on everything is of the document with these edits.
+    Edited(Arc<Edits>),
+    /// The edits couldn't be made, with why.
+    NotEdited(String),
+    /// A file was written, or why not.
+    Saved(PathBuf, Result<(), String>),
 }
 
 /// What a worker does.
@@ -84,6 +109,8 @@ enum Work {
 /// What a worker is on.
 struct Running {
     work: Work,
+    /// Which version of the document it is for.
+    version: u64,
     /// Since when it hasn't been wanted, or something else has been more. Text doesn't take long
     /// enough for this to matter.
     unwanted: Option<Instant>,
@@ -91,6 +118,12 @@ struct Running {
 
 struct State {
     doc: Option<Arc<dyn Document>>,
+    /// How many times `doc` was replaced.
+    version: u64,
+    /// The edits to make next, of which only the last matters as each says all of them.
+    edits: Option<Arc<Edits>>,
+    /// A thread is making edits.
+    editing: bool,
     wanted: Vec<Job>,
     /// What shows with the pointer, which comes before everything else.
     cut_outs: Vec<Arc<CutOut>>,
@@ -155,9 +188,9 @@ impl Shared {
 
     /// Starts as many workers as what is wanted can use.
     fn hire(self: &Arc<Self>, state: &mut State) {
-        let Some(doc) = state.doc.clone() else {
+        if state.doc.is_none() {
             return;
-        };
+        }
         let wanted = state.wanted.len()
             + state.cut_outs.len()
             + state.thumbnails.len()
@@ -170,10 +203,9 @@ impl Shared {
         for _ in 0..hires {
             state.workers += 1;
             let shared = self.clone();
-            let doc = doc.clone();
             let started = std::thread::Builder::new()
                 .name("pdf".into())
-                .spawn(move || work(&shared, &*doc));
+                .spawn(move || work(&shared));
             if let Err(e) = started {
                 log::warn!("can't start a thread to draw PDF pages: {e}");
                 state.workers -= 1;
@@ -199,16 +231,16 @@ impl Shared {
         if state.standing_by || state.workers >= most || Self::stuck_since(state).is_none() {
             return;
         }
-        let Some(doc) = state.doc.clone() else {
+        if state.doc.is_none() {
             return;
-        };
+        }
         state.standing_by = true;
         let shared = self.clone();
         let started = std::thread::Builder::new()
             .name("pdf".into())
             .spawn(move || {
                 if shared.wait_until_stuck() {
-                    work(&shared, &*doc);
+                    work(&shared);
                 }
             });
         if let Err(e) = started {
@@ -243,7 +275,7 @@ impl Shared {
     }
 
     fn settle(&self, state: &mut State) {
-        if state.nothing_wanted() && state.running.is_empty() {
+        if state.nothing_wanted() && state.running.is_empty() && !state.editing {
             state.work = None;
         } else if state.work.is_none() {
             state.work = Some(self.out.work());
@@ -251,41 +283,67 @@ impl Shared {
     }
 }
 
-/// A worker: sessions one after the other, of which there is only more than one after a panic.
-fn work(shared: &Shared, doc: &dyn Document) {
+/// How a session ended.
+enum Ended {
+    /// There is nothing more for this worker to do.
+    Left,
+    /// There is another version of the document to do it with.
+    NewVersion,
+}
+
+/// A worker: sessions one after the other, of which there is only more than one after a panic or
+/// when the document changes.
+fn work(shared: &Shared) {
     loop {
+        let Some((doc, version)) = ({
+            let state = shared.lock();
+            state.doc.clone().map(|doc| (doc, state.version))
+        }) else {
+            shared.lock().workers -= 1;
+            return;
+        };
         let mut current = None;
-        let done = catch_unwind(AssertUnwindSafe(|| session(shared, doc, &mut current)));
-        if done.is_ok() {
-            // What it kept is small pieces, which `malloc` wouldn't give back by itself.
-            #[cfg(all(target_os = "linux", target_env = "gnu"))]
-            // SAFETY: this takes no pointers and only touches what `malloc` has free.
-            unsafe {
-                libc::malloc_trim(0);
+        let ended = catch_unwind(AssertUnwindSafe(|| {
+            session(shared, &*doc, version, &mut current)
+        }));
+        match ended {
+            Ok(Ended::Left) => {
+                // What it kept is small pieces, which `malloc` wouldn't give back by itself.
+                #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                // SAFETY: this takes no pointers and only touches what `malloc` has free.
+                unsafe {
+                    libc::malloc_trim(0);
+                }
+                return;
             }
-            break;
+            Ok(Ended::NewVersion) => continue,
+            Err(_) => {}
         }
         let Some(work) = current else {
             continue;
         };
         let mut state = shared.lock();
-        if let Work::Text(page) = work {
-            state.text_sent.insert(page);
+        if version == state.version {
+            if let Work::Text(page) = work {
+                state.text_sent.insert(page);
+            }
+            match &work {
+                Work::Draw(job) => shared.out.send(Event::NotDrawn(*job)),
+                Work::Thumbnail(job) => shared.out.send(Event::Thumbnail(*job, None)),
+                Work::Text(page) => shared.out.send(Event::Text(*page, Arc::default())),
+                // It only shows for as long as it is dragged.
+                Work::CutOut(_) => {}
+            }
         }
-        match &work {
-            Work::Draw(job) => shared.out.send(Event::NotDrawn(*job)),
-            Work::Thumbnail(job) => shared.out.send(Event::Thumbnail(*job, None)),
-            Work::Text(page) => shared.out.send(Event::Text(*page, Arc::default())),
-            // It only shows for as long as it is dragged.
-            Work::CutOut(_) => {}
-        }
-        state.running.retain(|r| r.work != work);
+        state
+            .running
+            .retain(|r| r.work != work || r.version != version);
         shared.settle(&mut state);
     }
 }
 
 /// Draws until there has been nothing to do for a while.
-fn session(shared: &Shared, doc: &dyn Document, current: &mut Option<Work>) {
+fn session(shared: &Shared, doc: &dyn Document, version: u64, current: &mut Option<Work>) -> Ended {
     let mut session = doc.session();
     let mut first = true;
     loop {
@@ -297,11 +355,15 @@ fn session(shared: &Shared, doc: &dyn Document, current: &mut Option<Work>) {
                 let extra = state.workers > shared.max_workers;
                 if state.stopped || (extra && (!first || state.nothing_wanted())) {
                     state.workers -= 1;
-                    return;
+                    return Ended::Left;
+                }
+                if state.version != version {
+                    return Ended::NewVersion;
                 }
                 if let Some(work) = state.next_work() {
                     state.running.push(Running {
                         work: work.clone(),
+                        version,
                         unwanted: None,
                     });
                     first = false;
@@ -316,7 +378,7 @@ fn session(shared: &Shared, doc: &dyn Document, current: &mut Option<Work>) {
                 state.idle -= 1;
                 if timeout.timed_out() && state.nothing_wanted() {
                     state.workers -= 1;
-                    return;
+                    return Ended::Left;
                 }
             }
         };
@@ -332,12 +394,50 @@ fn session(shared: &Shared, doc: &dyn Document, current: &mut Option<Work>) {
         };
         *current = None;
         let mut state = shared.lock();
-        if let Work::Text(page) = work {
-            state.text_sent.insert(page);
+        // Under the lock, so that nothing of an old version comes after saying there is a new one.
+        if state.version == version {
+            if let Work::Text(page) = work {
+                state.text_sent.insert(page);
+            }
+            shared.out.send(event);
         }
-        shared.out.send(event);
-        state.running.retain(|r| r.work != work);
+        state
+            .running
+            .retain(|r| r.work != work || r.version != version);
         shared.settle(&mut state);
+    }
+}
+
+/// Makes the edits that were asked for until there are none left.
+fn make_edits(shared: &Shared) {
+    loop {
+        let (doc, edits) = {
+            let mut state = shared.lock();
+            let doc = state.doc.clone();
+            match (doc, state.edits.take()) {
+                (Some(doc), Some(edits)) if !state.stopped => (doc, edits),
+                _ => {
+                    state.editing = false;
+                    shared.settle(&mut state);
+                    return;
+                }
+            }
+        };
+        let edited = catch_unwind(AssertUnwindSafe(|| doc.edited(&edits)))
+            .unwrap_or_else(|_| Err("making the edits panicked".to_owned()));
+        let mut state = shared.lock();
+        match edited {
+            Ok(doc) => {
+                state.doc = Some(doc);
+                state.version += 1;
+                // What these were for won't come.
+                state.text_sent.clear();
+                shared.out.send(Event::Edited(edits));
+            }
+            Err(e) => shared.out.send(Event::NotEdited(e)),
+        }
+        drop(state);
+        shared.changed.notify_all();
     }
 }
 
@@ -357,6 +457,9 @@ impl Engine {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 doc: None,
+                version: 0,
+                edits: None,
+                editing: false,
                 wanted: Vec::new(),
                 cut_outs: Vec::new(),
                 thumbnails: Vec::new(),
@@ -392,6 +495,8 @@ impl Engine {
                         // After the first pictures are on their way, as it can take a while.
                         let outline = catch_unwind(AssertUnwindSafe(|| doc.outline()));
                         thread.out.send(Event::Outline(outline.unwrap_or_default()));
+                        let marks = catch_unwind(AssertUnwindSafe(|| doc.marks()));
+                        thread.out.send(Event::Marks(marks.unwrap_or_default()));
                     }
                     Err(e) => thread.out.send(Event::Failed(e)),
                 }
@@ -409,9 +514,10 @@ impl Engine {
     pub fn want(&self, jobs: Vec<Job>) {
         let mut state = self.shared.lock();
         let now = Instant::now();
+        let version = state.version;
         for running in &mut state.running {
             let wanted = match &running.work {
-                Work::Draw(job) => jobs.contains(job),
+                Work::Draw(job) => running.version == version && jobs.contains(job),
                 // There is something better to do than this, however much it is wanted.
                 Work::Thumbnail(_) => jobs.is_empty(),
                 Work::Text(_) | Work::CutOut(_) => continue,
@@ -423,7 +529,12 @@ impl Engine {
             }
         }
         let mut wanted = jobs;
-        wanted.retain(|job| !state.running.iter().any(|r| r.work == Work::Draw(*job)));
+        wanted.retain(|job| {
+            !state
+                .running
+                .iter()
+                .any(|r| r.version == version && r.work == Work::Draw(*job))
+        });
         if state.wanted == wanted {
             self.shared.stand_by(&mut state);
             return;
@@ -439,12 +550,13 @@ impl Engine {
     /// Says what thumbnails are wanted, most urgent first, instead of what was wanted before.
     pub fn want_thumbnails(&self, jobs: Vec<Job>) {
         let mut state = self.shared.lock();
+        let version = state.version;
         let mut wanted = jobs;
         wanted.retain(|job| {
             !state
                 .running
                 .iter()
-                .any(|r| r.work == Work::Thumbnail(*job))
+                .any(|r| r.version == version && r.work == Work::Thumbnail(*job))
         });
         if state.thumbnails == wanted {
             return;
@@ -475,7 +587,10 @@ impl Engine {
             let mut pages = pages;
             pages.retain(|&page| {
                 !state.text_sent.contains(&page)
-                    && !state.running.iter().any(|r| r.work == Work::Text(page))
+                    && !state
+                        .running
+                        .iter()
+                        .any(|r| r.version == state.version && r.work == Work::Text(page))
             });
             pages
         };
@@ -498,6 +613,53 @@ impl Engine {
         self.shared.lock().text_sent.remove(&page);
     }
 
+    /// Replaces the document with the one that was opened with these edits, on another thread, and
+    /// says so with [`Event::Edited`].
+    pub fn edit(&self, edits: Arc<Edits>) {
+        let mut state = self.shared.lock();
+        state.edits = Some(edits);
+        if !state.editing {
+            state.editing = true;
+            let shared = self.shared.clone();
+            let started = std::thread::Builder::new()
+                .name("pdf edits".into())
+                .spawn(move || make_edits(&shared));
+            if let Err(e) = started {
+                state.editing = false;
+                state.edits = None;
+                self.shared.out.send(Event::NotEdited(e.to_string()));
+            }
+        }
+        self.shared.settle(&mut state);
+    }
+
+    /// Writes the document with these edits to a file, on another thread. It first goes to another
+    /// file next to it, so that nothing happens to what is there when it doesn't work out.
+    pub fn save(&self, edits: Arc<Edits>, path: PathBuf) {
+        let state = self.shared.lock();
+        let Some(doc) = state.doc.clone() else {
+            self.shared
+                .out
+                .send(Event::Saved(path, Err("it isn't open yet".to_owned())));
+            return;
+        };
+        let out = self.shared.out.clone();
+        let work = self.shared.out.work();
+        let target = path.clone();
+        let started = std::thread::Builder::new()
+            .name("pdf save".into())
+            .spawn(move || {
+                let saved = catch_unwind(AssertUnwindSafe(|| doc.saved(&edits)))
+                    .unwrap_or_else(|_| Err("saving panicked".to_owned()))
+                    .and_then(|bytes| write_file(&target, &bytes));
+                out.send(Event::Saved(target, saved));
+                drop(work);
+            });
+        if let Err(e) = started {
+            self.shared.out.send(Event::Saved(path, Err(e.to_string())));
+        }
+    }
+
     /// Lets the workers go. Those drawing finish that first.
     pub fn stop(&self) {
         let mut state = self.shared.lock();
@@ -511,6 +673,25 @@ impl Engine {
         drop(state);
         self.shared.changed.notify_all();
     }
+}
+
+/// Writes a file so that it is there as a whole or not at all.
+fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.part", std::process::id()));
+    let part = path.with_file_name(name);
+    let written = std::fs::write(&part, bytes).and_then(|()| {
+        // A file keeps what others may do with it.
+        if let Ok(old) = std::fs::metadata(path) {
+            let _ = std::fs::set_permissions(&part, old.permissions());
+        }
+        std::fs::rename(&part, path)
+    });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&part);
+        return Err(e.to_string());
+    }
+    Ok(())
 }
 
 impl Drop for Engine {

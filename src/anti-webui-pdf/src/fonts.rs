@@ -8,7 +8,7 @@ use fontique::{
 use hayro::hayro_interpret::FontResolverFn;
 use hayro::hayro_interpret::font::{FontData, FontQuery, StandardFont};
 use hayro::hayro_interpret::hayro_cmap::CidFamily;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 
 const SERIF_JA: &[&str] = &[
@@ -196,4 +196,39 @@ fn resolve(query: &FontQuery) -> Option<(FontData, u32)> {
 
 pub(crate) fn resolver() -> FontResolverFn {
     Arc::new(resolve)
+}
+
+/// The fonts to write text with that the fonts of a document can't write, in the order to try them.
+const WRITING: &[&[&str]] = &[
+    &[
+        "Liberation Sans",
+        "Arimo",
+        "Arial",
+        "Helvetica",
+        "DejaVu Sans",
+        "Noto Sans",
+    ],
+    SANS_JA,
+    SANS_ZH_HANS,
+    SANS_ZH_HANT,
+    SANS_KO,
+];
+
+/// A font of the system that has all of the characters, or as many of them as there are.
+pub(crate) fn covering(chars: &BTreeSet<char>) -> Option<(FontData, u32)> {
+    let mut book = book().lock().unwrap_or_else(|e| e.into_inner());
+    let mut best: Option<((FontData, u32), usize)> = None;
+    for names in WRITING {
+        let Some(font) = book.first_of(names, false, false) else {
+            continue;
+        };
+        let has = crate::embed::coverage((*font.0).as_ref(), font.1, chars);
+        if has == chars.len() {
+            return Some(font);
+        }
+        if best.as_ref().is_none_or(|b| has > b.1) {
+            best = Some((font, has));
+        }
+    }
+    best.map(|b| b.0)
 }
