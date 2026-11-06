@@ -102,6 +102,32 @@ impl NodeRef {
         with_doc(|d| d.window_rect(id))
     }
 
+    /// Where the node's border box is in what an ancestor scrolls (from the ancestor's border box,
+    /// as if it hadn't scrolled), in logical pixels, as of the last layout. Unlike
+    /// [`rect`](Self::rect), it doesn't change when the ancestor scrolls.
+    pub fn offset_in(&self, ancestor: NodeRef) -> Option<PointF> {
+        let (id, top) = (self.0.get_untracked()?, ancestor.0.get_untracked()?);
+        with_doc(|d| {
+            let (mut x, mut y) = (0, 0);
+            let mut at = id;
+            while at != top {
+                let n = d.get(at)?;
+                x += n.rect.x;
+                y += n.rect.y;
+                at = n.parent?;
+                if at != top {
+                    let p = d.get(at)?;
+                    x -= p.scroll.x;
+                    y -= p.scroll.y;
+                }
+            }
+            Some(PointF::new(
+                d.scale.to_logical(x as f32),
+                d.scale.to_logical(y as f32),
+            ))
+        })
+    }
+
     /// How far a scrolling node has scrolled, in logical pixels.
     pub fn scroll_offset(&self) -> PointF {
         self.0
@@ -2021,6 +2047,21 @@ impl EditorRef {
             }
         });
         crate::text::editor::sync(id);
+    }
+
+    /// The line at the top of the editor's box as of the last layout, with how far down into it:
+    /// `10.5` is halfway down line 10 (from 0). For keeping something else in step with it.
+    pub fn top_line(&self) -> Option<f64> {
+        let id = self.0.get_untracked()?;
+        with_doc(|d| crate::text::editor::top_line(d, id))
+    }
+
+    /// Scrolls until a line, as [`top_line`](Self::top_line) gives it, is at the top of the
+    /// editor's box, as far as it goes.
+    pub fn scroll_to_line(&self, line: f64) {
+        if let Some(id) = self.0.get_untracked() {
+            with_doc(|d| crate::text::editor::scroll_to_line(d, id, line));
+        }
     }
 
     /// The text, without tracking it.

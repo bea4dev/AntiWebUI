@@ -176,6 +176,10 @@ pub(crate) struct Highlighter {
     pub limit: usize,
     /// Asks for the compiled grammar and the first tree, and is told when they come.
     pub started: bool,
+    /// A part in another language wasn't colored, as its grammar was being compiled.
+    pub waiting: bool,
+    /// The grammars of other languages asked for, once each.
+    asked: std::collections::HashSet<Language>,
     send: SendFn,
 }
 
@@ -212,8 +216,18 @@ impl Highlighter {
             passes: 0,
             limit,
             started: false,
+            waiting: false,
+            asked: Default::default(),
             send,
         }
+    }
+
+    /// Colors with a tree parsed elsewhere, from now on.
+    pub fn set_tree(&mut self, compiled: Arc<Compiled>, tree: Tree) {
+        self.compiled = Some(compiled);
+        self.tree = Some(tree);
+        self.started = true;
+        self.stale = false;
     }
 
     /// The text changed.
@@ -424,9 +438,16 @@ impl Highlighter {
             let Some(lang) = Language::from_name(&name) else {
                 continue;
             };
-            let sub = match compiled_or_ask(lang, &self.send) {
-                Some(c) => c,
-                None => continue,
+            let sub = match self::compiled(lang) {
+                Some(Some(c)) => c,
+                Some(None) => continue,
+                None => {
+                    self.waiting = true;
+                    if self.asked.insert(lang) {
+                        ask(lang, &self.send);
+                    }
+                    continue;
+                }
             };
             let key = (
                 lang,
@@ -488,19 +509,13 @@ impl Highlighter {
     }
 }
 
-/// The compiled language, or `None` after asking the worker to compile it.
-fn compiled_or_ask(lang: Language, send: &SendFn) -> Option<Arc<Compiled>> {
-    match compiled(lang) {
-        Some(c) => c,
-        None => {
-            let send = send.clone();
-            spawn(move || {
-                compile(lang);
-                send(Done::Ready(lang));
-            });
-            None
-        }
-    }
+/// Asks the worker to compile a language, and to say when it has.
+pub(crate) fn ask(lang: Language, send: &SendFn) {
+    let send = send.clone();
+    spawn(move || {
+        compile(lang);
+        send(Done::Ready(lang));
+    });
 }
 
 /// How the worker reaches the editor.

@@ -114,6 +114,11 @@ pub(crate) struct Decorator {
 }
 
 impl Decorator {
+    /// Forgets the rows it made, to make them all again.
+    fn forget(&self) {
+        self.entries.borrow_mut().clear();
+    }
+
     pub(crate) fn new(
         theme: MarkdownTheme,
         ctx: Rc<Ctx>,
@@ -564,8 +569,7 @@ impl Decorator {
                             {
                                 let (a, b) =
                                     (starts[body_lines.start], line_end(body_lines.end - 1));
-                                for (r, style) in f(&lang, &src[a..b]) {
-                                    let style = Rc::new(style);
+                                for (r, style) in untrack(|| f(&lang, &src[a..b])) {
                                     let r = r.start + a..(r.end + a).min(b);
                                     for l in body_lines.clone() {
                                         let x = r.start.max(starts[l]);
@@ -974,6 +978,8 @@ pub struct MarkdownEditor {
     on_link: OnLink,
     image: Pictures,
     highlight: Option<Rc<Highlight>>,
+    #[cfg(feature = "code")]
+    code_theme: Option<anti_webui_code::CodeTheme>,
     style: Style,
 }
 
@@ -984,6 +990,8 @@ pub fn markdown_editor(source: Signal<String>) -> MarkdownEditor {
         on_link: None,
         image: None,
         highlight: None,
+        #[cfg(feature = "code")]
+        code_theme: None,
         style: Style::default(),
     }
 }
@@ -1009,9 +1017,16 @@ impl MarkdownEditor {
     /// Colors the code of code blocks, as `markdown_view`'s does.
     pub fn highlight(
         mut self,
-        f: impl Fn(&str, &str) -> Vec<(Range<usize>, Style)> + 'static,
+        f: impl Fn(&str, &str) -> Vec<(Range<usize>, Rc<Style>)> + 'static,
     ) -> Self {
         self.highlight = Some(Rc::new(f));
+        self
+    }
+
+    /// The colors of code blocks, as `markdown_view`'s.
+    #[cfg(feature = "code")]
+    pub fn code_theme(mut self, theme: anti_webui_code::CodeTheme) -> Self {
+        self.code_theme = Some(theme);
         self
     }
 }
@@ -1068,7 +1083,7 @@ fn continuation(line: &str) -> Option<(String, bool)> {
 
 /// Enter in a list or a quote goes on with it, and ends it on an empty item. Tab in an item moves
 /// it in or out.
-fn list_keys(editor: EditorRef, e: &KeyboardEvent) {
+pub(crate) fn list_keys(editor: EditorRef, e: &KeyboardEvent) {
     use anti_webui_core::event::{Key, NamedKey};
     let m = e.modifiers;
     if m.ctrl || m.alt {
@@ -1141,19 +1156,28 @@ impl IntoView for MarkdownEditor {
     fn into_view(self) -> View {
         let editor = editor_ref();
         let on_link = self.on_link.clone();
+        #[cfg(feature = "code")]
+        let (highlight, ready) = crate::view::code_colors(self.highlight, self.code_theme);
+        #[cfg(not(feature = "code"))]
+        let (highlight, ready) = (self.highlight, None::<Signal<u64>>);
         let ctx = Ctx::new(
             self.theme.clone(),
             self.on_link,
             self.image,
             None,
-            self.highlight.clone(),
+            highlight.clone(),
         );
-        let deco = Rc::new(Decorator::new(
-            self.theme.clone(),
-            ctx,
-            self.highlight,
-            editor,
-        ));
+        let deco = Rc::new(Decorator::new(self.theme.clone(), ctx, highlight, editor));
+        if let Some(ready) = ready {
+            // A grammar came: the code blocks are made again with its colors.
+            let deco = deco.clone();
+            effect(move || {
+                if ready.get() > 0 {
+                    deco.forget();
+                    editor.redecorate();
+                }
+            });
+        }
         let mut e = text_editor()
             .value(self.source)
             .editor_ref(editor)

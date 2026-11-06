@@ -1,7 +1,9 @@
-//! A Markdown editor that shows what it says while it is written, as Obsidian's live preview.
+//! A Markdown editor that shows what it says while it is written, as Obsidian's live preview, or
+//! with `--split` the source on the left and what it shows on the right.
 //!
 //! ```sh
 //! cargo run --release -p anti-webui --example markdown_editor --features markdown -- notes.md
+//! cargo run --release -p anti-webui --example markdown_editor --features markdown -- notes.md --split
 //! ```
 //!
 //! Ctrl+S saves the file. Ctrl + click on a link prints it. Pictures are found next to the file.
@@ -12,8 +14,14 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 fn main() {
-    let Some(path) = std::env::args().nth(1).map(PathBuf::from) else {
-        eprintln!("usage: markdown_editor <file.md>");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let split = args.iter().any(|a| a == "--split");
+    let Some(path) = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .map(PathBuf::from)
+    else {
+        eprintln!("usage: markdown_editor <file.md> [--split]");
         return;
     };
     let started = Instant::now();
@@ -72,22 +80,41 @@ fn main() {
                             format!("{name}{}", if dirty { " ●" } else { "" })
                         })),
                 )
-                .child(
-                    div().flex_1().min_h(0.0).flex().justify_center().child(
-                        markdown_editor(source)
-                            .on_link(|url| println!("link: {url}"))
-                            .image(move |src| {
-                                let p = PathBuf::from(src);
-                                ImageSource::from(if p.is_absolute() { p } else { dir.join(p) })
-                            })
-                            .w_full()
-                            .max_w(900.0)
-                            .h_full()
-                            .overflow_y_scroll()
-                            .px(32.0)
-                            .py(24.0),
-                    ),
-                )
+                .child(if split {
+                    let editor = editor_ref();
+                    request_frame(move |_| editor.focus());
+                    markdown_split_editor(source)
+                        .editor_ref(editor)
+                        .on_link(|url| println!("link: {url}"))
+                        .image(move |src| picture(&dir, src))
+                        .flex_1()
+                        .min_h(0.0)
+                        .into_view()
+                } else {
+                    div()
+                        .flex_1()
+                        .min_h(0.0)
+                        .flex()
+                        .justify_center()
+                        .child(
+                            markdown_editor(source)
+                                .on_link(|url| println!("link: {url}"))
+                                .image(move |src| picture(&dir, src))
+                                .w_full()
+                                .max_w(900.0)
+                                .h_full()
+                                .overflow_y_scroll()
+                                .px(32.0)
+                                .py(24.0),
+                        )
+                        .into_view()
+                })
         })
         .unwrap();
+}
+
+/// A picture next to the file, unless its path is absolute.
+fn picture(dir: &std::path::Path, src: &str) -> ImageSource {
+    let p = PathBuf::from(src);
+    ImageSource::from(if p.is_absolute() { p } else { dir.join(p) })
 }

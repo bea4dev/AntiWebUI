@@ -2622,6 +2622,61 @@ pub(crate) fn hit(doc: &Document, host: NodeId, p: PointF) -> Option<usize> {
     Some(hit_rows(doc, e, q.x, q.y))
 }
 
+/// How far down the top of the editor's box is in the rows' coordinates (device pixels from the
+/// top of the first row), going by its scroll offset and the last layout.
+fn view_top(doc: &Document, host: NodeId) -> Option<i64> {
+    let h = doc.get(host)?;
+    let first = doc.get(*h.children.first()?)?;
+    Some(h.scroll.y as i64 - first.rect.y as i64)
+}
+
+/// The line at the top of the editor's box, with how far down into it (`10.5` is halfway down
+/// line 10). Rows of several lines count as their lines, evenly.
+pub(crate) fn top_line(doc: &Document, host: NodeId) -> Option<f64> {
+    let y = view_top(doc, host)?;
+    let e = doc.get(host)?.editor()?;
+    let (s, hs) = (&e.structure, &e.heights);
+    if hs.tops.len() != s.len() + 1 || s.len() == 0 {
+        return None;
+    }
+    let row = hs.row_at(y);
+    let (top, bottom) = (hs.tops[row], hs.tops[row + 1]);
+    let into = if bottom > top {
+        ((y - top) as f64 / (bottom - top) as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    Some(s.first_line(row) as f64 + into * s.lines_of(row) as f64)
+}
+
+/// Scrolls the editor until `line` (as `top_line` gives it) is at the top of its box, as far as
+/// it goes.
+pub(crate) fn scroll_to_line(doc: &mut Document, host: NodeId, line: f64) {
+    let (Some(y), Some(h)) = (view_top(doc, host), doc.get(host)) else {
+        return;
+    };
+    let Some(e) = h.editor() else {
+        return;
+    };
+    let (s, hs) = (&e.structure, &e.heights);
+    if hs.tops.len() != s.len() + 1 || s.lines == 0 {
+        return;
+    }
+    let l = line.max(0.0);
+    let row = s.row_of_line((l as usize).min(s.lines - 1));
+    let into = ((l - s.first_line(row) as f64) / s.lines_of(row) as f64).clamp(0.0, 1.0);
+    let (top, bottom) = (hs.tops[row], hs.tops[row + 1]);
+    let want = top + ((bottom - top) as f64 * into).round() as i64;
+    let pad = h.padding_abs();
+    let most = (h.content_size.height - pad.height).max(0) as i64;
+    let to = (h.scroll.y as i64 + want - y).clamp(0, most) as i32;
+    if to != h.scroll.y {
+        let h = doc.get_mut(host).expect("looked at above");
+        h.scroll.y = to;
+        doc.mark_scrolled(host);
+    }
+}
+
 /// Moves the caret, by the text or by how it is laid out.
 pub(crate) fn move_caret(
     doc: &mut Document,

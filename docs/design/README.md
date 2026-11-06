@@ -36,6 +36,7 @@ AntiWebUI は WebView に頼らず、wgpu による自前描画とネイティ�
 | 29 | [content-visibility](29-content-visibility.md) | 画面から遠い要素の中身を飛ばす（CSS の `content-visibility`）、文字を整形しない見積もり、スクロールのずれの直し |
 | 30 | [performance-overlay](30-performance-overlay.md) | fps、CPU と GPU の時間、遅延、先行描画の状態を右上に出すデバッグ用のオーバーレイ |
 | 31 | [code-editor](31-code-editor.md) | ノードを軽くする、`text_editor` の見えている行だけ作る仕組み、tree-sitter の色分け、`code_editor`、ほかのエディタとの比較 |
+| 32 | [markdown-split](32-markdown-split.md) | 左にソース、右にプレビューの `markdown_split_editor`、左右のスクロールの同期、コードブロックの tree-sitter の色分け、ほかのエディタとの比較 |
 
 ## 用語
 

@@ -22,7 +22,7 @@ Web で Markdown エディタを作るときと同じく、基礎の部品を co
 | M3 | core: `text_editor`（作った。2026-11-06） |
 | M4 | markdown: `markdown_editor`（ライブプレビュー。作った。2026-11-06） |
 
-ソースをそのまま書くモード（Markdown 用のコードエディタ）は後回しにし、コードエディタとして別に作る。その土台も M3 の `text_editor` になる。
+ソースをそのまま書くモード（Markdown 用のコードエディタ）は、コードエディタ（[31](31-code-editor.md)）として別に作り、左にソースと右にプレビューの `markdown_split_editor`（[32](32-markdown-split.md)）の左側に使った。
 
 ## M1: `rich_text`
 
@@ -87,7 +87,7 @@ markdown_view(source)                     // &str / String / Signal<String>
     .on_link(|url| open(url))
     .image(|src| resolve(src))            // 相対パスの解決
     .emoji(|name| custom_emoji(name))     // ":party:" → Option<ImageSource>
-    .highlight(|lang, code| spans)        // コードの色分け（既定はなし）
+    .highlight(|lang, code| spans)        // コードの色分け（`code` feature では既定で tree-sitter。[32](32-markdown-split.md)）
 ```
 
 - パーサは `pulldown-cmark`。速く、要素ごとにソースのバイト位置を返す。GFM の表、タスクリスト、取り消し線、脚注を有効にする。
@@ -101,7 +101,7 @@ markdown_view(source)                     // &str / String / Signal<String>
 - テーマは要素ごとの `Style` で、CSS で書くときと同じ感覚で当てられる。既定のテーマは GitHub の見た目に近づける。
 - 終わったタスク（`- [x]`）の文字は `task_done` のスタイルで、既定は空（GitHub と同じくチェックが付くだけ）。Obsidian や Notion のように取り消し線と薄い色にするなら、`task_done` に `strikethrough()` と色を入れる。ビュワーとエディタの両方が使う。
 - ソースが変わったときは、ブロックごとにソースの文字列を比べ、変わったブロックだけを作り直す。
-- コードの色分けは重い依存（`syntect` など）を持ち込まないように、関数を渡すだけにする。色分けは後で作るコードエディタの側で用意する。
+- コードの色分けは関数を渡すだけにする。`code` feature（既定で有効）では、渡さなければ `anti-webui-code` の `CodeHighlighter`（tree-sitter）で色分けする（[32](32-markdown-split.md)）。
 
 ### 表
 

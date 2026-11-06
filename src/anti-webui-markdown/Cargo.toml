@@ -10,10 +10,14 @@ description = "A fast Markdown viewer and editor for AntiWebUI"
 anti-webui-core.workspace = true
 pulldown-cmark = { workspace = true }
 log.workspace = true
+anti-webui-code = { workspace = true, optional = true }
 # Pinned: it is an alpha, and its API changes between releases.
 merman = { version = "=0.10.0-alpha.1", default-features = false, features = ["svg", "all-diagrams", "layout-cytoscape"], optional = true }
 
 [features]
-default = ["mermaid"]
+default = ["mermaid", "code"]
+## Code blocks colored by tree-sitter grammars, and the split editor, whose source side is a
+## `code_editor`.
+code = ["dep:anti-webui-code"]
 ## Mermaid diagrams, on `merman`, which follows mermaid.js closely and adds about 25 MB.
 mermaid = ["dep:merman", "anti-webui-core/svg"]

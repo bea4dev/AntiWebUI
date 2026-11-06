@@ -1,6 +1,6 @@
 # 31. コードエディタ（シンタックスハイライト）
 
-最軽量級、最速級のコードエディタを作る。比べる相手は VS Code、Zed、Sublime Text、Kate、gnome-text-editor、Chromium の CodeMirror 6（比べるためだけに使う）。土台は M3 の `text_editor`（[28](28-markdown.md)）。後で作る Markdown のソースモードもこの上に載せる。
+最軽量級、最速級のコードエディタを作る。比べる相手は VS Code、Zed、Sublime Text、Kate、gnome-text-editor、Chromium の CodeMirror 6（比べるためだけに使う）。土台は M3 の `text_editor`（[28](28-markdown.md)）。Markdown のソースも、この上に載せた（[32](32-markdown-split.md)）。
 
 ## 調べたこと
 
@@ -229,4 +229,4 @@ code_editor(source)                 // 最初の文字列
 - タブ文字の幅（今は parley の空白の幅）。Go のようにタブで字下げする言語では、字下げが狭く見える。
 - 折りたたみの印を行番号の横に出すこと（今はキーと、たたんだ行の「⋯」だけ）。
 - 長いファイルの色分けで、画面の位置から解析すること（今は開いたときの先頭だけ先に解析する）。
-- Markdown のソースモード（`markdown_editor` から切り替える）。言語としての Markdown（コードブロックの中の言語を含む）はもう色が付く。
+- `markdown_editor` の中でソースモードに切り替えること。ソースは左右に分かれたエディタ（[32](32-markdown-split.md)）の左側として使えるようになった。

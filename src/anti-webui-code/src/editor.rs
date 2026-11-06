@@ -28,6 +28,8 @@ mod over {
 }
 
 type OnChange = Rc<dyn Fn(&str)>;
+type OnScrolled = Rc<dyn Fn(PointF)>;
+type OnKey = Rc<dyn Fn(&KeyboardEvent)>;
 
 /// A text version and caret, and the brackets found at them.
 type BracketsAt = (u64, usize, Option<(usize, usize)>);
@@ -35,10 +37,13 @@ type BracketsAt = (u64, usize, Option<(usize, usize)>);
 /// A code editor.
 pub struct CodeEditor {
     text: String,
+    value: Option<Signal<String>>,
     language: Language,
     theme: CodeTheme,
     style: Style,
     on_change: Option<OnChange>,
+    on_scrolled: Option<OnScrolled>,
+    on_key_down: Option<OnKey>,
     editor_ref: Option<EditorRef>,
     read_only: bool,
     wrap: bool,
@@ -50,10 +55,13 @@ pub struct CodeEditor {
 pub fn code_editor(text: impl Into<String>) -> CodeEditor {
     CodeEditor {
         text: text.into(),
+        value: None,
         language: Language::PlainText,
         theme: CodeTheme::default(),
         style: Style::default(),
         on_change: None,
+        on_scrolled: None,
+        on_key_down: None,
         editor_ref: None,
         read_only: false,
         wrap: false,
@@ -82,6 +90,27 @@ impl CodeEditor {
     /// Called with the text whenever it changes.
     pub fn on_change(mut self, f: impl Fn(&str) + 'static) -> Self {
         self.on_change = Some(Rc::new(f));
+        self
+    }
+
+    /// Two-way binds the text to a signal, instead of the text it starts with. The signal is given
+    /// a copy of the whole text at every change.
+    pub fn value(mut self, value: Signal<String>) -> Self {
+        self.value = Some(value);
+        self
+    }
+
+    /// Called when the text has scrolled, however that happened, with its offset in logical
+    /// pixels.
+    pub fn on_scrolled(mut self, f: impl Fn(PointF) + 'static) -> Self {
+        self.on_scrolled = Some(Rc::new(f));
+        self
+    }
+
+    /// Called with each key before the editor's own keys. Preventing the default keeps the editor
+    /// from doing anything with it.
+    pub fn on_key_down(mut self, f: impl Fn(&KeyboardEvent) + 'static) -> Self {
+        self.on_key_down = Some(Rc::new(f));
         self
     }
 
@@ -931,6 +960,7 @@ impl IntoView for CodeEditor {
         let f1 = find.clone();
         let f2 = find.clone();
         let on_change = self.on_change.clone();
+        let on_key = self.on_key_down.clone();
         let mut te = text_editor()
             .text(self.text)
             .editor_ref(editor)
@@ -962,7 +992,21 @@ impl IntoView for CodeEditor {
                     f(t);
                 }
             })
-            .on_key_down(move |e| keys(editor, &s4, &f2, e));
+            .on_key_down(move |e| {
+                if let Some(f) = &on_key {
+                    f(e);
+                    if e.is_default_prevented() {
+                        return;
+                    }
+                }
+                keys(editor, &s4, &f2, e)
+            });
+        if let Some(v) = self.value {
+            te = te.value(v);
+        }
+        if let Some(f) = self.on_scrolled {
+            te = te.on_scrolled(move |p| f(p));
+        }
         if !self.wrap {
             te = te.whitespace_nowrap();
         }

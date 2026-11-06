@@ -203,7 +203,11 @@ fn time_a_long_document() {
             .h_full()
             .overflow_y_scroll()
             .node_ref(scroller)
-            .child(markdown_view(doc).w(800.0))
+            .child(if std::env::var("NO_COLORS").is_ok() {
+                markdown_view(doc).highlight(|_, _| Vec::new()).w(800.0)
+            } else {
+                markdown_view(doc).w(800.0)
+            })
     });
     let built = started.elapsed();
     ui.handle_event(WindowEvent::Resized {
@@ -248,5 +252,56 @@ fn time_a_long_document() {
         "paging down: {} pages, {mean:.2} ms each, {worst:.2} ms at worst; first height {first}, last {}",
         steps.len(),
         height()
+    );
+}
+
+/// How long the viewer takes to follow one keystroke in a long document, as the preview of a
+/// split editor does: `MARKDOWN_FILE=... cargo test --release -p anti-webui-markdown --test view
+/// time_an_edit -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn time_an_edit() {
+    let doc = std::env::var("MARKDOWN_FILE")
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_else(|| SAMPLE.repeat(50));
+    let source = Rc::new(RefCell::new(None));
+    let s2 = source.clone();
+    let scroller = node_ref();
+    let mut ui = Ui::new(move || {
+        let s = signal(doc);
+        *s2.borrow_mut() = Some(s);
+        div()
+            .w_full()
+            .h_full()
+            .overflow_y_scroll()
+            .node_ref(scroller)
+            .child(markdown_view(move || s.get()).w(800.0))
+    });
+    ui.handle_event(WindowEvent::Resized {
+        size: SizeI::new(1000, 900),
+        scale: Scale(120),
+    });
+    ui.update();
+    settle(&mut ui);
+    let s = source.borrow().unwrap();
+    // In a paragraph in the middle of the document, scrolled to.
+    let at = s.with(|t| {
+        let mid = t.len() / 2;
+        mid + t[mid..].find("\n\n").unwrap() + 2
+    });
+    let mut times = Vec::new();
+    for i in 0..40 {
+        let t = Instant::now();
+        s.update(|t| t.insert(at + i, 'x'));
+        ui.update();
+        let _ = ui.paint(Instant::now());
+        times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    times.sort_by(f64::total_cmp);
+    eprintln!(
+        "an edit: {:.2} ms median, {:.2} ms at worst",
+        times[times.len() / 2],
+        times[times.len() - 1]
     );
 }

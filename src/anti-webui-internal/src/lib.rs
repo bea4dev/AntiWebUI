@@ -18,12 +18,15 @@ pub use anti_webui_app::App;
 pub mod prelude {
     pub use anti_webui_app::App;
     #[cfg(feature = "code")]
-    pub use anti_webui_code::{CodeEditor, CodeTheme, Language as CodeLanguage, code_editor};
+    pub use anti_webui_code::{
+        CodeEditor, CodeHighlighter, CodeTheme, Language as CodeLanguage, code_editor,
+    };
     pub use anti_webui_core::prelude::*;
     pub use anti_webui_macros::ShaderParams;
     #[cfg(feature = "markdown")]
     pub use anti_webui_markdown::{
-        Emoji, MarkdownEditor, MarkdownTheme, MarkdownView, markdown_editor, markdown_view,
+        Emoji, MarkdownEditor, MarkdownSplitEditor, MarkdownTheme, MarkdownView, markdown_editor,
+        markdown_split_editor, markdown_view,
     };
     #[cfg(feature = "pdf")]
     pub use anti_webui_pdf::{

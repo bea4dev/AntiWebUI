@@ -7,8 +7,10 @@ mod edits;
 mod highlight;
 mod language;
 mod search;
+mod snippet;
 mod theme;
 
 pub use editor::{CodeEditor, HIGHLIGHT_LIMIT, code_editor};
 pub use language::Language;
+pub use snippet::{CodeHighlighter, Colors, SNIPPET_LIMIT};
 pub use theme::{CodeTheme, MONO};

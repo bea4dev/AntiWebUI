@@ -298,6 +298,11 @@ impl KeyboardEvent {
     pub fn prevent_default(&self) {
         self.default_prevented.set(true);
     }
+
+    /// Whether a handler before this one has prevented the built-in behavior.
+    pub fn is_default_prevented(&self) -> bool {
+        self.default_prevented.get()
+    }
 }
 
 #[derive(Debug)]

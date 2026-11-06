@@ -47,7 +47,7 @@ impl<F: Fn() -> S + 'static, S: Into<String>> IntoMarkdown for F {
     }
 }
 
-pub(crate) type Highlight = dyn Fn(&str, &str) -> Vec<(Range<usize>, Style)>;
+pub(crate) type Highlight = dyn Fn(&str, &str) -> Vec<(Range<usize>, Rc<Style>)>;
 pub(crate) type OnLink = Option<Rc<dyn Fn(&str)>>;
 pub(crate) type Pictures = Option<Rc<dyn Fn(&str) -> ImageSource>>;
 pub(crate) type Emojis = Option<Rc<dyn Fn(&str) -> Option<Emoji>>>;
@@ -61,6 +61,9 @@ pub struct MarkdownView {
     image: Pictures,
     emoji: Emojis,
     highlight: Option<Rc<Highlight>>,
+    #[cfg(feature = "code")]
+    code_theme: Option<anti_webui_code::CodeTheme>,
+    anchors: Option<Rc<Anchors>>,
     style: Style,
 }
 
@@ -72,6 +75,9 @@ pub fn markdown_view(source: impl IntoMarkdown) -> MarkdownView {
         image: None,
         emoji: None,
         highlight: None,
+        #[cfg(feature = "code")]
+        code_theme: None,
+        anchors: None,
         style: Style::default(),
     }
 }
@@ -102,14 +108,61 @@ impl MarkdownView {
     }
 
     /// Colors the code of a code block: given the language and the code, the ranges of the code
-    /// with their styles, in order.
+    /// with their styles, in order. A block reads it again when signals it read change. With the
+    /// `code` feature, code is colored by its tree-sitter grammar unless this is given.
     pub fn highlight(
         mut self,
-        f: impl Fn(&str, &str) -> Vec<(Range<usize>, Style)> + 'static,
+        f: impl Fn(&str, &str) -> Vec<(Range<usize>, Rc<Style>)> + 'static,
     ) -> Self {
         self.highlight = Some(Rc::new(f));
         self
     }
+
+    /// The colors of code blocks. [`CodeTheme::light`](anti_webui_code::CodeTheme::light) by
+    /// default.
+    #[cfg(feature = "code")]
+    pub fn code_theme(mut self, theme: anti_webui_code::CodeTheme) -> Self {
+        self.code_theme = Some(theme);
+        self
+    }
+
+    /// Keeps where the blocks are, for a split editor.
+    pub(crate) fn anchors(mut self, anchors: Rc<Anchors>) -> Self {
+        self.anchors = Some(anchors);
+        self
+    }
+}
+
+/// Where the blocks at the top of a document start in the source and where they are shown, for
+/// keeping the two sides of a split editor in step.
+#[derive(Default)]
+pub(crate) struct Anchors {
+    /// In the order of the document: the line each block starts on, its key and the room above
+    /// it in logical pixels.
+    pub blocks: RefCell<Vec<(usize, EntryKey, f32)>>,
+    /// The box of each block that is shown, by its key.
+    pub boxes: RefCell<HashMap<EntryKey, NodeRef>>,
+    /// How many lines the source has.
+    pub lines: std::cell::Cell<usize>,
+}
+
+/// The colors of code blocks by their grammars, unless they are given otherwise.
+#[cfg(feature = "code")]
+pub(crate) fn code_colors(
+    given: Option<Rc<Highlight>>,
+    theme: Option<anti_webui_code::CodeTheme>,
+) -> (Option<Rc<Highlight>>, Option<Signal<u64>>) {
+    if given.is_some() {
+        return (given, None);
+    }
+    let h = anti_webui_code::CodeHighlighter::new(
+        theme.unwrap_or_else(anti_webui_code::CodeTheme::light),
+    );
+    let ready = h.ready();
+    (
+        Some(Rc::new(move |lang, code| h.highlight(lang, code))),
+        Some(ready),
+    )
 }
 
 impl Styled for MarkdownView {
@@ -133,11 +186,15 @@ pub(crate) struct Ctx {
     /// The number of each footnote, in the order they are referred to.
     footnotes: RefCell<HashMap<String, usize>>,
     footnote_refs: RefCell<HashMap<String, NodeRef>>,
+    /// Where the blocks are kept for a split editor.
+    split: RefCell<Option<Rc<Anchors>>>,
 }
+
+pub(crate) type EntryKey = (u64, u32, u32);
 
 /// A block at the top of a document as it is shown.
 struct Entry {
-    key: (u64, u32, u32),
+    key: EntryKey,
     gap: f32,
     kind: EntryKind,
 }
@@ -183,6 +240,7 @@ impl Ctx {
             anchors: RefCell::default(),
             footnotes: RefCell::default(),
             footnote_refs: RefCell::default(),
+            split: RefCell::default(),
         })
     }
 
@@ -487,8 +545,29 @@ impl Ctx {
             overflow_x: Some(Overflow::Scroll),
             ..Style::default()
         };
-        let body = match self.highlight.as_ref().map(|f| f(lang, code)) {
-            Some(ranges) if !ranges.is_empty() => {
+        let body = match &self.highlight {
+            // Again when what the colors depend on changes, as a grammar that is ready.
+            Some(f) => {
+                let (f, ctx, lang, code) =
+                    (f.clone(), self.clone(), lang.to_owned(), code.to_owned());
+                dyn_view(move || ctx.code_text(&code, f(&lang, &code)))
+            }
+            None => self.code_text(code, Vec::new()),
+        };
+        div()
+            .style(&t.code_block)
+            .style(&scroll)
+            .mt(gap)
+            .mb(0.0)
+            .child(body)
+            .into_view()
+    }
+
+    /// The text of a code block, with its colors.
+    fn code_text(&self, code: &str, ranges: Vec<(Range<usize>, Rc<Style>)>) -> View {
+        let t = &self.theme;
+        match ranges {
+            ranges if !ranges.is_empty() => {
                 let mut runs: Vec<Run> = Vec::new();
                 let mut at = 0;
                 for (range, style) in ranges {
@@ -499,7 +578,7 @@ impl Ctx {
                         runs.push(Run::Text(code[at..range.start].to_owned()));
                     }
                     runs.push(Run::Span(
-                        span(code[range.clone()].to_owned()).shared_style(Rc::new(style)),
+                        span(code[range.clone()].to_owned()).shared_style(style),
                     ));
                     at = range.end;
                 }
@@ -515,14 +594,7 @@ impl Ctx {
                 .style(&t.code_text)
                 .whitespace_nowrap()
                 .into_view(),
-        };
-        div()
-            .style(&t.code_block)
-            .style(&scroll)
-            .mt(gap)
-            .mb(0.0)
-            .child(body)
-            .into_view()
+        }
     }
 
     fn quote(
@@ -793,7 +865,18 @@ impl Ctx {
         let mut prev: Option<f32> = None;
         let mut notes = Vec::new();
         let mut notes_hash = DefaultHasher::new();
+        let anchors = self.split.borrow().clone();
+        let mut lines = Vec::new();
+        let (mut line, mut counted) = (0, 0);
         for top in tops {
+            if anchors.is_some() {
+                let at = top.range.start.max(counted);
+                line += source.as_bytes()[counted..at]
+                    .iter()
+                    .filter(|&&b| b == b'\n')
+                    .count();
+                counted = at;
+            }
             if let Block::Footnote(label, blocks) = top.block {
                 source[top.range.clone()].hash(&mut notes_hash);
                 notes.push((label, blocks));
@@ -805,11 +888,28 @@ impl Ctx {
             let hash = hash_of(&source[top.range.clone()]);
             let n = seen.entry(hash).or_insert(0);
             *n += 1;
+            let key = (hash, *n, gap.to_bits());
+            if anchors.is_some() {
+                lines.push((line, key, gap));
+            }
             out.push(Rc::new(Entry {
-                key: (hash, *n, gap.to_bits()),
+                key,
                 gap,
                 kind: EntryKind::Block(top.block),
             }));
+        }
+        if let Some(a) = anchors {
+            let total = line
+                + source.as_bytes()[counted..]
+                    .iter()
+                    .filter(|&&b| b == b'\n')
+                    .count()
+                + 1;
+            a.lines.set(total);
+            // The boxes of blocks that go are forgotten; those of new ones come as they are made.
+            let keys: std::collections::HashSet<EntryKey> = lines.iter().map(|l| l.1).collect();
+            a.boxes.borrow_mut().retain(|k, _| keys.contains(k));
+            *a.blocks.borrow_mut() = lines;
         }
         if !notes.is_empty() {
             let numbers = self.footnotes.borrow();
@@ -828,13 +928,12 @@ impl Ctx {
 
 impl IntoView for MarkdownView {
     fn into_view(self) -> View {
-        let ctx = Ctx::new(
-            self.theme,
-            self.on_link,
-            self.image,
-            self.emoji,
-            self.highlight,
-        );
+        #[cfg(feature = "code")]
+        let (highlight, _) = code_colors(self.highlight, self.code_theme);
+        #[cfg(not(feature = "code"))]
+        let highlight = self.highlight;
+        let ctx = Ctx::new(self.theme, self.on_link, self.image, self.emoji, highlight);
+        *ctx.split.borrow_mut() = self.anchors.clone();
         let source = self.source;
         let items = {
             let ctx = ctx.clone();
@@ -845,11 +944,18 @@ impl IntoView for MarkdownView {
         };
         let view = {
             let ctx = ctx.clone();
+            let anchors = self.anchors.clone();
             move |e: Rc<Entry>| {
-                lazy(match &e.kind {
+                let block = match &e.kind {
                     EntryKind::Block(b) => ctx.block(b, e.gap, 0),
                     EntryKind::Footnotes(notes) => ctx.footnotes(notes, e.gap),
-                })
+                };
+                let r = anchors.as_ref().map(|a| {
+                    let r = node_ref();
+                    a.boxes.borrow_mut().insert(e.key, r);
+                    r
+                });
+                lazy(block, r)
             }
         };
         div()
@@ -863,12 +969,14 @@ impl IntoView for MarkdownView {
 /// A block that isn't laid out, nor its text shaped, while it is far from the screen. See
 /// `docs/design/29-content-visibility.md`. The block is made first, so that what is in it isn't
 /// made on top of this on the stack.
-fn lazy(block: View) -> View {
-    div()
-        .content_visibility_auto()
-        .estimate_contents()
-        .child(block)
-        .into_view()
+fn lazy(block: View, r: Option<NodeRef>) -> View {
+    let d = div().content_visibility_auto().estimate_contents();
+    match r {
+        Some(r) => d.node_ref(r),
+        None => d,
+    }
+    .child(block)
+    .into_view()
 }
 
 /// What of a block of HTML can be shown without a browser: its text, its pictures, its links and

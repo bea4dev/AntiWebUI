@@ -162,6 +162,7 @@ dependencies = [
 name = "anti-webui-markdown"
 version = "0.1.0"
 dependencies = [
+ "anti-webui-code",
  "anti-webui-core",
  "log",
  "merman",

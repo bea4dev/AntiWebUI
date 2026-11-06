@@ -18,7 +18,9 @@ video = ["anti-webui-internal/video"]
 pdf = ["anti-webui-internal/pdf"]
 ## The JavaScript of PDF forms, on QuickJS, which adds about 1 MB.
 pdf-js = ["pdf", "anti-webui-internal/pdf-js"]
-## A Markdown viewer and editor with Mermaid diagrams. See `docs/design/28-markdown.md`.
+## A Markdown viewer and editors (live preview, and source beside preview) with Mermaid diagrams
+## and code blocks colored by tree-sitter. See `docs/design/28-markdown.md` and
+## `docs/design/32-markdown-split.md`.
 markdown = ["anti-webui-internal/markdown"]
 ## A code editor with tree-sitter highlighting for 14 languages. See `docs/design/31-code-editor.md`.
 code = ["anti-webui-internal/code"]
