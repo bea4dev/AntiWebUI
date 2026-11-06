@@ -52,11 +52,12 @@ pub struct NodeStyle {
     pub sheet: Option<Rc<Sheet>>,
     pub base: Style,
     pub dynamic: Vec<Style>,
-    pub hover: Option<Style>,
-    pub focus: Option<Style>,
-    pub active: Option<Style>,
-    pub dragging: Option<Style>,
-    pub drag_over: Option<Style>,
+    // Boxed: most nodes have none of these, and a `Style` is big.
+    pub hover: Option<Box<Style>>,
+    pub focus: Option<Box<Style>>,
+    pub active: Option<Box<Style>>,
+    pub dragging: Option<Box<Style>>,
+    pub drag_over: Option<Box<Style>>,
 }
 
 impl NodeStyle {

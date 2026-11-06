@@ -2,6 +2,8 @@
 //! directly; it exists so `anti-webui-dylib` can link everything into one shared library.
 
 pub use anti_webui_app as app;
+#[cfg(feature = "code")]
+pub use anti_webui_code as code;
 pub use anti_webui_core as core;
 #[cfg(feature = "markdown")]
 pub use anti_webui_markdown as markdown;
@@ -15,6 +17,8 @@ pub use anti_webui_app::App;
 
 pub mod prelude {
     pub use anti_webui_app::App;
+    #[cfg(feature = "code")]
+    pub use anti_webui_code::{CodeEditor, CodeTheme, Language as CodeLanguage, code_editor};
     pub use anti_webui_core::prelude::*;
     pub use anti_webui_macros::ShaderParams;
     #[cfg(feature = "markdown")]

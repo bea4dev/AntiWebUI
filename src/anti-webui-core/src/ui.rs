@@ -188,6 +188,8 @@ impl Ui {
         // styles and even layout again.
         for _ in 0..4 {
             let changed = self.update_once();
+            // Rows of editors that come into view get nodes, laid out in the next round.
+            crate::text::editor::follow_views();
             if changed && self.drag.is_some() {
                 self.retarget(false);
             } else if changed

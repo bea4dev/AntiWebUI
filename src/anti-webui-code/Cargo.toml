@@ -1,0 +1,49 @@
+[package]
+name = "anti-webui-code"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "A fast code editor with tree-sitter highlighting for AntiWebUI"
+
+[dependencies]
+anti-webui-core.workspace = true
+anti-webui-widgets.workspace = true
+log.workspace = true
+tree-sitter = "0.27"
+tree-sitter-language = "0.1"
+regex = { version = "1.13", default-features = false, features = ["std", "perf", "unicode"] }
+memchr = "2.8"
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-c = { version = "0.24", optional = true }
+tree-sitter-cpp = { version = "0.23", optional = true }
+tree-sitter-python = { version = "0.25", optional = true }
+tree-sitter-javascript = { version = "0.25", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-json = { version = "0.24", optional = true }
+tree-sitter-toml-ng = { version = "0.7", optional = true }
+tree-sitter-yaml = { version = "0.7", optional = true }
+tree-sitter-md = { version = "0.5", optional = true }
+tree-sitter-html = { version = "0.23", optional = true }
+tree-sitter-css = { version = "0.25", optional = true }
+tree-sitter-bash = { version = "0.25", optional = true }
+tree-sitter-go = { version = "0.25", optional = true }
+
+[features]
+default = ["rust", "c", "cpp", "python", "javascript", "typescript", "json", "toml", "yaml", "markdown", "html", "css", "bash", "go"]
+rust = ["dep:tree-sitter-rust"]
+c = ["dep:tree-sitter-c"]
+## C++, whose highlighting builds on C's.
+cpp = ["c", "dep:tree-sitter-cpp"]
+python = ["dep:tree-sitter-python"]
+javascript = ["dep:tree-sitter-javascript"]
+## TypeScript and TSX, whose highlighting builds on JavaScript's.
+typescript = ["javascript", "dep:tree-sitter-typescript"]
+json = ["dep:tree-sitter-json"]
+toml = ["dep:tree-sitter-toml-ng"]
+yaml = ["dep:tree-sitter-yaml"]
+markdown = ["dep:tree-sitter-md"]
+html = ["dep:tree-sitter-html"]
+css = ["dep:tree-sitter-css"]
+bash = ["dep:tree-sitter-bash"]
+go = ["dep:tree-sitter-go"]

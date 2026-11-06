@@ -16,6 +16,7 @@ members = [
     "src/anti-webui-video",
     "src/anti-webui-pdf",
     "src/anti-webui-markdown",
+    "src/anti-webui-code",
     "src/anti-webui-wayland",
     "src/anti-webui-x11",
     "src/anti-webui-windows",
@@ -42,6 +43,7 @@ anti-webui-wgpu = { path = "src/anti-webui-wgpu", version = "0.1.0" }
 anti-webui-video = { path = "src/anti-webui-video", version = "0.1.0" }
 anti-webui-pdf = { path = "src/anti-webui-pdf", version = "0.1.0" }
 anti-webui-markdown = { path = "src/anti-webui-markdown", version = "0.1.0" }
+anti-webui-code = { path = "src/anti-webui-code", version = "0.1.0" }
 anti-webui-wayland = { path = "src/anti-webui-wayland", version = "0.1.0" }
 anti-webui-symbols-outlined = { path = "src/anti-webui-symbols-outlined", version = "0.1.0" }
 

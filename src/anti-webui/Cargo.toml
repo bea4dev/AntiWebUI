@@ -20,6 +20,8 @@ pdf = ["anti-webui-internal/pdf"]
 pdf-js = ["pdf", "anti-webui-internal/pdf-js"]
 ## A Markdown viewer and editor with Mermaid diagrams. See `docs/design/28-markdown.md`.
 markdown = ["anti-webui-internal/markdown"]
+## A code editor with tree-sitter highlighting for 14 languages. See `docs/design/31-code-editor.md`.
+code = ["anti-webui-internal/code"]
 ## Link AntiWebUI dynamically for faster incremental builds (development only).
 dynamic_linking = ["dep:anti-webui-dylib"]
 
@@ -37,6 +39,10 @@ required-features = ["markdown"]
 [[example]]
 name = "markdown_editor"
 required-features = ["markdown"]
+
+[[example]]
+name = "code_editor"
+required-features = ["code"]
 
 [[example]]
 name = "pdf"

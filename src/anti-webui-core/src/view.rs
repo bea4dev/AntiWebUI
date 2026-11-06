@@ -387,11 +387,11 @@ pub(crate) struct ElementConfig {
 impl ElementConfig {
     pub(crate) fn build(self, mut node: Node) -> NodeId {
         node.style.base = self.style;
-        node.style.hover = self.hover;
-        node.style.focus = self.focus;
-        node.style.active = self.active;
-        node.style.dragging = self.dragging;
-        node.style.drag_over = self.drag_over;
+        node.style.hover = self.hover.map(Box::new);
+        node.style.focus = self.focus.map(Box::new);
+        node.style.active = self.active.map(Box::new);
+        node.style.dragging = self.dragging.map(Box::new);
+        node.style.drag_over = self.drag_over.map(Box::new);
         node.listeners = self.listeners;
         if !self.gesture.is_empty() {
             node.listeners.gesture = Some(Rc::new(self.gesture));
@@ -1966,6 +1966,26 @@ impl EditorRef {
         self.change(|e| e.replace(range, text));
     }
 
+    /// Replaces a range of bytes of the text, as one step of undo, and then selects from one byte
+    /// to another in the new text: the same as `replace` and `select`, in one go.
+    pub fn replace_and_select(
+        &self,
+        range: std::ops::Range<usize>,
+        text: &str,
+        anchor: usize,
+        focus: usize,
+    ) {
+        self.change(|e| {
+            let out = e.replace(range, text);
+            e.select(anchor, focus);
+            e.keep_selection_after();
+            EditorOutcome {
+                changed: out.changed,
+                moved: true,
+            }
+        });
+    }
+
     /// Selects from one byte to another.
     pub fn select(&self, anchor: usize, focus: usize) {
         self.change(|e| {
@@ -1989,11 +2009,25 @@ impl EditorRef {
         with_doc(|d| crate::text::editor::hit(d, id, p))
     }
 
+    /// Asks the decorations again for the rows that are shown, when what they depend on changed
+    /// without the text or the selection changing (colors that came from another thread).
+    pub fn redecorate(&self) {
+        let Some(id) = self.0.get_untracked() else {
+            return;
+        };
+        with_doc(|d| {
+            if let Some(e) = d.get_mut(id).and_then(Node::editor_mut) {
+                e.looks_version += 1;
+            }
+        });
+        crate::text::editor::sync(id);
+    }
+
     /// The text, without tracking it.
     pub fn text(&self) -> String {
         self.0
             .get_untracked()
-            .and_then(|id| with_doc(|d| Some(d.get(id)?.editor()?.text.clone())))
+            .and_then(|id| with_doc(|d| Some(d.get(id)?.editor()?.text.to_string())))
             .unwrap_or_default()
     }
 
@@ -2009,9 +2043,14 @@ impl EditorRef {
 /// style, hide and replace parts of it. See "M3" in `docs/design/28-markdown.md`.
 pub struct TextEditor {
     cfg: ElementConfig,
+    text: Option<String>,
     value: Option<Signal<String>>,
     on_change: Option<TextCallback>,
     decorate: Option<Rc<crate::text::editor::Decorate>>,
+    decorate_lines: Option<Rc<crate::text::editor::DecorateLines>>,
+    blocks: Option<Rc<crate::text::editor::Blocks>>,
+    on_edit: Option<Rc<crate::text::editor::OnEdit>>,
+    gutter: Option<crate::text::editor::Gutter>,
     editor_ref: Option<EditorRef>,
     read_only: bool,
 }
@@ -2019,9 +2058,14 @@ pub struct TextEditor {
 pub fn text_editor() -> TextEditor {
     TextEditor {
         cfg: ElementConfig::default(),
+        text: None,
         value: None,
         on_change: None,
         decorate: None,
+        decorate_lines: None,
+        blocks: None,
+        on_edit: None,
+        gutter: None,
         editor_ref: None,
         read_only: false,
     }
@@ -2036,6 +2080,13 @@ impl Styled for TextEditor {
 impl TextEditor {
     element_methods!();
     box_paint_methods!();
+
+    /// The text it starts with, when it isn't bound to a signal. A long text is cheaper this way:
+    /// a bound signal is given a copy of the whole text at every change.
+    pub fn text(mut self, text: impl Into<String>) -> Self {
+        self.text = Some(text.into());
+        self
+    }
 
     /// Two-way binds the text to a signal.
     pub fn value(mut self, value: Signal<String>) -> Self {
@@ -2060,6 +2111,44 @@ impl TextEditor {
         self
     }
 
+    /// How the lines that get rows look, asked only for those: when they come into view, when the
+    /// text or the selection changes, and on [`EditorRef::redecorate`]. One look for each line of
+    /// the range. It should give the same `Rc` for a line that looks the same.
+    pub fn decorate_lines(
+        mut self,
+        f: impl Fn(
+            &crate::text::editor::DecorateContext,
+            std::ops::Range<usize>,
+        ) -> Vec<Rc<crate::text::editor::LineLook>>
+        + 'static,
+    ) -> Self {
+        self.decorate_lines = Some(Rc::new(f));
+        self
+    }
+
+    /// With `decorate_lines`: the rows that show several lines as one node (folded code), each by
+    /// its first line, in order. Asked whenever the text or the selection changes.
+    pub fn blocks(
+        mut self,
+        f: impl Fn(&crate::text::editor::DecorateContext) -> Vec<(usize, crate::text::editor::Row)>
+        + 'static,
+    ) -> Self {
+        self.blocks = Some(Rc::new(f));
+        self
+    }
+
+    /// Told of every change to the text, before the decorations are asked again.
+    pub fn on_edit(mut self, f: impl Fn(&crate::text::editor::TextEdit) + 'static) -> Self {
+        self.on_edit = Some(Rc::new(f));
+        self
+    }
+
+    /// Line numbers on the left, which stay there when the text scrolls across.
+    pub fn gutter(mut self, gutter: crate::text::editor::Gutter) -> Self {
+        self.gutter = Some(gutter);
+        self
+    }
+
     pub fn editor_ref(mut self, r: EditorRef) -> Self {
         self.editor_ref = Some(r);
         self
@@ -2077,14 +2166,19 @@ impl IntoView for TextEditor {
             self.cfg.style.cursor = Some(Some(anti_webui_style::CursorIcon::Text));
         }
         let mut data = crate::text::editor::EditorData::new();
-        if let Some(v) = self.value {
-            data.set_text(&v.get_untracked());
+        let start = self.value.map(|v| v.get_untracked()).or(self.text);
+        if let Some(text) = start {
+            data.set_text(&text);
             data.select(0, 0);
             data.clear_history();
         }
         data.value = self.value;
         data.on_change = self.on_change;
         data.decorate = self.decorate;
+        data.decorate_lines = self.decorate_lines;
+        data.blocks = self.blocks;
+        data.on_edit = self.on_edit;
+        data.gutter = self.gutter;
         data.read_only = self.read_only;
         data.owner = Owner::current();
         let mut node = Node::new(NodeKind::Editor(Box::new(data)));

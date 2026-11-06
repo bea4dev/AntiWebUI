@@ -148,6 +148,28 @@ fn offset_in(doc: &Document, id: NodeId, scroller: NodeId) -> Option<i32> {
     Some(y)
 }
 
+/// Whether a node shows: in the window and in the view of what scrolls it.
+pub(crate) fn is_in_view(doc: &Document, id: NodeId) -> bool {
+    let Some(n) = doc.nodes.get(id) else {
+        return false;
+    };
+    let window = RectI::new(0, 0, doc.viewport.width, doc.viewport.height);
+    n.visible && !doc.visible_part(n, n.abs).intersect(&window).is_empty()
+}
+
+/// Keeps a node where it shows while what is around it changes size in the next layout: what
+/// scrolls it moves by as much as it does.
+pub(crate) fn hold_in_place(doc: &mut Document, id: NodeId) {
+    let Some(s) = scroller_of(doc, id) else {
+        return;
+    };
+    if !doc.visibility.anchors.iter().any(|a| a.0 == s)
+        && let Some(y) = offset_in(doc, id, s)
+    {
+        doc.visibility.anchors.push((s, id, y));
+    }
+}
+
 /// After layout: what is around the anchors took its real size, so their scrollers move by as much
 /// as they did, and what shows stays where it was.
 pub(crate) fn keep_in_place(doc: &mut Document) {
