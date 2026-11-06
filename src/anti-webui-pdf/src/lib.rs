@@ -13,6 +13,7 @@ mod links;
 mod marks;
 mod plan;
 mod reading;
+mod script;
 mod slides;
 mod text;
 mod thumbnails;
@@ -34,6 +35,7 @@ pub use marks::{
 };
 use plan::{Direction, Have, Held, Job, PageTable, Turn};
 use reading::{BoxKind, HitPlace, Hits, Place, Reader, Selection};
+pub use script::{PdfAnswer, PdfButtons, PdfDialog, PdfDialogKind};
 use slides::Slides;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -218,6 +220,12 @@ pub struct PdfViewer {
     presenting: Signal<bool>,
     /// The page that is wanted when presenting.
     slide: Signal<usize>,
+    /// What a script of the document is showing and waiting for, and what was answered to it.
+    dialog: Signal<Option<PdfDialog>>,
+    dialog_answer: Signal<Option<PdfAnswer>>,
+    /// The next change of the fields that the scripts hear about comes from the application, which
+    /// they then work out the rest from.
+    calculate_next: Signal<bool>,
 }
 
 /// Makes what controls a [`pdf_view`], to hand it with [`PdfView::viewer`].
@@ -262,6 +270,9 @@ pub fn pdf_viewer() -> PdfViewer {
         present_asked: signal(false),
         presenting: signal(false),
         slide: signal(0),
+        dialog: signal(None),
+        dialog_answer: signal(None),
+        calculate_next: signal(false),
     }
 }
 
@@ -471,11 +482,13 @@ impl PdfViewer {
     }
 
     /// Fills in a field by its whole name. It says whether there is such a field. Being read only
-    /// doesn't stop this, as it is for what a person does.
+    /// doesn't stop this, as it is for what a person does. The scripts of the document then work
+    /// out what depends on it, but don't check it.
     pub fn set_field(&self, name: &str, value: PdfFieldValue) -> bool {
         let Some(at) = self.field_named(name) else {
             return false;
         };
+        self.calculate_next.set(true);
         self.set_field_at(at, value);
         true
     }
@@ -483,11 +496,64 @@ impl PdfViewer {
     /// Puts all of the fields back to what the document says they start with.
     pub fn reset_fields(&self) {
         let marks = self.marks.get_untracked();
+        self.calculate_next.set(true);
         self.batch_edits(|viewer| {
             for (at, field) in marks.fields.iter().enumerate() {
                 viewer.set_field_at(at, field.default.clone());
             }
         });
+    }
+
+    /// What shows for a field: its value, or what a script of the document makes of it, like
+    /// `$1,234.50` for `1234.5`. Lists give the values that are picked, and check boxes and radio
+    /// buttons what they are on, or `Off`.
+    pub fn field_text(&self, name: &str) -> Option<String> {
+        let _ = self.edits.get();
+        let at = self.field_named(name)?;
+        if let Some(shown) = self.edits.with_untracked(|e| e.shown.get(&at).cloned()) {
+            return Some(shown);
+        }
+        Some(match self.field_value_at(at) {
+            PdfFieldValue::Text(text) => text,
+            PdfFieldValue::State(state) => state.unwrap_or_else(|| "Off".to_owned()),
+            PdfFieldValue::Choice(picked) => picked.join(", "),
+        })
+    }
+
+    /// Whether the document has JavaScript for its forms, which runs if this was built with the
+    /// `js` feature. Links that run scripts aren't counted.
+    pub fn has_scripts(&self) -> bool {
+        self.marks.with(|m| m.has_scripts())
+    }
+
+    /// What a script of the document is asking, which the view shows until it is answered.
+    pub fn dialog(&self) -> Option<PdfDialog> {
+        self.dialog.get()
+    }
+
+    /// Answers what a script is asking, as the buttons of the dialog do.
+    pub fn answer_dialog(&self, answer: PdfAnswer) {
+        if self.dialog.with_untracked(Option::is_some) {
+            self.dialog_answer.set(Some(answer));
+        }
+    }
+
+    /// Whether a field can be changed now: what the document says, unless a script said otherwise.
+    fn field_read_only_at(&self, at: usize) -> bool {
+        let edited = self.edits.with_untracked(|e| e.read_only.get(&at).copied());
+        edited.unwrap_or_else(|| self.marks.with_untracked(|m| m.fields[at].info.read_only))
+    }
+
+    /// Whether a widget shows now: what the document says, unless a script said otherwise.
+    fn widget_hidden(&self, marks: &Marks, page: usize, widget: usize) -> bool {
+        let w = &marks.pages[page].widgets[widget];
+        match self
+            .edits
+            .with_untracked(|e| e.display.get(&w.field).copied())
+        {
+            Some(display) => !display.shows(),
+            None => w.hidden,
+        }
     }
 
     fn field_named(&self, name: &str) -> Option<usize> {
@@ -527,6 +593,14 @@ impl PdfViewer {
         self.undone.update(|all| all.push(now));
         self.redone.update(Vec::clear);
         self.edits.set(Arc::new(next));
+    }
+
+    /// Changes the list of edits for what follows from what was there, which isn't one more thing to
+    /// undo: going back goes to before what it followed from.
+    fn amend_edits(&self, next: Edits) {
+        if self.edits.with_untracked(|now| **now != next) {
+            self.edits.set(Arc::new(next));
+        }
     }
 
     /// Makes all that a function changes one thing to undo.
@@ -1110,12 +1184,26 @@ impl IntoView for PdfView {
         );
         {
             // Not the editor itself, which already has the reader.
-            let editor = Rc::downgrade(&editor);
+            let weak = Rc::downgrade(&editor);
             reader.set_marker(Rc::new(move |kind, pages| {
-                if let Some(editor) = editor.upgrade() {
+                if let Some(editor) = weak.upgrade() {
                     editor.mark(kind, pages);
                 }
             }));
+            let weak = Rc::downgrade(&editor);
+            reader.set_script_runner(Rc::new(move |script| {
+                if let Some(editor) = weak.upgrade() {
+                    editor.run_link(script);
+                }
+            }));
+            let file_name = match &source {
+                PdfSource::Path(path) => path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                _ => "document.pdf".to_owned(),
+            };
+            editor.watch_scripts(file_name);
         }
 
         let slides = Slides::new(viewer, reader.clone(), direction.clone());
@@ -1179,6 +1267,7 @@ impl IntoView for PdfView {
             let keep = keep.clone();
             let reader = reader.clone();
             let engine = engine.clone();
+            let editor = editor.clone();
             ui_channel(move |event: Event| match event {
                 Event::Text(page, text) => reader.text_arrived(page, text),
                 Event::Outline(outline) => viewer.outline.set(Rc::new(outline)),
@@ -1188,6 +1277,7 @@ impl IntoView for PdfView {
                     if needs_looks && let Some(engine) = &*engine.borrow() {
                         engine.edit(viewer.edits.get_untracked());
                     }
+                    editor.start_scripts();
                 }
                 Event::Edited(edits) => {
                     let marks = viewer.marks.get_untracked();
@@ -1848,6 +1938,7 @@ impl IntoView for PdfView {
                         return;
                     }
                     reader.pointer_moved(e);
+                    editor.hover(e);
                     if let Some(cursor) = editor.cursor_at(e) {
                         reader.cursor.set_if_changed(cursor);
                     }
@@ -1887,11 +1978,12 @@ impl IntoView for PdfView {
                         |page| *page,
                         page_view,
                     ))
-                    .child(show(
-                        move || !viewer.presenting.get(),
-                        move || editor.layer(),
-                    )),
+                    .child(show(move || !viewer.presenting.get(), {
+                        let editor = editor.clone();
+                        move || editor.layer()
+                    })),
             )
+            .child(editor.dialog_view())
             .child(show(
                 {
                     let blank = slides.blank;

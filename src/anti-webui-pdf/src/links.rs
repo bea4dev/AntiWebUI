@@ -44,6 +44,8 @@ pub struct PdfOutlineItem {
 pub(crate) enum LinkTarget {
     Place(PdfTarget),
     Url(String),
+    /// JavaScript to run.
+    Script(String),
 }
 
 /// A place on a page that goes somewhere when clicked, in the points of [`crate::text`].
@@ -187,6 +189,7 @@ impl Places {
                 action.get::<Object<'_>>(D)?,
                 NAME_DEPTH,
             )?)),
+            b"JavaScript" => crate::marks::javascript_of(&action).map(LinkTarget::Script),
             _ => None,
         }
     }
@@ -238,7 +241,7 @@ impl Places {
     fn action_target(&self, pdf: &Pdf, item: &Dict<'_>) -> Option<PdfTarget> {
         match self.link_target(pdf, item)? {
             LinkTarget::Place(target) => Some(target),
-            LinkTarget::Url(_) => None,
+            LinkTarget::Url(_) | LinkTarget::Script(_) => None,
         }
     }
 }

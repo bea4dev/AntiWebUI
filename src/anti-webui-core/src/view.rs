@@ -170,6 +170,21 @@ impl NodeRef {
         with_doc(|d| d.pending_focus = Some(None));
     }
 
+    /// Replaces the text of a text input and selects from one byte offset of it to another, as
+    /// something that checks what is typed does. A signal bound with `value` has to be told the same
+    /// text, which then changes nothing more. It isn't something to undo.
+    pub fn set_text(&self, text: &str, selection: (usize, usize)) {
+        if let Some(id) = self.0.get_untracked() {
+            with_doc(|d| {
+                if let Some(e) = d.get_mut(id).and_then(Node::edit_mut) {
+                    e.set_text(text.to_owned());
+                    e.select_range(selection.0, selection.1);
+                    d.invalidate_layout(id);
+                }
+            });
+        }
+    }
+
     /// Puts the caret of a text input after what it has.
     pub fn select_end(&self) {
         if let Some(id) = self.0.get_untracked() {

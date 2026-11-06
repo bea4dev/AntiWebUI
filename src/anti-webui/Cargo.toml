@@ -16,6 +16,8 @@ svg-text = ["anti-webui-internal/svg-text"]
 video = ["anti-webui-internal/video"]
 ## A PDF viewer on `hayro`. See `docs/design/26-pdf.md`.
 pdf = ["anti-webui-internal/pdf"]
+## The JavaScript of PDF forms, on QuickJS, which adds about 1 MB.
+pdf-js = ["pdf", "anti-webui-internal/pdf-js"]
 ## Link AntiWebUI dynamically for faster incremental builds (development only).
 dynamic_linking = ["dep:anti-webui-dylib"]
 

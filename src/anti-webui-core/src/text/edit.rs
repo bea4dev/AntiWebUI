@@ -524,6 +524,13 @@ impl EditData {
         }
     }
 
+    /// Selects from one byte offset to another, kept inside of the text and on its characters.
+    pub fn select_range(&mut self, anchor: usize, focus: usize) {
+        self.anchor = floor_char_boundary(&self.text, anchor.min(self.text.len()));
+        self.focus = floor_char_boundary(&self.text, focus.min(self.text.len()));
+        self.moved();
+    }
+
     pub fn select_all(&mut self) {
         self.anchor = 0;
         self.focus = self.text.len();

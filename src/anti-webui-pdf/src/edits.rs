@@ -5,8 +5,8 @@
 use crate::appearance::{self, DefaultLook, Face, Frame, SimpleFont, TextStyle};
 use crate::embed::{self, Subset, SubsetCache};
 use crate::marks::{
-    Annot, Field, Marks, PdfAnnotationId, PdfAnnotationKind, PdfFieldKind, PdfFieldValue, Shape,
-    annotations,
+    Annot, Field, HIDDEN, Marks, NO_VIEW, PRINT, PdfAnnotationId, PdfAnnotationKind, PdfFieldKind,
+    PdfFieldValue, READ_ONLY, Shape, annotations,
 };
 use crate::writer::{Entries, Tail, Update, Value};
 use hayro::hayro_syntax::Pdf;
@@ -22,11 +22,81 @@ pub(crate) struct Edits {
     pub fields: BTreeMap<usize, PdfFieldValue>,
     /// The annotations that were added or changed, and those that were removed from the document.
     pub annots: BTreeMap<PdfAnnotationId, Annot>,
+    /// What shows for the value of a field, when a script of the document says it shows otherwise:
+    /// `$1,234.50` for `1234.5`.
+    pub shown: BTreeMap<usize, String>,
+    /// Whether a field shows, as a script said: [`Display`].
+    pub display: BTreeMap<usize, Display>,
+    /// Whether a field can be changed, as a script said.
+    pub read_only: BTreeMap<usize, bool>,
+}
+
+/// Whether the widgets of a field show and get printed, as `display` of Acrobat's JavaScript has it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Display {
+    Visible,
+    Hidden,
+    NoPrint,
+    NoView,
+}
+
+#[cfg_attr(not(feature = "js"), allow(dead_code))]
+impl Display {
+    pub fn from_number(n: i64) -> Option<Self> {
+        Some(match n {
+            0 => Self::Visible,
+            1 => Self::Hidden,
+            2 => Self::NoPrint,
+            3 => Self::NoView,
+            _ => return None,
+        })
+    }
+
+    pub fn number(self) -> i64 {
+        match self {
+            Self::Visible => 0,
+            Self::Hidden => 1,
+            Self::NoPrint => 2,
+            Self::NoView => 3,
+        }
+    }
+
+    /// What `/F` of a widget says.
+    pub fn of_flags(flags: u32) -> Self {
+        if flags & HIDDEN != 0 {
+            Self::Hidden
+        } else if flags & NO_VIEW != 0 {
+            Self::NoView
+        } else if flags & PRINT == 0 {
+            Self::NoPrint
+        } else {
+            Self::Visible
+        }
+    }
+
+    /// `/F` of a widget that had `flags` before.
+    pub fn flags(self, flags: u32) -> u32 {
+        let rest = flags & !(HIDDEN | NO_VIEW | PRINT);
+        match self {
+            Self::Visible => rest | PRINT,
+            Self::Hidden => rest | HIDDEN | PRINT,
+            Self::NoPrint => rest,
+            Self::NoView => rest | NO_VIEW | PRINT,
+        }
+    }
+
+    pub fn shows(self) -> bool {
+        matches!(self, Self::Visible | Self::NoPrint)
+    }
 }
 
 impl Edits {
     pub fn is_empty(&self) -> bool {
-        self.fields.is_empty() && self.annots.is_empty()
+        self.fields.is_empty()
+            && self.annots.is_empty()
+            && self.shown.is_empty()
+            && self.display.is_empty()
+            && self.read_only.is_empty()
     }
 
     /// The pages that don't look the same with these as with those.
@@ -36,12 +106,17 @@ impl Edits {
             .fields
             .keys()
             .chain(other.fields.keys())
+            .chain(self.shown.keys())
+            .chain(other.shown.keys())
+            .chain(self.display.keys())
+            .chain(other.display.keys())
             .copied()
             .collect();
         for key in keys {
-            if self.fields.get(&key) != other.fields.get(&key)
-                && let Some(field) = marks.fields.get(key)
-            {
+            let differs = self.fields.get(&key) != other.fields.get(&key)
+                || self.shown.get(&key) != other.shown.get(&key)
+                || self.display.get(&key) != other.display.get(&key);
+            if differs && let Some(field) = marks.fields.get(key) {
                 pages.extend(field.widgets.iter().map(|w| w.0));
             }
         }
@@ -112,7 +187,9 @@ pub(crate) fn build(
         .fields
         .iter()
         .enumerate()
-        .filter(|(i, f)| f.needs_look || edits.fields.contains_key(i))
+        .filter(|(i, f)| {
+            f.needs_look || edits.fields.contains_key(i) || edits.shown.contains_key(i)
+        })
         .map(|(i, _)| i)
         .collect();
 
@@ -149,6 +226,7 @@ pub(crate) fn build(
         builder.write_field(i, edits)?;
     }
     builder.write_annots(edits)?;
+    builder.write_flags(edits);
 
     // Those who read XFA would show what was in the fields before.
     if !edits.fields.is_empty() && form.as_ref().is_some_and(|f| f.contains_key(b"XFA")) {
@@ -219,11 +297,14 @@ impl Builder<'_, '_> {
         edits.fields.get(&i).unwrap_or(&self.marks.fields[i].value)
     }
 
-    /// What shows for a field, of its text and its list.
-    fn shown_text(field: &Field, value: &PdfFieldValue) -> Vec<String> {
+    /// What shows for a field, of its text and its list. `formatted` is what a script said shows.
+    fn shown_text(field: &Field, value: &PdfFieldValue, formatted: Option<&String>) -> Vec<String> {
         match (value, field.info.kind) {
             (PdfFieldValue::Text(text), _) if field.password() => {
                 vec!["*".repeat(text.chars().count())]
+            }
+            (_, PdfFieldKind::Text | PdfFieldKind::Combo { .. }) if formatted.is_some() => {
+                formatted.into_iter().cloned().collect()
             }
             (PdfFieldValue::Text(text), _) => vec![text.clone()],
             (PdfFieldValue::Choice(_), PdfFieldKind::List { .. }) => {
@@ -250,7 +331,7 @@ impl Builder<'_, '_> {
         let field = &self.marks.fields[i];
         let look = appearance::parse_default_look(&field.da);
         let value = self.field_value(i, edits);
-        for text in Self::shown_text(field, value) {
+        for text in Self::shown_text(field, value, edits.shown.get(&i)) {
             for &(page, widget) in &field.widgets {
                 let widget = self.marks.pages[page].widgets[widget].object;
                 let dict = self.widget_dict(widget);
@@ -283,10 +364,46 @@ impl Builder<'_, '_> {
                     &widget.on_state,
                 ),
                 PdfFieldKind::Push | PdfFieldKind::Signature => {}
-                _ => self.write_text_look(&field, &widget.object, widget.rect, &value),
+                _ => self.write_text_look(
+                    &field,
+                    &widget.object,
+                    widget.rect,
+                    &value,
+                    edits.shown.get(&i),
+                ),
             }
         }
         Ok(())
+    }
+
+    /// Whether the fields show and can be changed, as scripts said.
+    fn write_flags(&mut self, edits: &Edits) {
+        for (&i, display) in &edits.display {
+            let Some(field) = self.marks.fields.get(i) else {
+                continue;
+            };
+            for &(page, widget) in &field.widgets {
+                let widget = &self.marks.pages[page].widgets[widget];
+                if let Some(entries) = self.rewrites.of(self.pdf, widget.object) {
+                    entries.set(b"F", Value::Int(display.flags(widget.flags) as i64));
+                }
+            }
+        }
+        for (&i, &on) in &edits.read_only {
+            let Some(field) = self.marks.fields.get(i) else {
+                continue;
+            };
+            let flags = if on {
+                field.flags | READ_ONLY
+            } else {
+                field.flags & !READ_ONLY
+            };
+            for holder in &field.holders {
+                if let Some(entries) = self.rewrites.of(self.pdf, *holder) {
+                    entries.set(b"Ff", Value::Int(flags as i64));
+                }
+            }
+        }
     }
 
     fn write_button(
@@ -351,13 +468,14 @@ impl Builder<'_, '_> {
         object: &ObjRef,
         rect: [f64; 4],
         value: &PdfFieldValue,
+        formatted: Option<&String>,
     ) {
         let Some(dict) = self.widget_dict(*object) else {
             return;
         };
         let frame = Frame::read(&dict, rect);
         let look = appearance::parse_default_look(&field.da);
-        let shown = Self::shown_text(field, value);
+        let shown = Self::shown_text(field, value, formatted);
         let all = shown.join("\n");
         let (ops, resources) = self.with_face(&all, &look, Some(&dict), |face| {
             let style = TextStyle {

@@ -15,6 +15,11 @@ hayro.workspace = true
 fontique.workspace = true
 log.workspace = true
 subsetter = { workspace = true }
+rquickjs = { workspace = true, optional = true }
+
+[features]
+## The JavaScript of documents, on QuickJS. See "JavaScript" in `docs/design/26-pdf.md`.
+js = ["dep:rquickjs"]
 
 [dev-dependencies]
 anti-webui-core = { workspace = true, features = ["svg"] }

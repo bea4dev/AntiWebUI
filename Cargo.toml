@@ -73,3 +73,4 @@ libloading = "0.8"
 hayro = "=0.9.0"
 fontique = "0.12"
 subsetter = { version = "0.2.6", default-features = false }
+rquickjs = "0.11"

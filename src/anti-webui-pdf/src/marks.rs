@@ -10,15 +10,17 @@ use hayro::hayro_interpret::util::TransformExt;
 use hayro::hayro_syntax::Pdf;
 use hayro::hayro_syntax::object::String as PdfString;
 use hayro::hayro_syntax::object::dict::keys::{ANNOTS, AP, AS, N, PARENT, RECT, SUBTYPE};
-use hayro::hayro_syntax::object::{Array, Dict, MaybeRef, Name, ObjRef, Object, Rect};
+use hayro::hayro_syntax::object::{Array, Dict, MaybeRef, Name, ObjRef, Object, Rect, Stream};
 use hayro::kurbo::Affine;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 /// How many parents a field can have, as a broken document can make this go on forever.
 const FIELD_DEPTH: usize = 32;
+/// How many actions can follow each other with `/Next`, and how deep a tree of names goes.
+const ACTION_DEPTH: usize = 16;
 
-const READ_ONLY: u32 = 1;
+pub(crate) const READ_ONLY: u32 = 1;
 const REQUIRED: u32 = 1 << 1;
 const MULTILINE: u32 = 1 << 12;
 const PASSWORD: u32 = 1 << 13;
@@ -30,8 +32,9 @@ const EDIT: u32 = 1 << 18;
 const FILE_SELECT: u32 = 1 << 20;
 const MULTI_SELECT: u32 = 1 << 21;
 const COMB: u32 = 1 << 24;
-const HIDDEN: u32 = 1 << 1;
-const NO_VIEW: u32 = 1 << 5;
+pub(crate) const HIDDEN: u32 = 1 << 1;
+pub(crate) const PRINT: u32 = 1 << 2;
+pub(crate) const NO_VIEW: u32 = 1 << 5;
 
 /// Whether a document can be edited, and otherwise why not.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -110,6 +113,7 @@ pub(crate) struct Field {
     pub widgets: Vec<(usize, usize)>,
     /// What shows for it has to be made when opening.
     pub needs_look: bool,
+    pub scripts: FieldScripts,
 }
 
 impl Field {
@@ -132,6 +136,55 @@ impl Field {
     }
 }
 
+/// The scripts of a field, from the `/AA` of the field: what is typed, how the value shows, whether
+/// it may be, and how it is worked out from the others.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct FieldScripts {
+    pub keystroke: Option<String>,
+    pub format: Option<String>,
+    pub validate: Option<String>,
+    pub calculate: Option<String>,
+}
+
+impl FieldScripts {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The scripts of a widget, for what the pointer and the focus do to it. `up` has what `/A` says
+/// too, which is what a click does.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct WidgetScripts {
+    pub down: Option<String>,
+    pub up: Option<String>,
+    pub enter: Option<String>,
+    pub exit: Option<String>,
+    pub focus: Option<String>,
+    pub blur: Option<String>,
+}
+
+impl WidgetScripts {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The scripts of the whole document, and what they can ask about it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct DocumentScripts {
+    /// Those in `/Names /JavaScript`, by name, which run when it opens.
+    pub named: Vec<(String, String)>,
+    /// What `/OpenAction` runs after them.
+    pub open: Option<String>,
+    /// The fields that are worked out, in the order they are: `/CO`.
+    pub calculation_order: Vec<usize>,
+    /// What runs when a page becomes the one being read, and when it stops being that.
+    pub pages: Vec<(usize, Option<String>, Option<String>)>,
+    /// `/Info`: title, author, subject, keywords, creator and producer.
+    pub info: Vec<(&'static str, String)>,
+}
+
 /// What a widget does when it is pressed, apart from its field.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum WidgetAction {
@@ -150,7 +203,10 @@ pub(crate) struct Widget {
     /// What is on for this one, of a check box or a radio button.
     pub on_state: Option<String>,
     pub hidden: bool,
+    /// What its `/F` says.
+    pub flags: u32,
     pub action: WidgetAction,
+    pub scripts: WidgetScripts,
 }
 
 /// What kind of annotation something is.
@@ -316,6 +372,7 @@ pub(crate) struct Marks {
     pub signed: bool,
     pub fields: Vec<Field>,
     pub pages: Vec<PageMarks>,
+    pub scripts: DocumentScripts,
 }
 
 impl Marks {
@@ -323,6 +380,134 @@ impl Marks {
     pub fn needs_looks(&self) -> bool {
         self.fields.iter().any(|f| f.needs_look)
     }
+
+    /// Whether anything of it runs JavaScript. Links aren't counted: they start it when clicked.
+    pub fn has_scripts(&self) -> bool {
+        let s = &self.scripts;
+        !s.named.is_empty()
+            || s.open.is_some()
+            || !s.pages.is_empty()
+            || self.fields.iter().any(|f| !f.scripts.is_empty())
+            || self
+                .pages
+                .iter()
+                .any(|p| p.widgets.iter().any(|w| !w.scripts.is_empty()))
+    }
+}
+
+/// The text of a script of a PDF: a text string or a stream.
+fn script_text(object: Object<'_>) -> Option<String> {
+    let text = match object {
+        Object::String(s) => text_string(s.as_bytes()),
+        Object::Stream(stream) => text_string(&stream_bytes(&stream)?),
+        _ => return None,
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn stream_bytes(stream: &Stream<'_>) -> Option<Vec<u8>> {
+    stream.decoded().ok().map(|b| b.into_owned())
+}
+
+/// What JavaScript an action runs, with the actions that follow it by `/Next`.
+pub(crate) fn javascript_of(action: &Dict<'_>) -> Option<String> {
+    let mut all = Vec::new();
+    collect_javascript(action, ACTION_DEPTH, &mut all);
+    (!all.is_empty()).then(|| all.join("\n"))
+}
+
+fn collect_javascript(action: &Dict<'_>, depth: usize, all: &mut Vec<String>) {
+    if depth == 0 {
+        return;
+    }
+    if action
+        .get::<Name<'_>>(b"S" as &[u8])
+        .is_some_and(|s| s.as_ref() == b"JavaScript")
+        && let Some(text) = action
+            .get::<Object<'_>>(b"JS" as &[u8])
+            .and_then(script_text)
+    {
+        all.push(text);
+    }
+    match action.get::<Object<'_>>(b"Next" as &[u8]) {
+        Some(Object::Dict(next)) => collect_javascript(&next, depth - 1, all),
+        Some(Object::Array(list)) => {
+            for next in list.iter::<Dict<'_>>() {
+                collect_javascript(&next, depth - 1, all);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The JavaScript of an entry of `/AA`.
+fn additional(dict: &Dict<'_>, key: &[u8]) -> Option<String> {
+    let actions = dict.get::<Dict<'_>>(b"AA" as &[u8])?;
+    javascript_of(&actions.get::<Dict<'_>>(key)?)
+}
+
+/// All of the leaves of a tree of names, in order.
+fn name_tree_leaves<'a>(node: &Dict<'a>, depth: usize, out: &mut Vec<(String, Object<'a>)>) {
+    if depth == 0 {
+        return;
+    }
+    if let Some(names) = node.get::<Array<'_>>(b"Names" as &[u8]) {
+        let mut items = names.iter::<Object<'_>>();
+        while let (Some(key), Some(value)) = (items.next(), items.next()) {
+            if let Object::String(key) = key {
+                out.push((text_string(key.as_bytes()), value));
+            }
+        }
+    }
+    if let Some(kids) = node.get::<Array<'_>>(b"Kids" as &[u8]) {
+        for kid in kids.iter::<Dict<'_>>() {
+            name_tree_leaves(&kid, depth - 1, out);
+        }
+    }
+}
+
+/// What the document runs by itself, apart from its fields.
+fn document_scripts(pdf: &Pdf, catalog: Option<&Dict<'_>>) -> DocumentScripts {
+    let mut scripts = DocumentScripts::default();
+    if let Some(catalog) = catalog {
+        if let Some(tree) = catalog
+            .get::<Dict<'_>>(b"Names" as &[u8])
+            .and_then(|n| n.get::<Dict<'_>>(b"JavaScript" as &[u8]))
+        {
+            let mut leaves = Vec::new();
+            name_tree_leaves(&tree, ACTION_DEPTH, &mut leaves);
+            for (name, action) in leaves {
+                if let Object::Dict(action) = action
+                    && let Some(text) = javascript_of(&action)
+                {
+                    scripts.named.push((name, text));
+                }
+            }
+        }
+        if let Some(Object::Dict(action)) = catalog.get::<Object<'_>>(b"OpenAction" as &[u8]) {
+            scripts.open = javascript_of(&action);
+        }
+    }
+    for (index, page) in pdf.pages().iter().enumerate() {
+        let (open, close) = (additional(page.raw(), b"O"), additional(page.raw(), b"C"));
+        if open.is_some() || close.is_some() {
+            scripts.pages.push((index, open, close));
+        }
+    }
+    let info = pdf.metadata();
+    for (key, value) in [
+        ("title", &info.title),
+        ("author", &info.author),
+        ("subject", &info.subject),
+        ("keywords", &info.keywords),
+        ("creator", &info.creator),
+        ("producer", &info.producer),
+    ] {
+        if let Some(value) = value {
+            scripts.info.push((key, text_string(value)));
+        }
+    }
+    scripts
 }
 
 /// Goes up from a field for something it inherits.
@@ -495,6 +680,7 @@ pub(crate) fn read(pdf: &Pdf, tail: Option<&Tail>) -> Marks {
         signed,
         ..Marks::default()
     };
+    marks.scripts = document_scripts(pdf, catalog.as_ref());
     let mut by_name: HashMap<String, usize> = HashMap::new();
     let mut by_holder: HashMap<(u32, i32), usize> = HashMap::new();
     for (index, page) in pdf.pages().iter().enumerate() {
@@ -553,6 +739,21 @@ pub(crate) fn read(pdf: &Pdf, tail: Option<&Tail>) -> Marks {
         }
         marks.pages.push(shown);
     }
+    if let Some(order) = form
+        .as_ref()
+        .and_then(|f| f.get::<Array<'_>>(b"CO" as &[u8]))
+    {
+        for item in order.raw_iter() {
+            if let MaybeRef::Ref(r) = item {
+                let r: ObjRef = r;
+                if let Some(&field) = by_holder.get(&(r.obj_number, r.gen_number))
+                    && !marks.scripts.calculation_order.contains(&field)
+                {
+                    marks.scripts.calculation_order.push(field);
+                }
+            }
+        }
+    }
     marks
 }
 
@@ -605,6 +806,7 @@ fn read_widget(
             holders: Vec::new(),
             widgets: Vec::new(),
             needs_look: false,
+            scripts: FieldScripts::default(),
         });
         at
     });
@@ -614,6 +816,22 @@ fn read_widget(
     }
     let flags = dict.get::<u32>(b"F" as &[u8]).unwrap_or(0);
     let info = &mut fields[field];
+    // What the field runs is in the dictionary of the field, which is the widget's when they are one.
+    if info.scripts.is_empty() {
+        let holder_dict = if holder == own {
+            Some(dict.clone())
+        } else {
+            dict.get::<Dict<'_>>(PARENT)
+        };
+        if let Some(d) = holder_dict {
+            info.scripts = FieldScripts {
+                keystroke: additional(&d, b"K"),
+                format: additional(&d, b"F"),
+                validate: additional(&d, b"V"),
+                calculate: additional(&d, b"C"),
+            };
+        }
+    }
     if !info.holders.contains(&holder) {
         info.holders.push(holder);
     }
@@ -645,17 +863,35 @@ fn read_widget(
     if is_look_kind && ((has_value && need_looks && !is_button) || (has_value && !has_look)) {
         info.needs_look = true;
     }
-    let action = dict
-        .get::<Dict<'_>>(b"A" as &[u8])
+    let pressed = dict.get::<Dict<'_>>(b"A" as &[u8]);
+    let action = pressed
+        .as_ref()
         .and_then(|a| a.get::<Name<'_>>(b"S" as &[u8]))
         .filter(|s| s.as_ref() == b"ResetForm")
         .map_or(WidgetAction::None, |_| WidgetAction::Reset);
+    let up = [
+        pressed.as_ref().and_then(javascript_of),
+        additional(dict, b"U"),
+    ]
+    .into_iter()
+    .flatten()
+    .reduce(|a, b| format!("{a}\n{b}"));
+    let scripts = WidgetScripts {
+        down: additional(dict, b"D"),
+        up,
+        enter: additional(dict, b"E"),
+        exit: additional(dict, b"X"),
+        focus: additional(dict, b"Fo"),
+        blur: additional(dict, b"Bl"),
+    };
     shown.widgets.push(Widget {
         field,
         object: own,
         rect,
         on_state,
         hidden: flags & (HIDDEN | NO_VIEW) != 0,
+        flags,
         action,
+        scripts,
     });
 }

@@ -2,6 +2,8 @@
 //! is changing the list of edits, and the document comes back with them from [`crate::edits`]. See
 //! "フォームと注釈" in `docs/design/26-pdf.md`.
 
+mod scripts;
+
 use crate::appearance;
 use crate::edits::Edits;
 use crate::marks::{
@@ -10,6 +12,7 @@ use crate::marks::{
 };
 use crate::plan::PageTable;
 use crate::reading::{BoxKind, PageBox, Reader};
+use crate::script::{Mouse, ScriptHost};
 use crate::{FieldListener, PdfViewer};
 use anti_webui_core::event::{Key, KeyboardEvent, NamedKey, PointerButton, PointerEvent};
 use anti_webui_core::geometry::{PointF, RectI};
@@ -17,7 +20,7 @@ use anti_webui_core::platform::ImePurpose;
 use anti_webui_core::prelude::*;
 use anti_webui_core::svg;
 use kurbo::BezPath;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -72,6 +75,8 @@ struct Active {
     value: Signal<String>,
     /// Something happened to it, so that it doesn't happen again when losing focus.
     done: Rc<Cell<bool>>,
+    /// The text as the scripts of the document last saw it.
+    typed: Rc<RefCell<String>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -143,6 +148,21 @@ pub(crate) struct Editor {
     moving: Signal<Option<[f32; 4]>>,
     /// The line being drawn, on its page, in the points of the page.
     ink: Signal<Option<InkLine>>,
+
+    /// The scripts of the document, once it turns out to have some.
+    scripts: RefCell<Option<ScriptHost>>,
+    /// What the scripts were last told the edits are.
+    told: RefCell<Arc<Edits>>,
+    /// The widget the pointer is over: its page and which of the page's widgets.
+    hovered: Cell<Option<(usize, usize)>>,
+    /// What the scripts get for the name of the file.
+    file_name: RefCell<String>,
+    /// The page that was being read when the scripts started.
+    start_page: Cell<usize>,
+    /// A field a script wants to type in, which waits for what is being committed to be done.
+    focus_after: Cell<Option<Option<usize>>>,
+    /// The way back from the scripts, made with the view.
+    script_out: RefCell<Option<anti_webui_core::channel::UiSender<crate::script::Message>>>,
 }
 
 impl Editor {
@@ -170,6 +190,13 @@ impl Editor {
             on_text: Cell::new(None),
             moving: signal(None),
             ink: signal(None),
+            scripts: RefCell::new(None),
+            told: RefCell::new(Arc::default()),
+            hovered: Cell::new(None),
+            file_name: RefCell::new(String::new()),
+            start_page: Cell::new(0),
+            focus_after: Cell::new(None),
+            script_out: RefCell::new(None),
         });
         // What was committed goes when the page shows it too.
         let (active, lingering) = (this.active, this.lingering);
@@ -213,6 +240,7 @@ impl Editor {
         self.active.set(Some(Active {
             number,
             kind,
+            typed: Rc::new(RefCell::new(value.clone())),
             value: signal(value),
             done: Rc::new(Cell::new(false)),
         }));
@@ -226,13 +254,25 @@ impl Editor {
         if active.done.replace(true) {
             return;
         }
+        self.focus_after.set(Some(None));
         let text = active.value.get_untracked();
         let mut linger = None;
         match active.kind {
-            ActiveKind::Field { field, page, .. } => {
-                if self.set_field_by_user(field, PdfFieldValue::Text(text)) {
+            ActiveKind::Field {
+                field,
+                page,
+                widget,
+            } => {
+                let value = match self.marks().fields.get(field).map(|f| f.info.kind) {
+                    Some(PdfFieldKind::Combo { .. }) => PdfFieldValue::Choice(
+                        Some(text).filter(|t| !t.is_empty()).into_iter().collect(),
+                    ),
+                    _ => PdfFieldValue::Text(text),
+                };
+                if self.set_field_by_user(field, value) {
                     linger = Some(page);
                 }
+                self.mouse(page, widget, Mouse::Blur, None);
             }
             ActiveKind::Options { .. } => {}
             ActiveKind::FreeText { page, area, id } => {
@@ -246,6 +286,9 @@ impl Editor {
             Some(page) => self.lingering.set(Some(page)),
             None => self.active.set(None),
         }
+        if let Some(Some(field)) = self.focus_after.take() {
+            self.focus_field(field);
+        }
     }
 
     /// Goes back to how it was, without what was typed.
@@ -254,6 +297,9 @@ impl Editor {
             active.done.set(true);
             self.active.set(None);
             self.viewer.focus();
+            if let ActiveKind::Field { page, widget, .. } = active.kind {
+                self.mouse(page, widget, Mouse::Blur, None);
+            }
         }
     }
 
@@ -263,7 +309,13 @@ impl Editor {
         let Some(info) = marks.fields.get(field) else {
             return false;
         };
-        if info.info.read_only || !self.viewer.set_field_at(field, value.clone()) {
+        if self.viewer.field_read_only_at(field) {
+            return false;
+        }
+        if let Some(changed) = self.commit_with_scripts(field, value.clone()) {
+            return changed;
+        }
+        if !self.viewer.set_field_at(field, value.clone()) {
             return false;
         }
         if let Some(f) = &self.on_change {
@@ -370,9 +422,13 @@ impl Editor {
     fn widget_at(&self, page: usize, x: f32, y: f32) -> Option<usize> {
         let marks = self.marks();
         let shown = marks.pages.get(page)?;
-        shown.widgets.iter().rposition(|w| {
-            let b = shown.box_to_points(w.rect);
-            !w.hidden && x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3]
+        (0..shown.widgets.len()).rev().find(|&i| {
+            let b = shown.box_to_points(shown.widgets[i].rect);
+            !self.viewer.widget_hidden(&marks, page, i)
+                && x >= b[0]
+                && x <= b[2]
+                && y >= b[1]
+                && y <= b[3]
         })
     }
 
@@ -443,14 +499,18 @@ impl Editor {
             let marks = self.marks();
             let w = &marks.pages[page].widgets[widget];
             let field = &marks.fields[w.field];
-            let does_something = !field.info.read_only
-                && (!matches!(
-                    field.info.kind,
-                    PdfFieldKind::Push | PdfFieldKind::Signature
-                ) || w.action != WidgetAction::None);
+            let scripted =
+                self.has_scripts() && (w.scripts.down.is_some() || w.scripts.up.is_some());
+            let does_something = scripted
+                || (!self.viewer.field_read_only_at(w.field)
+                    && (!matches!(
+                        field.info.kind,
+                        PdfFieldKind::Push | PdfFieldKind::Signature
+                    ) || w.action != WidgetAction::None));
             if does_something {
                 self.viewer.selected.set_if_changed(None);
                 self.pressed.set(Some(Pressed::Widget { page, widget }));
+                self.mouse(page, widget, Mouse::Down, Some(e));
                 return true;
             }
         }
@@ -591,6 +651,7 @@ impl Editor {
                     && self.widget_at(page, x, y) == Some(widget)
                 {
                     self.use_widget(page, widget);
+                    self.mouse(page, widget, Mouse::Up, Some(e));
                 }
             }
             Pressed::Annot { id, .. } => {
@@ -700,6 +761,9 @@ impl Editor {
             self.viewer.reset_fields();
             return;
         }
+        if self.viewer.field_read_only_at(w.field) {
+            return;
+        }
         let current = self.viewer.field_value_at(w.field);
         match field.info.kind {
             PdfFieldKind::Check | PdfFieldKind::Radio => {
@@ -729,6 +793,7 @@ impl Editor {
                     },
                     text,
                 );
+                self.mouse(page, widget, Mouse::Focus, None);
             }
             PdfFieldKind::Combo { editable } => {
                 let PdfFieldValue::Choice(picked) = current else {
@@ -744,6 +809,7 @@ impl Editor {
                         },
                         text,
                     );
+                    self.mouse(page, widget, Mouse::Focus, None);
                 } else {
                     self.start(
                         ActiveKind::Options {
@@ -798,7 +864,10 @@ impl Editor {
             let marks = self.marks();
             let w = &marks.pages[page].widgets[widget];
             let field = &marks.fields[w.field];
-            if field.info.read_only {
+            if self.has_scripts() && w.scripts.up.is_some() {
+                return Some(CursorIcon::Pointer);
+            }
+            if self.viewer.field_read_only_at(w.field) {
                 return None;
             }
             return match field.info.kind {
@@ -863,6 +932,7 @@ impl Editor {
         }
         let marks = self.viewer.marks.get();
         let table = self.table.get();
+        let _ = self.viewer.edits.get();
         if marks.editing != PdfEditing::Yes || page >= table.len() {
             return Vec::new();
         }
@@ -872,16 +942,17 @@ impl Editor {
         shown
             .widgets
             .iter()
-            .filter(|w| {
+            .enumerate()
+            .filter(|(i, w)| {
                 let field = &marks.fields[w.field];
-                !w.hidden
-                    && !field.info.read_only
+                !self.viewer.widget_hidden(&marks, page, *i)
+                    && !self.viewer.field_read_only_at(w.field)
                     && !matches!(
                         field.info.kind,
                         PdfFieldKind::Push | PdfFieldKind::Signature
                     )
             })
-            .map(|w| {
+            .map(|(_, w)| {
                 let r = self
                     .reader
                     .to_pixels(&table, page, &shown.box_to_points(w.rect));
@@ -1149,6 +1220,7 @@ impl Editor {
         let (input, node) = self.input_events(input, &active);
         let this = self.clone();
         let (table, value) = (self.table, active.value);
+        let typed = active.typed.clone();
         let max_len = info.max_len;
         let points = marks.pages[page].box_to_points(w.rect);
         let view = input
@@ -1183,11 +1255,15 @@ impl Editor {
                         .text_size(logical)
                 }
             })
-            .on_input(move |text| {
-                if let Some(most) = max_len
-                    && text.chars().count() > most as usize
-                {
-                    value.set(text.chars().take(most as usize).collect());
+            .on_input({
+                let this = this.clone();
+                move |text| {
+                    if let Some(most) = max_len
+                        && text.chars().count() > most as usize
+                    {
+                        value.set(text.chars().take(most as usize).collect());
+                    }
+                    this.keystroke(field, &typed, value, node);
                 }
             })
             .on_submit({
@@ -1233,10 +1309,11 @@ impl Editor {
         };
         let count = all.len();
         let offsets = 1..count;
-        let takes_text = |w: &Widget| {
+        let takes_text = |p: usize, i: usize| {
+            let w: &Widget = &marks.pages[p].widgets[i];
             let f: &Field = &marks.fields[w.field];
-            !w.hidden
-                && !f.info.read_only
+            !self.viewer.widget_hidden(&marks, p, i)
+                && !self.viewer.field_read_only_at(w.field)
                 && w.field != field
                 && matches!(f.info.kind, PdfFieldKind::Text | PdfFieldKind::Combo { .. })
         };
@@ -1248,7 +1325,7 @@ impl Editor {
                     all[(at + step) % count]
                 }
             })
-            .find(|(p, w)| takes_text(&marks.pages[*p].widgets[*w]));
+            .find(|(p, w)| takes_text(*p, *w));
         let Some((p, w)) = next else {
             self.viewer.focus();
             return;

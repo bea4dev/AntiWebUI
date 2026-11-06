@@ -17,6 +17,10 @@
 //! F11 puts the window on all of the screen. F5 shows the document one page at a time there, where
 //! the arrows, Space, a click and the wheel go through the pages, a number and Enter go to a page,
 //! `B` and `W` blank the screen, and Escape ends it.
+//!
+//! With `--features pdf-js` the JavaScript of forms runs too: totals are worked out, amounts and
+//! dates show in their format, what doesn't fit a field isn't taken, and the dialogs of the
+//! document show over the window.
 
 use anti_webui::prelude::*;
 

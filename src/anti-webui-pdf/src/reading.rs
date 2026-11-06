@@ -204,6 +204,9 @@ pub(crate) enum BoxKind {
     Field,
 }
 
+/// What runs the JavaScript of a link.
+type ScriptRunner = Rc<dyn Fn(String)>;
+
 /// See the top of this file. A [`crate::PdfView`] has one.
 pub(crate) struct Reader {
     pub viewer: PdfViewer,
@@ -248,6 +251,8 @@ pub(crate) struct Reader {
     /// All of that together, in the box.
     cut_bounds: Cell<RectI>,
     marker: RefCell<Option<Marker>>,
+    /// What runs the JavaScript of a link.
+    script_runner: RefCell<Option<ScriptRunner>>,
 }
 
 impl Reader {
@@ -287,11 +292,16 @@ impl Reader {
             cut_outs: signal(Vec::new()),
             cut_bounds: Cell::new(RectI::default()),
             marker: RefCell::new(None),
+            script_runner: RefCell::new(None),
         })
     }
 
     pub fn set_marker(&self, marker: Marker) {
         *self.marker.borrow_mut() = Some(marker);
+    }
+
+    pub fn set_script_runner(&self, run: ScriptRunner) {
+        *self.script_runner.borrow_mut() = Some(run);
     }
 
     /// Marks what is selected, as soon as all of it has been read.
@@ -745,6 +755,12 @@ impl Reader {
             Some(LinkTarget::Url(url)) => {
                 if let Some(f) = &self.on_link {
                     f(url);
+                }
+            }
+            Some(LinkTarget::Script(script)) => {
+                let run = self.script_runner.borrow().clone();
+                if let Some(run) = run {
+                    run(script.clone());
                 }
             }
             None => return false,
