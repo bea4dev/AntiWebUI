@@ -588,10 +588,20 @@ fn resolve_node(
     if let Some(source) = picture {
         doc.images.get_mut().info(id, &source);
     }
+    let scale = doc.scale;
     let node = doc.nodes.get_mut(id).unwrap();
     node.style_dirty = false;
     node.resolved = resolved;
     node.computed = computed;
+    if let NodeKind::Text(t) = &mut node.kind
+        && let Some(rich) = &mut t.rich
+        && (changed || rich.resolved.len() != rich.spans.len())
+    {
+        if rich.resolve(&node.computed, scale) {
+            out.layout.push(id);
+        }
+        out.content = true;
+    }
     if stacking_changed {
         node.stacked = stacked;
         node.stacking_context = context;
@@ -844,6 +854,25 @@ fn overflows(node: &Node) -> bool {
     let pad = node.padding_abs();
     (c.overflow_y == Overflow::Scroll && node.content_size.height > pad.height)
         || (c.overflow_x == Overflow::Scroll && node.content_size.width > pad.width)
+}
+
+/// Where the lines of a text put the nodes among its words, by the index of their `BoxData`.
+fn placed_boxes(layout: &crate::text::TextLayout) -> Vec<Option<PointI>> {
+    let mut out: Vec<Option<PointI>> = Vec::new();
+    for line in layout.layout.lines() {
+        for item in line.items() {
+            if let parley::PositionedLayoutItem::InlineBox(b) = item
+                && crate::text::pad_of(b.id).is_none()
+            {
+                let i = b.id as usize;
+                if out.len() <= i {
+                    out.resize(i + 1, None);
+                }
+                out[i] = Some(PointI::new(b.x.round() as i32, b.y.round() as i32));
+            }
+        }
+    }
+    out
 }
 
 /// Lays out the whole document against the viewport.
@@ -1617,7 +1646,38 @@ impl Engine<'_> {
             unreachable!()
         };
         let style = style.zoomed(data.zoom);
-        data.layout.shape(self.ts, &data.text, data.version, &style);
+        let boxes: Vec<NodeId> = data
+            .rich
+            .as_ref()
+            .map(|r| r.boxes.iter().map(|b| b.node).collect())
+            .unwrap_or_default();
+        // What is among the words takes the size it would like, as an `inline-block` does.
+        let base = (avail_w, None);
+        let sizes: Vec<SizeI> = boxes
+            .iter()
+            .map(|&c| {
+                let s = self.compute(c, (None, None), avail_w, base, false);
+                let m = self.margins_of(c, avail_w);
+                SizeI::new(s.width + m.left + m.right, s.height + m.top + m.bottom)
+            })
+            .collect();
+        let node = &mut self.doc.nodes[id];
+        let NodeKind::Text(data) = &mut node.kind else {
+            unreachable!()
+        };
+        if let Some(rich) = &mut data.rich {
+            for (b, size) in rich.boxes.iter_mut().zip(sizes) {
+                b.size = size;
+            }
+        }
+        data.layout.shape_rich(
+            self.ts,
+            &data.text,
+            data.version,
+            &style,
+            data.rich.as_deref(),
+            scale,
+        );
         let width = match w {
             Some(w) => w,
             None => {
@@ -1639,11 +1699,35 @@ impl Engine<'_> {
             data.layout.set_final(width, align);
             node.rect.width = width;
             node.rect.height = height;
+            if !boxes.is_empty() {
+                let placed = placed_boxes(&data.layout);
+                self.place_boxes(&boxes, &placed, avail_w);
+            }
         } else {
             // Measuring must not disturb the line breaks that are painted.
             data.layout.restore_final();
         }
         SizeI::new(width, height)
+    }
+
+    fn margins_of(&self, id: NodeId, base_w: Option<i32>) -> Edges<i32> {
+        self.resolve_margins(&self.doc.nodes[id].resolved, base_w)
+    }
+
+    /// Lays out the nodes among the words of a text where its lines put them. One that isn't on
+    /// any line, because the text is cut short, isn't shown.
+    fn place_boxes(&mut self, boxes: &[NodeId], placed: &[Option<PointI>], avail_w: Option<i32>) {
+        let base = (avail_w, None);
+        for (i, &c) in boxes.iter().enumerate() {
+            let at = placed.get(i).copied().flatten();
+            let s = self.compute(c, (None, None), avail_w, base, false);
+            self.compute(c, (Some(s.width), Some(s.height)), avail_w, base, true);
+            let m = self.margins_of(c, avail_w);
+            let at = at.unwrap_or(PointI::new(0, -(1 << 20)));
+            let node = &mut self.doc.nodes[c];
+            node.rect.x = at.x + m.left;
+            node.rect.y = at.y + m.top;
+        }
     }
 
     fn compute_edit(

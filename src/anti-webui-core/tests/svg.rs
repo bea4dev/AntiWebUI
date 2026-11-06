@@ -629,3 +629,47 @@ fn a_sheet_about_rectangles_leaves_labels_alone() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].0.color, Color::BLACK, "not faded");
 }
+
+/// Mermaid's sheets pick markers by how their `id` ends, which `usvg` doesn't know.
+#[test]
+fn a_sheet_can_pick_by_how_an_attribute_ends() {
+    let data = br##"<svg id="m" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100">
+        <style>#m .marker{fill:#000000}#m [id$="-hollowEnd"],#m .hollow{fill:#00ff00!important}</style>
+        <defs><marker id="m-hollowEnd" class="marker" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 Z"/></marker></defs>
+        <path d="M10 10 L100 80" fill="none" stroke="#000" marker-end="url(#m-hollowEnd)"/>
+    </svg>"##;
+    let mut ui = mount((800, 600), ONE, || {
+        svg::parse(data).unwrap().w(200.0).h(100.0)
+    });
+    let d = paths(&mut ui);
+    assert_eq!(d.len(), 2, "the line and the arrow");
+    assert_eq!(
+        d[1].paint,
+        anti_webui_core::scene::PathPaint::Color(Color::from_rgb(0x00ff00))
+    );
+}
+
+/// The names of Mermaid's classes are `bolder` than what is around them.
+#[test]
+fn labels_can_be_bolder() {
+    let data = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100">
+        <g style="font-weight: bolder"><foreignObject width="100" height="24">
+            <div xmlns="http://www.w3.org/1999/xhtml">Label</div>
+        </foreignObject></g>
+        <g transform="translate(0 40)"><foreignObject width="100" height="24">
+            <div xmlns="http://www.w3.org/1999/xhtml">Label</div>
+        </foreignObject></g>
+    </svg>"##;
+    let mut ui = mount((800, 600), ONE, || {
+        svg::parse(data).unwrap().w(200.0).h(100.0)
+    });
+    let runs = texts(&mut ui);
+    assert_eq!(runs.len(), 2);
+    let (bold, normal) = (&runs[0].0, &runs[1].0);
+    assert!(
+        bold.embolden != normal.embolden
+            || bold.normalized_coords != normal.normalized_coords
+            || bold.glyphs.last().map(|g| g.x) != normal.glyphs.last().map(|g| g.x),
+        "the first is bold"
+    );
+}

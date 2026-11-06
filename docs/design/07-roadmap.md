@@ -37,6 +37,7 @@
 - [x] `flex-wrap`、`align-content`（[03](03-layout.md)）
 - [x] パス描画、`svg` と形のノード、SVG ファイルの読み込み（[25](25-svg.md)）
 - [x] ウィンドウと要素のフルスクリーン（[27](27-fullscreen.md)）
+- [x] `rich_text`（段落の中の `span` とノード）（[28](28-markdown.md)）
 
 ### M1 の既知の制限
 
@@ -64,5 +65,6 @@
 ## M4: おまけ機能
 
 - PDF ビュワー（`hayro` を土台に、PDF.js 以上の速度を目標。[26](26-pdf.md) 参照。P4、フォーム、注釈、プレゼンテーションモード、フォームの JavaScript（`pdf-js` feature）まで実装済み）
+- Markdown のビュワーとエディタ（[28](28-markdown.md) 参照。ビュワーと Mermaid（`markdown` feature）まで実装済み。次はライブプレビューのエディタ）
 
 - WebRTC、画面キャプチャ、通知

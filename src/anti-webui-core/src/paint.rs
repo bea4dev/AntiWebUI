@@ -499,10 +499,10 @@ fn paints_overlapping(doc: &Document, id: NodeId) -> bool {
         let c = &node.computed;
         match &node.kind {
             NodeKind::Popup(_) => return,
-            // The lines and runs of a text don't overlap.
-            NodeKind::Text(_) => {
-                *things += 1;
-                return;
+            // The lines and runs of a text don't overlap, but the backgrounds of its spans are
+            // under them.
+            NodeKind::Text(t) => {
+                *things += 1 + u32::from(t.rich.is_some());
             }
             NodeKind::Edit(_) => *things += 2,
             NodeKind::Fragment | NodeKind::SvgText(_) => {}
@@ -1169,6 +1169,16 @@ impl Painter<'_> {
                 return;
             }
             NodeKind::Text(t) => {
+                if let Some(rich) = &t.rich {
+                    self.chunk(id, part::BOX);
+                    self.span_backgrounds(
+                        &t.layout,
+                        rich,
+                        node.abs.origin(),
+                        opacity,
+                        node.clip_shape(),
+                    );
+                }
                 if let Some(sel) = &doc.state.selection
                     && let Some((a, b)) = node_range(doc, sel, id)
                 {
@@ -1180,14 +1190,29 @@ impl Painter<'_> {
                 }
                 self.chunk(id, part::CONTENT);
                 let color = if t.in_svg { text_fill(c) } else { c.color };
-                self.text_layout(
-                    &t.layout,
-                    node.abs.origin(),
-                    fade(color, opacity),
-                    node.clip_shape(),
-                    c.underline,
-                    c.strikethrough,
-                );
+                let base = (fade(color, opacity), c.underline, c.strikethrough);
+                match &t.rich {
+                    Some(rich) => self.text_layout_with(
+                        &t.layout,
+                        node.abs.origin(),
+                        node.clip_shape(),
+                        |brush| match brush.checked_sub(1).and_then(|i| rich.paint(i as usize)) {
+                            Some(p) => (fade(p.color, opacity), p.underline, p.strikethrough),
+                            None => base,
+                        },
+                    ),
+                    None => self.text_layout(
+                        &t.layout,
+                        node.abs.origin(),
+                        base.0,
+                        node.clip_shape(),
+                        base.1,
+                        base.2,
+                    ),
+                }
+                if !node.children.is_empty() {
+                    self.contents(id, opacity, cull);
+                }
                 return;
             }
             _ => {}
@@ -1696,12 +1721,24 @@ impl Painter<'_> {
         underline: bool,
         strikethrough: bool,
     ) {
+        self.text_layout_with(layout, origin, clip, |_| (color, underline, strikethrough));
+    }
+
+    /// Paints the runs of a text with the color and lines `style` gives for their brush.
+    fn text_layout_with(
+        &mut self,
+        layout: &TextLayout,
+        origin: PointI,
+        clip: Clip,
+        style: impl Fn(crate::text::Brush) -> (Color, bool, bool),
+    ) {
         let (ox, oy) = (origin.x as f32, origin.y as f32);
         for line in layout.layout.lines() {
             for item in line.items() {
                 let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
                     continue;
                 };
+                let (color, underline, strikethrough) = style(glyph_run.style().brush);
                 self.glyph_run(&glyph_run, ox, oy, color, clip);
                 let run = glyph_run.run();
                 let m = run.font_metrics();
@@ -1719,6 +1756,97 @@ impl Painter<'_> {
                     let y = baseline - m.strikethrough_offset.round() as i32;
                     self.scene.fill(RectI::new(x0, y, x1 - x0, t), color, clip);
                 }
+            }
+        }
+    }
+
+    /// The backgrounds of the spans of a text, one box per line a span is on. They are as tall
+    /// as the font, not as the line, like the backgrounds of inline elements in CSS.
+    fn span_backgrounds(
+        &mut self,
+        layout: &TextLayout,
+        rich: &crate::text::rich::RichData,
+        origin: PointI,
+        opacity: f32,
+        clip: Clip,
+    ) {
+        let (ox, oy) = (origin.x as f32, origin.y as f32);
+        let painted = |i: usize| {
+            rich.paint(i)
+                .filter(|p| !p.background.is_transparent())
+                .is_some()
+        };
+        if !(0..rich.spans.len()).any(painted) {
+            return;
+        }
+        // Span → left, right, top and bottom on the line.
+        let mut boxes: Vec<(usize, [f32; 4])> = Vec::new();
+        for line in layout.layout.lines() {
+            boxes.clear();
+            let mut grow = |i: usize, x0: f32, x1: f32, y: Option<(f32, f32)>| {
+                let at = match boxes.iter().position(|(s, _)| *s == i) {
+                    Some(at) => at,
+                    None => {
+                        boxes.push((i, [f32::MAX, f32::MIN, f32::MAX, f32::MIN]));
+                        boxes.len() - 1
+                    }
+                };
+                let b = &mut boxes[at].1;
+                b[0] = b[0].min(x0);
+                b[1] = b[1].max(x1);
+                if let Some((y0, y1)) = y {
+                    b[2] = b[2].min(y0);
+                    b[3] = b[3].max(y1);
+                }
+            };
+            for item in line.items() {
+                match item {
+                    PositionedLayoutItem::GlyphRun(run) => {
+                        let Some(i) = run.style().brush.checked_sub(1).map(|i| i as usize) else {
+                            continue;
+                        };
+                        if !painted(i) {
+                            continue;
+                        }
+                        let m = run.run().font_metrics();
+                        let baseline = oy + run.baseline();
+                        let x0 = ox + run.offset();
+                        grow(
+                            i,
+                            x0,
+                            x0 + run.advance(),
+                            Some((baseline - m.ascent, baseline + m.descent)),
+                        );
+                    }
+                    PositionedLayoutItem::InlineBox(b) => {
+                        if let Some((i, _)) = crate::text::pad_of(b.id)
+                            && painted(i)
+                        {
+                            grow(i, ox + b.x, ox + b.x + b.width, None);
+                        }
+                    }
+                }
+            }
+            for (i, [x0, x1, y0, y1]) in boxes.iter().copied() {
+                // Padding alone on a line, with no letters to say how tall it is.
+                if y0 > y1 {
+                    continue;
+                }
+                let Some(p) = rich.paint(i) else { continue };
+                let rect = RectI::new(
+                    x0.round() as i32,
+                    y0.round() as i32,
+                    (x1.round() - x0.round()) as i32,
+                    (y1.round() - y0.round()) as i32,
+                );
+                self.scene.primitives.push(Primitive::Quad(Quad {
+                    rect,
+                    background: fade(p.background, opacity),
+                    border_widths: [0; 4],
+                    border_color: Color::TRANSPARENT,
+                    radii: p.radii,
+                    clip,
+                }));
             }
         }
     }

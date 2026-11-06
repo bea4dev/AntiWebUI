@@ -742,7 +742,9 @@ impl Ui {
             .map(|t| with_doc(|d| d.ancestors(t)))
             .unwrap_or_default();
         self.set_hovered(chain);
-        let cursor = with_doc(|d| cursor_for(d, target));
+        let cursor = with_doc(|d| {
+            crate::text::rich::hover_span(d, target, p).unwrap_or_else(|| cursor_for(d, target))
+        });
         self.set_cursor(cursor);
     }
 

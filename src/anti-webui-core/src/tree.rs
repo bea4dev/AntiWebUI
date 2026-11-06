@@ -78,6 +78,8 @@ pub struct TextData {
     pub zoom: f32,
     /// It is in an `svg`, where text is painted with `fill`.
     pub in_svg: bool,
+    /// Its spans and the nodes among its words, for a `rich_text`.
+    pub rich: Option<Box<crate::text::rich::RichData>>,
 }
 
 /// What a popup's surface needs to hold its box and what sticks out of it.
@@ -486,6 +488,8 @@ pub struct Dirty {
 pub struct WindowState {
     /// Hovered nodes from the innermost outwards.
     pub hovered: Vec<NodeId>,
+    /// The span of a `rich_text` the pointer is over.
+    pub hovered_span: Option<(NodeId, usize)>,
     /// The pressed node and its ancestors while the primary button is down.
     pub active: Vec<NodeId>,
     pub focused: Option<NodeId>,

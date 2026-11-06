@@ -12,6 +12,7 @@ svg-text = ["anti-webui-core/svg-text"]
 video = ["anti-webui-app/video"]
 pdf = ["dep:anti-webui-pdf"]
 pdf-js = ["pdf", "anti-webui-pdf/js"]
+markdown = ["dep:anti-webui-markdown"]
 
 [dependencies]
 anti-webui-core.workspace = true
@@ -21,3 +22,4 @@ anti-webui-app.workspace = true
 anti-webui-wgpu.workspace = true
 anti-webui-macros.workspace = true
 anti-webui-pdf = { workspace = true, optional = true }
+anti-webui-markdown = { workspace = true, optional = true }

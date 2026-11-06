@@ -46,7 +46,7 @@ impl IntoView for View {
 }
 
 /// Inserts a node and removes it when the current owner is disposed.
-fn create_node(node: Node) -> NodeId {
+pub(crate) fn create_node(node: Node) -> NodeId {
     let id = with_doc(|d| d.create(node));
     on_cleanup(move || with_doc(|d| d.remove(id)));
     id
@@ -198,7 +198,7 @@ impl NodeRef {
     }
 }
 
-type StyleFn = Box<dyn Fn(Style) -> Style>;
+pub(crate) type StyleFn = Box<dyn Fn(Style) -> Style>;
 
 /// Keeps the node's dynamic style layers in sync with their closures.
 pub(crate) fn bind_dynamic_styles(id: NodeId, layers: Vec<StyleFn>) {
@@ -1221,6 +1221,7 @@ impl IntoView for Text {
             layout: TextLayout::default(),
             zoom: 1.0,
             in_svg: false,
+            rich: None,
         }));
         node.style.base = self.style;
         let id = create_node(node);

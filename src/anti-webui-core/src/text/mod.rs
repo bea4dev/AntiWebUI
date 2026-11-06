@@ -3,6 +3,7 @@
 //! sub-pixel precision.
 
 pub mod edit;
+pub mod rich;
 pub mod selection;
 
 use crate::geometry::{RectI, Scale, SizeI};
@@ -20,6 +21,7 @@ use parley::{
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 pub use parley::{Affinity, Cursor, Selection as LayoutSelection};
@@ -377,6 +379,57 @@ struct ShapeKey {
     version: u64,
     fonts: u64,
     style: ShapeStyle,
+    rich: Option<RichKey>,
+}
+
+/// What of a `rich_text` changes how it is shaped.
+#[derive(Clone, Debug, PartialEq)]
+struct RichKey {
+    spans: Vec<(ShapeStyle, parley::VerticalAlign, (i32, i32))>,
+    boxes: Vec<(SizeI, parley::VerticalAlign)>,
+}
+
+impl RichKey {
+    fn of(rich: &rich::RichData, scale: Scale) -> Self {
+        Self {
+            spans: rich
+                .resolved
+                .iter()
+                .map(|r| (r.shape.clone(), r.align, r.pad))
+                .collect(),
+            boxes: rich
+                .boxes
+                .iter()
+                .map(|b| (b.size, b.align.parley(scale)))
+                .collect(),
+        }
+    }
+}
+
+/// The id of the empty box that makes the padding on side `end` of span `i`. The boxes of
+/// `inline` have the index of their `BoxData` as theirs.
+const PAD: u64 = 1 << 63;
+
+fn pad_id(i: usize, end: bool) -> u64 {
+    PAD | ((i as u64) << 1) | end as u64
+}
+
+/// Which span and side an id of a box of padding is for.
+pub(crate) fn pad_of(id: u64) -> Option<(usize, bool)> {
+    (id & PAD != 0).then_some((((id & !PAD) >> 1) as usize, id & 1 == 1))
+}
+
+/// What a span changes that needs the text system to work out.
+struct SpanShape {
+    family: Option<Arc<str>>,
+    variations: Option<Vec<FontVariation>>,
+}
+
+fn parley_style(style: FontStyle) -> parley::FontStyle {
+    match style {
+        FontStyle::Normal => parley::FontStyle::Normal,
+        FontStyle::Italic => parley::FontStyle::Italic,
+    }
 }
 
 /// A shaped paragraph that can be re-broken at different widths cheaply.
@@ -399,10 +452,25 @@ impl TextLayout {
         version: u64,
         style: &ShapeStyle,
     ) -> bool {
+        self.shape_rich(ts, text, version, style, None, Scale(120))
+    }
+
+    /// Like `shape`, with the spans and boxes of a `rich_text`, once they are resolved and
+    /// measured.
+    pub fn shape_rich(
+        &mut self,
+        ts: &mut TextSystem,
+        text: &str,
+        version: u64,
+        style: &ShapeStyle,
+        rich: Option<&rich::RichData>,
+        scale: Scale,
+    ) -> bool {
         let key = ShapeKey {
             version,
             fonts: ts.fonts_generation,
             style: style.clone(),
+            rich: rich.map(|r| RichKey::of(r, scale)),
         };
         if self.key.as_ref() == Some(&key) {
             return false;
@@ -412,6 +480,33 @@ impl TextLayout {
         let variations = ts.variations(style);
         let locale = ts.locale;
         let stand_ins = ts.list_with_stand_ins(&style.family);
+        // What each span changes, worked out before the builder holds on to the contexts.
+        let spans: Vec<(Range<usize>, SpanShape)> = rich
+            .map(|r| {
+                r.spans
+                    .iter()
+                    .zip(&r.resolved)
+                    .filter(|(s, _)| !s.range.is_empty())
+                    .map(|(s, resolved)| {
+                        let shape = &resolved.shape;
+                        if shape.family != style.family {
+                            ts.note_asked(&shape.family);
+                        }
+                        (
+                            s.range.clone(),
+                            SpanShape {
+                                family: (shape.family != style.family)
+                                    .then(|| ts.list_with_stand_ins(&shape.family)),
+                                variations: (shape.axes != style.axes
+                                    || shape.weight != style.weight
+                                    || shape.optical_size != style.optical_size)
+                                    .then(|| ts.variations(shape)),
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut builder = ts.lcx.ranged_builder(&mut ts.fcx, text, 1.0, true);
         builder.push_default(StyleProperty::FontFamily(parley::FontFamily::Source(
             stand_ins.as_ref().to_owned().into(),
@@ -420,10 +515,7 @@ impl TextLayout {
         builder.push_default(StyleProperty::FontWeight(parley::FontWeight::new(
             style.weight.0 as f32,
         )));
-        builder.push_default(StyleProperty::FontStyle(match style.style {
-            FontStyle::Normal => parley::FontStyle::Normal,
-            FontStyle::Italic => parley::FontStyle::Italic,
-        }));
+        builder.push_default(StyleProperty::FontStyle(parley_style(style.style)));
         builder.push_default(StyleProperty::FontVariations(FontVariations::List(
             variations.as_slice().into(),
         )));
@@ -439,12 +531,117 @@ impl TextLayout {
         if !style.wrap {
             builder.push_default(StyleProperty::TextWrapMode(TextWrapMode::NoWrap));
         }
+        if let Some(rich) = rich {
+            let mut index = 0;
+            for (i, (s, resolved)) in rich.spans.iter().zip(&rich.resolved).enumerate() {
+                if s.range.is_empty() {
+                    continue;
+                }
+                let (range, changes) = &spans[index];
+                index += 1;
+                let shape = &resolved.shape;
+                let range = range.clone();
+                builder.push(StyleProperty::Brush(i as Brush + 1), range.clone());
+                if let Some(family) = &changes.family {
+                    builder.push(
+                        StyleProperty::FontFamily(parley::FontFamily::Source(
+                            family.as_ref().to_owned().into(),
+                        )),
+                        range.clone(),
+                    );
+                }
+                if shape.size != style.size {
+                    builder.push(StyleProperty::FontSize(shape.size), range.clone());
+                }
+                if shape.weight != style.weight {
+                    builder.push(
+                        StyleProperty::FontWeight(parley::FontWeight::new(shape.weight.0 as f32)),
+                        range.clone(),
+                    );
+                }
+                if shape.style != style.style {
+                    builder.push(
+                        StyleProperty::FontStyle(parley_style(shape.style)),
+                        range.clone(),
+                    );
+                }
+                if let Some(v) = &changes.variations {
+                    builder.push(
+                        StyleProperty::FontVariations(FontVariations::List(v.as_slice().into())),
+                        range.clone(),
+                    );
+                }
+                if shape.line_height != style.line_height {
+                    builder.push(
+                        StyleProperty::LineHeight(match shape.line_height {
+                            Some(px) => parley::LineHeight::Absolute(px as f32),
+                            None => parley::LineHeight::MetricsRelative(1.0),
+                        }),
+                        range.clone(),
+                    );
+                }
+                if shape.letter_spacing != style.letter_spacing {
+                    builder.push(
+                        StyleProperty::LetterSpacing(shape.letter_spacing),
+                        range.clone(),
+                    );
+                }
+                if resolved.align != parley::VerticalAlign::BASELINE {
+                    builder.push(StyleProperty::VerticalAlign(resolved.align), range.clone());
+                }
+            }
+            // The boxes go in the order of the text, a span's padding around what is in it.
+            let mut boxes: Vec<parley::InlineBox> = Vec::new();
+            let mut put = |id: u64, index: usize, size: SizeI, align: parley::VerticalAlign| {
+                boxes.push(parley::InlineBox {
+                    id,
+                    kind: parley::InlineBoxKind::InFlow,
+                    index,
+                    width: size.width as f32,
+                    height: size.height as f32,
+                    baseline: None,
+                    vertical_align: align,
+                });
+            };
+            for (i, b) in rich.boxes.iter().enumerate() {
+                put(i as u64, b.at, b.size, b.align.parley(scale));
+            }
+            for (i, (s, r)) in rich.spans.iter().zip(&rich.resolved).enumerate() {
+                if r.pad.0 > 0 {
+                    put(
+                        pad_id(i, false),
+                        s.range.start,
+                        SizeI::new(r.pad.0, 0),
+                        parley::VerticalAlign::BASELINE,
+                    );
+                }
+                if r.pad.1 > 0 {
+                    put(
+                        pad_id(i, true),
+                        s.range.end,
+                        SizeI::new(r.pad.1, 0),
+                        parley::VerticalAlign::BASELINE,
+                    );
+                }
+            }
+            // Stable, so that what is at the same place stays in the order it was put.
+            boxes.sort_by_key(|b| (b.index, pad_of(b.id).is_some_and(|(_, end)| !end)));
+            for b in boxes {
+                builder.push_inline_box(b);
+            }
+        }
         builder.build_into(&mut self.layout, text);
         self.key = Some(key);
         self.broken_at = None;
         self.aligned = None;
         self.final_break = None;
         true
+    }
+
+    /// The byte where the cluster at a point starts, if there is one right there.
+    pub fn cluster_at(&self, x: f32, y: f32) -> Option<usize> {
+        let (cluster, _) = parley::Cluster::from_point_exact(&self.layout, x, y)?;
+        Some(cluster.text_range().start)
     }
 
     /// Breaks lines at `max_width` physical pixels (`None` = max-content).

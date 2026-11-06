@@ -475,8 +475,14 @@ fn outline(path: &BezPath, style: &StrokeStyle, scale: f64) -> BezPath {
             LineJoin::Bevel => Join::Bevel,
         })
         .with_miter_limit(style.miter_limit as f64);
-    if let Some(dashes) = &style.dashes {
-        stroke = stroke.with_dashes(style.dash_offset as f64, dashes.iter().map(|d| *d as f64));
+    if let Some((dashes, shift)) = style
+        .dashes
+        .as_deref()
+        .and_then(|d| dashes_to_stroke(d, style.cap))
+    {
+        let total: f64 = dashes.iter().sum();
+        let offset = (style.dash_offset as f64 - shift).rem_euclid(total);
+        stroke = stroke.with_dashes(offset, dashes);
     }
     kurbo::stroke(
         path.elements().iter().copied(),
@@ -484,6 +490,51 @@ fn outline(path: &BezPath, style: &StrokeStyle, scale: f64) -> BezPath {
         &StrokeOpts::default(),
         FLATTENING / scale.max(1e-3),
     )
+}
+
+/// The dashes to stroke with, as SVG means them, with how much further into them the line starts,
+/// or `None` for a line without gaps. A pattern
+/// whose gaps are all empty is a whole line (Mermaid draws its edges with `0 0 65 0`), and the
+/// stroker makes a mess of dashes that are empty, which only show with caps that stick out.
+fn dashes_to_stroke(dashes: &[f32], cap: LineCap) -> Option<(Vec<f64>, f64)> {
+    if dashes.iter().any(|d| !d.is_finite() || *d < 0.0) || dashes.iter().sum::<f32>() <= 0.0 {
+        return None;
+    }
+    // An odd number of them is said twice.
+    let mut list: Vec<f64> = dashes.iter().map(|d| *d as f64).collect();
+    if list.len() % 2 == 1 {
+        list.extend_from_within(..);
+    }
+    if list.iter().skip(1).step_by(2).all(|gap| *gap == 0.0) {
+        return None;
+    }
+    if cap != LineCap::Butt {
+        return Some((list, 0.0));
+    }
+    // An empty dash adds its room to the gap before it.
+    let mut out: Vec<f64> = Vec::with_capacity(list.len());
+    let mut lead = 0.0;
+    for pair in list.chunks_exact(2) {
+        let (dash, gap) = (pair[0], pair[1]);
+        if dash == 0.0 {
+            match out.last_mut() {
+                Some(last) => *last += gap,
+                None => lead += gap,
+            }
+        } else {
+            out.push(dash);
+            out.push(gap);
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    // What came before the first dash goes after the last, where the pattern starts over, and the
+    // line starts that much into it.
+    if let Some(last) = out.last_mut() {
+        *last += lead;
+    }
+    Some((out, -lead))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1214,6 +1265,35 @@ fn coverage_at(strips: &Strips, x: i32, y: i32) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dashes_that_are_empty_are_left_out() {
+        use super::dashes_to_stroke;
+        use anti_webui_core::style::LineCap;
+        assert_eq!(
+            dashes_to_stroke(&[0.0, 0.0, 65.0, 0.0], LineCap::Butt),
+            None
+        );
+        assert_eq!(dashes_to_stroke(&[0.0, 0.0], LineCap::Butt), None);
+        assert_eq!(
+            dashes_to_stroke(&[4.0, 2.0], LineCap::Butt),
+            Some((vec![4.0, 2.0], 0.0))
+        );
+        assert_eq!(
+            dashes_to_stroke(&[3.0], LineCap::Butt),
+            Some((vec![3.0, 3.0], 0.0))
+        );
+        // A gap first: the same pattern, starting into it.
+        assert_eq!(
+            dashes_to_stroke(&[0.0, 10.0, 5.0, 5.0], LineCap::Butt),
+            Some((vec![5.0, 15.0], -10.0))
+        );
+        // Round caps make dots of empty dashes.
+        assert_eq!(
+            dashes_to_stroke(&[0.0, 4.0], LineCap::Round),
+            Some((vec![0.0, 4.0], 0.0))
+        );
+    }
+
     use super::*;
     use kurbo::Shape;
 

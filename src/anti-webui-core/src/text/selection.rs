@@ -289,7 +289,10 @@ pub fn selected_text(doc: &Document, sel: &DocSelection) -> String {
         if let Some(p) = prev {
             out.push(if rect.y >= p.bottom() - 1 { '\n' } else { ' ' });
         }
-        out.push_str(&t.text[a..b]);
+        match &t.rich {
+            Some(rich) => out.push_str(&rich.copied(&t.text, a, b)),
+            None => out.push_str(&t.text[a..b]),
+        }
         prev = Some(rect);
     }
     out

@@ -3,6 +3,8 @@
 
 pub use anti_webui_app as app;
 pub use anti_webui_core as core;
+#[cfg(feature = "markdown")]
+pub use anti_webui_markdown as markdown;
 #[cfg(feature = "pdf")]
 pub use anti_webui_pdf as pdf;
 pub use anti_webui_style as style;
@@ -15,6 +17,8 @@ pub mod prelude {
     pub use anti_webui_app::App;
     pub use anti_webui_core::prelude::*;
     pub use anti_webui_macros::ShaderParams;
+    #[cfg(feature = "markdown")]
+    pub use anti_webui_markdown::{Emoji, MarkdownTheme, MarkdownView, markdown_view};
     #[cfg(feature = "pdf")]
     pub use anti_webui_pdf::{
         PdfAnnotationId, PdfAnnotationKind, PdfEditing, PdfError, PdfField, PdfFieldChange,

@@ -1,0 +1,19 @@
+[package]
+name = "anti-webui-markdown"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "A fast Markdown viewer and editor for AntiWebUI"
+
+[dependencies]
+anti-webui-core.workspace = true
+pulldown-cmark = { workspace = true }
+log.workspace = true
+# Pinned: it is an alpha, and its API changes between releases.
+merman = { version = "=0.10.0-alpha.1", default-features = false, features = ["svg", "all-diagrams", "layout-cytoscape"], optional = true }
+
+[features]
+default = ["mermaid"]
+## Mermaid diagrams, on `merman`, which follows mermaid.js closely and adds about 25 MB.
+mermaid = ["dep:merman", "anti-webui-core/svg"]

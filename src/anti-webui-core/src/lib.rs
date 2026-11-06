@@ -49,6 +49,9 @@ pub mod prelude {
     pub use crate::settings::{FrameAdvance, ImageSettings, Settings, settings, update_settings};
     pub use crate::shader::{Image, IntoImage, IntoPaint, Shader, ShaderPaint, ShaderParams};
     pub use crate::svg::{self, Svg, svg};
+    pub use crate::text::rich::{
+        Inline, IntoRuns, RichText, Run, Span, VerticalAlign, inline, rich_text, span,
+    };
     pub use crate::text::{NotAFont, register_font, register_font_as};
     pub use crate::video::{
         VideoError, VideoLibraries, VideoPlayer, VideoSettings, can_play_video, video_availability,
