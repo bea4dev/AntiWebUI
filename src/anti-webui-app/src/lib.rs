@@ -6,6 +6,8 @@ pub mod headless;
 #[cfg(target_os = "linux")]
 mod pacing;
 #[cfg(target_os = "linux")]
+mod perf_overlay;
+#[cfg(target_os = "linux")]
 mod present;
 
 use anti_webui_core::settings::{Settings, update_settings};
@@ -130,6 +132,7 @@ mod wayland {
     use super::App;
     use crate::frame_stats::FrameStats;
     use crate::pacing::Pacing;
+    use crate::perf_overlay::{LAST_WORD, OverlayFeed};
     use crate::present::{Presented, Presenter};
     use anti_webui_core::Ui;
     use anti_webui_core::event::WindowEvent;
@@ -147,6 +150,8 @@ mod wayland {
         dump: Option<(String, anti_webui_wgpu::Renderer)>,
         /// `ANTIWEBUI_FRAME_STATS=path.csv` records what every frame took (see `frame_stats`).
         stats: Option<FrameStats>,
+        /// What frames take, over the window (see `perf_overlay`).
+        overlay: OverlayFeed,
         pacing: Pacing,
         /// Decoded pictures say so through the event loop.
         waker_set: bool,
@@ -281,11 +286,14 @@ mod wayland {
                     }
                 }
             }
-            let stats = &mut self.stats;
+            self.overlay.update();
+            let own = self.overlay.is_own_frame(self.ui.needs_redraw());
+            let (stats, overlay) = (&mut self.stats, &mut self.overlay);
             self.pacing.begin_frame(ctx, |frame| {
                 if let Some(s) = stats {
                     s.add(frame);
                 }
+                overlay.add(frame);
             });
             let now = Instant::now();
             self.ui
@@ -297,9 +305,17 @@ mod wayland {
             self.ui.update();
             // Not `process`: the frame painted below is the redraw it would ask for.
             self.handle_requests(ctx);
-            let frame = self.ui.paint_frame(now);
+            let mut frame = self.ui.paint_frame(now);
+            let trace = self.pacing.trace();
+            self.overlay.paint(
+                &mut frame.window,
+                self.ui.scale(),
+                self.pacing.advance_words(),
+                trace.token,
+                own,
+            );
             let presenter = self.presenter.as_mut().unwrap();
-            presenter.trace_next(self.pacing.trace());
+            presenter.trace_next(trace);
             let window = presenter.present(ctx, SurfaceId::Window, frame.window);
             if presenter.take_video_import_failed() {
                 self.ui.video_use_memory();
@@ -346,6 +362,9 @@ mod wayland {
                 ctx.request_redraw_after(wait.unwrap_or(soon));
             } else if self.ui.animating() {
                 ctx.request_redraw();
+            } else if committed && self.overlay.wants_last_word(own) {
+                // The last frames are still on their way to the screen.
+                ctx.request_redraw_after(LAST_WORD);
             }
         }
 
@@ -399,6 +418,7 @@ mod wayland {
             error: None,
             dump: None,
             stats: FrameStats::from_env(),
+            overlay: OverlayFeed::new(),
             pacing: Pacing::new(),
             waker_set: false,
         };

@@ -349,6 +349,33 @@ impl Pacing {
         }
     }
 
+    /// How rendering ahead is set and, for `Auto`, what it is doing, as the performance overlay
+    /// says it.
+    pub fn advance_words(&self) -> String {
+        let words = match self
+            .forced
+            .unwrap_or_else(|| settings().rendering.frame_advance)
+        {
+            FrameAdvance::Auto => format!(
+                "Auto: {}",
+                match self.auto.state {
+                    AutoState::Off => "off",
+                    AutoState::Unhelpful { .. } => "off (no gain)",
+                    AutoState::Trying { .. } => "trying",
+                    AutoState::On => "on",
+                }
+            ),
+            FrameAdvance::Enable => "Enable".to_owned(),
+            FrameAdvance::Disable => "Disable".to_owned(),
+            FrameAdvance::Custom { max_advance } => format!("Custom {max_advance}"),
+        };
+        if self.forced.is_some() {
+            format!("{words} (env)")
+        } else {
+            words
+        }
+    }
+
     /// To call first thing in a frame. Passes to `finished` the frames nothing more will be
     /// learned about.
     pub fn begin_frame(&mut self, ctx: &mut Ctx<'_>, mut finished: impl FnMut(&FrameRecord)) {

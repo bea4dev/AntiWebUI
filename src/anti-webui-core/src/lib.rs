@@ -9,6 +9,7 @@ pub mod event;
 pub mod geometry;
 pub mod images;
 pub mod layout;
+pub mod overlay;
 pub mod paint;
 pub mod platform;
 pub mod reactive;

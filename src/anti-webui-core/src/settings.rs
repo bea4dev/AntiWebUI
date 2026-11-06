@@ -9,6 +9,16 @@ pub struct Settings {
     pub rendering: RenderingSettings,
     pub images: ImageSettings,
     pub video: crate::video::VideoSettings,
+    pub debug: DebugSettings,
+}
+
+/// What helps while making an app.
+#[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
+pub struct DebugSettings {
+    /// Shows what frames take and how they are paced at the top right of the window
+    /// (`ANTIWEBUI_PERF_OVERLAY=1` does too). See `docs/design/30-performance-overlay.md`.
+    pub performance_overlay: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -91,6 +101,7 @@ impl Default for Settings {
                 cache_bytes: 256 << 20,
             },
             video: Default::default(),
+            debug: DebugSettings::default(),
         }
     }
 }

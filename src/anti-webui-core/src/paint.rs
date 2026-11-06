@@ -696,7 +696,7 @@ fn background_rect(
 
 /// The coordinates of a variable font on steps of 1/64, so that what moves along an axis doesn't
 /// fill the glyph atlas. All at the default is none at all (see `docs/design/17-font-axes.md`).
-fn rounded_coords(coords: impl Iterator<Item = i16> + Clone) -> Vec<i16> {
+pub(crate) fn rounded_coords(coords: impl Iterator<Item = i16> + Clone) -> Vec<i16> {
     const STEP: i32 = 1 << 8;
     let round = |c: i16| ((c as i32 + STEP / 2) & !(STEP - 1)) as i16;
     if coords.clone().all(|c| round(c) == 0) {
