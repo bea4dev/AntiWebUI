@@ -1,6 +1,7 @@
 //! When frames are produced: what became of the last ones, and whether to render ahead of the
 //! compositor (see `docs/design/10-frame-pacing.md`).
 
+use crate::vsync::FrameClock;
 use anti_webui_core::settings::{FrameAdvance, settings};
 use anti_webui_wayland::{Ctx, Presentation, SurfaceId};
 use anti_webui_wgpu::linux_sync;
@@ -74,6 +75,10 @@ pub(crate) struct FrameRecord {
     pub token: u64,
     pub callback: Option<i64>,
     pub start: i64,
+    /// What animations were given as the time.
+    pub frame_time: i64,
+    /// The frame's place on the refresh grid, if known.
+    pub slot: Option<i64>,
     pub ui_done: i64,
     pub diff_done: i64,
     pub buffer_ready: i64,
@@ -292,8 +297,11 @@ pub(crate) struct Pacing {
     ui_done: i64,
     /// Going by the last frame shown.
     refresh: Option<Duration>,
-    /// When the last frame was shown, on the clock of `linux_sync::monotonic_ns`.
-    shown_ns: Option<i64>,
+    clock: FrameClock,
+    /// `ANTIWEBUI_FRAME_TIME=start` gives animations when frames start, as before there was
+    /// [`FrameClock`].
+    start_time_only: bool,
+    frame: crate::vsync::FrameTime,
 }
 
 /// The first refresh after `now`, of those that `last` was the start of one of.
@@ -332,7 +340,12 @@ impl Pacing {
             callback: None,
             ui_done: 0,
             refresh: None,
-            shown_ns: None,
+            clock: FrameClock::default(),
+            start_time_only: std::env::var("ANTIWEBUI_FRAME_TIME").is_ok_and(|v| v == "start"),
+            frame: crate::vsync::FrameTime {
+                time: 0,
+                slot: None,
+            },
         }
     }
 
@@ -385,6 +398,18 @@ impl Pacing {
         self.callback = ctx
             .last_frame_callback(SurfaceId::Window)
             .map(|t| ns + t.saturating_duration_since(instant).as_nanos() as i64);
+        self.frame = self.clock.frame_time(self.started, PAUSE_NS);
+        if self.start_time_only {
+            self.frame.time = self.started;
+        }
+    }
+
+    /// The time animations go by in this frame: on the refresh grid when frames land on it
+    /// steadily, and when the frame started otherwise.
+    pub fn frame_time(&self) -> Instant {
+        let (instant, ns) = self.base;
+        let since = Duration::from_nanos((self.frame.time - ns).max(0) as u64);
+        instant + since
     }
 
     /// To call when the UI's part of the frame is done.
@@ -402,10 +427,10 @@ impl Pacing {
         self.refresh
     }
 
-    /// When a refresh was, going by the last frame shown. This has none of the wobble of when a
-    /// frame callback gets here.
+    /// When a refresh was, going by the frames shown. This has none of the wobble of when a frame
+    /// callback gets here, nor of times on the screen that come late.
     pub fn last_refresh(&self) -> Option<Instant> {
-        let ago = linux_sync::monotonic_ns() - self.shown_ns?;
+        let ago = linux_sync::monotonic_ns() - self.clock.refresh_at()?;
         let ago = Duration::from_nanos(ago.max(0) as u64);
         Instant::now().checked_sub(ago)
     }
@@ -427,6 +452,8 @@ impl Pacing {
                 token: trace.token,
                 callback: self.callback,
                 start: self.started,
+                frame_time: self.frame.time,
+                slot: self.frame.slot,
                 ui_done: self.ui_done,
                 diff_done: trace.diff_done,
                 buffer_ready: trace.buffer_ready,
@@ -496,10 +523,12 @@ impl Pacing {
             self.refresh = Some(Duration::from_nanos(s.refresh_ns as u64));
         }
         let offset = self.presentation_offset.unwrap_or(0);
+        let f = self.flying.iter_mut().find(|f| f.record.token == p.token);
         if let Some(s) = p.shown {
-            self.shown_ns = Some(s.time_ns + offset);
+            let slot = f.as_ref().and_then(|f| f.record.slot);
+            self.clock.shown(s.time_ns + offset, s.refresh_ns, slot);
         }
-        let Some(f) = self.flying.iter_mut().find(|f| f.record.token == p.token) else {
+        let Some(f) = f else {
             return;
         };
         f.feedback = false;

@@ -9,6 +9,8 @@ mod pacing;
 mod perf_overlay;
 #[cfg(target_os = "linux")]
 mod present;
+#[cfg(target_os = "linux")]
+mod vsync;
 
 use anti_webui_core::settings::{Settings, update_settings};
 use anti_webui_core::view::IntoView;
@@ -295,7 +297,7 @@ mod wayland {
                 }
                 overlay.add(frame);
             });
-            let now = Instant::now();
+            let now = self.pacing.frame_time();
             self.ui
                 .set_video_timing(self.pacing.refresh().map(|refresh| VideoTiming {
                     refresh,

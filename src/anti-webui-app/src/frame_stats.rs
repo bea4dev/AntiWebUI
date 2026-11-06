@@ -60,16 +60,18 @@ impl FrameStats {
 fn csv(records: &[FrameRecord]) -> String {
     let opt = |v: Option<i64>| v.map_or(String::new(), |v| v.to_string());
     let mut out = String::from(
-        "token,callback,start,ui_done,diff_done,buffer_ready,recorded,submitted,committed,end,\
-         gpu_done,presented,refresh,flags,discarded,damage,repaint,pixels,buffers\n",
+        "token,callback,start,frame_time,slot,ui_done,diff_done,buffer_ready,recorded,submitted,\
+         committed,end,gpu_done,presented,refresh,flags,discarded,damage,repaint,pixels,buffers\n",
     );
     for r in records {
         let _ = writeln!(
             out,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             r.token,
             opt(r.callback),
             r.start,
+            r.frame_time,
+            opt(r.slot),
             r.ui_done,
             r.diff_done,
             r.buffer_ready,
@@ -179,14 +181,15 @@ pub(crate) fn summarize(records: &[FrameRecord]) -> String {
         v.sort_by(f64::total_cmp);
         v
     };
-    // How far the time between starts is from the time between the frames on the screen: what
-    // animations are off by.
+    // How far the step in the time animations were given is from the time between the frames on
+    // the screen: what animations are off by. Times on the screen can come late, so this is at
+    // most that much too high.
     let step_error = {
         let mut v: Vec<f64> = records
             .windows(2)
             .filter_map(|p| {
                 let on_screen = p[1].presented? - p[0].presented?;
-                Some((p[1].start - p[0].start - on_screen).abs() as f64 / 1e6)
+                Some((p[1].frame_time - p[0].frame_time - on_screen).abs() as f64 / 1e6)
             })
             .collect();
         v.sort_by(f64::total_cmp);
