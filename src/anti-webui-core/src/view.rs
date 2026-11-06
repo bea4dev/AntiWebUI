@@ -17,6 +17,7 @@ use crate::reactive::{
 use crate::shader::{Image, IntoImage, IntoPaint, ShaderPaint};
 use crate::text::TextLayout;
 use crate::text::edit::{EditData, TextCallback};
+use crate::text::editor::EditorOutcome;
 use crate::tree::{
     Document, Handler, Listeners, Node, NodeId, NodeKind, PopupData, TextData, with_doc,
 };
@@ -1222,6 +1223,7 @@ impl IntoView for Text {
             zoom: 1.0,
             in_svg: false,
             rich: None,
+            row: None,
         }));
         node.style.base = self.style;
         let id = create_node(node);
@@ -1936,6 +1938,178 @@ impl IntoView for Popup {
         let id = create_node(node);
         let children: Vec<NodeId> = self.children.into_iter().map(|v| v.0).collect();
         with_doc(|d| d.set_children(id, children));
+        View(id)
+    }
+}
+
+/// A handle to a `text_editor`, to change its text from outside as one step of undo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EditorRef(Signal<Option<NodeId>>);
+
+pub fn editor_ref() -> EditorRef {
+    EditorRef(signal(None))
+}
+
+impl EditorRef {
+    fn change(&self, f: impl FnOnce(&mut crate::text::editor::EditorData) -> EditorOutcome) {
+        let Some(id) = self.0.get_untracked() else {
+            return;
+        };
+        let out = with_doc(|d| d.get_mut(id).and_then(Node::editor_mut).map(f));
+        if let Some(out) = out {
+            crate::text::editor::after_edit(id, out);
+        }
+    }
+
+    /// Replaces a range of bytes of the text, as one step of undo.
+    pub fn replace(&self, range: std::ops::Range<usize>, text: &str) {
+        self.change(|e| e.replace(range, text));
+    }
+
+    /// Selects from one byte to another.
+    pub fn select(&self, anchor: usize, focus: usize) {
+        self.change(|e| {
+            e.select(anchor, focus);
+            EditorOutcome {
+                changed: false,
+                moved: true,
+            }
+        });
+    }
+
+    /// Looks at the text and the selection, without tracking them.
+    pub fn with<R>(&self, f: impl FnOnce(&crate::text::editor::EditorData) -> R) -> Option<R> {
+        let id = self.0.get_untracked()?;
+        with_doc(|d| d.get(id)?.editor().map(f))
+    }
+
+    /// The byte of the text under a point in window coordinates.
+    pub fn offset_at(&self, p: PointF) -> Option<usize> {
+        let id = self.0.get_untracked()?;
+        with_doc(|d| crate::text::editor::hit(d, id, p))
+    }
+
+    /// The text, without tracking it.
+    pub fn text(&self) -> String {
+        self.0
+            .get_untracked()
+            .and_then(|id| with_doc(|d| Some(d.get(id)?.editor()?.text.clone())))
+            .unwrap_or_default()
+    }
+
+    /// Gives it the keyboard focus.
+    pub fn focus(&self) {
+        if let Some(id) = self.0.get_untracked() {
+            with_doc(|d| d.pending_focus = Some(Some(id)));
+        }
+    }
+}
+
+/// Text edited line by line, each line a node shaped only near the screen, with decorations that
+/// style, hide and replace parts of it. See "M3" in `docs/design/28-markdown.md`.
+pub struct TextEditor {
+    cfg: ElementConfig,
+    value: Option<Signal<String>>,
+    on_change: Option<TextCallback>,
+    decorate: Option<Rc<crate::text::editor::Decorate>>,
+    editor_ref: Option<EditorRef>,
+    read_only: bool,
+}
+
+pub fn text_editor() -> TextEditor {
+    TextEditor {
+        cfg: ElementConfig::default(),
+        value: None,
+        on_change: None,
+        decorate: None,
+        editor_ref: None,
+        read_only: false,
+    }
+}
+
+impl Styled for TextEditor {
+    fn style_mut(&mut self) -> &mut Style {
+        &mut self.cfg.style
+    }
+}
+
+impl TextEditor {
+    element_methods!();
+    box_paint_methods!();
+
+    /// Two-way binds the text to a signal.
+    pub fn value(mut self, value: Signal<String>) -> Self {
+        self.value = Some(value);
+        self
+    }
+
+    /// Called with the text whenever it changes.
+    pub fn on_change(mut self, f: impl Fn(&str) + 'static) -> Self {
+        self.on_change = Some(Rc::new(f));
+        self
+    }
+
+    /// How the lines look: given the text, its lines and the selection, a row for each line or
+    /// for some lines together, from the first line to the last. It runs whenever the text or the
+    /// selection changes, so it should give the same `Rc` for what stays the same.
+    pub fn decorate(
+        mut self,
+        f: impl Fn(&crate::text::editor::DecorateContext) -> Vec<crate::text::editor::Row> + 'static,
+    ) -> Self {
+        self.decorate = Some(Rc::new(f));
+        self
+    }
+
+    pub fn editor_ref(mut self, r: EditorRef) -> Self {
+        self.editor_ref = Some(r);
+        self
+    }
+
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+}
+
+impl IntoView for TextEditor {
+    fn into_view(mut self) -> View {
+        if self.cfg.style.cursor.is_none() {
+            self.cfg.style.cursor = Some(Some(anti_webui_style::CursorIcon::Text));
+        }
+        let mut data = crate::text::editor::EditorData::new();
+        if let Some(v) = self.value {
+            data.set_text(&v.get_untracked());
+            data.select(0, 0);
+            data.clear_history();
+        }
+        data.value = self.value;
+        data.on_change = self.on_change;
+        data.decorate = self.decorate;
+        data.read_only = self.read_only;
+        data.owner = Owner::current();
+        let mut node = Node::new(NodeKind::Editor(Box::new(data)));
+        node.focusable = true;
+        let id = self.cfg.build(node);
+        if let Some(r) = self.editor_ref {
+            r.0.set(Some(id));
+        }
+        on_cleanup(move || crate::text::editor::dispose_rows(id));
+        crate::text::editor::sync(id);
+        if let Some(value) = self.value {
+            effect(move || {
+                let v = value.get();
+                let out = with_doc(|d| {
+                    d.get_mut(id)
+                        .and_then(Node::editor_mut)
+                        .map(|e| e.set_text(&v))
+                });
+                if let Some(out) = out
+                    && out.changed
+                {
+                    crate::text::editor::after_edit(id, out);
+                }
+            });
+        }
         View(id)
     }
 }

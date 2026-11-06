@@ -32,7 +32,7 @@ AntiWebUI は WebView に頼らず、wgpu による自前描画とネイティ�
 | 25 | [svg](25-svg.md) | パス描画の方式、`svg` と形のノード、SVG ファイルの読み込み（Mermaid の `foreignObject` を含む）、Chromium との画素と速度の比較 |
 | 26 | [pdf](26-pdf.md) | PDF ビュワー、`hayro` の評価と PDF.js との比較、優先度つきのワーカー、全体の絵と部分の絵、フォント解決、文字の抽出と選択 |
 | 27 | [fullscreen](27-fullscreen.md) | ウィンドウと要素のフルスクリーン |
-| 28 | [markdown](28-markdown.md) | `rich_text`（段落の中の `span` とノード）、Markdown のビュワー、Mermaid（`merman`）、SVG の `<text>` の取り出し、Chromium との比較 |
+| 28 | [markdown](28-markdown.md) | `rich_text`（段落の中の `span` とノード）、`text_editor`、Markdown のビュワーとライブプレビューのエディタ、Mermaid（`merman`）、SVG の `<text>` の取り出し、Chromium との比較 |
 | 29 | [content-visibility](29-content-visibility.md) | 画面から遠い要素の中身を飛ばす（CSS の `content-visibility`）、文字を整形しない見積もり、スクロールのずれの直し |
 | 30 | [performance-overlay](30-performance-overlay.md) | fps、CPU と GPU の時間、遅延、先行描画の状態を右上に出すデバッグ用のオーバーレイ |
 

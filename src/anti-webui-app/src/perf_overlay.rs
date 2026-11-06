@@ -19,6 +19,49 @@ pub(crate) struct OverlayFeed {
     ahead: bool,
     /// The last frame that had nothing new of the app's, which isn't one of its frames to count.
     own: Option<u64>,
+    /// The GPU and the CPU, as the overlay names them, a line each.
+    devices: Option<Vec<String>>,
+}
+
+/// A name without what every name of its kind has: trademarks, the maker, "Graphics", the GPU
+/// a CPU comes with.
+fn short_name(name: &str) -> String {
+    let mut s = name
+        .replace("(R)", "")
+        .replace("(TM)", "")
+        .replace("(tm)", "");
+    for cut in [" w/ ", " with "] {
+        if let Some(i) = s.find(cut) {
+            s.truncate(i);
+        }
+    }
+    for word in ["Graphics", "Processor", "Corporation"] {
+        s = s.replace(word, "");
+    }
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    for maker in ["AMD ", "Intel ", "NVIDIA "] {
+        if let Some(rest) = s.strip_prefix(maker)
+            && !rest.is_empty()
+        {
+            return rest.to_owned();
+        }
+    }
+    s
+}
+
+/// The CPU's name, from `/proc/cpuinfo`, and how many threads it runs.
+fn cpu_name() -> String {
+    let model = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("model name"))
+                .and_then(|l| l.split_once(':'))
+                .map(|(_, m)| m.trim().to_owned())
+        })
+        .unwrap_or_else(|| "?".to_owned());
+    let threads = std::thread::available_parallelism().map_or(0, |n| n.get());
+    format!("{} ({threads} threads)", short_name(&model))
 }
 
 impl OverlayFeed {
@@ -32,6 +75,7 @@ impl OverlayFeed {
             last_gpu_done: None,
             ahead: false,
             own: None,
+            devices: None,
         }
     }
 
@@ -84,6 +128,24 @@ impl OverlayFeed {
         });
     }
 
+    /// What draws, once the GPU is chosen: its name, its driver and how frames reach the
+    /// compositor.
+    pub fn describe(&mut self, gpu: &anti_webui_wgpu::Gpu, path: &str) {
+        if self.devices.is_none() && self.overlay.is_some() {
+            let info = gpu.adapter.get_info();
+            self.devices = Some(vec![
+                format!("GPU {}", short_name(&info.name)),
+                // `path` is the kind of sync of the buffers of our own, or the wgpu surface.
+                if path.contains("surface") {
+                    format!("    {}, {path}", info.driver)
+                } else {
+                    format!("    {}, dmabuf ({path} sync)", info.driver)
+                },
+                format!("CPU {}", cpu_name()),
+            ]);
+        }
+    }
+
     /// Puts the overlay on the window's scene. `token` is that of the frame, and `own` says it
     /// is the overlay's own frame.
     pub fn paint(
@@ -99,6 +161,9 @@ impl OverlayFeed {
         };
         if own {
             self.own = Some(token);
+        }
+        if let Some(lines) = &self.devices {
+            overlay.set_devices(lines.clone());
         }
         overlay.set_advance(if self.ahead {
             format!("{advance}, ahead")
@@ -211,6 +276,24 @@ mod tests {
         // The app's next frame comes after a pause, which the numbers leave out.
         f.add(&record(3, 600));
         assert_eq!(samples(&f)[1].interval, Some(300.0));
+    }
+
+    #[test]
+    fn names_leave_out_what_every_name_has() {
+        assert_eq!(short_name("AMD Radeon 880M Graphics"), "Radeon 880M");
+        assert_eq!(
+            short_name("AMD Ryzen AI 9 365 w/ Radeon 880M"),
+            "Ryzen AI 9 365"
+        );
+        assert_eq!(
+            short_name("Intel(R) Core(TM) i7-1360P Processor"),
+            "Core i7-1360P"
+        );
+        assert_eq!(short_name("NVIDIA GeForce RTX 4060"), "GeForce RTX 4060");
+        assert_eq!(
+            short_name("llvmpipe (LLVM 19.1.7, 256 bits)"),
+            "llvmpipe (LLVM 19.1.7, 256 bits)"
+        );
     }
 
     #[test]

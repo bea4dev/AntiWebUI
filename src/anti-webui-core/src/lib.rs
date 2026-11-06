@@ -51,6 +51,7 @@ pub mod prelude {
     pub use crate::settings::{FrameAdvance, ImageSettings, Settings, settings, update_settings};
     pub use crate::shader::{Image, IntoImage, IntoPaint, Shader, ShaderPaint, ShaderParams};
     pub use crate::svg::{self, Svg, svg};
+    pub use crate::text::editor::{DecorateContext, LineLook, Row, Widget};
     pub use crate::text::rich::{
         Inline, IntoRuns, RichText, Run, Span, VerticalAlign, inline, rich_text, span,
     };
@@ -60,11 +61,11 @@ pub mod prelude {
         video_player,
     };
     pub use crate::view::{
-        BitmapView, Div, ForEach, Img, IntoImageSource, IntoTextSource, IntoVideoSource, IntoView,
-        NodeRef, Popup, Show, Text, TextInput, Video, View, bitmap_view, clear_text_selection, div,
-        dyn_view, exit_fullscreen, for_each, fragment, img, node_ref, popup, portal, set_clipboard,
-        set_window_fullscreen, shader, show, text, text_area, text_input, video, window_fullscreen,
-        window_scale,
+        BitmapView, Div, EditorRef, ForEach, Img, IntoImageSource, IntoTextSource, IntoVideoSource,
+        IntoView, NodeRef, Popup, Show, Text, TextEditor, TextInput, Video, View, bitmap_view,
+        clear_text_selection, div, dyn_view, editor_ref, exit_fullscreen, for_each, fragment, img,
+        node_ref, popup, portal, set_clipboard, set_window_fullscreen, shader, show, text,
+        text_area, text_editor, text_input, video, window_fullscreen, window_scale,
     };
     pub use anti_webui_style::*;
 }

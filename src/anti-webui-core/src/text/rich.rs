@@ -282,6 +282,7 @@ impl IntoView for RichText {
                 resolved: Vec::new(),
                 hovered: None,
             })),
+            row: None,
         }));
         node.style.base = self.style;
         let id = create_node(node);

@@ -18,7 +18,7 @@ video = ["anti-webui-internal/video"]
 pdf = ["anti-webui-internal/pdf"]
 ## The JavaScript of PDF forms, on QuickJS, which adds about 1 MB.
 pdf-js = ["pdf", "anti-webui-internal/pdf-js"]
-## A Markdown viewer with Mermaid diagrams. See `docs/design/28-markdown.md`.
+## A Markdown viewer and editor with Mermaid diagrams. See `docs/design/28-markdown.md`.
 markdown = ["anti-webui-internal/markdown"]
 ## Link AntiWebUI dynamically for faster incremental builds (development only).
 dynamic_linking = ["dep:anti-webui-dylib"]
@@ -32,6 +32,10 @@ image.workspace = true
 
 [[example]]
 name = "markdown"
+required-features = ["markdown"]
+
+[[example]]
+name = "markdown_editor"
 required-features = ["markdown"]
 
 [[example]]

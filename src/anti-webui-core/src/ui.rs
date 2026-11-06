@@ -18,6 +18,7 @@ use crate::scene::Scene;
 use crate::scroll::{Booster, FLING_SPEED_RATIO, Fling, VelocityTracker};
 use crate::settings::with_settings;
 use crate::text::edit::{EditOutcome, Motion};
+use crate::text::editor::EditorOutcome;
 use crate::text::selection::{self, Granularity};
 use crate::text::with_text;
 use crate::tree::{Document, Handler, Node, NodeId, NodeKind, popup_id, popup_node, with_doc};
@@ -39,6 +40,8 @@ pub(crate) enum Drag {
     Select,
     /// Selecting inside an edit node.
     Edit(NodeId),
+    /// Selecting inside a `text_editor`.
+    Editor(NodeId),
     /// Dragging a scrollbar thumb: node, vertical?, pointer offset into the content.
     Scrollbar(NodeId, bool, f32),
     /// Pressed on selected text, which goes along if it moves. Where it was pressed.
@@ -263,6 +266,7 @@ impl Ui {
                 if doc.dirty.carets {
                     doc.dirty.carets = false;
                     scroll_carets_into_view(doc);
+                    scroll_editor_carets_into_view(doc);
                 }
                 let mut waiting = Vec::new();
                 for id in std::mem::take(&mut doc.pending_scroll) {
@@ -566,10 +570,15 @@ impl Ui {
             if !d.state.window_focused {
                 return None;
             }
-            let edit = d.get(id)?.edit()?;
-            let elapsed = now.saturating_duration_since(edit.caret_epoch);
+            let n = d.get(id)?;
+            let epoch = match (n.edit(), n.editor()) {
+                (Some(e), _) => e.caret_epoch,
+                (_, Some(e)) if !e.read_only => e.caret_epoch,
+                _ => return None,
+            };
+            let elapsed = now.saturating_duration_since(epoch);
             let periods = elapsed.as_millis() / CARET_BLINK.as_millis() + 1;
-            Some(edit.caret_epoch + CARET_BLINK * periods as u32)
+            Some(epoch + CARET_BLINK * periods as u32)
         });
         let picture = with_doc(|d| d.images.get_mut().next_frame());
         let video = with_doc(|d| crate::video::next_deadline(d, Instant::now()));
@@ -680,6 +689,11 @@ impl Ui {
                     d.state.window_focused = focused;
                     if let Some(id) = d.state.focused
                         && let Some(e) = d.get_mut(id).and_then(Node::edit_mut)
+                    {
+                        e.caret_epoch = Instant::now();
+                    }
+                    if let Some(id) = d.state.focused
+                        && let Some(e) = d.get_mut(id).and_then(Node::editor_mut)
                     {
                         e.caret_epoch = Instant::now();
                     }
@@ -865,12 +879,17 @@ impl Ui {
                     d.mark_paint();
                 }
             }),
+            Drag::Editor(id) => {
+                if with_doc(|d| crate::text::editor::pointer_drag(d, id, p)) {
+                    crate::text::editor::after_edit(id, EditorOutcome::MOVED);
+                }
+            }
             Drag::Scrollbar(id, vertical, grab) => {
                 with_doc(|d| scrollbar_drag(d, id, vertical, grab, p))
             }
             Drag::SelectedText(..) | Drag::None => {}
         }
-        if drag == Drag::Select {
+        if matches!(drag, Drag::Select | Drag::Editor(_)) {
             self.update_selection_edge(p);
         }
         self.gesture_moved(p);
@@ -938,6 +957,7 @@ impl Ui {
                 let chain = with_doc(|d| d.ancestors(t));
                 set_active(chain);
             }
+            let editor = target.and_then(|t| with_doc(|d| editor_under(d, t)));
             if let Some((id, vertical, grab)) =
                 with_doc(|d| target.and_then(|t| scrollbar_hit(d, t, p)))
             {
@@ -948,13 +968,24 @@ impl Ui {
             {
                 drag = Drag::SelectedText(origin, p);
                 // There is one selection to be seen, as when pressing an input anywhere else.
-                if matches!(origin, TextOrigin::Edit(_)) {
+                if matches!(origin, TextOrigin::Edit(_) | TextOrigin::Editor(_)) {
                     with_doc(|d| {
                         if d.state.selection.take().is_some() {
                             d.mark_paint();
                         }
                     });
                 }
+            } else if let Some(host) = editor {
+                let extend = self.modifiers.shift;
+                with_doc(|d| {
+                    crate::text::editor::pointer_down(d, host, p, clicks, extend);
+                    if d.state.selection.take().is_some() {
+                        d.mark_paint();
+                    }
+                    d.mark_caret_moved();
+                });
+                crate::text::editor::after_edit(host, EditorOutcome::MOVED);
+                drag = Drag::Editor(host);
             } else if let Some(edit) =
                 target.filter(|t| with_doc(|d| d.get(*t).is_some_and(Node::is_edit)))
             {
@@ -994,6 +1025,18 @@ impl Ui {
                 });
                 drag = Drag::Select;
             }
+        } else if button == PointerButton::Middle
+            && let Some(host) = target.and_then(|t| with_doc(|d| editor_under(d, t)))
+        {
+            with_doc(|d| {
+                crate::text::editor::pointer_down(d, host, p, 1, false);
+                if let Some(e) = d.get_mut(host).and_then(Node::editor_mut) {
+                    e.drag = None;
+                }
+                d.request(PlatformRequest::Paste(ClipboardKind::Primary));
+            });
+            crate::text::editor::after_edit(host, EditorOutcome::MOVED);
+            self.paste_target = Some(host);
         } else if button == PointerButton::Middle
             && let Some(edit) =
                 target.filter(|t| with_doc(|d| d.get(*t).is_some_and(Node::is_edit)))
@@ -1065,6 +1108,18 @@ impl Ui {
                     }
                 }
             }),
+            Drag::Editor(id) => with_doc(|d| {
+                if let Some(e) = d.get_mut(id).and_then(Node::editor_mut) {
+                    e.drag = None;
+                    if e.has_selection() {
+                        let text = e.selected_text().to_owned();
+                        d.request(PlatformRequest::SetClipboard {
+                            kind: ClipboardKind::Primary,
+                            text,
+                        });
+                    }
+                }
+            }),
             Drag::Edit(id) => with_doc(|d| {
                 if let Some(e) = d.get_mut(id).and_then(Node::edit_mut) {
                     e.drag = None;
@@ -1090,10 +1145,20 @@ impl Ui {
                             e.drag = None;
                         }
                     }
+                    TextOrigin::Editor(id) => {
+                        crate::text::editor::pointer_down(d, id, p, 1, false);
+                        if let Some(e) = d.get_mut(id).and_then(Node::editor_mut) {
+                            e.drag = None;
+                        }
+                        d.mark_caret_moved();
+                    }
                 }
                 d.mark_paint();
             }),
             _ => {}
+        }
+        if let Drag::SelectedText(TextOrigin::Editor(id), _) = press.drag {
+            crate::text::editor::after_edit(id, EditorOutcome::MOVED);
         }
         set_active(Vec::new());
         self.update_hover(p);
@@ -1113,6 +1178,11 @@ impl Ui {
         with_doc(|d| {
             if let Drag::Edit(id) = press.drag
                 && let Some(e) = d.get_mut(id).and_then(Node::edit_mut)
+            {
+                e.drag = None;
+            }
+            if let Drag::Editor(id) = press.drag
+                && let Some(e) = d.get_mut(id).and_then(Node::editor_mut)
             {
                 e.drag = None;
             }
@@ -1415,6 +1485,13 @@ impl Ui {
             if let Some(e) = prev.and_then(|id| d.get_mut(id)).and_then(Node::edit_mut) {
                 e.preedit = None;
             }
+            if let Some(e) = next.and_then(|id| d.get_mut(id)).and_then(Node::editor_mut) {
+                e.caret_epoch = Instant::now();
+                e.scroll_to_caret = true;
+            }
+            if let Some(e) = prev.and_then(|id| d.get_mut(id)).and_then(Node::editor_mut) {
+                e.preedit = None;
+            }
             d.dirty.carets = true;
             for id in [prev, next].into_iter().flatten() {
                 d.mark_style_of(id);
@@ -1423,6 +1500,9 @@ impl Ui {
         });
         if prev == next {
             return;
+        }
+        for id in [prev, next].into_iter().flatten() {
+            crate::text::editor::sync(id);
         }
         batch(|| {
             for (h, f) in handlers {
@@ -1529,6 +1609,13 @@ impl Ui {
         let focused_edit = focused.filter(|id| with_doc(|d| d.get(*id).is_some_and(Node::is_edit)));
         if let Some(id) = focused_edit
             && self.edit_key(id, &key)
+        {
+            return;
+        }
+        let focused_editor =
+            focused.filter(|id| with_doc(|d| d.get(*id).is_some_and(Node::is_editor)));
+        if let Some(id) = focused_editor
+            && self.editor_key(id, &key)
         {
             return;
         }
@@ -1731,6 +1818,141 @@ impl Ui {
         true
     }
 
+    /// Keys a `text_editor` acts on. Returns whether the key was taken.
+    fn editor_key(&mut self, id: NodeId, key: &KeyEvent) -> bool {
+        use crate::text::editor::EditorData;
+        let m = key.modifiers;
+        let (shift, word) = (m.shift, m.ctrl);
+        type EditFn = Box<dyn FnOnce(&mut EditorData) -> EditorOutcome>;
+        enum Op {
+            Move(Motion),
+            Edit(EditFn),
+        }
+        let op = match &key.key {
+            Key::Named(NamedKey::ArrowLeft) => {
+                Op::Move(if word { Motion::WordLeft } else { Motion::Left })
+            }
+            Key::Named(NamedKey::ArrowRight) => Op::Move(if word {
+                Motion::WordRight
+            } else {
+                Motion::Right
+            }),
+            Key::Named(NamedKey::ArrowUp) => Op::Move(Motion::Up),
+            Key::Named(NamedKey::ArrowDown) => Op::Move(Motion::Down),
+            Key::Named(NamedKey::Home) => Op::Move(if word {
+                Motion::DocStart
+            } else {
+                Motion::LineStart
+            }),
+            Key::Named(NamedKey::End) => Op::Move(if word {
+                Motion::DocEnd
+            } else {
+                Motion::LineEnd
+            }),
+            Key::Named(NamedKey::PageUp) => Op::Move(Motion::PageUp),
+            Key::Named(NamedKey::PageDown) => Op::Move(Motion::PageDown),
+            Key::Named(NamedKey::Backspace) => Op::Edit(Box::new(move |e| e.delete(false, word))),
+            Key::Named(NamedKey::Delete) if shift && !word => {
+                self.editor_clipboard(id, true);
+                return true;
+            }
+            Key::Named(NamedKey::Delete) => Op::Edit(Box::new(move |e| e.delete(true, word))),
+            Key::Named(NamedKey::Insert) if shift => {
+                self.request_paste(id);
+                return true;
+            }
+            Key::Named(NamedKey::Insert) if word => {
+                self.editor_clipboard(id, false);
+                return true;
+            }
+            Key::Named(NamedKey::Enter) if !m.ctrl && !m.alt => {
+                Op::Edit(Box::new(|e| e.insert("\n")))
+            }
+            Key::Named(NamedKey::Tab) if !m.ctrl && !m.alt => {
+                Op::Edit(Box::new(move |e| e.indent(shift)))
+            }
+            k if m.primary() && k.is_char('a') => Op::Edit(Box::new(|e| {
+                e.select_all();
+                EditorOutcome::MOVED
+            })),
+            k if m.primary() && k.is_char('c') => {
+                self.editor_clipboard(id, false);
+                return true;
+            }
+            k if m.primary() && k.is_char('x') => {
+                self.editor_clipboard(id, true);
+                return true;
+            }
+            k if m.primary() && k.is_char('v') => {
+                self.request_paste(id);
+                return true;
+            }
+            k if m.primary() && k.is_char('z') => {
+                if shift {
+                    Op::Edit(Box::new(|e| e.redo()))
+                } else {
+                    Op::Edit(Box::new(|e| e.undo()))
+                }
+            }
+            k if m.primary() && k.is_char('y') => Op::Edit(Box::new(|e| e.redo())),
+            _ => match &key.text {
+                Some(t) if !m.ctrl && !m.alt && !t.is_empty() => {
+                    let t = t.clone();
+                    Op::Edit(Box::new(move |e| e.insert(&t)))
+                }
+                _ => return false,
+            },
+        };
+        let out = with_doc(|d| {
+            let out = match op {
+                Op::Move(motion) => {
+                    let page = d
+                        .visible_window_rect(id)
+                        .map_or(0, |r| r.height * 9 / 10)
+                        .max(1);
+                    crate::text::editor::move_caret(d, id, motion, shift, page)
+                }
+                Op::Edit(f) => d
+                    .get_mut(id)
+                    .and_then(Node::editor_mut)
+                    .map(f)
+                    .unwrap_or_default(),
+            };
+            if out.changed || out.moved {
+                d.mark_caret_moved();
+            }
+            out
+        });
+        crate::text::editor::after_edit(id, out);
+        true
+    }
+
+    fn editor_clipboard(&mut self, id: NodeId, cut: bool) {
+        let out = with_doc(|d| {
+            let e = d.get_mut(id)?.editor_mut()?;
+            if !e.has_selection() {
+                return None;
+            }
+            let text = e.selected_text().to_owned();
+            let out = if cut {
+                e.delete(false, false)
+            } else {
+                EditorOutcome::default()
+            };
+            d.request(PlatformRequest::SetClipboard {
+                kind: ClipboardKind::Clipboard,
+                text,
+            });
+            if out.changed {
+                d.mark_caret_moved();
+            }
+            Some(out)
+        });
+        if let Some(out) = out {
+            crate::text::editor::after_edit(id, out);
+        }
+    }
+
     fn edit_clipboard(&mut self, id: NodeId, cut: bool) {
         let outcome = with_doc(|d| {
             let e = d.get_mut(id)?.edit_mut()?;
@@ -1770,6 +1992,15 @@ impl Ui {
         else {
             return;
         };
+        if let Some(out) = with_doc(|d| {
+            d.get_mut(id)
+                .and_then(Node::editor_mut)
+                .map(|e| e.insert(&text))
+        }) {
+            with_doc(|d| d.mark_caret_moved());
+            crate::text::editor::after_edit(id, out);
+            return;
+        }
         let outcome = with_doc(|d| {
             let out = d
                 .get_mut(id)
@@ -1789,6 +2020,15 @@ impl Ui {
         let Some(id) = with_doc(|d| d.state.focused) else {
             return;
         };
+        if let Some(out) = with_doc(|d| {
+            d.get_mut(id)
+                .and_then(Node::editor_mut)
+                .map(|e| e.apply_ime(&update))
+        }) {
+            with_doc(|d| d.mark_caret_moved());
+            crate::text::editor::after_edit(id, out);
+            return;
+        }
         let outcome = with_doc(|d| {
             let out = d
                 .get_mut(id)
@@ -1833,6 +2073,15 @@ impl Ui {
             }
             let id = d.state.focused?;
             let n = d.get(id)?;
+            if let Some(e) = n.editor() {
+                if e.read_only {
+                    return Some(None);
+                }
+                let (row, _) = e.caret_row?;
+                let caret = crate::text::editor::caret_rect(d, id, caret_width(d))?;
+                let caret = d.rect_to_window(d.get(row)?, caret);
+                return Some(Some(e.ime_state(caret)));
+            }
             let e = n.edit()?;
             if e.read_only {
                 return Some(None);
@@ -1848,7 +2097,7 @@ impl Ui {
                     d.state
                         .focused
                         .and_then(|id| d.get(id))
-                        .is_some_and(Node::is_edit)
+                        .is_some_and(|n| n.is_edit() || n.is_editor())
                 });
                 if focused_edit {
                     // Wait for the layout to settle before reporting.
@@ -1912,7 +2161,7 @@ impl Document {
     }
 
     /// Caret or selection moved without changing text: repaint and re-scroll only.
-    fn mark_caret_moved(&mut self) {
+    pub(crate) fn mark_caret_moved(&mut self) {
         self.dirty.carets = true;
         self.mark_paint();
     }
@@ -2150,9 +2399,13 @@ fn scrollbar_drag(doc: &mut Document, id: NodeId, vertical: bool, grab: f32, p: 
 
 /// Scrolls the ancestors of `id` until it is in view, as far as they can.
 fn scroll_into_view(doc: &mut Document, id: NodeId) {
-    let Some(mut rect) = doc.window_rect(id) else {
-        return;
-    };
+    if let Some(rect) = doc.window_rect(id) {
+        scroll_rect_into_view(doc, id, rect);
+    }
+}
+
+/// Scrolls what `id` is in so that `rect`, in window coordinates, shows.
+fn scroll_rect_into_view(doc: &mut Document, id: NodeId, mut rect: RectI) {
     let ancestors = doc.ancestors(id);
     for &a in &ancestors[1..] {
         let Some(n) = doc.nodes.get(a) else {
@@ -2371,5 +2624,49 @@ fn scroll_carets_into_view(doc: &mut Document) {
     }
     if moved {
         doc.mark_paint();
+    }
+}
+
+/// The `text_editor` that a press on `target` goes to: the closest one around it, unless something
+/// between them takes clicks itself (a check box in a line).
+pub(crate) fn editor_under(doc: &Document, target: NodeId) -> Option<NodeId> {
+    let mut at = target;
+    loop {
+        let n = doc.get(at)?;
+        if n.is_editor() {
+            return Some(at);
+        }
+        if n.listeners.click.is_some() || n.listeners.pointer_down.is_some() || n.is_edit() {
+            return None;
+        }
+        at = n.parent?;
+    }
+}
+
+/// Scrolls the carets of `text_editor`s that moved into view. A caret in a line that isn't laid
+/// out yet waits for it, as scrolling to a node does.
+fn scroll_editor_carets_into_view(doc: &mut Document) {
+    let width = caret_width(doc);
+    for id in doc.editors.clone() {
+        let Some(e) = doc.get(id).and_then(Node::editor) else {
+            continue;
+        };
+        if !e.scroll_to_caret {
+            continue;
+        }
+        let Some((row, div)) = e.caret_row else {
+            continue;
+        };
+        match crate::text::editor::caret_rect(doc, id, width) {
+            Some(caret) => {
+                let Some(n) = doc.get(row) else { continue };
+                let rect = doc.rect_to_window(n, caret);
+                scroll_rect_into_view(doc, row, rect);
+            }
+            None => doc.pending_scroll.push(div),
+        }
+        if let Some(e) = doc.get_mut(id).and_then(Node::editor_mut) {
+            e.scroll_to_caret = false;
+        }
     }
 }

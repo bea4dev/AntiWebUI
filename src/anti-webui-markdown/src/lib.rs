@@ -7,12 +7,14 @@
 //!     .on_link(|url| open(url))
 //! ```
 
+mod editor;
 #[cfg(feature = "mermaid")]
 mod mermaid;
 mod parse;
 mod theme;
 mod view;
 
+pub use editor::{MarkdownEditor, markdown_editor};
 #[cfg(feature = "mermaid")]
 pub use mermaid::mermaid_svg;
 pub use theme::MarkdownTheme;

@@ -3,6 +3,7 @@
 //! sub-pixel precision.
 
 pub mod edit;
+pub mod editor;
 pub mod rich;
 pub mod selection;
 

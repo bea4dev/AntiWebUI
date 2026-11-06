@@ -80,6 +80,8 @@ pub struct TextData {
     pub in_svg: bool,
     /// Its spans and the nodes among its words, for a `rich_text`.
     pub rich: Option<Box<crate::text::rich::RichData>>,
+    /// The editor it is a line of, for a line of a `text_editor`.
+    pub row: Option<Box<crate::text::editor::RowLink>>,
 }
 
 /// What a popup's surface needs to hold its box and what sticks out of it.
@@ -171,6 +173,9 @@ pub enum NodeKind {
     Element,
     Text(TextData),
     Edit(Box<EditData>),
+    /// Text edited line by line, its lines as children: `text_editor`. See "M3" in
+    /// `docs/design/28-markdown.md`.
+    Editor(Box<crate::text::editor::EditorData>),
     /// A picture in its box: `img`. See `docs/design/22-images.md`.
     Image(Box<ImageData>),
     /// A moving picture in its box: `video`. See `docs/design/24-video.md`.
@@ -366,6 +371,24 @@ impl Node {
         matches!(self.kind, NodeKind::Edit(_))
     }
 
+    pub fn is_editor(&self) -> bool {
+        matches!(self.kind, NodeKind::Editor(_))
+    }
+
+    pub fn editor(&self) -> Option<&crate::text::editor::EditorData> {
+        match &self.kind {
+            NodeKind::Editor(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    pub fn editor_mut(&mut self) -> Option<&mut crate::text::editor::EditorData> {
+        match &mut self.kind {
+            NodeKind::Editor(e) => Some(e),
+            _ => None,
+        }
+    }
+
     pub fn is_popup(&self) -> bool {
         matches!(self.kind, NodeKind::Popup(_))
     }
@@ -551,6 +574,8 @@ pub struct Document {
     pub reposition: Vec<NodeId>,
     /// All edit nodes, which are few, to look through for pending caret scrolling.
     pub edits: Vec<NodeId>,
+    /// The `text_editor`s.
+    pub editors: Vec<NodeId>,
     /// All nodes with `stacked` set.
     pub stacked: HashSet<NodeId>,
     /// The stacked descendants of each stacking context that has any, in paint order. See
@@ -625,6 +650,7 @@ thread_local! {
         style_all: false,
         reposition: Vec::new(),
         edits: Vec::new(),
+        editors: Vec::new(),
         stacked: HashSet::new(),
         stacking: HashMap::new(),
         stacking_dirty: false,
@@ -759,10 +785,14 @@ impl Document {
 
     pub fn create(&mut self, node: Node) -> NodeId {
         let edit = node.is_edit();
+        let editor = node.is_editor();
         let popup = node.is_popup();
         let id = self.nodes.insert(node);
         if edit {
             self.edits.push(id);
+        }
+        if editor {
+            self.editors.push(id);
         }
         if popup {
             self.popups.push(id);
@@ -1161,6 +1191,7 @@ impl Document {
             self.root = None;
         }
         self.edits.retain(|e| *e != id);
+        self.editors.retain(|e| *e != id);
         self.stacked.remove(&id);
         self.transitioning.remove(&id);
         self.stacking_dirty = true;

@@ -12,6 +12,7 @@ video = ["dep:anti-webui-video"]
 [dependencies]
 anti-webui-core.workspace = true
 anti-webui-wgpu.workspace = true
+log.workspace = true
 anti-webui-video = { workspace = true, optional = true }
 png.workspace = true
 

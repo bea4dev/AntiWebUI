@@ -338,6 +338,7 @@ mod wayland {
             if let Some(stats) = &mut self.stats {
                 stats.describe(presenter.gpu(), presenter.path());
             }
+            self.overlay.describe(presenter.gpu(), presenter.path());
             let mut committed = false;
             let mut retry = false;
             for (i, (surface, presented)) in results.into_iter().enumerate() {
@@ -410,6 +411,14 @@ mod wayland {
         app: App,
         root: impl FnOnce() -> V,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Before any thread of the app's: it sets the environment of the process.
+        if let Some(device) = anti_webui_wayland::compositor_main_device() {
+            // SAFETY: the app's views, and with them its threads, aren't made yet.
+            let drivers = unsafe { anti_webui_wgpu::limit_vulkan_drivers(device) };
+            if let Some(d) = drivers {
+                log::debug!("Vulkan drivers of the compositor's GPU only: {d}");
+            }
+        }
         #[cfg(feature = "video")]
         anti_webui_video::install();
         let runner = Runner {

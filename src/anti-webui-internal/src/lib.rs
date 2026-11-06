@@ -18,7 +18,9 @@ pub mod prelude {
     pub use anti_webui_core::prelude::*;
     pub use anti_webui_macros::ShaderParams;
     #[cfg(feature = "markdown")]
-    pub use anti_webui_markdown::{Emoji, MarkdownTheme, MarkdownView, markdown_view};
+    pub use anti_webui_markdown::{
+        Emoji, MarkdownEditor, MarkdownTheme, MarkdownView, markdown_editor, markdown_view,
+    };
     #[cfg(feature = "pdf")]
     pub use anti_webui_pdf::{
         PdfAnnotationId, PdfAnnotationKind, PdfEditing, PdfError, PdfField, PdfFieldChange,

@@ -18,6 +18,8 @@ pub(crate) struct Visibility {
     pub check: bool,
     /// The ends of the selection and the focus they were last checked with.
     last: (Option<(NodeId, NodeId)>, Option<NodeId>),
+    /// The lines with the caret of a `text_editor`, which are laid out wherever they are.
+    carets: Vec<NodeId>,
     /// For each scroller with contents that change: a node in its view, and how far down its
     /// content that is, which stays the same.
     anchors: Vec<(NodeId, NodeId, i32)>,
@@ -35,8 +37,10 @@ pub(crate) fn check(doc: &mut Document) -> bool {
             .map(|s| (s.anchor.node, s.focus.node)),
         doc.state.focused,
     );
-    if inputs != doc.visibility.last {
+    let carets = crate::text::editor::caret_rows(doc);
+    if inputs != doc.visibility.last || carets != doc.visibility.carets {
         doc.visibility.last = inputs;
+        doc.visibility.carets = carets.clone();
         doc.visibility.check = true;
     }
     if !std::mem::take(&mut doc.visibility.check) || doc.visibility.auto.is_empty() {
@@ -52,6 +56,7 @@ pub(crate) fn check(doc: &mut Document) -> bool {
     let targets: Vec<u32> = doc
         .pending_scroll
         .iter()
+        .chain(&carets)
         .filter_map(|&id| order(id))
         .collect();
     let window = RectI::new(0, 0, doc.viewport.width, doc.viewport.height);

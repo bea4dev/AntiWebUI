@@ -96,7 +96,7 @@ pub struct EditOutcome {
     pub moved: bool,
 }
 
-fn prev_grapheme(text: &str, i: usize) -> usize {
+pub(crate) fn prev_grapheme(text: &str, i: usize) -> usize {
     text[..i]
         .grapheme_indices(true)
         .next_back()
@@ -104,7 +104,7 @@ fn prev_grapheme(text: &str, i: usize) -> usize {
         .unwrap_or(0)
 }
 
-fn next_grapheme(text: &str, i: usize) -> usize {
+pub(crate) fn next_grapheme(text: &str, i: usize) -> usize {
     text[i..]
         .grapheme_indices(true)
         .nth(1)
@@ -112,7 +112,7 @@ fn next_grapheme(text: &str, i: usize) -> usize {
         .unwrap_or(text.len())
 }
 
-fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+pub(crate) fn floor_char_boundary(s: &str, mut i: usize) -> usize {
     i = i.min(s.len());
     while !s.is_char_boundary(i) {
         i -= 1;

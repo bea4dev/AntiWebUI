@@ -47,10 +47,10 @@ impl<F: Fn() -> S + 'static, S: Into<String>> IntoMarkdown for F {
     }
 }
 
-type Highlight = dyn Fn(&str, &str) -> Vec<(Range<usize>, Style)>;
-type OnLink = Option<Rc<dyn Fn(&str)>>;
-type Pictures = Option<Rc<dyn Fn(&str) -> ImageSource>>;
-type Emojis = Option<Rc<dyn Fn(&str) -> Option<Emoji>>>;
+pub(crate) type Highlight = dyn Fn(&str, &str) -> Vec<(Range<usize>, Style)>;
+pub(crate) type OnLink = Option<Rc<dyn Fn(&str)>>;
+pub(crate) type Pictures = Option<Rc<dyn Fn(&str) -> ImageSource>>;
+pub(crate) type Emojis = Option<Rc<dyn Fn(&str) -> Option<Emoji>>>;
 
 /// A Markdown document, shown with ordinary nodes. When the source is a closure, the blocks whose
 /// source didn't change stay as they are.
@@ -119,7 +119,7 @@ impl Styled for MarkdownView {
 }
 
 /// What the blocks of a document are made with.
-struct Ctx {
+pub(crate) struct Ctx {
     theme: MarkdownTheme,
     on_link: OnLink,
     image: Pictures,
@@ -165,7 +165,40 @@ fn hash_of(s: &str) -> u64 {
 }
 
 impl Ctx {
-    fn follow(&self, url: &str) {
+    pub(crate) fn new(
+        theme: MarkdownTheme,
+        on_link: OnLink,
+        image: Pictures,
+        emoji: Emojis,
+        highlight: Option<Rc<Highlight>>,
+    ) -> Rc<Self> {
+        Rc::new(Ctx {
+            link_hover: Rc::new(theme.link_hover.clone()),
+            theme,
+            on_link,
+            image,
+            emoji,
+            highlight,
+            spans: RefCell::default(),
+            anchors: RefCell::default(),
+            footnotes: RefCell::default(),
+            footnote_refs: RefCell::default(),
+        })
+    }
+
+    /// The first block of `source`, as the viewer shows it.
+    pub(crate) fn block_of(self: &Rc<Self>, source: &str) -> View {
+        match parse::parse(source).into_iter().next() {
+            Some(top) => self.block(&top.block, 0.0, 0),
+            None => div().into_view(),
+        }
+    }
+
+    pub(crate) fn picture_of(&self, url: &str) -> ImageSource {
+        self.picture(url)
+    }
+
+    pub(crate) fn follow(&self, url: &str) {
         if let Some(id) = url.strip_prefix('#') {
             let target = self
                 .anchors
@@ -294,6 +327,8 @@ impl Ctx {
 
     /// A paragraph of inlines, at font size `size` (for emoji and what is raised).
     fn inlines(self: &Rc<Self>, pieces: &Inlines, size: f32) -> View {
+        let split = parse::split_scripts(pieces);
+        let pieces = split.as_ref().unwrap_or(pieces);
         if let [Piece::Text(t, m)] = &pieces[..]
             && m.bits == 0
             && m.link.is_none()
@@ -538,6 +573,7 @@ impl Ctx {
             t.item_gap
         };
         let bullets = ["•", "◦", "▪"];
+        let no_style = Style::default();
         let rows = items.iter().enumerate().map(|(i, item)| {
             let marker: View = match (item.task, start) {
                 (Some(done), _) => {
@@ -589,6 +625,10 @@ impl Ctx {
                         .flex_col()
                         .flex_1()
                         .min_w(0.0)
+                        .style(match item.task {
+                            Some(true) => &t.task_done,
+                            _ => &no_style,
+                        })
                         .children(self.stack(&item.blocks, depth + 1)),
                 )
         });
@@ -788,18 +828,13 @@ impl Ctx {
 
 impl IntoView for MarkdownView {
     fn into_view(self) -> View {
-        let ctx = Rc::new(Ctx {
-            link_hover: Rc::new(self.theme.link_hover.clone()),
-            theme: self.theme,
-            on_link: self.on_link,
-            image: self.image,
-            emoji: self.emoji,
-            highlight: self.highlight,
-            spans: RefCell::default(),
-            anchors: RefCell::default(),
-            footnotes: RefCell::default(),
-            footnote_refs: RefCell::default(),
-        });
+        let ctx = Ctx::new(
+            self.theme,
+            self.on_link,
+            self.image,
+            self.emoji,
+            self.highlight,
+        );
         let source = self.source;
         let items = {
             let ctx = ctx.clone();

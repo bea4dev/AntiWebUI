@@ -95,6 +95,26 @@ wgpu の Surface（Vulkan WSI）を使わず、表示用バッファを自前で
 4. メモリを dmabuf としてエクスポートし（`VK_KHR_external_memory_fd`）、プレーンごとの offset / stride と選ばれた modifier を `zwp_linux_buffer_params_v1` に渡して `wl_buffer` を作る。
 5. 同じ VkImage を wgpu-hal 経由で `wgpu::Texture` として取り込み、通常のレンダラで描く。
 
+### 読み込む Vulkan ドライバ
+
+Vulkan ローダーは、インスタンスを作るときに入っているドライバを全部読む。NVIDIA のドライバは、読むだけで D3cold で寝ている dGPU を起こし、起動が約 0.9 秒遅くなっていた（AMD の内蔵 GPU でコンポジタが動くハイブリッド構成。[28](28-markdown.md) の「既存の Markdown ソフトとの比較」）。描くのはどのみち main device なので、ほかの GPU のドライバは読まなくてよい。
+
+- `App::run` の最初、ビューを作ってスレッドが動き出す前に、Wayland に別の接続を短く張り、`get_default_feedback` の `main_device` を受け取る（`anti_webui_wayland::compositor_main_device`、1〜2 ms）。
+- その dev_t のドライバを sysfs（`/sys/dev/char/<major>:<minor>/device/driver`）で調べ、そのドライバの Vulkan ドライバのマニフェストだけを `VK_LOADER_DRIVERS_SELECT` に入れる（`anti_webui_wgpu::limit_vulkan_drivers`）。GPU は起こさない。
+
+| main device のドライバ | 読む Vulkan ドライバ（マニフェストの名前に含まれるもの） |
+|---|---|
+| `amdgpu`、`radeon` | `radeon`（RADV）、`amd_icd`（AMDVLK） |
+| `i915`、`xe` | `intel` |
+| `nouveau` | `nouveau` |
+| `nvidia` | 絞らない（dGPU はコンポジタのために起きている。wgpu Surface のフォールバックが省電力で AMD を選べるように、今のまま） |
+| それ以外、分からない | 絞らない |
+
+- 利用者が `VK_LOADER_DRIVERS_SELECT`、`VK_LOADER_DRIVERS_DISABLE`、`VK_DRIVER_FILES`、`VK_ICD_FILENAMES`、`VK_ADD_DRIVER_FILES` を指定しているとき、または dGPU で描かせる指定（`DRI_PRIME`、`__NV_PRIME_RENDER_OFFLOAD`）があるときは、何もしない。
+- マニフェストは、ローダーと同じ場所（`$XDG_CONFIG_HOME`、`$XDG_CONFIG_DIRS`、`/etc`、`$XDG_DATA_HOME`、`$XDG_DATA_DIRS` の下の `vulkan/icd.d`）から探し、見つかったものの名前だけを入れる。1 つも見つからなければ絞らない（ドライバが無くなって描けなくなることはない）。
+- 環境変数はプロセス全体に効くので、Rust 2024 では `unsafe` の `set_var` を使う。ほかのスレッドが環境変数を読んでいる間に書くのを避けるため、スレッドを作る前の `App::run` の最初に呼ぶ。利用者が `App::run` の前に自分でスレッドを作っていても、ローダーを読む前なら影響は無い。
+- `ANTIWEBUI_VULKAN_DRIVERS=all` で絞るのをやめられる（切り分け用）。
+
 バッファは必要に応じて最大 4 枚（保留中のフレームがあればその分を足した枚数）まで増やす。サイズや feedback が変わったら作り直す（古いバッファはコンポジタが返却してから破棄する）。
 
 ### フレームの流れ

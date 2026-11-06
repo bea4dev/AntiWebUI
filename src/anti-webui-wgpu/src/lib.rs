@@ -3,6 +3,10 @@
 mod custom_shader;
 #[cfg(target_os = "linux")]
 pub mod dmabuf;
+#[cfg(target_os = "linux")]
+mod drivers;
+#[cfg(target_os = "linux")]
+pub use drivers::limit_vulkan_drivers;
 mod effects;
 mod glyph_cache;
 #[cfg(target_os = "linux")]

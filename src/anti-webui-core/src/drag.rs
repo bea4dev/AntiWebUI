@@ -6,7 +6,8 @@ use crate::paint::{DragContent, DragVisual, paint_selected_text, paint_snapshot}
 use crate::platform::{CursorIcon, DragOffer, ImePurpose, PlatformRequest};
 use crate::reactive::{Owner, Signal, batch, create_root, signal, untrack};
 use crate::scroll::VelocityTracker;
-use crate::text::edit::EditOutcome;
+use crate::text::edit::{EditData, EditOutcome};
+use crate::text::editor::{EditorData, EditorOutcome};
 use crate::text::selection::{self, node_range};
 use crate::tree::{Document, Node, NodeId, NodeKind, with_doc};
 use crate::ui::{Drag, Press, Ui, can_scroll, edit_point, scroll_node, set_active};
@@ -112,12 +113,30 @@ pub struct DraggedText(pub String);
 pub(crate) enum TextOrigin {
     Document,
     Edit(NodeId),
+    /// A `text_editor`.
+    Editor(NodeId),
 }
 
 /// Whether `p` is on selected text in `target`, which can be dragged. Goes by what is highlighted.
 pub(crate) fn pressed_selection(doc: &Document, target: NodeId, p: PointF) -> Option<TextOrigin> {
     let n = doc.get(target).filter(|n| !n.is_disabled())?;
     match &n.kind {
+        NodeKind::Text(t) if t.row.is_some() => {
+            // A line of a `text_editor`, with what of the editor's selection is on it.
+            let row = t.row.as_ref()?;
+            let r = row.selected.clone()?;
+            let e = doc.get(row.host)?.editor()?;
+            if e.preedit.is_some() {
+                return None;
+            }
+            let q = doc.from_window(n, p)?;
+            let end = r.end.min(t.text.len().saturating_sub(1)).max(r.start);
+            t.layout
+                .range_rects(r.start, end, n.abs.x, n.abs.y)
+                .iter()
+                .any(|r| r.contains(q))
+                .then_some(TextOrigin::Editor(row.host))
+        }
         NodeKind::Text(t) => {
             let (a, b) = node_range(doc, doc.state.selection.as_ref()?, target)?;
             let q = doc.from_window(n, p)?;
@@ -145,8 +164,61 @@ pub(crate) fn pressed_selection(doc: &Document, target: NodeId, p: PointF) -> Op
 
 /// Where in the input something dropped at `p` would go.
 fn drop_offset(doc: &Document, id: NodeId, p: PointF) -> Option<usize> {
+    if doc.get(id)?.is_editor() {
+        return crate::text::editor::hit(doc, id, p);
+    }
     let at = edit_point(doc, id, p);
     Some(doc.get(id)?.edit()?.hit(at.x, at.y).0)
+}
+
+/// The selection of an input or a `text_editor` that can be written in, and its text.
+fn writable_selection(n: &Node) -> Option<((usize, usize), &str)> {
+    match (n.edit(), n.editor()) {
+        (Some(e), _) if !e.read_only => Some((e.selection_range(), e.selected_text())),
+        (_, Some(e)) if !e.read_only => Some((e.selection_range(), e.selected_text())),
+        _ => None,
+    }
+}
+
+/// What became of an input or a `text_editor` that was changed.
+enum Changed {
+    Edit(EditOutcome),
+    Editor(EditorOutcome),
+}
+
+impl Changed {
+    fn changed(&self) -> bool {
+        match self {
+            Changed::Edit(o) => o.changed,
+            Changed::Editor(o) => o.changed,
+        }
+    }
+}
+
+/// Changes an input with `edit`, or a `text_editor` with `editor`.
+fn change(
+    d: &mut Document,
+    id: NodeId,
+    edit: &dyn Fn(&mut EditData) -> EditOutcome,
+    editor: &dyn Fn(&mut EditorData) -> EditorOutcome,
+) -> Option<Changed> {
+    let n = d.get_mut(id)?;
+    let out = match (n.is_edit(), n.is_editor()) {
+        (true, _) => Changed::Edit(edit(n.edit_mut()?)),
+        (_, true) => Changed::Editor(editor(n.editor_mut()?)),
+        _ => return None,
+    };
+    if let Changed::Edit(o) = &out
+        && o.changed
+    {
+        d.invalidate_layout(id);
+    }
+    if let Changed::Editor(o) = &out
+        && o.changed
+    {
+        d.mark_caret_moved();
+    }
+    Some(out)
 }
 
 /// The format an input takes from this, if it takes any.
@@ -517,10 +589,9 @@ fn accepts(doc: &Document, id: NodeId, session: &DragSession) -> Option<(Rc<Drop
 /// `None` that it does, but can't be dropped there.
 fn edit_accepts(doc: &Document, id: NodeId, session: &DragSession) -> Option<Option<Accept>> {
     let n = doc.get(id).filter(|n| !n.is_disabled())?;
-    let e = n.edit().filter(|e| !e.read_only)?;
+    let ((a, b), _) = writable_selection(n)?;
     let mime = text_mime(&session.mimes)?;
     if session.text_source == Some(id) {
-        let (a, b) = e.selection_range();
         let at = drop_offset(doc, id, session.position)?;
         if (a..=b).contains(&at) {
             return Some(None);
@@ -854,16 +925,20 @@ impl Ui {
             return false;
         }
         let edit = match origin {
-            TextOrigin::Edit(id) => Some(id),
+            TextOrigin::Edit(id) | TextOrigin::Editor(id) => Some(id),
             TextOrigin::Document => None,
         };
         let found = with_doc(|d| {
-            let (text, moves) = match edit {
-                Some(id) => {
+            let (text, moves) = match origin {
+                TextOrigin::Edit(id) => {
                     let e = d.get(id)?.edit()?;
                     (e.selected_text().to_owned(), !e.read_only)
                 }
-                None => (
+                TextOrigin::Editor(id) => {
+                    let e = d.get(id)?.editor()?;
+                    (e.selected_text().to_owned(), !e.read_only)
+                }
+                TextOrigin::Document => (
                     selection::selected_text(d, d.state.selection.as_ref()?),
                     false,
                 ),
@@ -885,7 +960,7 @@ impl Ui {
                 DragActions::Copy
             });
         self.ensure_layout();
-        let painted = with_doc(|d| paint_selected_text(d, edit));
+        let painted = with_doc(|d| paint_selected_text(d, origin));
         let grip = painted.as_ref().map_or((0.0, 0.0), |(_, _, b)| {
             (
                 ((start.x - b.x as f32) / b.width.max(1) as f32).clamp(0.0, 1.0),
@@ -1065,27 +1140,27 @@ impl Ui {
             action == DragAction::Move
                 && with_doc(|d| {
                     d.get(*s)
-                        .and_then(Node::edit)
-                        .is_some_and(|e| !e.read_only && e.selected_text() == text)
+                        .and_then(writable_selection)
+                        .is_some_and(|(_, t)| t == text)
                 })
         });
         let (taken, put) = with_doc(|d| {
             let at = drop_offset(d, id, p).unwrap_or_default();
-            let mut edit_of =
-                |n: NodeId, f: &dyn Fn(&mut crate::text::edit::EditData) -> EditOutcome| {
-                    let out = d.get_mut(n).and_then(Node::edit_mut).map(f);
-                    if out.as_ref().is_some_and(|o| o.changed) {
-                        d.invalidate_layout(n);
-                    }
-                    out
-                };
             let (taken, put) = if source == Some(id) {
-                (None, edit_of(id, &|e| e.move_selection(at)))
+                let put = change(d, id, &|e| e.move_selection(at), &|e| e.move_selection(at));
+                (None, put)
             } else {
-                let put = edit_of(id, &|e| e.drop_text(at, &text));
+                let put = change(d, id, &|e| e.drop_text(at, &text), &|e| {
+                    e.drop_text(at, &text)
+                });
                 let taken = source
-                    .filter(|_| put.as_ref().is_some_and(|o| o.changed))
-                    .and_then(|s| edit_of(s, &|e| e.delete(false, false)).map(|o| (s, o)));
+                    .filter(|_| put.as_ref().is_some_and(Changed::changed))
+                    .and_then(|s| {
+                        change(d, s, &|e| e.delete(false, false), &|e| {
+                            e.delete(false, false)
+                        })
+                        .map(|o| (s, o))
+                    });
                 (taken, put)
             };
             if d.state.selection.take().is_some() {
@@ -1094,11 +1169,11 @@ impl Ui {
             (taken, put)
         });
         self.set_focus(Some(id));
-        if let Some((s, outcome)) = taken {
-            self.after_edit(s, outcome);
-        }
-        if let Some(outcome) = put {
-            self.after_edit(id, outcome);
+        for (n, outcome) in taken.into_iter().chain(put.map(|o| (id, o))) {
+            match outcome {
+                Changed::Edit(o) => self.after_edit(n, o),
+                Changed::Editor(o) => crate::text::editor::after_edit(n, o),
+            }
         }
     }
 
@@ -1511,7 +1586,7 @@ impl Ui {
         } else if self
             .press
             .as_ref()
-            .is_some_and(|p| matches!(p.drag, crate::ui::Drag::Select))
+            .is_some_and(|p| matches!(p.drag, crate::ui::Drag::Select | crate::ui::Drag::Editor(_)))
         {
             self.pointer_moved(p);
         } else {
@@ -1522,6 +1597,12 @@ impl Ui {
 
 /// Says where what is dragged over an input would go, if anywhere.
 fn set_drop_caret(doc: &mut Document, id: Option<NodeId>, at: Option<usize>) {
+    if let Some(id) = id
+        && doc.get(id).is_some_and(Node::is_editor)
+    {
+        crate::text::editor::set_drop_caret(doc, id, at);
+        return;
+    }
     if let Some(id) = id
         && let Some(e) = doc.get_mut(id).and_then(Node::edit_mut)
         && e.drop_caret != at

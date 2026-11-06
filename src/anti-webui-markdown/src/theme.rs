@@ -42,6 +42,9 @@ pub struct MarkdownTheme {
     /// The box of a diagram.
     pub diagram: Style,
     pub footnotes: Style,
+    /// The text of a task that is done (`- [x]`). Empty by default, as on GitHub, where only the
+    /// box is ticked; `Style::default().strikethrough().text_color(muted)` looks like Obsidian.
+    pub task_done: Style,
     /// How big an emoji that is a picture is, by the font size around it.
     pub emoji_size: f32,
 }
@@ -139,6 +142,7 @@ impl Default for MarkdownTheme {
                 .pt(16.0)
                 .mt(16.0),
             emoji_size: 1.25,
+            task_done: Style::default(),
         }
     }
 }

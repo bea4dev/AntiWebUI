@@ -23,7 +23,9 @@ const CHUNK: ChunkKey = ChunkKey {
 
 /// Logical pixels.
 const MARGIN: f32 = 8.0;
-const WIDTH: f32 = 200.0;
+const WIDTH: f32 = 240.0;
+/// How many letters of the monospace font fit across.
+const LETTERS: usize = 34;
 const PADDING: f32 = 6.0;
 const FONT_SIZE: f32 = 11.0;
 const LINE: f32 = 14.0;
@@ -37,6 +39,16 @@ const GOOD: Color = Color::from_rgb(0x3fb950);
 const LATE: Color = Color::from_rgb(0xf85149);
 const CPU: Color = Color::from_rgb(0x58a6ff);
 const GPU: Color = Color::from_rgb(0xf0883e);
+
+/// As many letters of a line as fit in the panel.
+fn fit(line: String) -> String {
+    if line.chars().count() <= LETTERS {
+        return line;
+    }
+    let mut short: String = line.chars().take(LETTERS - 1).collect();
+    short.push('…');
+    short
+}
 
 /// What a frame took, in milliseconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -61,6 +73,8 @@ pub struct PerformanceOverlay {
     frames: VecDeque<FrameSample>,
     /// What renders ahead, as words: `Auto: on`, `Disable`.
     advance: String,
+    /// What draws: the GPU and how frames reach the compositor, and the CPU, a line each.
+    devices: Vec<String>,
     /// The lines of text last shaped, kept while they stay the same.
     shaped: Vec<(String, TextLayout)>,
 }
@@ -80,6 +94,12 @@ impl PerformanceOverlay {
     /// The frames it has, oldest first.
     pub fn frames(&self) -> impl Iterator<Item = &FrameSample> {
         self.frames.iter()
+    }
+
+    /// What draws, a line each: the GPU, how frames reach the compositor, the CPU. Lines too
+    /// long for the panel are cut short.
+    pub fn set_devices(&mut self, lines: Vec<String>) {
+        self.devices = lines;
     }
 
     /// How rendering ahead is set and what it is doing.
@@ -112,6 +132,9 @@ impl PerformanceOverlay {
             format!("latency {} ms", ms(latency)),
             format!("Advance {}", self.advance),
         ]
+        .into_iter()
+        .chain(self.devices.iter().cloned().map(fit))
+        .collect()
     }
 
     /// Adds the overlay at the top right of `scene`, over everything.
@@ -273,6 +296,21 @@ mod tests {
         assert!(lines[1].contains("3.0 ms (UI 1.5)"), "{lines:?}");
         assert!(lines[2].contains("1.0 ms"), "{lines:?}");
         assert_eq!(lines[4], "Advance Auto: on");
+    }
+
+    #[test]
+    fn it_names_what_draws_in_as_much_as_fits() {
+        let mut o = PerformanceOverlay::new();
+        o.push(frame(16.0, 4.0, Some(2.0)));
+        o.set_devices(vec![
+            "GPU Radeon 780M".into(),
+            "    radv, explicit sync, and a lot more than fits".into(),
+        ]);
+        let lines = o.lines();
+        assert_eq!(lines.len(), 7);
+        assert_eq!(lines[5], "GPU Radeon 780M");
+        assert_eq!(lines[6].chars().count(), LETTERS);
+        assert!(lines[6].ends_with('…'));
     }
 
     #[test]

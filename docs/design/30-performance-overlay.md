@@ -31,6 +31,7 @@ App::new()
 | CPU | フレームを作り始めてから submit と commit までの時間（`end - start`）。括弧はそのうちの UI の部分（スタイル、レイアウト、シーンを作る）。直近 30 フレームの平均 |
 | GPU | GPU がそのフレームに使った時間の目安: 描き終わり（sync_file）から、submit と前のフレームの描き終わりの遅い方を引いた時間。先行描画で前のフレームを待っていた時間を含めないため。直近 30 フレームの平均。時刻が取れない経路（wgpu Surface）では `-` |
 | latency | 作り始めてから画面に出るまで（`presented - start`） |
+| GPU、CPU | 描いている GPU の名前、その下の行にドライバと、フレームをコンポジタに渡す経路（`dmabuf (explicit sync)`、`dmabuf (implicit sync)`、`wgpu surface`）。CPU の名前とスレッド数（`/proc/cpuinfo`）。メーカー名、「Graphics」、CPU に付く GPU の名前などは省き、入りきらない行は `…` で切る |
 | Advance | `FrameAdvance` の設定。`Auto` のときは今の状態（`on`、`off`、`trying`、`off (no gain)`）。環境変数で上書きしているときは `(env)` を付ける。最後のフレームが実際に先行して描かれていた（commit が次のコールバックまで待った）ときは `, ahead` を付ける |
 
 グラフは直近 90 フレームの棒で、上は間隔（リフレッシュより長いものは赤）、下は CPU と GPU を並べる。横線はリフレッシュの周期。縦の目盛りはリフレッシュの 2 倍まで（それより長いものは頭打ち）。

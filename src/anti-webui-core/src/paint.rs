@@ -212,7 +212,10 @@ fn selected_runs(
 
 /// The selected text and nothing else: what Blink paints with `kSelectionDragImageOnly`, in window
 /// coordinates. `edit` says it is the selection in that input rather than the document's.
-pub(crate) fn paint_selected_text(doc: &Document, edit: Option<NodeId>) -> Option<DragPainted> {
+pub(crate) fn paint_selected_text(
+    doc: &Document,
+    origin: crate::drag::TextOrigin,
+) -> Option<DragPainted> {
     let screen = RectI::new(0, 0, doc.viewport.width, doc.viewport.height);
     let mut scene = Scene::default();
     let mut boxes = RectI::default();
@@ -234,15 +237,28 @@ pub(crate) fn paint_selected_text(doc: &Document, edit: Option<NodeId>) -> Optio
                 boxes = boxes.union(&r.intersect(&visible));
             }
         };
-    match edit {
-        Some(id) => {
+    match origin {
+        crate::drag::TextOrigin::Edit(id) => {
             let n = doc.get(id)?;
             let e = n.edit()?;
             let inner = child_clip(n, doc.scale, n.clip_shape()).rect;
             let origin = edit_text_origin(doc, id);
             add(id, &e.layout, origin, e.selection_range(), inner);
         }
-        None => {
+        crate::drag::TextOrigin::Editor(host) => {
+            for &id in &doc.get(host)?.editor()?.selected_rows {
+                let n = &doc.nodes[id];
+                if let NodeKind::Text(t) = &n.kind
+                    && let Some(r) = t.row.as_ref().and_then(|l| l.selected.clone())
+                    && !n.held
+                {
+                    // Not the space at the end that stands for the line break.
+                    let end = r.end.min(t.text.len().saturating_sub(1)).max(r.start);
+                    add(id, &t.layout, n.abs.origin(), (r.start, end), n.abs);
+                }
+            }
+        }
+        crate::drag::TextOrigin::Document => {
             let sel = doc.state.selection.as_ref()?;
             for id in selectable_text_nodes(doc) {
                 let n = &doc.nodes[id];
@@ -1188,6 +1204,20 @@ impl Painter<'_> {
                         self.scene.fill(r, color, node.clip_shape());
                     }
                 }
+                if let Some(row) = &t.row
+                    && let Some(r) = &row.selected
+                {
+                    self.chunk(id, part::SELECTION);
+                    let focused = doc.state.focused == Some(row.host) && doc.state.window_focused;
+                    let color = if focused {
+                        c.selection_color
+                    } else {
+                        c.selection_color.with_alpha(c.selection_color.a * 0.5)
+                    };
+                    for r in t.layout.range_rects(r.start, r.end, node.abs.x, node.abs.y) {
+                        self.scene.fill(r, fade(color, opacity), node.clip_shape());
+                    }
+                }
                 self.chunk(id, part::CONTENT);
                 let color = if t.in_svg { text_fill(c) } else { c.color };
                 let base = (fade(color, opacity), c.underline, c.strikethrough);
@@ -1209,6 +1239,9 @@ impl Painter<'_> {
                         base.1,
                         base.2,
                     ),
+                }
+                if let Some(row) = &t.row {
+                    self.editor_row(id, row, opacity);
                 }
                 if !node.children.is_empty() {
                     self.contents(id, opacity, cull);
@@ -1240,9 +1273,36 @@ impl Painter<'_> {
             self.contents(id, opacity, cull.intersect(&inner.rect));
         }
 
+        self.selected_block(id, opacity);
         self.chunk(id, part::AFTER);
         self.scrollbars(id, opacity);
         self.outline(id, opacity);
+    }
+
+    /// Lines of a `text_editor` shown as one node (a table, a diagram) that are selected: the
+    /// selection's color over them, as Chromium has over a selected picture.
+    fn selected_block(&mut self, id: NodeId, opacity: f32) {
+        let doc = self.doc;
+        let node = &doc.nodes[id];
+        let Some(host) = node.parent.and_then(|p| doc.get(p)) else {
+            return;
+        };
+        let Some(e) = host.editor() else {
+            return;
+        };
+        if !e.selected_blocks.contains(&id) {
+            return;
+        }
+        let c = &node.computed;
+        let focused = doc.state.focused == node.parent && doc.state.window_focused;
+        let color = if focused {
+            c.selection_color
+        } else {
+            c.selection_color.with_alpha(c.selection_color.a * 0.5)
+        };
+        self.chunk(id, part::SELECTION);
+        self.scene
+            .fill(node.abs, fade(color, opacity), node.clip_shape());
     }
 
     fn box_decorations(&mut self, id: NodeId, opacity: f32) {
@@ -1709,6 +1769,66 @@ impl Painter<'_> {
                 self.scene
                     .fill(caret, fade(c.caret_color.unwrap_or(c.color), opacity), clip);
             }
+        }
+    }
+
+    /// The pre-edit and the caret of a line of a `text_editor`.
+    fn editor_row(&mut self, id: NodeId, row: &crate::text::editor::RowLink, opacity: f32) {
+        let doc = self.doc;
+        let node = &doc.nodes[id];
+        let NodeKind::Text(t) = &node.kind else {
+            return;
+        };
+        let c = &node.computed;
+        let clip = node.clip_shape();
+        let (ox, oy) = (node.abs.x, node.abs.y);
+        if let Some((range, cursor)) = &row.preedit {
+            let thin = doc.scale.px_min1(1.0);
+            for r in t.layout.range_rects(range.start, range.end, ox, oy) {
+                let line = RectI::new(r.x, r.bottom() - thin * 2, r.width, thin);
+                self.scene.fill(line, fade(c.color, opacity), clip);
+            }
+            if let Some((a, b)) = cursor
+                && a != b
+            {
+                let (a, b) = (range.start + a, range.start + b);
+                for r in t.layout.range_rects(a, b, ox, oy) {
+                    let line = RectI::new(r.x, r.bottom() - thin * 3, r.width, thin * 2);
+                    self.scene.fill(line, fade(c.color, opacity), clip);
+                }
+            }
+        }
+        if let Some(at) = row.drop_caret {
+            self.chunk(id, part::CARET);
+            let caret = t
+                .layout
+                .caret_rect(at, crate::text::Affinity::Downstream, caret_width(doc))
+                .translate(ox, oy);
+            self.scene.fill(caret, fade(c.color, opacity), clip);
+            return;
+        }
+        let Some(at) = row.caret else {
+            return;
+        };
+        let Some(host) = doc.get(row.host) else {
+            return;
+        };
+        let Some(e) = host.editor() else {
+            return;
+        };
+        if doc.state.focused != Some(row.host) || !doc.state.window_focused || e.read_only {
+            return;
+        }
+        let elapsed = self.now.saturating_duration_since(e.caret_epoch);
+        let on = (elapsed.as_millis() / CARET_BLINK.as_millis()).is_multiple_of(2);
+        if on || e.preedit.is_some() {
+            self.chunk(id, part::CARET);
+            let caret = t
+                .layout
+                .caret_rect(at, crate::text::Affinity::Downstream, caret_width(doc))
+                .translate(ox, oy);
+            let color = host.computed.caret_color.unwrap_or(c.color);
+            self.scene.fill(caret, fade(color, opacity), clip);
         }
     }
 

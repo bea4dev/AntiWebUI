@@ -438,6 +438,66 @@ pub(crate) fn parse(source: &str) -> Vec<Top> {
 }
 
 /// The plain text of some inlines, as a slug for a heading is made from it.
+/// Where `^raised^` and `~lowered~` are in a text, as Pandoc has them: no spaces between the marks,
+/// and inside words too (`x^2^`, `H~2~O`), which `pulldown-cmark` leaves as they are. A `~~` is
+/// a line through. Says for each whether it is raised.
+pub(crate) fn scripts(s: &str) -> Vec<(Range<usize>, bool)> {
+    let b = s.as_bytes();
+    let tilde_run = |i: usize| b.get(i + 1) == Some(&b'~') || (i > 0 && b[i - 1] == b'~');
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if (c == b'^' || (c == b'~' && !tilde_run(i))) && i + 1 < b.len() {
+            let mut j = i + 1;
+            while j < b.len() && b[j] != c && !b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < b.len() && b[j] == c && j > i + 1 && !(c == b'~' && tilde_run(j)) {
+                out.push((i..j + 1, c == b'^'));
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The inlines with what [`scripts`] finds in their text raised or lowered. `None` when there is
+/// nothing.
+pub(crate) fn split_scripts(pieces: &Inlines) -> Option<Inlines> {
+    let found = |t: &str, m: &Marks| m.bits & mark::CODE == 0 && t.contains(['^', '~']);
+    if !pieces
+        .iter()
+        .any(|p| matches!(p, Piece::Text(t, m) if found(t, m)))
+    {
+        return None;
+    }
+    let mut out = Vec::with_capacity(pieces.len() + 2);
+    for p in pieces {
+        let Piece::Text(t, m) = p else {
+            out.push(p.clone());
+            continue;
+        };
+        let runs = if found(t, m) { scripts(t) } else { Vec::new() };
+        let mut at = 0;
+        for (r, up) in runs {
+            if r.start > at {
+                out.push(Piece::Text(t[at..r.start].to_owned(), m.clone()));
+            }
+            let mut inner = m.clone();
+            inner.bits |= if up { mark::SUPER } else { mark::SUB };
+            out.push(Piece::Text(t[r.start + 1..r.end - 1].to_owned(), inner));
+            at = r.end;
+        }
+        if at < t.len() {
+            out.push(Piece::Text(t[at..].to_owned(), m.clone()));
+        }
+    }
+    Some(out)
+}
+
 pub(crate) fn plain(inlines: &Inlines) -> String {
     let mut out = String::new();
     for p in inlines {
@@ -472,6 +532,13 @@ mod tests {
 
     fn text(t: &str, bits: u8) -> Piece {
         Piece::Text(t.into(), Marks { bits, link: None })
+    }
+
+    #[test]
+    fn raised_and_lowered_inside_words() {
+        let s = "x^2^ and H~2~O, 上付き^2^と ~~line~~ a^b c^";
+        let found: Vec<(&str, bool)> = scripts(s).into_iter().map(|(r, up)| (&s[r], up)).collect();
+        assert_eq!(found, [("^2^", true), ("~2~", false), ("^2^", true)]);
     }
 
     #[test]

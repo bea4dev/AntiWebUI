@@ -2,6 +2,7 @@
 
 mod drag;
 mod keyboard;
+mod main_device;
 mod popup;
 mod present;
 mod state;
@@ -14,6 +15,7 @@ pub use present::{
 use anti_webui_core::event::{ClipboardKind, DragAction, WindowEvent};
 use anti_webui_core::geometry::{PointI, RectI, Scale, SizeI};
 use anti_webui_core::platform::{CursorIcon, DragOffer, ImeState, PopupId, PopupParams};
+pub use main_device::compositor_main_device;
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
 };
