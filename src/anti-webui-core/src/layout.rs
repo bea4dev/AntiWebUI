@@ -9,8 +9,8 @@ use crate::scene::Clip;
 use crate::text::{ShapeStyle, TextSystem};
 use crate::tree::{Document, Node, NodeId, NodeKind, PopupSurface};
 use anti_webui_style::{
-    ANIMATED_FIELDS, AlignContent, AlignItems, ComputedStyle, Display, Edges, FlexWrap,
-    JustifyContent, Length, Overflow, Position, Sheet, WhiteSpace,
+    ANIMATED_FIELDS, AlignContent, AlignItems, ComputedStyle, ContentVisibility, Display, Edges,
+    FlexWrap, JustifyContent, Length, Overflow, Position, Sheet, WhiteSpace,
 };
 use std::collections::BinaryHeap;
 use std::time::Instant;
@@ -240,6 +240,10 @@ pub struct MeasureKey {
     base: (Option<i32>, Option<i32>),
 }
 
+/// What the width of a box comes from: what its parent decided or else the room it has, and what
+/// percentages are of. A remembered size goes with them (see `docs/design/29-content-visibility.md`).
+pub(crate) type WidthInputs = (Option<i32>, Option<i32>);
+
 #[derive(Default)]
 pub(crate) struct MeasureCache {
     entries: Vec<(MeasureKey, SizeI)>,
@@ -286,6 +290,10 @@ fn same_layout(a: &ComputedStyle, b: &ComputedStyle) -> bool {
         && a.letter_spacing == b.letter_spacing
         && a.text_align == b.text_align
         && a.white_space == b.white_space
+        && a.content_visibility == b.content_visibility
+        && a.contain_intrinsic_width == b.contain_intrinsic_width
+        && a.contain_intrinsic_height == b.contain_intrinsic_height
+        && a.estimate_contents == b.estimate_contents
 }
 
 /// Whether what a shape's outline can touch is the same.
@@ -593,6 +601,15 @@ fn resolve_node(
     node.style_dirty = false;
     node.resolved = resolved;
     node.computed = computed;
+    let auto = node.computed.content_visibility == ContentVisibility::Auto;
+    if auto != doc.visibility.auto.contains(&id) {
+        if auto {
+            doc.visibility.auto.insert(id);
+        } else {
+            doc.visibility.auto.remove(&id);
+        }
+        doc.visibility.check = true;
+    }
     if let NodeKind::Text(t) = &mut node.kind
         && let Some(rich) = &mut t.rich
         && (changed || rich.resolved.len() != rich.spans.len())
@@ -881,7 +898,13 @@ pub fn layout_document(doc: &mut Document, ts: &mut TextSystem) {
     let Some(root) = doc.shown_root() else { return };
     let viewport = doc.viewport;
     let scale = doc.scale;
-    let mut engine = Engine { doc, ts, scale };
+    let mut engine = Engine {
+        doc,
+        ts,
+        scale,
+        estimating: 0,
+        last_letter: None,
+    };
     let size = (Some(viewport.width), Some(viewport.height));
     engine.compute(root, size, Some(viewport.width), size, true);
     engine.doc.nodes[root].rect = RectI::new(0, 0, viewport.width, viewport.height);
@@ -1057,6 +1080,7 @@ fn position_node(
     let resized =
         node.listeners.resized.is_some() && (!node.visible || node.abs.size() != abs.size());
     node.visible = true;
+    node.held = false;
     node.abs = abs;
     if resized {
         doc.resized.push(id);
@@ -1099,7 +1123,11 @@ fn position_node(
     let space = node.space;
     let scroll_root = scroller && space.is_none_or(|s| doc.nodes[s].is_popup());
     doc.nodes[id].scroll_root = scroll_root;
-    position_children(doc, id, order);
+    if doc.nodes[id].skipped {
+        skip_children(doc, id, order);
+    } else {
+        position_children(doc, id, order);
+    }
     let node = &mut doc.nodes[id];
     node.subtree_nodes = *order - first;
 }
@@ -1160,11 +1188,50 @@ pub fn reposition_children(doc: &mut Document, id: NodeId) {
     position_children(doc, id, &mut order);
 }
 
+/// The descendants of a node whose contents are skipped: in document order, so that the selection
+/// can still go through them, but not shown.
+fn skip_children(doc: &mut Document, id: NodeId, order: &mut u32) {
+    fn hide(doc: &mut Document, id: NodeId, order: &mut u32) {
+        let children = std::mem::take(&mut doc.nodes[id].children);
+        for &c in &children {
+            let Some(n) = doc.nodes.get_mut(c) else {
+                continue;
+            };
+            if n.is_popup() {
+                continue;
+            }
+            if n.computed.display == Display::None {
+                hide_subtree(doc, c);
+                continue;
+            }
+            let first = *order;
+            *order += 1;
+            n.visible = false;
+            n.held = true;
+            n.subtree_bounds = RectI::default();
+            n.scroll_root = false;
+            n.position_dirty = true;
+            n.doc_order = first;
+            hide(doc, c, order);
+            doc.nodes[c].subtree_nodes = *order - first;
+        }
+        doc.nodes[id].children = children;
+    }
+    hide(doc, id, order);
+    let scale = doc.scale;
+    let node = &mut doc.nodes[id];
+    node.child_bounds.clear();
+    node.child_bounds
+        .resize(node.children.len(), RectI::default());
+    node.subtree_bounds = grown_by_filter(own_bounds(node, scale), node, scale);
+}
+
 fn hide_subtree(doc: &mut Document, id: NodeId) {
     let mut stack = vec![id];
     while let Some(id) = stack.pop() {
         if let Some(n) = doc.nodes.get_mut(id) {
             n.visible = false;
+            n.held = false;
             n.subtree_bounds = RectI::default();
             n.scroll_root = false;
             stack.extend(n.children.iter().copied());
@@ -1176,7 +1243,22 @@ struct Engine<'a> {
     doc: &'a mut Document,
     ts: &'a mut TextSystem,
     scale: Scale,
+    /// Measuring contents that are skipped, with their text estimated instead of shaped.
+    estimating: u32,
+    /// The average letter of the last text estimated, which the next one most often shares.
+    last_letter: Option<(LetterKey, crate::text::AverageLetter)>,
 }
+
+/// What the average letter of a text depends on.
+type LetterKey = (
+    anti_webui_style::FontFamily,
+    f32,
+    anti_webui_style::FontWeight,
+    anti_webui_style::FontStyle,
+    anti_webui_style::LineHeight,
+    f32,
+    f32,
+);
 
 struct Item {
     id: NodeId,
@@ -1296,6 +1378,10 @@ impl Engine<'_> {
             avail_w,
             base,
         };
+        if self.estimating > 0 {
+            // An estimate isn't what the box measures, so nothing keeps it.
+            return self.compute_inner(id, known, avail_w, base, perform);
+        }
         let node = &self.doc.nodes[id];
         if perform {
             // A clean subtree laid out with the same inputs keeps its previous result.
@@ -1416,6 +1502,58 @@ impl Engine<'_> {
             return SizeI::new(w, h);
         }
 
+        let node = &self.doc.nodes[id];
+        let skipped = self.estimating == 0
+            && match node.computed.content_visibility {
+                ContentVisibility::Visible => false,
+                ContentVisibility::Auto => !node.relevant,
+                ContentVisibility::Hidden => true,
+            };
+        if skipped {
+            // As big as it was when its contents were last laid out, or as they are estimated to
+            // be, or as it says, or as if it were empty.
+            let c = &node.computed;
+            let inputs = (known.0.or(avail_w), base.0);
+            let remembered = node
+                .remembered
+                .or(node.estimated)
+                .filter(|(k, _)| *k == inputs)
+                .map(|(_, s)| s);
+            let (estimate, iw, ih) = (
+                c.estimate_contents,
+                c.contain_intrinsic_width,
+                c.contain_intrinsic_height,
+            );
+            let scale = self.scale;
+            let side = |v: Option<f32>, pb, min, max| {
+                clamp_opt(v.map_or(0, |v| scale.px(v)) + pb, min, max)
+            };
+            let size = match (w, h, remembered) {
+                (Some(w), Some(h), _) => SizeI::new(w, h),
+                (_, _, Some(s)) => SizeI::new(w.unwrap_or(s.width), h.unwrap_or(s.height)),
+                _ if estimate => {
+                    self.estimating += 1;
+                    let s = self.compute_inner(id, (w, h), avail_w, base, false);
+                    self.estimating -= 1;
+                    // Kept until something in it changes.
+                    self.doc.nodes[id].estimated = Some((inputs, s));
+                    s
+                }
+                _ => SizeI::new(
+                    w.unwrap_or_else(|| side(iw, pb_h, min_w, max_w)),
+                    h.unwrap_or_else(|| side(ih, pb_v, min_h, max_h)),
+                ),
+            };
+            if perform {
+                let node = &mut self.doc.nodes[id];
+                node.rect.width = size.width;
+                node.rect.height = size.height;
+                node.content_size = SizeI::default();
+                node.skipped = true;
+            }
+            return size;
+        }
+
         if let (Some(w), Some(h)) = (w, h)
             && !perform
         {
@@ -1461,6 +1599,10 @@ impl Engine<'_> {
             let node = &mut self.doc.nodes[id];
             node.rect.width = w;
             node.rect.height = h;
+            node.skipped = false;
+            if node.computed.content_visibility != ContentVisibility::Visible {
+                node.remembered = Some(((known.0.or(avail_w), base.0), size));
+            }
             self.place_fragments(id, size);
             self.layout_absolute(id, size);
             self.update_content_size(id);
@@ -1637,6 +1779,9 @@ impl Engine<'_> {
         avail_w: Option<i32>,
         perform: bool,
     ) -> SizeI {
+        if self.estimating > 0 {
+            return self.estimate_text(id, w, avail_w);
+        }
         let scale = self.scale;
         let node = &mut self.doc.nodes[id];
         let style = ShapeStyle::from_computed(&node.computed, scale);
@@ -1708,6 +1853,62 @@ impl Engine<'_> {
             data.layout.restore_final();
         }
         SizeI::new(width, height)
+    }
+
+    /// The size of a text without shaping it, from the average width of its letters. See
+    /// "見積もり" in `docs/design/29-content-visibility.md`.
+    fn estimate_text(&mut self, id: NodeId, w: Option<i32>, avail_w: Option<i32>) -> SizeI {
+        let node = &self.doc.nodes[id];
+        let NodeKind::Text(data) = &node.kind else {
+            unreachable!()
+        };
+        let c = &node.computed;
+        let wraps = c.white_space == WhiteSpace::PreWrap;
+        let key: LetterKey = (
+            c.font_family.clone(),
+            c.font_size,
+            c.font_weight,
+            c.font_style,
+            c.line_height,
+            c.letter_spacing,
+            data.zoom,
+        );
+        let average = match &self.last_letter {
+            Some((k, a)) if *k == key => *a,
+            _ => {
+                let style = ShapeStyle::from_computed(c, self.scale).zoomed(data.zoom);
+                let a = crate::text::average_letter(self.ts, &style);
+                self.last_letter = Some((key, a));
+                a
+            }
+        };
+        let node = &self.doc.nodes[id];
+        let NodeKind::Text(data) = &node.kind else {
+            unreachable!()
+        };
+        let limit = w.or(avail_w).filter(|_| wraps).map(|a| a as f32);
+        // Words don't break, so lines end short of the room by about half of one.
+        let room = limit.map(|a| (a - 3.0 * average.narrow).max(average.narrow));
+        let (mut widest, mut lines) = (0.0f32, 0usize);
+        for line in data.text.split('\n') {
+            let width: f32 = line
+                .chars()
+                .map(|c| {
+                    if crate::text::is_wide(c) {
+                        average.wide
+                    } else {
+                        average.narrow
+                    }
+                })
+                .sum();
+            widest = widest.max(width);
+            lines += room.map_or(1, |r| ((width / r).ceil() as usize).max(1));
+        }
+        let width = w.unwrap_or(match limit {
+            Some(a) if widest > a => a as i32,
+            _ => widest.ceil() as i32,
+        });
+        SizeI::new(width, (lines as f32 * average.line).ceil() as i32)
     }
 
     fn margins_of(&self, id: NodeId, base_w: Option<i32>) -> Edges<i32> {

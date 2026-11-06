@@ -810,9 +810,11 @@ impl IntoView for MarkdownView {
         };
         let view = {
             let ctx = ctx.clone();
-            move |e: Rc<Entry>| match &e.kind {
-                EntryKind::Block(b) => ctx.block(b, e.gap, 0),
-                EntryKind::Footnotes(notes) => ctx.footnotes(notes, e.gap),
+            move |e: Rc<Entry>| {
+                lazy(match &e.kind {
+                    EntryKind::Block(b) => ctx.block(b, e.gap, 0),
+                    EntryKind::Footnotes(notes) => ctx.footnotes(notes, e.gap),
+                })
             }
         };
         div()
@@ -821,6 +823,17 @@ impl IntoView for MarkdownView {
             .child(for_each(items, |e: &Rc<Entry>| e.key, view))
             .into_view()
     }
+}
+
+/// A block that isn't laid out, nor its text shaped, while it is far from the screen. See
+/// `docs/design/29-content-visibility.md`. The block is made first, so that what is in it isn't
+/// made on top of this on the stack.
+fn lazy(block: View) -> View {
+    div()
+        .content_visibility_auto()
+        .estimate_contents()
+        .child(block)
+        .into_view()
 }
 
 /// What of a block of HTML can be shown without a browser: its text, its pictures, its links and

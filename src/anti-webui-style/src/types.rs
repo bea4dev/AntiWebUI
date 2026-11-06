@@ -406,6 +406,18 @@ pub enum TextAlign {
     Right,
 }
 
+/// Whether the contents are laid out and painted (CSS `content-visibility`). See
+/// `docs/design/29-content-visibility.md`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ContentVisibility {
+    #[default]
+    Visible,
+    /// Only while it is near the screen, focused, selected or scrolled to.
+    Auto,
+    /// Never.
+    Hidden,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum WhiteSpace {
     /// Preserve whitespace and wrap at the box edge.

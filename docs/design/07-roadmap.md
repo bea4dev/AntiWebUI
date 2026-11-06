@@ -65,6 +65,6 @@
 ## M4: おまけ機能
 
 - PDF ビュワー（`hayro` を土台に、PDF.js 以上の速度を目標。[26](26-pdf.md) 参照。P4、フォーム、注釈、プレゼンテーションモード、フォームの JavaScript（`pdf-js` feature）まで実装済み）
-- Markdown のビュワーとエディタ（[28](28-markdown.md) 参照。ビュワーと Mermaid（`markdown` feature）まで実装済み。次はライブプレビューのエディタ）
+- Markdown のビュワーとエディタ（[28](28-markdown.md) 参照。ビュワーと Mermaid（`markdown` feature）、画面から遠いブロックを後回しにする `content-visibility`（[29](29-content-visibility.md)）まで実装済み。次はライブプレビューのエディタ）
 
 - WebRTC、画面キャプチャ、通知

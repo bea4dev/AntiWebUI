@@ -74,6 +74,27 @@ pub trait Styled: Sized {
         self
     }
 
+    /// CSS `contain-intrinsic-size: auto <width> auto <height>`, in logical pixels: the size of the
+    /// content box while the contents are skipped and their size isn't remembered.
+    fn contain_intrinsic_size(mut self, width: f32, height: f32) -> Self {
+        let style = self.style_mut();
+        style.contain_intrinsic_width = Some(Some(width));
+        style.contain_intrinsic_height = Some(Some(height));
+        self
+    }
+
+    /// CSS `contain-intrinsic-width: auto <width>`.
+    fn contain_intrinsic_width(mut self, width: f32) -> Self {
+        self.style_mut().contain_intrinsic_width = Some(Some(width));
+        self
+    }
+
+    /// CSS `contain-intrinsic-height: auto <height>`.
+    fn contain_intrinsic_height(mut self, height: f32) -> Self {
+        self.style_mut().contain_intrinsic_height = Some(Some(height));
+        self
+    }
+
     /// CSS `aspect-ratio`: width over height.
     fn aspect_ratio(mut self, ratio: f32) -> Self {
         self.style_mut().aspect_ratio = Some(Some(ratio));
@@ -221,6 +242,17 @@ pub trait Styled: Sized {
         select_text => user_select = UserSelect::Text;
         pointer_events_none => pointer_events = false;
         pointer_events_auto => pointer_events = true;
+        /// CSS `content-visibility: visible`, the default.
+        content_visibility_visible => content_visibility = ContentVisibility::Visible;
+        /// CSS `content-visibility: auto`: the contents are laid out and painted only while they
+        /// are near the screen, focused, selected or scrolled to. See
+        /// `docs/design/29-content-visibility.md`.
+        content_visibility_auto => content_visibility = ContentVisibility::Auto;
+        /// CSS `content-visibility: hidden`: the contents are never laid out or painted.
+        content_visibility_hidden => content_visibility = ContentVisibility::Hidden;
+        /// While the contents are skipped and their size isn't remembered yet, they are measured
+        /// with their text estimated instead of shaped. Not in CSS.
+        estimate_contents => estimate_contents = true;
     }
 
     /// Dashes and gaps along the outline of a shape in an `svg`, in turns.

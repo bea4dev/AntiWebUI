@@ -180,6 +180,15 @@ define_style! {
     z_index: Option<i32> = None, local;
     overflow_x: Overflow = Overflow::Visible, local;
     overflow_y: Overflow = Overflow::Visible, local;
+    /// See `docs/design/29-content-visibility.md`.
+    content_visibility: ContentVisibility = ContentVisibility::Visible, local;
+    /// Logical pixels: the size of the content box while the contents are skipped and their size
+    /// isn't remembered.
+    contain_intrinsic_width: Option<f32> = None, local;
+    contain_intrinsic_height: Option<f32> = None, local;
+    /// While the contents are skipped and their size isn't remembered, they are measured with the
+    /// text estimated instead of shaped. Not in CSS.
+    estimate_contents: bool = false, local;
     /// `None` means `auto`: an I-beam over selectable text, the default arrow elsewhere.
     cursor: Option<CursorIcon> = None, inherited;
     /// Whether this node receives pointer events.

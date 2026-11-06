@@ -194,11 +194,20 @@ fn time_a_long_document() {
         .and_then(|p| std::fs::read_to_string(p).ok())
         .unwrap_or_else(|| SAMPLE.repeat(50));
     let bytes = doc.len();
+    let scroller = node_ref();
     let started = Instant::now();
-    let mut ui = Ui::new(move || markdown_view(doc).w(800.0));
+    // In a window as big as one usually is, scrolling as an app does.
+    let mut ui = Ui::new(move || {
+        div()
+            .w_full()
+            .h_full()
+            .overflow_y_scroll()
+            .node_ref(scroller)
+            .child(markdown_view(doc).w(800.0))
+    });
     let built = started.elapsed();
     ui.handle_event(WindowEvent::Resized {
-        size: SizeI::new(900, 3000),
+        size: SizeI::new(1000, 900),
         scale: Scale(120),
     });
     ui.update();
@@ -207,6 +216,10 @@ fn time_a_long_document() {
     let painted = started.elapsed();
     settle(&mut ui);
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let height = || {
+        let id = scroller.get().unwrap();
+        with_doc(|d| d.nodes[id].content_size.height)
+    };
     eprintln!(
         "{bytes} bytes: built in {:.1} ms, laid out at {:.1} ms, painted at {:.1} ms, with diagrams at {:.1} ms, {} nodes",
         ms(built),
@@ -214,5 +227,26 @@ fn time_a_long_document() {
         ms(painted),
         ms(started.elapsed()),
         with_doc(|d| d.nodes.len())
+    );
+    // Down to the end a window at a time, as paging down does.
+    let first = height();
+    let mut steps = Vec::new();
+    loop {
+        let at = scroller.scroll_offset().y;
+        scroller.scroll_to(0.0, at + 900.0);
+        let t = Instant::now();
+        ui.update();
+        let _ = ui.paint(Instant::now());
+        steps.push(ms(t.elapsed()));
+        if scroller.scroll_offset().y <= at {
+            break;
+        }
+    }
+    let worst = steps.iter().copied().fold(0.0, f64::max);
+    let mean = steps.iter().sum::<f64>() / steps.len() as f64;
+    eprintln!(
+        "paging down: {} pages, {mean:.2} ms each, {worst:.2} ms at worst; first height {first}, last {}",
+        steps.len(),
+        height()
     );
 }

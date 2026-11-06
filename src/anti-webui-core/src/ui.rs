@@ -228,12 +228,14 @@ impl Ui {
                 }
                 if doc.dirty.layout {
                     layout_document(doc, ts);
+                    crate::visibility::keep_in_place(doc);
                     doc.dirty.layout = false;
                     doc.dirty.position = true;
                     changed = true;
                 }
                 if doc.dirty.position {
                     position_document(doc);
+                    doc.visibility.check = true;
                     doc.dirty.position = false;
                     doc.reposition.clear();
                     doc.dirty.carets = true;
@@ -262,9 +264,16 @@ impl Ui {
                     doc.dirty.carets = false;
                     scroll_carets_into_view(doc);
                 }
+                let mut waiting = Vec::new();
                 for id in std::mem::take(&mut doc.pending_scroll) {
-                    scroll_into_view(doc, id);
+                    // What is around it is laid out first.
+                    if crate::visibility::must_wait(doc, id) {
+                        waiting.push(id);
+                    } else {
+                        scroll_into_view(doc, id);
+                    }
                 }
+                doc.pending_scroll = waiting;
                 for (id, to) in std::mem::take(&mut doc.pending_scroll_to) {
                     let Some(n) = doc.get_mut(id) else {
                         continue;
@@ -279,6 +288,8 @@ impl Ui {
                         doc.mark_scrolled(id);
                     }
                 }
+                // Contents that come near the screen are laid out in the next round.
+                crate::visibility::check(doc);
                 changed
             })
         })
@@ -1910,6 +1921,7 @@ impl Document {
     /// of that content.
     pub fn mark_scrolled(&mut self, id: NodeId) {
         self.dirty.paint = true;
+        self.visibility.check = true;
         if self.get(id).is_some_and(|n| n.listeners.scrolled.is_some())
             && self.scrolled.last() != Some(&id)
         {

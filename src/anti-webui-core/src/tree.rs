@@ -259,6 +259,18 @@ pub struct Node {
     /// Inputs and result of the last layout pass, reused while the subtree is clean.
     pub(crate) last_perform: Option<(MeasureKey, SizeI)>,
     pub(crate) measure_cache: MeasureCache,
+    /// With `content-visibility: auto`: near the screen, focused, selected or scrolled to, so its
+    /// contents are laid out. See `docs/design/29-content-visibility.md`.
+    pub(crate) relevant: bool,
+    /// Its contents were skipped by the last layout.
+    pub(crate) skipped: bool,
+    /// Not shown only because it is in contents that are skipped: it still counts for the
+    /// selection.
+    pub(crate) held: bool,
+    /// Its size the last time its contents were laid out, with what its width came from.
+    pub(crate) remembered: Option<(crate::layout::WidthInputs, SizeI)>,
+    /// What its contents were estimated to need, until something in them changes.
+    pub(crate) estimated: Option<(crate::layout::WidthInputs, SizeI)>,
 }
 
 impl Node {
@@ -307,6 +319,11 @@ impl Node {
             layout_dirty: true,
             last_perform: None,
             measure_cache: MeasureCache::default(),
+            relevant: false,
+            skipped: false,
+            held: false,
+            remembered: None,
+            estimated: None,
         }
     }
 
@@ -561,6 +578,8 @@ pub struct Document {
     pub fullscreen: Fullscreen,
     /// Errors to tell of when the document isn't borrowed any more.
     pub(crate) videos_failed: Vec<(crate::video::VideoErrorListener, crate::video::VideoError)>,
+    /// What decides which contents to skip. See `docs/design/29-content-visibility.md`.
+    pub(crate) visibility: crate::visibility::Visibility,
 }
 
 /// Who is on all of the screen. See `docs/design/27-fullscreen.md`.
@@ -620,6 +639,7 @@ thread_local! {
         videos: RefCell::default(),
         fullscreen: Fullscreen::default(),
         videos_failed: Vec::new(),
+        visibility: Default::default(),
     });
 }
 
@@ -976,6 +996,7 @@ impl Document {
             n.layout_dirty = true;
             n.position_dirty = true;
             n.measure_cache.clear();
+            n.estimated = None;
             // Nothing outside of a popup depends on its size.
             cur = if n.is_popup() { None } else { n.parent };
         }
@@ -987,6 +1008,7 @@ impl Document {
         for (_, n) in self.nodes.iter_mut() {
             n.layout_dirty = true;
             n.measure_cache.clear();
+            n.estimated = None;
         }
         self.mark_layout();
     }

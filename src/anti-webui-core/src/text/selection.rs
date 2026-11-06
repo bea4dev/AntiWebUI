@@ -253,9 +253,18 @@ pub fn extend_from_anchor(doc: &Document, sel: &DocSelection, at: PointF) -> Opt
     Some(next)
 }
 
-/// Selects every selectable text node.
+/// Selects every selectable text node, also in contents that are skipped, which are then laid out
+/// (see `docs/design/29-content-visibility.md`).
 pub fn select_all(doc: &Document) -> Option<DocSelection> {
-    let nodes = selectable_text_nodes(doc);
+    let mut nodes: Vec<NodeId> = doc
+        .nodes
+        .iter()
+        .filter(|(_, n)| {
+            (n.visible || n.held) && n.is_text() && n.computed.user_select == UserSelect::Text
+        })
+        .map(|(id, _)| id)
+        .collect();
+    nodes.sort_by_key(|id| doc.nodes[*id].doc_order);
     let first = *nodes.first()?;
     let last = *nodes.last()?;
     let a = TextPoint {

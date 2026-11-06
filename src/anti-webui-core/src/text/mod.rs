@@ -56,7 +56,12 @@ pub struct TextSystem {
     asked_names: HashSet<String>,
     with_stand_ins: HashMap<FontFamily, Arc<str>>,
     centrals: HashMap<(FontFamily, u32, FontWeight), (f32, f32)>,
+    averages: HashMap<AverageKey, AverageLetter>,
 }
+
+/// What the average letter of a style depends on: the font, its size, the line height and the
+/// letter spacing.
+type AverageKey = (FontFamily, u32, FontWeight, FontStyle, Option<i32>, u32);
 
 impl TextSystem {
     fn new() -> Self {
@@ -79,6 +84,7 @@ impl TextSystem {
             asked_names: HashSet::new(),
             with_stand_ins: HashMap::new(),
             centrals: HashMap::new(),
+            averages: HashMap::new(),
         }
     }
 
@@ -338,6 +344,64 @@ pub(crate) fn baselines_of(ts: &mut TextSystem, style: &ShapeStyle) -> (f32, f32
     }
     ts.centrals.insert(key, out);
     out
+}
+
+/// How wide letters are on average and how tall a line is, for estimating text without shaping
+/// it. Physical pixels.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AverageLetter {
+    pub narrow: f32,
+    /// What [`is_wide`] says is wide.
+    pub wide: f32,
+    pub line: f32,
+}
+
+/// The average letter of a style, from text shaped once for it.
+pub(crate) fn average_letter(ts: &mut TextSystem, style: &ShapeStyle) -> AverageLetter {
+    let key = (
+        style.family.clone(),
+        style.size.to_bits(),
+        style.weight,
+        style.style,
+        style.line_height,
+        style.letter_spacing.to_bits(),
+    );
+    if let Some(v) = ts.averages.get(&key) {
+        return *v;
+    }
+    let mut measure = |sample: &str| {
+        let mut layout = TextLayout::default();
+        layout.shape(ts, sample, 1, style);
+        layout.break_lines(None);
+        let (width, height) = (layout.layout.width(), layout.layout.height());
+        (width / sample.chars().count() as f32, height)
+    };
+    // Mostly lower case and spaces, as text mostly is.
+    let (narrow, line) = measure(
+        "Most text is lower case words and spaces, with some Capitals, digits 0-9 (and) marks.",
+    );
+    let (wide, _) = measure("日本語の文字は全角");
+    let out = AverageLetter {
+        narrow,
+        wide: wide.max(narrow),
+        line,
+    };
+    ts.averages.insert(key, out);
+    out
+}
+
+/// Whether a letter takes about a whole em, as CJK letters, full width forms and emoji do.
+pub(crate) fn is_wide(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x115F
+        | 0x2E80..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1FAFF
+        | 0x20000..=0x3FFFD)
 }
 
 impl ShapeStyle {
