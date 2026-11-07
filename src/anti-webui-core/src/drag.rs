@@ -557,7 +557,7 @@ fn action_for(allowed: DragActions, modifiers: Modifiers) -> DragAction {
     match allowed {
         DragActions::Move => DragAction::Move,
         DragActions::Copy => DragAction::Copy,
-        DragActions::Both if modifiers.ctrl => DragAction::Copy,
+        DragActions::Both if modifiers.copies_drag() => DragAction::Copy,
         DragActions::Both => DragAction::Move,
     }
 }

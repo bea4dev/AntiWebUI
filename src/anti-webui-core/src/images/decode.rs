@@ -371,14 +371,8 @@ fn still(pixels: Vec<u8>, size: (u32, u32), target: (u32, u32), opaque: bool) ->
 
 #[cfg(feature = "svg")]
 fn svg_tree(bytes: &[u8]) -> Result<resvg::usvg::Tree, String> {
-    #[allow(unused_mut)]
-    let mut options = resvg::usvg::Options::default();
-    // Reading the fonts of the system takes a while, and few pictures have text.
-    #[cfg(feature = "svg-text")]
-    if bytes.windows(5).any(|w| w == b"<text") {
-        options.fontdb_mut().load_system_fonts();
-    }
-    resvg::usvg::Tree::from_data(bytes, &options).map_err(|e| e.to_string())
+    resvg::usvg::Tree::from_data(bytes, &crate::svg_file::options_for(bytes))
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(feature = "svg")]

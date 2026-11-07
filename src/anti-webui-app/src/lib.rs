@@ -1,19 +1,21 @@
 //! Wires a platform backend, the wgpu renderer and the core together.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod clock;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod frame_stats;
 pub mod headless;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod host;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod pacing;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod perf_overlay;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod present;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod runner;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod vsync;
 
 use anti_webui_core::settings::{Settings, update_settings};
@@ -115,11 +117,11 @@ impl App {
         root: impl FnOnce() -> V,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.apply_settings();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             runner::run(self, root)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = root;
             Err("no platform backend is available for this OS yet".into())

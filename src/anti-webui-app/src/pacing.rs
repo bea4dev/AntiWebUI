@@ -1,13 +1,13 @@
 //! When frames are produced: what became of the last ones, and whether to render ahead of the
 //! compositor (see `docs/design/10-frame-pacing.md`).
 
+use crate::clock;
 use crate::host::Host;
 use crate::vsync::FrameClock;
 use anti_webui_core::platform::{Presentation, SurfaceId};
 use anti_webui_core::settings::{FrameAdvance, settings};
-use anti_webui_wgpu::linux_sync;
 use std::collections::VecDeque;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
 
 /// More than this has no use: each frame ahead is one more refresh of latency.
@@ -52,7 +52,7 @@ const TOO_SOON: Duration = Duration::from_secs(5);
 /// ends by itself.
 const FORGET_AFTER: Duration = Duration::from_secs(5);
 
-/// What the presenter records about one presentation. Times are `CLOCK_MONOTONIC` nanoseconds.
+/// What the presenter records about one presentation. Times are nanoseconds of [`clock`].
 #[derive(Debug, Default)]
 pub(crate) struct PresentTrace {
     pub token: u64,
@@ -70,7 +70,7 @@ pub(crate) struct PresentTrace {
     pub fence: Option<OwnedFd>,
 }
 
-/// Everything known about a frame. Times are `CLOCK_MONOTONIC` nanoseconds.
+/// Everything known about a frame. Times are nanoseconds of [`clock`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct FrameRecord {
     pub token: u64,
@@ -286,9 +286,9 @@ pub(crate) struct Pacing {
     flying: VecDeque<InFlight>,
     last: Option<FrameRecord>,
     next_token: u64,
-    /// `Instant` and `CLOCK_MONOTONIC` at the same moment.
+    /// `Instant` and [`clock`] at the same moment.
     base: (Instant, i64),
-    /// Add to presentation times to get `CLOCK_MONOTONIC`.
+    /// Add to presentation times to get [`clock`]'s.
     presentation_offset: Option<i64>,
     auto: AutoAdvance,
     /// `ANTIWEBUI_FRAME_ADVANCE`, for trying out without changing the program.
@@ -331,7 +331,7 @@ impl Pacing {
             flying: VecDeque::new(),
             last: None,
             next_token: 0,
-            base: (Instant::now(), linux_sync::monotonic_ns()),
+            base: (Instant::now(), clock::monotonic_ns()),
             presentation_offset: None,
             auto: AutoAdvance::default(),
             forced: std::env::var("ANTIWEBUI_FRAME_ADVANCE")
@@ -394,7 +394,7 @@ impl Pacing {
     /// learned about.
     pub fn begin_frame(&mut self, ctx: &mut impl Host, mut finished: impl FnMut(&FrameRecord)) {
         self.collect(ctx, &mut finished);
-        self.started = linux_sync::monotonic_ns();
+        self.started = clock::monotonic_ns();
         let (instant, ns) = self.base;
         self.callback = ctx
             .last_frame_callback(SurfaceId::Window)
@@ -415,7 +415,7 @@ impl Pacing {
 
     /// To call when the UI's part of the frame is done.
     pub fn trace(&mut self) -> PresentTrace {
-        self.ui_done = linux_sync::monotonic_ns();
+        self.ui_done = clock::monotonic_ns();
         self.next_token += 1;
         PresentTrace {
             token: self.next_token,
@@ -431,7 +431,7 @@ impl Pacing {
     /// When a refresh was, going by the frames shown. This has none of the wobble of when a frame
     /// callback gets here, nor of times on the screen that come late.
     pub fn last_refresh(&self) -> Option<Instant> {
-        let ago = linux_sync::monotonic_ns() - self.clock.refresh_at()?;
+        let ago = clock::monotonic_ns() - self.clock.refresh_at()?;
         let ago = Duration::from_nanos(ago.max(0) as u64);
         Instant::now().checked_sub(ago)
     }
@@ -461,7 +461,7 @@ impl Pacing {
                 recorded: trace.recorded,
                 submitted: trace.submitted,
                 committed: trace.committed,
-                end: linux_sync::monotonic_ns(),
+                end: clock::monotonic_ns(),
                 damage: trace.damage,
                 repaint: trace.repaint,
                 pixels: trace.pixels,
@@ -482,17 +482,19 @@ impl Pacing {
 
     fn collect(&mut self, ctx: &mut impl Host, finished: &mut impl FnMut(&FrameRecord)) {
         if self.presentation_offset.is_none()
-            && let Some(clock) = ctx.presentation_clock()
-            && let Ok(theirs) = linux_sync::clock_ns(clock)
+            && let Some(id) = ctx.presentation_clock()
+            && let Ok(theirs) = clock::clock_ns(id)
         {
-            self.presentation_offset = Some(linux_sync::monotonic_ns() - theirs);
+            self.presentation_offset = Some(clock::monotonic_ns() - theirs);
         }
         for p in ctx.take_presentations() {
             self.apply_presentation(&p);
         }
+        #[cfg(target_os = "linux")]
         for f in &mut self.flying {
+            use std::os::fd::AsFd;
             if let Some(fence) = &f.fence {
-                match linux_sync::sync_file_signal(fence.as_fd()) {
+                match anti_webui_wgpu::linux_sync::sync_file_signal(fence.as_fd()) {
                     // Drivers don't have to say when.
                     Ok(Some(time)) => {
                         f.record.gpu_done = (time > 0).then_some(time);
@@ -503,7 +505,7 @@ impl Pacing {
                 }
             }
         }
-        let now = linux_sync::monotonic_ns();
+        let now = clock::monotonic_ns();
         while let Some(front) = self.flying.front() {
             let known = front.fence.is_none() && !front.feedback && front.record.committed != 0;
             if !known && now - front.record.start < GIVE_UP_NS {

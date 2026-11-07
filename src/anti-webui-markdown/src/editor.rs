@@ -1086,7 +1086,7 @@ fn continuation(line: &str) -> Option<(String, bool)> {
 pub(crate) fn list_keys(editor: EditorRef, e: &KeyboardEvent) {
     use anti_webui_core::event::{Key, NamedKey};
     let m = e.modifiers;
-    if m.ctrl || m.alt {
+    if m.ctrl || m.alt || m.logo {
         return;
     }
     let Some((line, text, caret, selected)) = editor.with(|ed| {
@@ -1187,7 +1187,7 @@ impl IntoView for MarkdownEditor {
             .on_key_down(move |e| list_keys(editor, e));
         if let Some(open) = on_link {
             e = e.on_click(move |p| {
-                if !p.modifiers.ctrl {
+                if !p.modifiers.primary() {
                     return;
                 }
                 let url = editor

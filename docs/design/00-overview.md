@@ -29,7 +29,9 @@ Web 技術の資産そのもの（HTML/JS）の流用は目標にしない。代
 ├──────────────────────────────────────────────────────────────┤
 │ anti-webui-wgpu       描画リスト → GPU（矩形 SDF・グリフアトラス）│
 │ anti-webui-wayland    Wayland バックエンド                      │
-│ anti-webui-{x11,windows,macos}   （未実装のプレースホルダ）       │
+│ anti-webui-x11        X11 バックエンド                          │
+│ anti-webui-macos      macOS バックエンド（AppKit）               │
+│ anti-webui-windows    （未実装のプレースホルダ）                 │
 └──────────────────────────────────────────────────────────────┘
 ```
 

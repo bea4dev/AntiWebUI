@@ -17,7 +17,7 @@ use anti_webui_style::{
 };
 use icu_properties::props::Script as IcuScript;
 use icu_properties::{CodePointMapData, PropertyNamesShort};
-use parley::fontique::{Blob, FallbackKey, FontInfoOverride, Script};
+use parley::fontique::{Blob, Collection, FallbackKey, FontInfoOverride, Script};
 use parley::{
     Alignment, AlignmentOptions, FontContext, FontFamilyName, FontVariation, FontVariations,
     Layout, LayoutContext, PositionedLayoutItem, StyleProperty, TextWrapMode,
@@ -25,7 +25,7 @@ use parley::{
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[doc(hidden)]
 pub use parley::{Affinity, Cursor, Selection as LayoutSelection};
@@ -81,7 +81,10 @@ impl TextSystem {
                 parley::Language::parse(&tag).ok()
             });
         Self {
-            fcx: FontContext::new(),
+            fcx: FontContext {
+                collection: system_fonts(),
+                source_cache: Default::default(),
+            },
             lcx: LayoutContext::new(),
             locale,
             prepared: Vec::new(),
@@ -234,6 +237,25 @@ impl TextSystem {
 
 thread_local! {
     static TEXT: RefCell<TextSystem> = RefCell::new(TextSystem::new());
+}
+
+/// The system's fonts, looked through once for every thread: that takes tens of milliseconds.
+static SYSTEM_FONTS: OnceLock<Collection> = OnceLock::new();
+
+/// Starts looking through the system's fonts on another thread, so that the first text shaped
+/// waits less for it, if at all. What a thread registers stays its own, as before.
+#[doc(hidden)]
+pub fn prepare_system_fonts() {
+    if SYSTEM_FONTS.get().is_none() {
+        let _ = std::thread::Builder::new()
+            .name("anti-webui fonts".into())
+            .spawn(system_fonts);
+    }
+}
+
+/// A collection of the system's fonts for a thread, which shares what it found with the others.
+fn system_fonts() -> Collection {
+    SYSTEM_FONTS.get_or_init(Collection::default).clone()
 }
 
 /// The data given to [`register_font`] holds no font that can be used.

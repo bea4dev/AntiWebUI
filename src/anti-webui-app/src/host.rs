@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 /// A backend's context in its callbacks. Each backend has methods of these names; this only lets
 /// the code above them be written once.
+// What is about dmabufs only Linux's presenter calls.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) trait Host {
     fn request_redraw(&mut self);
     /// For retrying a frame that could not be presented.
@@ -75,8 +77,15 @@ pub(crate) trait Host {
     fn set_opaque(&mut self, surface: SurfaceId, opaque: bool);
     /// Whether the surface was uncovered and has to be drawn again in full.
     fn take_exposed(&mut self, surface: SurfaceId) -> bool;
-    /// Raw handles for creating a GPU surface. Valid until the surface closes.
-    fn raw_handles(&self, surface: SurfaceId) -> (RawDisplayHandle, RawWindowHandle);
+    /// Raw handles for creating a GPU surface. Valid until the surface closes. `None` where the
+    /// platform can't make one, like for a window on a thread of its own on macOS.
+    fn raw_handles(&self, surface: SurfaceId) -> Option<(RawDisplayHandle, RawWindowHandle)>;
+    /// Wraps an `IOSurface` for showing on a layer.
+    #[cfg(target_os = "macos")]
+    fn create_iosurface_buffer(
+        &mut self,
+        surface: &anti_webui_wgpu::iosurface::IOSurfaceRef,
+    ) -> Option<BufferId>;
 
     fn show_popup(&mut self, params: PopupParams);
     fn update_popup(&mut self, params: PopupParams);
@@ -215,8 +224,18 @@ macro_rules! host_for {
             fn take_exposed(&mut self, surface: SurfaceId) -> bool {
                 self.take_exposed(surface)
             }
-            fn raw_handles(&self, surface: SurfaceId) -> (RawDisplayHandle, RawWindowHandle) {
+            fn raw_handles(
+                &self,
+                surface: SurfaceId,
+            ) -> Option<(RawDisplayHandle, RawWindowHandle)> {
                 self.raw_handles(surface)
+            }
+            #[cfg(target_os = "macos")]
+            fn create_iosurface_buffer(
+                &mut self,
+                surface: &anti_webui_wgpu::iosurface::IOSurfaceRef,
+            ) -> Option<BufferId> {
+                self.create_iosurface_buffer(surface)
             }
             fn show_popup(&mut self, params: PopupParams) {
                 self.show_popup(params)
@@ -258,7 +277,9 @@ macro_rules! host_for {
     };
 }
 
-#[cfg(feature = "wayland")]
+#[cfg(all(target_os = "linux", feature = "wayland"))]
 host_for!(anti_webui_wayland::Ctx<'_>);
-#[cfg(feature = "x11")]
+#[cfg(all(target_os = "linux", feature = "x11"))]
 host_for!(anti_webui_x11::Ctx<'_>);
+#[cfg(all(target_os = "macos", feature = "macos"))]
+host_for!(anti_webui_macos::Ctx<'_>);

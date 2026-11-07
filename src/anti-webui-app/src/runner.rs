@@ -1,6 +1,6 @@
 //! Runs the UI on whichever backend there is: Wayland or X11 (see "バックエンドの選び方" in
-//! `docs/design/35-platform-x11.md`), with as many windows as the program opens, on the threads
-//! it chooses (see `docs/design/36-multi-window.md`).
+//! `docs/design/35-platform-x11.md`), or AppKit on macOS (`37-platform-macos.md`), with as many
+//! windows as the program opens, on the threads it chooses (see `docs/design/36-multi-window.md`).
 
 use super::App;
 use crate::frame_stats::FrameStats;
@@ -124,10 +124,13 @@ impl Runner {
         if self.dump.is_none()
             && let Ok(path) = std::env::var("ANTIWEBUI_DUMP_FRAME")
         {
+            // Only Linux reads frames of videos on the GPU with it.
+            #[allow(unused_mut)]
             let mut r = anti_webui_wgpu::Renderer::new(
                 &presenter.gpu().device,
                 anti_webui_wgpu::wgpu::TextureFormat::Rgba8Unorm,
             );
+            #[cfg(target_os = "linux")]
             if let Some(importer) = presenter.video_importer() {
                 r.set_video_importer(importer);
             }
@@ -330,44 +333,62 @@ macro_rules! handler_for {
     };
 }
 
-#[cfg(feature = "wayland")]
+#[cfg(all(target_os = "linux", feature = "wayland"))]
 handler_for!(
     anti_webui_wayland::WaylandHandler,
     anti_webui_wayland::Ctx<'_>
 );
-#[cfg(feature = "x11")]
+#[cfg(all(target_os = "linux", feature = "x11"))]
 handler_for!(anti_webui_x11::X11Handler, anti_webui_x11::Ctx<'_>);
+#[cfg(all(target_os = "macos", feature = "macos"))]
+handler_for!(anti_webui_macos::MacHandler, anti_webui_macos::Ctx<'_>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Backend {
-    #[cfg(feature = "wayland")]
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
     Wayland,
-    #[cfg(feature = "x11")]
+    #[cfg(all(target_os = "linux", feature = "x11"))]
     X11,
+    #[cfg(all(target_os = "macos", feature = "macos"))]
+    MacOS,
+}
+
+/// AppKit on macOS, which has nothing else.
+#[cfg(target_os = "macos")]
+fn choose_backend() -> Result<Backend, BoxError> {
+    match std::env::var("ANTIWEBUI_BACKEND").ok().as_deref() {
+        None | Some("" | "macos") => {}
+        Some(other) => return Err(format!("ANTIWEBUI_BACKEND={other} isn't built in").into()),
+    }
+    #[cfg(all(target_os = "macos", feature = "macos"))]
+    return Ok(Backend::MacOS);
+    #[cfg(not(feature = "macos"))]
+    Err("the macos feature is off".into())
 }
 
 /// `ANTIWEBUI_BACKEND` if given, otherwise Wayland if it can be reached, and X11 after it.
+#[cfg(target_os = "linux")]
 fn choose_backend() -> Result<Backend, BoxError> {
     let wanted = std::env::var("ANTIWEBUI_BACKEND").ok();
     match wanted.as_deref() {
-        #[cfg(feature = "wayland")]
+        #[cfg(all(target_os = "linux", feature = "wayland"))]
         Some("wayland") => return Ok(Backend::Wayland),
-        #[cfg(feature = "x11")]
+        #[cfg(all(target_os = "linux", feature = "x11"))]
         Some("x11") => return Ok(Backend::X11),
         Some(other) if !other.is_empty() => {
             return Err(format!("ANTIWEBUI_BACKEND={other} isn't built in").into());
         }
         _ => {}
     }
-    #[cfg(feature = "wayland")]
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
     if std::env::var_os("WAYLAND_DISPLAY").is_some() && anti_webui_wayland::can_connect() {
         return Ok(Backend::Wayland);
     }
-    #[cfg(feature = "x11")]
+    #[cfg(all(target_os = "linux", feature = "x11"))]
     if std::env::var_os("DISPLAY").is_some() {
         return Ok(Backend::X11);
     }
-    #[cfg(feature = "wayland")]
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
     if std::env::var_os("WAYLAND_DISPLAY").is_none() {
         // `WAYLAND_DISPLAY` may be left out for the default socket.
         return Ok(Backend::Wayland);
@@ -377,6 +398,9 @@ fn choose_backend() -> Result<Backend, BoxError> {
 
 /// Before any thread of the app's: it sets the environment of the process.
 fn limit_vulkan_drivers(device: Option<u64>) {
+    #[cfg(not(target_os = "linux"))]
+    let _ = device;
+    #[cfg(target_os = "linux")]
     if let Some(device) = device {
         // SAFETY: the app's views, and with them its threads, aren't made yet.
         let drivers = unsafe { anti_webui_wgpu::limit_vulkan_drivers(device) };
@@ -425,10 +449,12 @@ impl Spec {
 /// What a window can be put above by, whichever thread it is on.
 #[derive(Clone)]
 enum Link {
-    #[cfg(feature = "wayland")]
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
     Wayland(anti_webui_wayland::ParentLink),
-    #[cfg(feature = "x11")]
+    #[cfg(all(target_os = "linux", feature = "x11"))]
     X11(anti_webui_x11::ParentLink),
+    #[cfg(all(target_os = "macos", feature = "macos"))]
+    MacOS(anti_webui_macos::ParentLink),
 }
 
 /// The open windows of every thread, for the windows that open above them.
@@ -449,6 +475,11 @@ trait Platform: Sized + 'static {
     fn connect() -> Result<Self, BoxError>;
     fn join(share: Self::Share) -> Result<Self, BoxError>;
     fn share(&self) -> Self::Share;
+    /// Whether windows from `spawn_window` get threads of their own.
+    fn own_threads() -> bool;
+    /// Waits a little while threads end. On macOS, the main thread does what they ask of it
+    /// meanwhile, as AppKit's windows are its (see `docs/design/37-platform-macos.md`).
+    fn idle(&mut self, timeout: std::time::Duration);
     fn waker(&self) -> Option<Arc<dyn Fn() + Send + Sync>>;
     fn open(&mut self, spec: Spec) -> Result<Self::Key, BoxError>;
     fn link(&self, key: Self::Key) -> Option<Link>;
@@ -480,6 +511,12 @@ impl<K: Copy + Eq> Windows<K> {
 
 /// Implements [`Platform`] for a backend's session, which has methods of these names.
 macro_rules! platform_for {
+    (@idle macos, $session:expr, $timeout:expr) => {
+        $session.idle($timeout)
+    };
+    (@idle $backend:ident, $session:expr, $timeout:expr) => {
+        std::thread::sleep($timeout)
+    };
     ($backend:ident, $variant:ident) => {
         impl $backend::Handlers for Windows<$backend::WindowKey> {
             type Handler = Runner;
@@ -499,6 +536,12 @@ macro_rules! platform_for {
             }
             fn share(&self) -> Self::Share {
                 $backend::Session::share(self)
+            }
+            fn own_threads() -> bool {
+                $backend::Session::OWN_THREADS
+            }
+            fn idle(&mut self, timeout: std::time::Duration) {
+                platform_for!(@idle $backend, self, timeout)
             }
             fn waker(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
                 let waker = $backend::Session::waker(self)?;
@@ -541,14 +584,18 @@ macro_rules! platform_for {
     };
 }
 
-#[cfg(feature = "wayland")]
+#[cfg(all(target_os = "linux", feature = "wayland"))]
 use anti_webui_wayland as wayland;
-#[cfg(feature = "wayland")]
+#[cfg(all(target_os = "linux", feature = "wayland"))]
 platform_for!(wayland, Wayland);
-#[cfg(feature = "x11")]
+#[cfg(all(target_os = "linux", feature = "x11"))]
 use anti_webui_x11 as x11;
-#[cfg(feature = "x11")]
+#[cfg(all(target_os = "linux", feature = "x11"))]
 platform_for!(x11, X11);
+#[cfg(all(target_os = "macos", feature = "macos"))]
+use anti_webui_macos as macos;
+#[cfg(all(target_os = "macos", feature = "macos"))]
+platform_for!(macos, MacOS);
 
 /// The loop of a thread with windows: it ends when they are all closed, or with the first window
 /// of the program.
@@ -692,6 +739,10 @@ impl<P: Platform> Thread<P> {
     }
 
     fn spawn(&mut self, request: SpawnRequest) {
+        if !P::own_threads() {
+            self.open(request.start());
+            return;
+        }
         let share = self.session.share();
         let app_id = self.app_id.clone();
         let handle = request.handle.clone();
@@ -729,7 +780,7 @@ fn run_spawned<P: Platform>(
 }
 
 /// Closes the windows on other threads and waits for them, at the end of the program.
-fn end_threads() {
+fn end_threads<P: Platform>(session: &mut P) {
     loop {
         let threads = std::mem::take(&mut *THREADS.lock().expect("no panics in here"));
         if threads.is_empty() {
@@ -739,6 +790,9 @@ fn end_threads() {
             handle.close();
         }
         for (_, thread) in threads {
+            while !thread.is_finished() {
+                session.idle(std::time::Duration::from_millis(5));
+            }
             let _ = thread.join();
         }
     }
@@ -760,25 +814,31 @@ fn run_on<P: Platform, V: IntoView>(app: App, root: impl FnOnce() -> V) -> Resul
     let key = thread.add(ui, spec)?;
     thread.first = Some(key);
     let result = thread.run();
-    end_threads();
+    end_threads(&mut thread.session);
     result
 }
 
 pub fn run<V: IntoView>(app: App, root: impl FnOnce() -> V) -> Result<(), BoxError> {
+    // While the platform and the window are set up.
+    anti_webui_core::text::prepare_system_fonts();
     let backend = choose_backend()?;
     limit_vulkan_drivers(match backend {
-        #[cfg(feature = "wayland")]
+        #[cfg(all(target_os = "linux", feature = "wayland"))]
         Backend::Wayland => anti_webui_wayland::compositor_main_device(),
-        #[cfg(feature = "x11")]
+        #[cfg(all(target_os = "linux", feature = "x11"))]
         Backend::X11 => anti_webui_x11::server_main_device(),
+        #[cfg(all(target_os = "macos", feature = "macos"))]
+        Backend::MacOS => None,
     });
     #[cfg(feature = "video")]
     anti_webui_video::install();
     anti_webui_core::window::start_ui_thread(false);
     match backend {
-        #[cfg(feature = "wayland")]
+        #[cfg(all(target_os = "linux", feature = "wayland"))]
         Backend::Wayland => run_on::<anti_webui_wayland::Session, V>(app, root),
-        #[cfg(feature = "x11")]
+        #[cfg(all(target_os = "linux", feature = "x11"))]
         Backend::X11 => run_on::<anti_webui_x11::Session, V>(app, root),
+        #[cfg(all(target_os = "macos", feature = "macos"))]
+        Backend::MacOS => run_on::<anti_webui_macos::Session, V>(app, root),
     }
 }

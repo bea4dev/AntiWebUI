@@ -6,9 +6,10 @@ authors.workspace = true
 license.workspace = true
 
 [features]
-default = ["svg", "svg-text", "wayland", "x11"]
+default = ["svg", "svg-text", "wayland", "x11", "macos"]
 wayland = ["anti-webui-app/wayland"]
 x11 = ["anti-webui-app/x11"]
+macos = ["anti-webui-app/macos"]
 svg = ["anti-webui-core/svg"]
 svg-text = ["anti-webui-core/svg-text"]
 video = ["anti-webui-app/video"]

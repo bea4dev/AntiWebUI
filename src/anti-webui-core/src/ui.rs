@@ -1839,9 +1839,23 @@ impl Ui {
             move |e: &mut crate::text::edit::EditData| e.move_caret(m, extend, page_lines)
         };
         let shift = m.shift;
-        let word = m.ctrl;
+        let word = m.word();
         type EditFn = Box<dyn FnOnce(&mut crate::text::edit::EditData) -> EditOutcome>;
+        let to = |line: Motion, doc: Motion| {
+            Some(Box::new(motion(if multiline { doc } else { line }, shift)) as EditFn)
+        };
         let op: Option<EditFn> = match &key.key {
+            // Command and the arrows on macOS.
+            Key::Named(NamedKey::ArrowLeft) if m.line() => to(Motion::LineStart, Motion::LineStart),
+            Key::Named(NamedKey::ArrowRight) if m.line() => to(Motion::LineEnd, Motion::LineEnd),
+            Key::Named(NamedKey::ArrowUp) if m.line() => to(Motion::LineStart, Motion::DocStart),
+            Key::Named(NamedKey::ArrowDown) if m.line() => to(Motion::LineEnd, Motion::DocEnd),
+            Key::Named(NamedKey::Backspace) if m.line() => Some(Box::new(move |e| {
+                if !e.has_selection() {
+                    e.move_caret(Motion::LineStart, true, page_lines);
+                }
+                e.delete(false, false)
+            })),
             Key::Named(NamedKey::ArrowLeft) => Some(Box::new(motion(
                 if word { Motion::WordLeft } else { Motion::Left },
                 shift,
@@ -1907,7 +1921,7 @@ impl Ui {
                 return true;
             }
             Key::Named(NamedKey::Enter) => {
-                if multiline && !m.ctrl {
+                if multiline && !m.primary() {
                     Some(Box::new(|e| e.insert("\n")))
                 } else {
                     let submit = with_doc(|d| {
@@ -1948,7 +1962,7 @@ impl Ui {
             }
             k if m.primary() && k.is_char('y') => Some(Box::new(|e| e.redo())),
             _ => match &key.text {
-                Some(t) if !m.ctrl && !m.alt && !t.is_empty() => {
+                Some(t) if m.types_text() && !t.is_empty() => {
                     let t = t.clone();
                     Some(Box::new(move |e| e.insert(&t)))
                 }
@@ -1977,13 +1991,21 @@ impl Ui {
     fn editor_key(&mut self, id: NodeId, key: &KeyEvent) -> bool {
         use crate::text::editor::EditorData;
         let m = key.modifiers;
-        let (shift, word) = (m.shift, m.ctrl);
+        let (shift, word) = (m.shift, m.word());
         type EditFn = Box<dyn FnOnce(&mut EditorData) -> EditorOutcome>;
         enum Op {
             Move(Motion),
             Edit(EditFn),
+            /// Selects to where the motion goes, and deletes it.
+            DeleteTo(Motion),
         }
         let op = match &key.key {
+            // Command and the arrows on macOS.
+            Key::Named(NamedKey::ArrowLeft) if m.line() => Op::Move(Motion::LineStart),
+            Key::Named(NamedKey::ArrowRight) if m.line() => Op::Move(Motion::LineEnd),
+            Key::Named(NamedKey::ArrowUp) if m.line() => Op::Move(Motion::DocStart),
+            Key::Named(NamedKey::ArrowDown) if m.line() => Op::Move(Motion::DocEnd),
+            Key::Named(NamedKey::Backspace) if m.line() => Op::DeleteTo(Motion::LineStart),
             Key::Named(NamedKey::ArrowLeft) => {
                 Op::Move(if word { Motion::WordLeft } else { Motion::Left })
             }
@@ -2051,7 +2073,7 @@ impl Ui {
             }
             k if m.primary() && k.is_char('y') => Op::Edit(Box::new(|e| e.redo())),
             _ => match &key.text {
-                Some(t) if !m.ctrl && !m.alt && !t.is_empty() => {
+                Some(t) if m.types_text() && !t.is_empty() => {
                     let t = t.clone();
                     Op::Edit(Box::new(move |e| e.insert(&t)))
                 }
@@ -2059,13 +2081,24 @@ impl Ui {
             },
         };
         let out = with_doc(|d| {
+            let page = d
+                .visible_window_rect(id)
+                .map_or(0, |r| r.height * 9 / 10)
+                .max(1);
             let out = match op {
-                Op::Move(motion) => {
-                    let page = d
-                        .visible_window_rect(id)
-                        .map_or(0, |r| r.height * 9 / 10)
-                        .max(1);
-                    crate::text::editor::move_caret(d, id, motion, shift, page)
+                Op::Move(motion) => crate::text::editor::move_caret(d, id, motion, shift, page),
+                Op::DeleteTo(motion) => {
+                    let selected = d
+                        .get(id)
+                        .and_then(Node::editor)
+                        .is_some_and(|e| e.has_selection());
+                    if !selected {
+                        crate::text::editor::move_caret(d, id, motion, true, page);
+                    }
+                    d.get_mut(id)
+                        .and_then(Node::editor_mut)
+                        .map(|e| e.delete(false, false))
+                        .unwrap_or_default()
                 }
                 Op::Edit(f) => d
                     .get_mut(id)

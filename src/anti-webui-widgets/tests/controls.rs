@@ -17,12 +17,7 @@ const SHIFT: Modifiers = Modifiers {
     alt: false,
     logo: false,
 };
-const CTRL: Modifiers = Modifiers {
-    shift: false,
-    ctrl: true,
-    alt: false,
-    logo: false,
-};
+const CTRL: Modifiers = Modifiers::PRIMARY;
 
 fn column_of(child: impl IntoView) -> Div {
     div().flex().flex_col().items_start().p(20.0).child(child)

@@ -1,6 +1,8 @@
 //! The backend against a real X server: Xvfb, started for the tests, or skipped when it isn't
 //! installed. Input goes in through XTEST. Xvfb has no DRI3, so nothing is presented here.
 
+#![cfg(target_os = "linux")]
+
 use anti_webui_core::event::{
     ClipboardKind, DragAction, DragActions, DragResult, Key, PointerButton, ScrollSource,
     WindowEvent,

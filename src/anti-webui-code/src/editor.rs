@@ -516,23 +516,23 @@ fn action(
                 }))
             }
         }
-        Key::Named(NamedKey::Backspace) if !m.ctrl && !m.alt && a == b => {
+        Key::Named(NamedKey::Backspace) if !m.ctrl && !m.alt && !m.logo && a == b => {
             edits::backspace(text, a, unit).map(Action::Replace)
         }
         Key::Named(NamedKey::Escape) if find_open => Some(Action::CloseFind),
         Key::Named(NamedKey::F(3)) => Some(Action::Step(!m.shift)),
-        _ if m.ctrl && !m.alt && ch("/") => replace(edits::toggle_comment(
+        _ if m.primary() && !m.alt && ch("/") => replace(edits::toggle_comment(
             text,
             a,
             b,
             lang.line_comment(),
             lang.block_comment(),
         )),
-        _ if m.ctrl && !m.alt && (ch("f") || ch("h")) => {
+        _ if m.primary() && !m.alt && (ch("f") || ch("h")) => {
             let selected = (a < b && !text[a..b].contains('\n')).then(|| text[a..b].to_owned());
             Some(Action::Find(selected, ch("h")))
         }
-        _ if m.ctrl && m.shift && (ch("[") || ch("{")) => {
+        _ if m.primary() && m.shift && (ch("[") || ch("{")) => {
             let line_text = |i: usize| &text[ed.line(i)];
             Some(
                 match edits::fold_around(&line_text, ed.line_count(), line) {
@@ -545,8 +545,8 @@ fn action(
                 },
             )
         }
-        _ if m.ctrl && m.shift && (ch("]") || ch("}")) => Some(Action::Unfold(line)),
-        Key::Character(c) if !m.ctrl && !m.alt && a == b => {
+        _ if m.primary() && m.shift && (ch("]") || ch("}")) => Some(Action::Unfold(line)),
+        Key::Character(c) if m.types_text() && a == b => {
             let mut chars = c.chars();
             let (Some(c), None) = (chars.next(), chars.next()) else {
                 return None;

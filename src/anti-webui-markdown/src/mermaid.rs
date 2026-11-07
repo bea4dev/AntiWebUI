@@ -38,6 +38,10 @@ fn worker() -> &'static std::sync::Mutex<Sender<Job>> {
                 backend::setup();
                 for job in rx {
                     let made = render(&job.source);
+                    // What `svg::parse` needs on the UI thread, which would stop it for as long.
+                    if let Ok(svg) = &made {
+                        svg::prepare_fonts_for(svg.as_bytes());
+                    }
                     (job.done)(made);
                 }
             })

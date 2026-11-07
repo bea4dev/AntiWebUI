@@ -12,6 +12,8 @@ use anti_webui_style::{
 use kurbo::BezPath;
 use resvg::usvg::{self, Node as N, roxmltree};
 use std::str::FromStr;
+#[cfg(feature = "svg-text")]
+use std::sync::{Arc, OnceLock};
 
 const LABEL_ID: &str = "__anti_webui_label_";
 
@@ -23,14 +25,7 @@ pub fn parse(data: &[u8]) -> Result<Svg, String> {
     let data = plain.as_deref().unwrap_or(data);
     let (without_labels, labels) = take_labels(data);
     let source = without_labels.as_deref().unwrap_or(data);
-    #[allow(unused_mut)]
-    let mut options = usvg::Options::default();
-    // Reading the fonts of the system takes a while, and few pictures have text.
-    #[cfg(feature = "svg-text")]
-    if source.windows(5).any(|w| w == b"<text") {
-        options.fontdb_mut().load_system_fonts();
-    }
-    let tree = usvg::Tree::from_data(source, &options).map_err(|e| e.to_string())?;
+    let tree = usvg::Tree::from_data(source, &options_for(source)).map_err(|e| e.to_string())?;
     let size = tree.size();
     let (width, height) = (size.width(), size.height());
     let mut root = svg().view_box(0.0, 0.0, width, height);
@@ -65,6 +60,48 @@ pub fn parse(data: &[u8]) -> Result<Svg, String> {
         )
         .children(placed)
     })
+}
+
+/// What `usvg` reads a file with: the fonts of the system when it has text, which few pictures do.
+pub(crate) fn options_for(data: &[u8]) -> usvg::Options<'static> {
+    #[allow(unused_mut)]
+    let mut options = usvg::Options::default();
+    #[cfg(feature = "svg-text")]
+    if has_text(data) {
+        options.fontdb = system_fonts();
+    }
+    options
+}
+
+#[cfg(feature = "svg-text")]
+fn has_text(data: &[u8]) -> bool {
+    data.windows(5).any(|w| w == b"<text")
+}
+
+/// The fonts of the system, read once for every thread: that takes hundreds of milliseconds on
+/// macOS, which on the UI thread stops scrolling for as long.
+#[cfg(feature = "svg-text")]
+fn system_fonts() -> Arc<usvg::fontdb::Database> {
+    static FONTS: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
+    FONTS
+        .get_or_init(|| {
+            let mut db = usvg::fontdb::Database::new();
+            db.load_system_fonts();
+            Arc::new(db)
+        })
+        .clone()
+}
+
+/// Reads the fonts of the system now if the file needs them for its text, so that [`parse`] on the
+/// UI thread later doesn't wait for them. For threads that make SVG files.
+#[doc(hidden)]
+pub fn prepare_fonts_for(data: &[u8]) {
+    #[cfg(feature = "svg-text")]
+    if has_text(data) {
+        system_fonts();
+    }
+    #[cfg(not(feature = "svg-text"))]
+    let _ = data;
 }
 
 /// A width of the file's `<svg>` that is a share of the room around it, with the `max-width` of its

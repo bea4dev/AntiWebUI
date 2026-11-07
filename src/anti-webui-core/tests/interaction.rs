@@ -79,12 +79,7 @@ fn named(ui: &mut Ui, k: NamedKey, modifiers: Modifiers) {
     key(ui, Key::Named(k), None, modifiers);
 }
 
-const CTRL: Modifiers = Modifiers {
-    shift: false,
-    ctrl: true,
-    alt: false,
-    logo: false,
-};
+const CTRL: Modifiers = Modifiers::PRIMARY;
 const SHIFT: Modifiers = Modifiers {
     shift: true,
     ctrl: false,
@@ -229,7 +224,7 @@ fn text_input_editing() {
     typ(&mut ui, "hello world");
     assert_eq!(value.get(), "hello world");
 
-    named(&mut ui, NamedKey::Backspace, CTRL);
+    named(&mut ui, NamedKey::Backspace, Modifiers::WORD);
     assert_eq!(value.get(), "hello ");
     named(&mut ui, NamedKey::Home, Modifiers::default());
     typ(&mut ui, ">");

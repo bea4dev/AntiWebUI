@@ -5,7 +5,8 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
-[dependencies]
+# Linux only: elsewhere the crate is empty, so that the workspace builds on every OS.
+[target.'cfg(target_os = "linux")'.dependencies]
 anti-webui-core.workspace = true
 wayland-client.workspace = true
 wayland-backend.workspace = true
@@ -14,6 +15,6 @@ xkbcommon.workspace = true
 raw-window-handle.workspace = true
 rustix = { workspace = true, features = ["fs"] }
 
-[dev-dependencies]
+[target.'cfg(target_os = "linux")'.dev-dependencies]
 wayland-server = "0.31"
 wayland-protocols = { workspace = true, features = ["server"] }

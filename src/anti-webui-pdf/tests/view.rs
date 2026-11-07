@@ -238,10 +238,7 @@ fn zooming_with_ctrl_keeps_what_is_under_the_pointer() {
         position: PointF::new(x, y),
         delta_x: 0.0,
         delta_y: -200.0,
-        modifiers: Modifiers {
-            ctrl: true,
-            ..Default::default()
-        },
+        modifiers: Modifiers::PRIMARY,
         source: ScrollSource::Wheel,
         phase: ScrollPhase::Single,
         time: 0,
@@ -754,10 +751,7 @@ fn control(ui: &mut Ui, key: &str) {
     ui.handle_event(WindowEvent::Key(KeyEvent {
         key: Key::Character(key.into()),
         text: None,
-        modifiers: Modifiers {
-            ctrl: true,
-            ..Default::default()
-        },
+        modifiers: Modifiers::PRIMARY,
         pressed: true,
         repeat: false,
     }));
@@ -2161,10 +2155,7 @@ fn zooming_does_nothing_while_presenting() {
         position: PointF::new(400.0, 300.0),
         delta_x: 0.0,
         delta_y: 0.0,
-        modifiers: Modifiers {
-            ctrl: true,
-            ..Default::default()
-        },
+        modifiers: Modifiers::PRIMARY,
         source: ScrollSource::Touchpad,
         phase: ScrollPhase::Moved,
         time: 0,

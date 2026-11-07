@@ -11,6 +11,9 @@ mod drivers;
 pub use drivers::limit_vulkan_drivers;
 mod effects;
 mod glyph_cache;
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub mod iosurface;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub mod linux_sync;
@@ -36,6 +39,10 @@ pub enum GpuError {
     Device(wgpu::RequestDeviceError),
     /// Our own display buffers are unavailable; use a surface instead.
     Dmabuf(String),
+    /// Our own display buffers on macOS are unavailable.
+    IoSurface(String),
+    /// The platform can't make a GPU surface here, like on a thread other than AppKit's.
+    NoSurface,
 }
 
 impl std::fmt::Display for GpuError {
@@ -45,6 +52,8 @@ impl std::fmt::Display for GpuError {
             GpuError::Adapter(e) => write!(f, "no suitable GPU adapter: {e}"),
             GpuError::Device(e) => write!(f, "failed to create GPU device: {e}"),
             GpuError::Dmabuf(e) => write!(f, "dmabuf presentation unavailable: {e}"),
+            GpuError::IoSurface(e) => write!(f, "IOSurface presentation unavailable: {e}"),
+            GpuError::NoSurface => f.write_str("no GPU surface can be made on this thread"),
         }
     }
 }
@@ -249,8 +258,12 @@ impl Gpu {
             wgpu::PresentMode::Fifo
         };
         // Popups have transparent corners and shadows; the window says it is opaque by other means.
+        // Metal has no `PreMultiplied`, and `Opaque` makes the layer opaque. Core Animation takes
+        // the pixels as premultiplied either way, so `PostMultiplied` only lets the layer have alpha.
         let alpha_mode = [
             wgpu::CompositeAlphaMode::PreMultiplied,
+            #[cfg(target_os = "macos")]
+            wgpu::CompositeAlphaMode::PostMultiplied,
             wgpu::CompositeAlphaMode::Opaque,
         ]
         .into_iter()

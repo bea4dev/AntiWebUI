@@ -264,13 +264,13 @@ column((
 
 ## 環境ごとの違い
 
-| | Wayland | X11 | Windows（今後） | macOS（今後） |
+| | Wayland | X11 | Windows（今後） | macOS（[37](37-platform-macos.md)） |
 |---|---|---|---|---|
 | ダイアログ（`dialog`、`modal`） | `set_parent` | `WM_TRANSIENT_FOR` | オーナー付きウィンドウ | `addChildWindow` |
 | 位置の指定 | できない（コンポジタが決める） | 今はしない | できる | できる |
 | モーダル | xdg-dialog があれば。core は常に親の入力を止める | `_NET_WM_STATE_MODAL` | 親を無効にする | シート |
 | 飾り | 取り決める。GNOME は CSD | WM が付ける | OS が付ける | OS が付ける |
-| spawn したスレッド | 同じ接続、別のキュー | 別の接続 | プラットフォームのスレッドに窓を置き、描くのは各スレッド | 同じ（AppKit はメインスレッドのみ） |
+| spawn したスレッド | 同じ接続、別のキュー | 別の接続 | プラットフォームのスレッドに窓を置き、描くのは各スレッド | 窓はメインスレッド（AppKit はメインスレッドのみ）、UI と描画は各スレッド |
 
 位置の指定と、親に貼り付く小窓（Wayland ではつかみのない xdg_popup）は、あとで足す。
 

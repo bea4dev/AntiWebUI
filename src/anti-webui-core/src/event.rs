@@ -13,9 +13,92 @@ pub struct Modifiers {
 }
 
 impl Modifiers {
-    /// The platform's primary shortcut modifier (Ctrl on Linux and Windows).
+    const NONE: Modifiers = Modifiers {
+        shift: false,
+        ctrl: false,
+        alt: false,
+        logo: false,
+    };
+    const CTRL: Modifiers = Modifiers {
+        ctrl: true,
+        ..Self::NONE
+    };
+    const ALT: Modifiers = Modifiers {
+        alt: true,
+        ..Self::NONE
+    };
+    const LOGO: Modifiers = Modifiers {
+        logo: true,
+        ..Self::NONE
+    };
+
+    /// The modifier of shortcuts alone, as [`Modifiers::primary`] takes it: for tests and input
+    /// made by programs.
+    pub const PRIMARY: Modifiers = if cfg!(target_os = "macos") {
+        Self::LOGO
+    } else {
+        Self::CTRL
+    };
+
+    /// The modifier of moving by words alone, as [`Modifiers::word`] takes it.
+    pub const WORD: Modifiers = if cfg!(target_os = "macos") {
+        Self::ALT
+    } else {
+        Self::CTRL
+    };
+
+    /// The modifier that makes drags copy alone, as [`Modifiers::copies_drag`] takes it.
+    pub const COPY_DRAG: Modifiers = Self::WORD;
+
+    /// These with Shift as well.
+    pub const fn with_shift(self) -> Modifiers {
+        Modifiers {
+            shift: true,
+            ..self
+        }
+    }
+
+    /// The platform's primary shortcut modifier (Ctrl on Linux and Windows, Command on macOS).
     pub fn primary(&self) -> bool {
-        self.ctrl
+        if cfg!(target_os = "macos") {
+            self.logo
+        } else {
+            self.ctrl
+        }
+    }
+
+    /// What moves and deletes by words (Ctrl, or Option on macOS).
+    pub fn word(&self) -> bool {
+        if cfg!(target_os = "macos") {
+            self.alt
+        } else {
+            self.ctrl
+        }
+    }
+
+    /// What moves and deletes to the ends of lines and of the text with the arrows (Command on
+    /// macOS; nothing elsewhere, where Home and End do).
+    pub fn line(&self) -> bool {
+        cfg!(target_os = "macos") && self.logo
+    }
+
+    /// Whether a key pressed with these types its text: not with the modifiers of shortcuts. Option
+    /// types characters on macOS.
+    pub fn types_text(&self) -> bool {
+        if cfg!(target_os = "macos") {
+            !self.ctrl && !self.logo
+        } else {
+            !self.ctrl && !self.alt
+        }
+    }
+
+    /// What makes a drag copy instead of move (Ctrl, or Option on macOS).
+    pub fn copies_drag(&self) -> bool {
+        if cfg!(target_os = "macos") {
+            self.alt
+        } else {
+            self.ctrl
+        }
     }
 }
 
