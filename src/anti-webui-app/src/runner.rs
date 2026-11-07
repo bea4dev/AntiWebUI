@@ -1,5 +1,6 @@
 //! Runs the UI on whichever backend there is: Wayland or X11 (see "バックエンドの選び方" in
-//! `docs/design/35-platform-x11.md`).
+//! `docs/design/35-platform-x11.md`), with as many windows as the program opens, on the threads
+//! it chooses (see `docs/design/36-multi-window.md`).
 
 use super::App;
 use crate::frame_stats::FrameStats;
@@ -12,7 +13,14 @@ use anti_webui_core::event::WindowEvent;
 use anti_webui_core::platform::{PlatformRequest, PopupId, SurfaceId};
 use anti_webui_core::video::VideoTiming;
 use anti_webui_core::view::IntoView;
+use anti_webui_core::window::{
+    Command, DecorationMode, OpenRequest, SpawnRequest, WindowHandle, WindowId,
+};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Instant;
+
+type BoxError = Box<dyn std::error::Error>;
 
 struct Runner {
     ui: Ui,
@@ -30,6 +38,19 @@ struct Runner {
 }
 
 impl Runner {
+    fn new(ui: Ui) -> Self {
+        Self {
+            ui,
+            presenter: None,
+            error: None,
+            dump: None,
+            stats: FrameStats::from_env(),
+            overlay: OverlayFeed::new(),
+            pacing: Pacing::new(),
+            waker_set: false,
+        }
+    }
+
     fn set_waker(&mut self, ctx: &mut impl Host) {
         if !std::mem::replace(&mut self.waker_set, true)
             && let Some(waker) = ctx.waker()
@@ -74,6 +95,11 @@ impl Runner {
                 PlatformRequest::AcceptDrag(wanted) => ctx.accept_drag(wanted),
                 PlatformRequest::ReceiveDrop(mime) => ctx.receive_drop(mime),
                 PlatformRequest::FinishDrop => ctx.finish_drop(),
+                PlatformRequest::StartMove => ctx.start_move(),
+                PlatformRequest::StartResize(edge) => ctx.start_resize(edge),
+                PlatformRequest::Minimize => ctx.minimize(),
+                PlatformRequest::SetMaximized(on) => ctx.set_maximized(on),
+                PlatformRequest::ShowWindowMenu => ctx.show_window_menu(),
             }
         }
     }
@@ -321,7 +347,7 @@ enum Backend {
 }
 
 /// `ANTIWEBUI_BACKEND` if given, otherwise Wayland if it can be reached, and X11 after it.
-fn choose_backend() -> Result<Backend, Box<dyn std::error::Error>> {
+fn choose_backend() -> Result<Backend, BoxError> {
     let wanted = std::env::var("ANTIWEBUI_BACKEND").ok();
     match wanted.as_deref() {
         #[cfg(feature = "wayland")]
@@ -360,10 +386,385 @@ fn limit_vulkan_drivers(device: Option<u64>) {
     }
 }
 
-pub fn run<V: IntoView>(
-    app: App,
-    root: impl FnOnce() -> V,
-) -> Result<(), Box<dyn std::error::Error>> {
+// --- Windows ----------------------------------------------------------------------------------
+
+/// How to open a window on the platform.
+struct Spec {
+    title: String,
+    app_id: String,
+    width: i32,
+    height: i32,
+    fullscreen: bool,
+    decorations: DecorationMode,
+    modal: bool,
+    /// What the system is told the window belongs to, for a dialog.
+    parent: Option<WindowId>,
+}
+
+impl Spec {
+    fn of(request: &OpenRequest, app_id: &str) -> Self {
+        let o = &request.options;
+        Self {
+            title: o.title.clone(),
+            app_id: app_id.to_owned(),
+            width: o.width,
+            height: o.height,
+            fullscreen: o.fullscreen,
+            decorations: o.decorations,
+            modal: o.modal,
+            // Only a dialog is the system's business: other windows get all of their buttons.
+            parent: request
+                .parent
+                .as_ref()
+                .filter(|_| o.dialog || o.modal)
+                .map(WindowHandle::id),
+        }
+    }
+}
+
+/// What a window can be put above by, whichever thread it is on.
+#[derive(Clone)]
+enum Link {
+    #[cfg(feature = "wayland")]
+    Wayland(anti_webui_wayland::ParentLink),
+    #[cfg(feature = "x11")]
+    X11(anti_webui_x11::ParentLink),
+}
+
+/// The open windows of every thread, for the windows that open above them.
+static LINKS: Mutex<Vec<(WindowId, Link)>> = Mutex::new(Vec::new());
+
+/// The threads windows were spawned on, which the program waits for at the end.
+static THREADS: Mutex<Vec<(WindowHandle, JoinHandle<()>)>> = Mutex::new(Vec::new());
+
+fn link_of(id: WindowId) -> Option<Link> {
+    let links = LINKS.lock().ok()?;
+    links.iter().find(|(w, _)| *w == id).map(|(_, l)| l.clone())
+}
+
+/// A backend's session: the windows of one thread.
+trait Platform: Sized + 'static {
+    type Key: Copy + Eq + std::fmt::Debug;
+    type Share: Send + 'static;
+    fn connect() -> Result<Self, BoxError>;
+    fn join(share: Self::Share) -> Result<Self, BoxError>;
+    fn share(&self) -> Self::Share;
+    fn waker(&self) -> Option<Arc<dyn Fn() + Send + Sync>>;
+    fn open(&mut self, spec: Spec) -> Result<Self::Key, BoxError>;
+    fn link(&self, key: Self::Key) -> Option<Link>;
+    fn close(&mut self, key: Self::Key);
+    fn exited(&self) -> Vec<Self::Key>;
+    fn dispatch(&mut self, windows: &mut Windows<Self::Key>) -> Result<(), BoxError>;
+    fn wait(&mut self, windows: &mut Windows<Self::Key>) -> Result<(), BoxError>;
+}
+
+/// The windows of a thread and what runs each.
+struct Windows<K> {
+    entries: Vec<Entry<K>>,
+}
+
+struct Entry<K> {
+    key: K,
+    id: WindowId,
+    runner: Runner,
+}
+
+impl<K: Copy + Eq> Windows<K> {
+    fn find(&mut self, key: K) -> Option<&mut Runner> {
+        self.entries
+            .iter_mut()
+            .find(|e| e.key == key)
+            .map(|e| &mut e.runner)
+    }
+}
+
+/// Implements [`Platform`] for a backend's session, which has methods of these names.
+macro_rules! platform_for {
+    ($backend:ident, $variant:ident) => {
+        impl $backend::Handlers for Windows<$backend::WindowKey> {
+            type Handler = Runner;
+            fn handler(&mut self, key: $backend::WindowKey) -> Option<&mut Runner> {
+                self.find(key)
+            }
+        }
+
+        impl Platform for $backend::Session {
+            type Key = $backend::WindowKey;
+            type Share = $backend::SessionShare;
+            fn connect() -> Result<Self, BoxError> {
+                Ok($backend::Session::connect()?)
+            }
+            fn join(share: Self::Share) -> Result<Self, BoxError> {
+                Ok($backend::Session::join(share)?)
+            }
+            fn share(&self) -> Self::Share {
+                $backend::Session::share(self)
+            }
+            fn waker(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+                let waker = $backend::Session::waker(self)?;
+                Some(Arc::new(waker))
+            }
+            fn open(&mut self, spec: Spec) -> Result<Self::Key, BoxError> {
+                let parent = spec.parent.and_then(link_of).map(|link| match link {
+                    Link::$variant(l) => l,
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("one backend per program"),
+                });
+                let options = $backend::WindowOptions {
+                    title: spec.title,
+                    app_id: spec.app_id,
+                    width: spec.width,
+                    height: spec.height,
+                    fullscreen: spec.fullscreen,
+                    decorations: spec.decorations,
+                    modal: spec.modal,
+                    parent,
+                };
+                Ok($backend::Session::open(self, options)?)
+            }
+            fn link(&self, key: Self::Key) -> Option<Link> {
+                self.parent_link(key).map(Link::$variant)
+            }
+            fn close(&mut self, key: Self::Key) {
+                $backend::Session::close(self, key)
+            }
+            fn exited(&self) -> Vec<Self::Key> {
+                $backend::Session::exited(self)
+            }
+            fn dispatch(&mut self, windows: &mut Windows<Self::Key>) -> Result<(), BoxError> {
+                Ok($backend::Session::dispatch(self, windows)?)
+            }
+            fn wait(&mut self, windows: &mut Windows<Self::Key>) -> Result<(), BoxError> {
+                Ok($backend::Session::wait(self, windows)?)
+            }
+        }
+    };
+}
+
+#[cfg(feature = "wayland")]
+use anti_webui_wayland as wayland;
+#[cfg(feature = "wayland")]
+platform_for!(wayland, Wayland);
+#[cfg(feature = "x11")]
+use anti_webui_x11 as x11;
+#[cfg(feature = "x11")]
+platform_for!(x11, X11);
+
+/// The loop of a thread with windows: it ends when they are all closed, or with the first window
+/// of the program.
+struct Thread<P: Platform> {
+    session: P,
+    windows: Windows<P::Key>,
+    /// The program's first window, which ends it.
+    first: Option<P::Key>,
+    app_id: String,
+}
+
+impl<P: Platform> Thread<P> {
+    fn new(session: P, app_id: String) -> Self {
+        if let Some(waker) = session.waker() {
+            anti_webui_core::channel::set_thread_waker(waker);
+        }
+        Self {
+            session,
+            windows: Windows {
+                entries: Vec::new(),
+            },
+            first: None,
+            app_id,
+        }
+    }
+
+    /// Puts a `Ui` in a window of the platform.
+    fn add(&mut self, ui: Ui, spec: Spec) -> Result<P::Key, BoxError> {
+        let id = ui.window();
+        let key = match self.session.open(spec) {
+            Ok(key) => key,
+            Err(e) => {
+                ui.close();
+                return Err(e);
+            }
+        };
+        if let Some(link) = self.session.link(key)
+            && let Ok(mut links) = LINKS.lock()
+        {
+            links.push((id, link));
+        }
+        self.windows.entries.push(Entry {
+            key,
+            id,
+            runner: Runner::new(ui),
+        });
+        Ok(key)
+    }
+
+    fn open(&mut self, request: OpenRequest) {
+        let spec = Spec::of(&request, &self.app_id);
+        let ui = Ui::open(request);
+        if let Err(e) = self.add(ui, spec) {
+            eprintln!("[anti-webui] could not open a window: {e}");
+        }
+    }
+
+    /// Closes a window; the error of its runner, if it had one.
+    fn close(&mut self, key: P::Key) -> Option<BoxError> {
+        let at = self.windows.entries.iter().position(|e| e.key == key)?;
+        let Entry { id, mut runner, .. } = self.windows.entries.remove(at);
+        // GPU objects go before the surface they render to.
+        runner.on_exit();
+        if let Ok(mut links) = LINKS.lock() {
+            links.retain(|(w, _)| *w != id);
+        }
+        let error = runner.error.take();
+        let Runner { ui, .. } = runner;
+        ui.close();
+        self.session.close(key);
+        error
+    }
+
+    /// Runs until the windows are gone. With the first window of the program, they all go with it.
+    fn run(&mut self) -> Result<(), BoxError> {
+        loop {
+            self.session.dispatch(&mut self.windows)?;
+            for key in self.session.exited() {
+                let error = self.close(key);
+                if Some(key) == self.first {
+                    let keys: Vec<_> = self.windows.entries.iter().map(|e| e.key).collect();
+                    for key in keys {
+                        self.close(key);
+                    }
+                    return error.map_or(Ok(()), Err);
+                }
+                if let Some(e) = error {
+                    eprintln!("[anti-webui] a window closed: {e}");
+                }
+            }
+            self.take_requests();
+            if self.windows.entries.is_empty() {
+                return Ok(());
+            }
+            if !anti_webui_core::window::has_pending() {
+                self.session.wait(&mut self.windows)?;
+            }
+        }
+    }
+
+    /// Opens, spawns and closes what was asked for while handling events.
+    fn take_requests(&mut self) {
+        for request in anti_webui_core::window::take_opens() {
+            self.open(request);
+        }
+        for request in anti_webui_core::window::take_spawns() {
+            self.spawn(request);
+        }
+        let mut wake = false;
+        let mut commands: std::collections::VecDeque<_> =
+            anti_webui_core::window::take_commands().into();
+        while let Some((id, command)) = commands.pop_front() {
+            wake |= self.command(id, command);
+            // What a command leads to, like a dialog that closed letting go of its parent, comes
+            // before what was asked after it.
+            for later in anti_webui_core::window::take_commands().into_iter().rev() {
+                commands.push_front(later);
+            }
+        }
+        // What the windows were told needs their handlers, which run when the session wakes.
+        if wake && let Some(waker) = self.session.waker() {
+            waker();
+        }
+    }
+
+    /// Does what a handle asked of a window of this thread. Whether its handlers have to run.
+    fn command(&mut self, id: WindowId, command: Command) -> bool {
+        let Some(at) = self.windows.entries.iter().position(|e| e.id == id) else {
+            return false;
+        };
+        let key = self.windows.entries[at].key;
+        if command == Command::Close && Some(key) != self.first {
+            if let Some(e) = self.close(key) {
+                eprintln!("[anti-webui] a window closed: {e}");
+            }
+            return false;
+        }
+        // The first window closes through the loop, which ends the program.
+        self.windows.entries[at].runner.ui.apply(command);
+        true
+    }
+
+    fn spawn(&mut self, request: SpawnRequest) {
+        let share = self.session.share();
+        let app_id = self.app_id.clone();
+        let handle = request.handle.clone();
+        let thread = std::thread::Builder::new()
+            .name("anti-webui window".into())
+            .spawn(move || {
+                if let Err(e) = run_spawned::<P>(share, request, app_id) {
+                    eprintln!("[anti-webui] a window's thread ended: {e}");
+                }
+            });
+        match thread {
+            Ok(thread) => {
+                if let Ok(mut threads) = THREADS.lock() {
+                    threads.push((handle, thread));
+                }
+            }
+            Err(e) => eprintln!("[anti-webui] could not start a thread for a window: {e}"),
+        }
+    }
+}
+
+/// The body of a thread a window was spawned on.
+fn run_spawned<P: Platform>(
+    share: P::Share,
+    request: SpawnRequest,
+    app_id: String,
+) -> Result<(), BoxError> {
+    #[cfg(feature = "video")]
+    anti_webui_video::install();
+    anti_webui_core::window::start_ui_thread(true);
+    let request = request.start();
+    let mut thread = Thread::new(P::join(share)?, app_id);
+    thread.open(request);
+    thread.run()
+}
+
+/// Closes the windows on other threads and waits for them, at the end of the program.
+fn end_threads() {
+    loop {
+        let threads = std::mem::take(&mut *THREADS.lock().expect("no panics in here"));
+        if threads.is_empty() {
+            return;
+        }
+        for (handle, _) in &threads {
+            handle.close();
+        }
+        for (_, thread) in threads {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn run_on<P: Platform, V: IntoView>(app: App, root: impl FnOnce() -> V) -> Result<(), BoxError> {
+    let mut thread = Thread::new(P::connect()?, app.app_id.clone());
+    let ui = Ui::new(root);
+    let spec = Spec {
+        title: app.title,
+        app_id: app.app_id,
+        width: app.width,
+        height: app.height,
+        fullscreen: app.fullscreen,
+        decorations: app.decorations,
+        modal: false,
+        parent: None,
+    };
+    let key = thread.add(ui, spec)?;
+    thread.first = Some(key);
+    let result = thread.run();
+    end_threads();
+    result
+}
+
+pub fn run<V: IntoView>(app: App, root: impl FnOnce() -> V) -> Result<(), BoxError> {
     let backend = choose_backend()?;
     limit_vulkan_drivers(match backend {
         #[cfg(feature = "wayland")]
@@ -373,42 +774,11 @@ pub fn run<V: IntoView>(
     });
     #[cfg(feature = "video")]
     anti_webui_video::install();
-    let mut runner = Runner {
-        ui: Ui::new(root),
-        presenter: None,
-        error: None,
-        dump: None,
-        stats: FrameStats::from_env(),
-        overlay: OverlayFeed::new(),
-        pacing: Pacing::new(),
-        waker_set: false,
-    };
+    anti_webui_core::window::start_ui_thread(false);
     match backend {
         #[cfg(feature = "wayland")]
-        Backend::Wayland => {
-            let options = anti_webui_wayland::WindowOptions {
-                title: app.title,
-                app_id: app.app_id,
-                width: app.width,
-                height: app.height,
-                fullscreen: app.fullscreen,
-            };
-            anti_webui_wayland::run(options, &mut runner)?;
-        }
+        Backend::Wayland => run_on::<anti_webui_wayland::Session, V>(app, root),
         #[cfg(feature = "x11")]
-        Backend::X11 => {
-            let options = anti_webui_x11::WindowOptions {
-                title: app.title,
-                app_id: app.app_id,
-                width: app.width,
-                height: app.height,
-                fullscreen: app.fullscreen,
-            };
-            anti_webui_x11::run(options, &mut runner)?;
-        }
-    }
-    match runner.error.take() {
-        Some(e) => Err(e),
-        None => Ok(()),
+        Backend::X11 => run_on::<anti_webui_x11::Session, V>(app, root),
     }
 }

@@ -272,20 +272,40 @@ pub fn register_font_as(
     register(data, Some(family))
 }
 
+/// The fonts registered on any thread, for the threads windows are spawned on later (see
+/// `docs/design/36-multi-window.md`).
+static SHARED_FONTS: std::sync::Mutex<Vec<(Blob<u8>, Option<String>)>> =
+    std::sync::Mutex::new(Vec::new());
+
 fn register(
     data: impl AsRef<[u8]> + Send + Sync + 'static,
     family: Option<&str>,
 ) -> Result<Vec<String>, NotAFont> {
+    let blob = Blob::new(Arc::new(data));
+    let names = register_blob(blob.clone(), family)?;
+    SHARED_FONTS
+        .lock()
+        .expect("no panics in here")
+        .push((blob, family.map(str::to_owned)));
+    Ok(names)
+}
+
+/// On a thread a window was spawned on: the fonts registered elsewhere.
+pub(crate) fn register_shared_fonts() {
+    let fonts = SHARED_FONTS.lock().expect("no panics in here").clone();
+    for (blob, family) in fonts {
+        let _ = register_blob(blob, family.as_deref());
+    }
+}
+
+fn register_blob(blob: Blob<u8>, family: Option<&str>) -> Result<Vec<String>, NotAFont> {
     let (names, unseen) = with_text(|ts| {
         let unseen = family.is_some_and(|name| ts.is_unseen_family(name));
         let info = family.map(|name| FontInfoOverride {
             family_name: Some(name),
             ..Default::default()
         });
-        let found = ts
-            .fcx
-            .collection
-            .register_fonts(Blob::new(Arc::new(data)), info);
+        let found = ts.fcx.collection.register_fonts(blob, info);
         if !unseen {
             ts.fonts_generation += 1;
         }

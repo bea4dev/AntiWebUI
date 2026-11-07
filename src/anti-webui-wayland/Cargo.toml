@@ -12,7 +12,7 @@ wayland-backend.workspace = true
 wayland-protocols.workspace = true
 xkbcommon.workspace = true
 raw-window-handle.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 wayland-server = "0.31"

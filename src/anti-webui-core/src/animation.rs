@@ -62,14 +62,34 @@ thread_local! {
     static NEXT_TIMER: Cell<u64> = const { Cell::new(0) };
 }
 
+/// What each window has of its own here; see `crate::window`.
+#[derive(Default)]
+pub(crate) struct Locals {
+    callbacks: Vec<FrameCallback>,
+    wanted: bool,
+    timers: Vec<Timer>,
+}
+
+/// Trades what the window being worked on has for `other`.
+pub(crate) fn swap_locals(other: &mut Locals) {
+    CALLBACKS.with(|c| std::mem::swap(&mut *c.borrow_mut(), &mut other.callbacks));
+    WANTED.with(|w| other.wanted = w.replace(other.wanted));
+    TIMERS.with(|t| std::mem::swap(&mut *t.borrow_mut(), &mut other.timers));
+}
+
 /// A running [`set_timeout`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Timeout(u64);
+pub struct Timeout {
+    id: u64,
+    window: u64,
+}
 
 impl Timeout {
     /// Keeps it from running, if it hasn't yet.
     pub fn cancel(self) {
-        TIMERS.with(|t| t.borrow_mut().retain(|timer| timer.id != self.0));
+        crate::window::within(self.window, || {
+            TIMERS.with(|t| t.borrow_mut().retain(|timer| timer.id != self.id));
+        });
     }
 }
 
@@ -83,7 +103,10 @@ pub fn set_timeout(delay: Duration, f: impl FnOnce() + 'static) -> Timeout {
         f: Box::new(f),
     };
     TIMERS.with(|t| t.borrow_mut().push(timer));
-    let timeout = Timeout(id);
+    let timeout = Timeout {
+        id,
+        window: crate::window::active_id(),
+    };
     on_cleanup(move || timeout.cancel());
     timeout
 }

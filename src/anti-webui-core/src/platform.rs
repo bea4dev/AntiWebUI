@@ -134,6 +134,15 @@ pub enum PlatformRequest {
     ReceiveDrop(String),
     /// What was dropped has been dealt with without reading it.
     FinishDrop,
+    /// The system moves the window with the pointer, from the press going on.
+    StartMove,
+    /// The system resizes the window with the pointer from an edge, from the press going on.
+    StartResize(crate::window::ResizeEdge),
+    Minimize,
+    /// Answered with `WindowEvent::Maximized`, if it happens.
+    SetMaximized(bool),
+    /// The system's menu for the window, where the pointer is.
+    ShowWindowMenu,
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -11,19 +11,22 @@ use anti_webui_core::scene::Scene;
 use anti_webui_wgpu::dmabuf::{DRM_FORMAT_ARGB8888, DmabufContext, DmabufImage};
 use anti_webui_wgpu::linux_sync::{self, DrmDevice};
 use anti_webui_wgpu::{FrameResult, Gpu, GpuError, Renderer, WindowRenderer, wgpu};
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::AsFd;
+use std::rc::{Rc, Weak};
 
 /// Buffers beyond this make the compositor wait for us instead. Frames held back use one more each.
 const MAX_BUFFERS: usize = 4;
 
 /// Presents to the window and the popups. They share the GPU, and all but the fallback also the
-/// renderer with its glyph atlas.
+/// renderer with its glyph atlas. The windows of a thread share the GPU and what makes dmabufs (see
+/// `docs/design/36-multi-window.md`).
 pub(crate) struct Presenter {
     // Dropped before `gpu`.
     targets: HashMap<SurfaceId, Target>,
     dmabuf: Option<DmabufPresenter>,
-    gpu: Gpu,
+    gpu: Rc<Gpu>,
     debug: bool,
     /// Filled in while presenting to the window, if asked for.
     trace: Option<PresentTrace>,
@@ -90,7 +93,7 @@ impl Presenter {
                 },
             )]),
             dmabuf: None,
-            gpu,
+            gpu: Rc::new(gpu),
             debug,
             trace: None,
         })
@@ -157,12 +160,12 @@ impl Presenter {
 
     /// The GPU that draws, if what decodes video can hand frames over on it.
     pub fn video_render_node(&self) -> Option<std::path::PathBuf> {
-        Some(self.dmabuf.as_ref()?.ctx.render_node()?.to_owned())
+        Some(self.dmabuf.as_ref()?.ctx.borrow().render_node()?.to_owned())
     }
 
     /// Something for another renderer to read frames of videos on the GPU with.
     pub fn video_importer(&self) -> Option<anti_webui_wgpu::dmabuf::VideoImporter> {
-        self.dmabuf.as_ref()?.ctx.video_importer().ok()
+        self.dmabuf.as_ref()?.ctx.borrow().video_importer().ok()
     }
 
     /// A frame of a video couldn't be read on the GPU, since this was last asked.
@@ -328,7 +331,7 @@ impl Presenter {
             && f.generation != d.generation
         {
             d.generation = f.generation;
-            let modifiers = wanted_modifiers(f, &d.ctx);
+            let modifiers = wanted_modifiers(f, &d.ctx.borrow());
             if debug_enabled() {
                 let scanout = f.tranches.iter().map(|t| t.scanout).collect::<Vec<_>>();
                 eprintln!(
@@ -369,7 +372,7 @@ impl Presenter {
                         prev: None,
                     },
                 );
-                self.gpu = gpu;
+                self.gpu = Rc::new(gpu);
             }
             Err(e) => {
                 eprintln!("[anti-webui] no GPU surface either: {e}");
@@ -467,7 +470,8 @@ impl Sync {
 
 /// What surfaces presenting our own buffers share.
 struct DmabufPresenter {
-    ctx: DmabufContext,
+    /// Shared with the other windows of the thread on the same GPU.
+    ctx: Rc<RefCell<DmabufContext>>,
     renderer: Renderer,
     sync: Sync,
     generation: u64,
@@ -520,13 +524,45 @@ fn wanted_modifiers(feedback: &DmabufFeedback, ctx: &DmabufContext) -> Vec<u64> 
     }
 }
 
+type SharedGpu = (Rc<Gpu>, Rc<RefCell<DmabufContext>>);
+/// A device the display server uses, and the GPU on it while some window has it.
+type KnownGpu = (u64, Weak<Gpu>, Weak<RefCell<DmabufContext>>);
+
+thread_local! {
+    /// The GPUs the windows of this thread draw with.
+    static SHARED: RefCell<Vec<KnownGpu>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The GPU of another window of this thread on the same device, or a new one: making a device
+/// takes tens of milliseconds and a good deal of memory.
+fn shared_gpu(main_device: u64) -> Result<SharedGpu, GpuError> {
+    let found = SHARED.with(|s| {
+        let mut s = s.borrow_mut();
+        s.retain(|(_, gpu, _)| gpu.strong_count() > 0);
+        s.iter()
+            .filter(|(device, _, _)| *device == main_device)
+            .find_map(|(_, gpu, ctx)| Some((gpu.upgrade()?, ctx.upgrade()?)))
+    });
+    if let Some(found) = found {
+        return Ok(found);
+    }
+    let (gpu, ctx) = Gpu::for_dmabuf(main_device)?;
+    let (gpu, ctx) = (Rc::new(gpu), Rc::new(RefCell::new(ctx)));
+    SHARED.with(|s| {
+        s.borrow_mut()
+            .push((main_device, Rc::downgrade(&gpu), Rc::downgrade(&ctx)))
+    });
+    Ok((gpu, ctx))
+}
+
 impl DmabufPresenter {
-    fn new(ctx: &mut impl Host) -> Result<(Gpu, Self), GpuError> {
+    fn new(ctx: &mut impl Host) -> Result<(Rc<Gpu>, Self), GpuError> {
         let feedback = ctx
             .dmabuf_feedback()
             .ok_or_else(|| GpuError::Dmabuf("the compositor sent no dmabuf feedback".into()))?;
         let generation = feedback.generation;
-        let (gpu, dctx) = Gpu::for_dmabuf(feedback.main_device)?;
+        let (gpu, shared) = shared_gpu(feedback.main_device)?;
+        let dctx = shared.borrow();
         let modifiers = wanted_modifiers(feedback, &dctx);
         if !dctx.supports_any(&modifiers) {
             return Err(GpuError::Dmabuf(
@@ -544,10 +580,11 @@ impl DmabufPresenter {
         if let Ok(importer) = dctx.video_importer() {
             renderer.set_video_importer(importer);
         }
+        drop(dctx);
         Ok((
             gpu,
             Self {
-                ctx: dctx,
+                ctx: shared,
                 renderer,
                 sync,
                 generation,
@@ -605,7 +642,7 @@ impl DmabufPresenter {
             ),
             _ => None,
         };
-        self.ctx.begin_access(&mut slot.image, wait)?;
+        self.ctx.borrow_mut().begin_access(&mut slot.image, wait)?;
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         self.renderer.set_target(renderer_target(surface));
         self.renderer.render_damaged(
@@ -620,7 +657,7 @@ impl DmabufPresenter {
             t.recorded = linux_sync::monotonic_ns();
         }
         gpu.queue.submit([encoder.finish()]);
-        let done = self.ctx.end_access(&mut slot.image)?;
+        let done = self.ctx.borrow_mut().end_access(&mut slot.image)?;
         if let Some(t) = &mut trace {
             t.submitted = linux_sync::monotonic_ns();
         }
@@ -760,7 +797,7 @@ impl DmabufPresenter {
         target: &mut DmabufTarget,
     ) -> Result<usize, GpuError> {
         let (w, h) = target.size;
-        let image = self.ctx.allocate(gpu, w, h, &self.modifiers)?;
+        let image = self.ctx.borrow_mut().allocate(gpu, w, h, &self.modifiers)?;
         let planes: Vec<DmabufPlaneDesc<'_>> = image
             .planes
             .iter()
@@ -814,7 +851,7 @@ impl DmabufPresenter {
                     drm.destroy_syncobj(r.handle);
                 }
             }
-            self.ctx.retire(slot.image);
+            self.ctx.borrow_mut().retire(slot.image);
         }
     }
 
@@ -832,7 +869,7 @@ impl Drop for Presenter {
             for target in targets.into_values() {
                 if let TargetKind::Dmabuf(mut t) = target.kind {
                     for slot in t.slots.drain(..) {
-                        d.ctx.retire(slot.image);
+                        d.ctx.borrow_mut().retire(slot.image);
                     }
                 }
             }

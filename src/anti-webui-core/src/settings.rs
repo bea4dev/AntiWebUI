@@ -1,6 +1,10 @@
 //! Settings for the whole framework (see `docs/design/08-scrolling-and-settings.md`).
 
+use crate::channel::UiSender;
 use crate::reactive::{Signal, create_root, signal};
+use std::cell::RefCell;
+use std::sync::Mutex;
+use std::thread::ThreadId;
 
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
@@ -116,9 +120,66 @@ pub fn settings() -> Settings {
     SETTINGS.with(|s| s.get())
 }
 
-/// Changes the settings. They apply from the next event on.
+/// Changes the settings. They apply from the next event on, in the windows of every thread.
 pub fn update_settings(f: impl FnOnce(&mut Settings)) {
     SETTINGS.with(|s| s.update(f));
+    broadcast();
+}
+
+pub(crate) fn settings_untracked() -> Settings {
+    SETTINGS.with(|s| s.get_untracked())
+}
+
+/// Takes the settings of another thread, without telling the others again.
+pub(crate) fn adopt(settings: Settings) {
+    SETTINGS.with(|s| s.set_if_changed(settings));
+}
+
+/// The UI threads, which hear of settings changed on any of them (see
+/// `docs/design/36-multi-window.md`).
+static UI_THREADS: Mutex<Vec<(ThreadId, UiSender<Settings>)>> = Mutex::new(Vec::new());
+
+/// Leaves [`UI_THREADS`] with the thread.
+struct Member;
+
+impl Drop for Member {
+    fn drop(&mut self) {
+        let here = std::thread::current().id();
+        if let Ok(mut threads) = UI_THREADS.lock() {
+            threads.retain(|(t, _)| *t != here);
+        }
+    }
+}
+
+thread_local! {
+    static MEMBER: RefCell<Option<Member>> = const { RefCell::new(None) };
+}
+
+/// This thread runs windows: it hears of settings changed on the others.
+pub(crate) fn join_broadcast() {
+    if MEMBER.with(|m| m.borrow().is_some()) {
+        return;
+    }
+    let sender = crate::channel::ui_channel(adopt);
+    UI_THREADS
+        .lock()
+        .expect("no panics in here")
+        .push((std::thread::current().id(), sender));
+    MEMBER.with(|m| *m.borrow_mut() = Some(Member));
+}
+
+fn broadcast() {
+    let here = std::thread::current().id();
+    let threads = UI_THREADS.lock().expect("no panics in here");
+    if threads.iter().all(|(t, _)| *t == here) {
+        return;
+    }
+    let settings = settings_untracked();
+    for (thread, sender) in threads.iter() {
+        if *thread != here {
+            sender.send(settings.clone());
+        }
+    }
 }
 
 pub(crate) fn with_settings<R>(f: impl FnOnce(&Settings) -> R) -> R {

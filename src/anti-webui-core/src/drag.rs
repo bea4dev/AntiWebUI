@@ -683,6 +683,7 @@ impl Ui {
     /// Says whether the platform can hand drags to the system. Without it, drags stay in the
     /// window whatever they carry.
     pub fn set_platform_drag(&mut self, supported: bool) {
+        crate::window::activate(self.window);
         self.platform_drag = supported;
     }
 

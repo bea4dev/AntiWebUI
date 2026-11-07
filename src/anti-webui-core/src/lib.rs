@@ -26,6 +26,7 @@ pub mod scene;
 mod scroll;
 pub mod settings;
 pub mod shader;
+pub mod shared;
 pub mod svg;
 #[cfg(feature = "svg")]
 mod svg_file;
@@ -37,6 +38,7 @@ pub mod ui;
 pub mod video;
 pub mod view;
 mod visibility;
+pub mod window;
 
 pub use anti_webui_style as style;
 pub use ui::Ui;
@@ -63,6 +65,7 @@ pub mod prelude {
     };
     pub use crate::settings::{FrameAdvance, ImageSettings, Settings, settings, update_settings};
     pub use crate::shader::{Image, IntoImage, IntoPaint, Shader, ShaderPaint, ShaderParams};
+    pub use crate::shared::{SharedSignal, shared_signal};
     pub use crate::svg::{self, Svg, svg};
     pub use crate::text::editor::{DecorateContext, Gutter, LineLook, Row, TextEdit, Widget};
     pub use crate::text::rich::{
@@ -76,10 +79,16 @@ pub mod prelude {
     pub use crate::view::{
         BitmapView, Div, EditorRef, ForEach, Img, Interaction, IntoImageSource, IntoTextSource,
         IntoVideoSource, IntoView, NodeRef, Popup, Show, Text, TextEditor, TextInput, Video, View,
-        bitmap_view, clear_text_selection, close_window, div, dyn_view, editor_ref,
-        exit_fullscreen, for_each, fragment, img, node_ref, popup, portal, set_clipboard,
-        set_window_fullscreen, shader, show, text, text_area, text_editor, text_input, video,
-        window_fullscreen, window_scale,
+        bitmap_view, clear_text_selection, div, dyn_view, editor_ref, exit_fullscreen, for_each,
+        fragment, img, node_ref, popup, portal, set_clipboard, set_window_fullscreen, shader, show,
+        text, text_area, text_editor, text_input, video, window_fullscreen, window_scale,
+    };
+    pub use crate::window::{
+        CloseRequest, DecorationMode, Decorations, ResizeEdge, WindowHandle, WindowId,
+        WindowOptions, close_window, current_window, minimize_window, on_close_request,
+        open_window, request_close_window, set_window_maximized, set_window_title,
+        show_window_menu, spawn_window, start_window_move, start_window_resize,
+        toggle_window_maximized, window_active, window_decorations, window_maximized,
     };
     pub use anti_webui_style::*;
 }

@@ -16,7 +16,8 @@ use std::time::Instant;
 use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::{
     wl_callback, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
-    wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_subcompositor, wl_surface,
+    wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, wl_subcompositor,
+    wl_surface,
 };
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop, event_created_child,
@@ -40,9 +41,7 @@ use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_v3::{self, ContentHint, ContentPurpose},
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
-use wayland_protocols::xdg::decoration::zv1::client::{
-    zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
-};
+use wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1;
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 pub const TEXT_MIMES: [&str; 5] = [
@@ -88,10 +87,11 @@ pub struct State {
     pub toplevel: xdg_toplevel::XdgToplevel,
     pub viewporter: Option<wp_viewporter::WpViewporter>,
     pub subcompositor: Option<wl_subcompositor::WlSubcompositor>,
+    pub shm: Option<wl_shm::WlShm>,
     pub seat: Option<wl_seat::WlSeat>,
     pub viewport: Option<wp_viewport::WpViewport>,
     pub fractional: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
-    pub _decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
+    pub(crate) decor: crate::decor::Decor,
     pub cursor_shape_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
     pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
     pub data_device_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
@@ -114,6 +114,11 @@ pub struct State {
     pub pointer: Option<wl_pointer::WlPointer>,
     pub cursor_device: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
     pub pointer_serial: u32,
+    /// The pointer is on a surface of this window. Every window of a session gets every pointer
+    /// event; the others drop them (see `docs/design/36-multi-window.md`).
+    pub pointer_here: bool,
+    /// The pointer is on an edge to resize the window from, and what it would resize.
+    pub(crate) pointer_border: Option<(crate::decor::Side, anti_webui_core::window::ResizeEdge)>,
     /// What the pointer is on, which `pointer_pos` is relative to.
     pub pointer_surface: SurfaceId,
     pub pointer_pos: (f64, f64),
@@ -131,6 +136,10 @@ pub struct State {
     /// What the keyboard is on, which the IME's cursor rectangle is relative to.
     pub keyboard_surface: SurfaceId,
     pub keyboard_focused: bool,
+    /// The keyboard is on a surface of this window, like `pointer_here`.
+    pub keyboard_here: bool,
+    /// Something dragged is over a surface of this window, like `pointer_here`.
+    pub drag_here: bool,
     /// What the core was told; moving between our surfaces isn't a change.
     pub focus_announced: bool,
     pub input_serial: u32,
@@ -190,10 +199,11 @@ impl State {
             toplevel,
             viewporter: None,
             subcompositor: None,
+            shm: None,
             seat: None,
             viewport: None,
             fractional: None,
-            _decoration: None,
+            decor: Default::default(),
             cursor_shape_manager: None,
             text_input_manager: None,
             data_device_manager: None,
@@ -211,6 +221,8 @@ impl State {
             pointer: None,
             cursor_device: None,
             pointer_serial: 0,
+            pointer_here: false,
+            pointer_border: None,
             pointer_surface: SurfaceId::Window,
             pointer_pos: (0.0, 0.0),
             cursor: CursorIcon::Default,
@@ -224,6 +236,8 @@ impl State {
             kb: Keyboard::new(),
             keyboard_surface: SurfaceId::Window,
             keyboard_focused: false,
+            keyboard_here: false,
+            drag_here: false,
             focus_announced: false,
             input_serial: 0,
             press_serial: 0,
@@ -251,6 +265,18 @@ impl State {
             present: Default::default(),
             drag: Default::default(),
         }
+    }
+
+    /// Whether a surface is one of this window's. Each window of a session gives its surfaces
+    /// the same kind of user data, so the objects themselves are compared.
+    pub(crate) fn owns(&self, surface: &wl_surface::WlSurface) -> bool {
+        *surface == self.surface
+            || self.popups.values().any(|p| p.surface == *surface)
+            || self.border_side(surface).is_some()
+    }
+
+    pub(crate) fn is_fullscreen(&self) -> bool {
+        self.fullscreen
     }
 
     /// A position on the pointer's surface in window coordinates.
@@ -349,6 +375,10 @@ impl State {
             self.surface
                 .set_buffer_scale((self.scale.0 / 120).max(1) as i32);
         }
+        // Edges to resize from are outside of it.
+        self.xdg_surface
+            .set_window_geometry(0, 0, w.max(1), h.max(1));
+        self.update_borders();
         if self.size_announced != Some((size, self.scale)) {
             self.size_announced = Some((size, self.scale));
             self.events.push(WindowEvent::Resized {
@@ -562,7 +592,6 @@ delegate_noop!(State: ignore wp_viewporter::WpViewporter);
 delegate_noop!(State: ignore wp_viewport::WpViewport);
 delegate_noop!(State: ignore wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1);
 delegate_noop!(State: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
-delegate_noop!(State: ignore zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1);
 delegate_noop!(State: ignore wp_cursor_shape_manager_v1::WpCursorShapeManagerV1);
 delegate_noop!(State: ignore wp_cursor_shape_device_v1::WpCursorShapeDeviceV1);
 delegate_noop!(State: ignore zwp_text_input_manager_v3::ZwpTextInputManagerV3);
@@ -611,6 +640,7 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceId> for State {
             if !state.fullscreen {
                 state.windowed_size = state.logical_size;
             }
+            state.apply_toplevel_states();
             state.configured = true;
             state.update_size();
             state.redraw_requested = true;
@@ -633,6 +663,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
                 height,
                 states,
             } => {
+                state.toplevel_states(&states);
                 let fullscreen = states
                     .chunks_exact(4)
                     .map(|s| u32::from_ne_bytes(s.try_into().unwrap()))
@@ -767,6 +798,24 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         let modifiers = state.kb.modifiers;
+        match &event {
+            wl_pointer::Event::Enter { surface, .. } => {
+                state.pointer_here = state.owns(surface);
+                if !state.pointer_here {
+                    return;
+                }
+            }
+            wl_pointer::Event::Leave { .. } => {
+                if !std::mem::take(&mut state.pointer_here) {
+                    return;
+                }
+            }
+            _ if !state.pointer_here => return,
+            _ => {}
+        }
+        if state.pointer_on_border(&event) {
+            return;
+        }
         match event {
             wl_pointer::Event::Enter {
                 serial,
@@ -949,6 +998,9 @@ impl Dispatch<zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1, ()> for Stat
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        if !state.pointer_here || state.pointer_border.is_some() {
+            return;
+        }
         if let zwp_pointer_gesture_hold_v1::Event::Begin { time, .. } = event {
             let (x, y) = state.pointer_pos;
             let position = state.physical(x, y);
@@ -976,6 +1028,9 @@ impl Dispatch<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1, ()> for St
         _: &QueueHandle<Self>,
     ) {
         use zwp_pointer_gesture_pinch_v1::Event;
+        if !state.pointer_here || state.pointer_border.is_some() {
+            return;
+        }
         let (phase, scale) = match event {
             Event::Begin { .. } => {
                 state.pinch_scale = 1.0;
@@ -1024,11 +1079,18 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             wl_keyboard::Event::Enter {
                 serial, surface, ..
             } => {
+                state.keyboard_here = state.owns(&surface);
+                if !state.keyboard_here {
+                    return;
+                }
                 state.input_serial = serial;
                 state.keyboard_surface = surface_id(&surface);
                 state.keyboard_focused = true;
             }
             wl_keyboard::Event::Leave { .. } => {
+                if !std::mem::take(&mut state.keyboard_here) {
+                    return;
+                }
                 state.kb.repeat = None;
                 state.keyboard_focused = false;
             }
@@ -1053,6 +1115,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 state: key_state,
                 ..
             } => {
+                if !state.keyboard_here {
+                    return;
+                }
                 state.input_serial = serial;
                 let pressed = matches!(key_state, WEnum::Value(wl_keyboard::KeyState::Pressed));
                 if pressed {
@@ -1084,6 +1149,12 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        match &event {
+            zwp_text_input_v3::Event::Enter { surface } if !state.owns(surface) => return,
+            zwp_text_input_v3::Event::Enter { .. } => {}
+            _ if !state.ti_entered => return,
+            _ => {}
+        }
         match event {
             zwp_text_input_v3::Event::Enter { .. } => {
                 state.ti_entered = true;
@@ -1151,10 +1222,21 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
                 x,
                 y,
                 id,
-            } => state.drag_entered(serial, surface_id(&surface), x, y, id),
-            wl_data_device::Event::Motion { x, y, .. } => state.drag_moved(x, y),
-            wl_data_device::Event::Leave => state.drag_left(),
-            wl_data_device::Event::Drop => state.drag_dropped(),
+            } => {
+                state.drag_here = state.owns(&surface);
+                if state.drag_here {
+                    state.drag_entered(serial, surface_id(&surface), x, y, id);
+                } else if let Some(offer) = id {
+                    // It is over another window of the session, which has an offer of its own.
+                    state.offers.remove(&offer.id());
+                    offer.destroy();
+                }
+            }
+            wl_data_device::Event::Motion { x, y, .. } if state.drag_here => state.drag_moved(x, y),
+            wl_data_device::Event::Leave if std::mem::take(&mut state.drag_here) => {
+                state.drag_left()
+            }
+            wl_data_device::Event::Drop if state.drag_here => state.drag_dropped(),
             _ => {}
         }
     }

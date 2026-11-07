@@ -2,6 +2,7 @@
 
 mod atoms;
 mod cursor;
+mod decor;
 mod ime;
 mod input;
 mod keyboard;
@@ -20,12 +21,14 @@ use anti_webui_core::platform::{
     BufferEvent, BufferId, CursorIcon, DmabufFeedback, DmabufPlaneDesc, DragOffer, ImeState,
     PopupId, PopupParams, Presentation, SurfaceId, SyncPoints, TimelineId,
 };
+use anti_webui_core::window::{DecorationMode, ResizeEdge};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, XcbDisplayHandle, XcbWindowHandle};
 use rustix::event::{PollFd, PollFlags};
 use state::State;
 use std::num::NonZeroU32;
-use std::os::fd::BorrowedFd;
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 
@@ -52,6 +55,38 @@ pub struct WindowOptions {
     pub height: i32,
     /// Whether it opens on all of the screen.
     pub fullscreen: bool,
+    pub decorations: DecorationMode,
+    /// What it stays above (`WM_TRANSIENT_FOR`).
+    pub parent: Option<ParentLink>,
+    /// Keeps input from the parent (`_NET_WM_STATE_MODAL`).
+    pub modal: bool,
+}
+
+impl Default for WindowOptions {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            app_id: String::new(),
+            width: 640,
+            height: 480,
+            fullscreen: false,
+            decorations: DecorationMode::Auto,
+            parent: None,
+            modal: false,
+        }
+    }
+}
+
+/// A window to open others above, from any thread: window ids hold on every connection.
+#[derive(Clone, Copy, Debug)]
+pub struct ParentLink(pub(crate) u32);
+
+impl ParentLink {
+    /// A window of any connection, for tests.
+    #[doc(hidden)]
+    pub fn from_window(window: u32) -> Self {
+        Self(window)
+    }
 }
 
 /// Callbacks from the event loop: the same as the Wayland backend's.
@@ -142,6 +177,29 @@ impl Ctx<'_> {
         Some(move || {
             let _ = rustix::io::write(&wake, &[1]);
         })
+    }
+
+    /// Lets the window manager move the window with the pointer, from the press going on.
+    pub fn start_move(&mut self) {
+        self.state.start_move();
+    }
+
+    /// Lets the window manager resize the window from an edge, from the press going on.
+    pub fn start_resize(&mut self, edge: ResizeEdge) {
+        self.state.start_resize(edge);
+    }
+
+    pub fn minimize(&mut self) {
+        self.state.minimize();
+    }
+
+    pub fn set_maximized(&mut self, on: bool) {
+        self.state.set_maximized(on);
+    }
+
+    /// The window manager's menu for the window, where the pointer is, if it has one.
+    pub fn show_window_menu(&mut self) {
+        self.state.show_window_menu();
     }
 
     pub fn set_title(&mut self, title: &str) {
@@ -385,18 +443,212 @@ impl Ctx<'_> {
     }
 }
 
-/// Opens a window and runs the event loop until the handler exits.
-pub fn run<H: X11Handler>(options: WindowOptions, mut handler: H) -> Result<(), Error> {
-    let (wake_read, wake_write) = rustix::pipe::pipe_with(
-        rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
-    )
-    .map_err(err)?;
-    let mut state = State::new(&options, wake_write)?;
-    let result = run_loop(&mut state, &wake_read, &mut handler);
-    handler.exit();
-    keep_clipboard(&mut state);
-    state.present.release(&state.conn);
-    let _ = state.conn.flush();
+/// A window of a [`Session`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WindowKey(u64);
+
+static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
+
+/// What a thread needs to open windows like another: each window has a connection of its own (see
+/// `docs/design/36-multi-window.md`), so nothing.
+pub struct SessionShare;
+
+/// Who a session's windows call: the handler of each.
+pub trait Handlers {
+    type Handler: X11Handler;
+    fn handler(&mut self, key: WindowKey) -> Option<&mut Self::Handler>;
+}
+
+/// One window, with its own connection, as if it were alone.
+struct Instance {
+    key: WindowKey,
+    state: State,
+    /// The deadline the session slept until; asking again now would give the one after it.
+    timer_deadline: Option<Instant>,
+    woken: bool,
+    exit: bool,
+}
+
+/// The windows of a thread.
+pub struct Session {
+    wake_read: OwnedFd,
+    wake_write: OwnedFd,
+    instances: Vec<Instance>,
+}
+
+impl Session {
+    pub fn connect() -> Result<Self, Error> {
+        let (wake_read, wake_write) = rustix::pipe::pipe_with(
+            rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
+        )
+        .map_err(err)?;
+        Ok(Self {
+            wake_read,
+            wake_write,
+            instances: Vec::new(),
+        })
+    }
+
+    pub fn join(_share: SessionShare) -> Result<Self, Error> {
+        Self::connect()
+    }
+
+    pub fn share(&self) -> SessionShare {
+        SessionShare
+    }
+
+    /// Something another thread can call to wake up the session, which then calls
+    /// [`X11Handler::woken`] of every window.
+    pub fn waker(&self) -> Option<impl Fn() + Send + Sync + use<>> {
+        let wake = self.wake_write.try_clone().ok()?;
+        Some(move || {
+            let _ = rustix::io::write(&wake, &[1]);
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.instances.is_empty()
+    }
+
+    pub fn open(&mut self, options: WindowOptions) -> Result<WindowKey, Error> {
+        let key = WindowKey(NEXT_KEY.fetch_add(1, Ordering::Relaxed));
+        let wake = self.wake_write.try_clone().map_err(err)?;
+        let state = State::new(&options, wake)?;
+        self.instances.push(Instance {
+            key,
+            state,
+            timer_deadline: None,
+            woken: false,
+            exit: false,
+        });
+        Ok(key)
+    }
+
+    pub fn parent_link(&self, key: WindowKey) -> Option<ParentLink> {
+        let i = self.instances.iter().find(|i| i.key == key)?;
+        Some(ParentLink(i.state.window))
+    }
+
+    /// Closes a window and its connection. GPU surfaces on it must go first.
+    pub fn close(&mut self, key: WindowKey) {
+        if let Some(at) = self.instances.iter().position(|i| i.key == key) {
+            let mut instance = self.instances.remove(at);
+            keep_clipboard(&mut instance.state);
+            instance.state.present.release(&instance.state.conn);
+            let window = instance.state.window;
+            let _ = x11rb::protocol::xproto::destroy_window(&*instance.state.conn, window);
+            let _ = instance.state.conn.flush();
+        }
+    }
+
+    /// The windows whose handlers asked to close them, through [`Ctx::exit`].
+    pub fn exited(&self) -> Vec<WindowKey> {
+        self.instances
+            .iter()
+            .filter(|i| i.exit || i.state.closed)
+            .map(|i| i.key)
+            .collect()
+    }
+
+    /// Hands every window what came for it, and draws those that are due. Doesn't wait.
+    pub fn dispatch<M: Handlers>(&mut self, handlers: &mut M) -> Result<(), Error> {
+        for instance in &mut self.instances {
+            if instance.exit {
+                continue;
+            }
+            if let Some(handler) = handlers.handler(instance.key) {
+                instance.turn(handler)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Waits until something comes for a window, or one of them has something to do.
+    pub fn wait<M: Handlers>(&mut self, handlers: &mut M) -> Result<(), Error> {
+        for i in &mut self.instances {
+            if i.exit || !i.state.events.is_empty() {
+                return Ok(());
+            }
+            // What came in while waiting for replies is already read off the socket, where poll
+            // wouldn't see it.
+            if let Some(event) = i.state.conn.poll_for_event().map_err(err)? {
+                i.state.handle(event);
+                return Ok(());
+            }
+        }
+        let now = Instant::now();
+        let mut deadline: Option<Instant> = None;
+        let mut earlier = |t: Instant| deadline = Some(deadline.map_or(t, |d| d.min(t)));
+        for i in &mut self.instances {
+            i.timer_deadline = handlers.handler(i.key).and_then(|h| h.deadline(now));
+            if let Some(t) = i.timer_deadline {
+                earlier(t);
+            }
+            if let Some(t) = i.state.redraw_at {
+                earlier(t);
+            }
+            if let Some(t) = i.state.selection_deadline() {
+                earlier(t);
+            }
+            if i.state.redraw_requested && i.state.mapped {
+                // A presentation the server doesn't answer is given up on after a while.
+                earlier(now + Duration::from_millis(50));
+            }
+        }
+        let timeout = deadline.map(|d| {
+            let dur = d.saturating_duration_since(now);
+            rustix::time::Timespec {
+                tv_sec: dur.as_secs() as _,
+                tv_nsec: dur.subsec_nanos() as _,
+            }
+        });
+        let mut fds: Vec<PollFd<'_>> = self
+            .instances
+            .iter()
+            .map(|i| PollFd::new(&*i.state.conn, PollFlags::IN))
+            .collect();
+        fds.push(PollFd::new(&self.wake_read, PollFlags::IN));
+        match rustix::event::poll(&mut fds, timeout.as_ref()) {
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(err(e)),
+        }
+        let woke = fds
+            .last()
+            .is_some_and(|f| f.revents().contains(PollFlags::IN));
+        drop(fds);
+        if woke {
+            let mut buf = [0u8; 64];
+            while matches!(rustix::io::read(&self.wake_read, &mut buf), Ok(n) if n > 0) {}
+            for i in &mut self.instances {
+                i.woken = true;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Opens a window alone and runs until its handler exits.
+pub fn run<H: X11Handler>(options: WindowOptions, handler: H) -> Result<(), Error> {
+    struct One<H>(WindowKey, H);
+    impl<H: X11Handler> Handlers for One<H> {
+        type Handler = H;
+        fn handler(&mut self, key: WindowKey) -> Option<&mut H> {
+            (key == self.0).then_some(&mut self.1)
+        }
+    }
+    let mut session = Session::connect()?;
+    let key = session.open(options)?;
+    let mut one = One(key, handler);
+    let result = (|| loop {
+        session.dispatch(&mut one)?;
+        if !session.exited().is_empty() {
+            return Ok(());
+        }
+        session.wait(&mut one)?;
+    })();
+    one.1.exit();
+    session.close(key);
     result
 }
 
@@ -423,15 +675,16 @@ fn keep_clipboard(state: &mut State) {
     }
 }
 
-fn run_loop<H: X11Handler>(
-    state: &mut State,
-    wake_read: &std::os::fd::OwnedFd,
-    handler: &mut H,
-) -> Result<(), Error> {
-    let mut exit = false;
-    let mut timer_deadline: Option<Instant> = None;
-    let mut woken = false;
-    loop {
+impl Instance {
+    /// What one pass of the event loop does for the window.
+    fn turn<H: X11Handler>(&mut self, handler: &mut H) -> Result<(), Error> {
+        let Instance {
+            state,
+            timer_deadline,
+            woken,
+            exit,
+            ..
+        } = self;
         while let Some(event) = state.conn.poll_for_event().map_err(err)? {
             state.handle(event);
         }
@@ -456,32 +709,22 @@ fn run_loop<H: X11Handler>(
             both
         });
         for ev in events {
-            let mut ctx = Ctx {
-                state,
-                exit: &mut exit,
-            };
+            let mut ctx = Ctx { state, exit };
             handler.event(&mut ctx, ev);
         }
         // Every position of a drop gets an answer, whether or not the core changed its mind.
         state.answer_positions();
-        if std::mem::take(&mut woken) {
-            let mut ctx = Ctx {
-                state,
-                exit: &mut exit,
-            };
+        if std::mem::take(woken) {
+            let mut ctx = Ctx { state, exit };
             handler.woken(&mut ctx);
         }
-        // The deadline we slept until; asking again now would give the one after it.
         if timer_deadline.is_some_and(|d| d <= Instant::now()) {
-            timer_deadline = None;
-            let mut ctx = Ctx {
-                state,
-                exit: &mut exit,
-            };
+            *timer_deadline = None;
+            let mut ctx = Ctx { state, exit };
             handler.timer(&mut ctx, Instant::now());
         }
-        if exit || state.closed {
-            break;
+        if *exit || state.closed {
+            return Ok(());
         }
 
         if state.redraw_at.is_some_and(|t| t <= Instant::now()) {
@@ -490,10 +733,7 @@ fn run_loop<H: X11Handler>(
         }
         if state.mapped {
             let ready = state.frame_wait(Instant::now()).is_ok();
-            let mut ctx = Ctx {
-                state,
-                exit: &mut exit,
-            };
+            let mut ctx = Ctx { state, exit };
             if ready {
                 handler.surfaces_ready(&mut ctx);
                 ctx.state.conn.flush().map_err(err)?;
@@ -506,56 +746,6 @@ fn run_loop<H: X11Handler>(
                 handler.frame(&mut ctx);
             }
         }
-
-        state.conn.flush().map_err(err)?;
-        if exit {
-            break;
-        }
-        if !state.events.is_empty() {
-            continue;
-        }
-        // What came in while waiting for replies is already read off the socket, where poll
-        // wouldn't see it.
-        if let Some(event) = state.conn.poll_for_event().map_err(err)? {
-            state.handle(event);
-            continue;
-        }
-
-        let now = Instant::now();
-        timer_deadline = handler.deadline(now);
-        let mut deadline = timer_deadline;
-        if let Some(t) = state.redraw_at {
-            deadline = Some(deadline.map_or(t, |d| d.min(t)));
-        }
-        if let Some(t) = state.selection_deadline() {
-            deadline = Some(deadline.map_or(t, |d| d.min(t)));
-        }
-        if state.redraw_requested && state.mapped {
-            // A presentation the server doesn't answer is given up on after a while.
-            let t = now + Duration::from_millis(50);
-            deadline = Some(deadline.map_or(t, |d| d.min(t)));
-        }
-        let timeout = deadline.map(|d| {
-            let dur = d.saturating_duration_since(now);
-            rustix::time::Timespec {
-                tv_sec: dur.as_secs() as _,
-                tv_nsec: dur.subsec_nanos() as _,
-            }
-        });
-        let mut fds = [
-            PollFd::new(&state.conn, PollFlags::IN),
-            PollFd::new(wake_read, PollFlags::IN),
-        ];
-        match rustix::event::poll(&mut fds, timeout.as_ref()) {
-            Ok(_) => {}
-            Err(rustix::io::Errno::INTR) => {}
-            Err(e) => return Err(err(e)),
-        }
-        if fds[1].revents().contains(PollFlags::IN) {
-            let mut buf = [0u8; 64];
-            while matches!(rustix::io::read(wake_read, &mut buf), Ok(n) if n > 0) {}
-            woken = true;
-        }
+        state.conn.flush().map_err(err)
     }
-    Ok(())
 }

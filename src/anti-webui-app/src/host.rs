@@ -7,6 +7,7 @@ use anti_webui_core::platform::{
     BufferEvent, BufferId, CursorIcon, DmabufFeedback, DmabufPlaneDesc, DragOffer, ImeState,
     PopupId, PopupParams, Presentation, SurfaceId, SyncPoints, TimelineId,
 };
+use anti_webui_core::window::ResizeEdge;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
@@ -26,6 +27,11 @@ pub(crate) trait Host {
     fn waker(&self) -> Option<Arc<dyn Fn() + Send + Sync>>;
     fn set_title(&mut self, title: &str);
     fn set_fullscreen(&mut self, on: bool);
+    fn start_move(&mut self);
+    fn start_resize(&mut self, edge: ResizeEdge);
+    fn minimize(&mut self);
+    fn set_maximized(&mut self, on: bool);
+    fn show_window_menu(&mut self);
     fn exit(&mut self);
     fn buffer_size(&self) -> SizeI;
 
@@ -117,6 +123,21 @@ macro_rules! host_for {
             }
             fn set_fullscreen(&mut self, on: bool) {
                 self.set_fullscreen(on)
+            }
+            fn start_move(&mut self) {
+                self.start_move()
+            }
+            fn start_resize(&mut self, edge: ResizeEdge) {
+                self.start_resize(edge)
+            }
+            fn minimize(&mut self) {
+                self.minimize()
+            }
+            fn set_maximized(&mut self, on: bool) {
+                self.set_maximized(on)
+            }
+            fn show_window_menu(&mut self) {
+                self.show_window_menu()
             }
             fn exit(&mut self) {
                 self.exit()

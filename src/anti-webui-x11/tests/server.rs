@@ -7,7 +7,8 @@ use anti_webui_core::event::{
 };
 use anti_webui_core::geometry::{PointI, RectI, Scale, SizeI};
 use anti_webui_core::platform::{DragOffer, Placement, PopupId, PopupKind, PopupParams};
-use anti_webui_x11::{Ctx, WindowOptions, X11Handler};
+use anti_webui_core::window::{DecorationMode, Decorations};
+use anti_webui_x11::{Ctx, ParentLink, WindowOptions, X11Handler};
 use std::process::{Child, Command};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Mutex, OnceLock};
@@ -123,15 +124,20 @@ struct App {
 
 impl App {
     fn start(title: &str) -> App {
+        Self::start_with(title, |_| {})
+    }
+
+    fn start_with(title: &str, change: impl FnOnce(&mut WindowOptions)) -> App {
         let (events_tx, events) = channel();
         let (todo, todo_rx) = channel();
-        let options = WindowOptions {
+        let mut options = WindowOptions {
             title: title.into(),
             app_id: "test".into(),
             width: 400,
             height: 300,
-            fullscreen: false,
+            ..Default::default()
         };
+        change(&mut options);
         let thread = std::thread::spawn(move || {
             let recorder = Recorder {
                 events: events_tx,
@@ -725,4 +731,43 @@ fn a_drag_goes_to_another_program_which_reads_it() {
     let ended = app.wait_for(|e| matches!(e, WindowEvent::DragSourceEnded(_)));
     assert_eq!(ended, WindowEvent::DragSourceEnded(DragResult::Copied));
     app.stop();
+}
+
+#[test]
+fn a_window_opened_above_another_says_so_and_can_draw_its_own_frame() {
+    let Some(_turn) = server() else { return };
+    let parent = App::start("parent");
+    let child = App::start_with("child", |o| {
+        o.parent = Some(ParentLink::from_window(parent.window));
+        o.modal = true;
+        o.decorations = DecorationMode::Client;
+    });
+    let read = |name: &str, kind: u32| {
+        let prop = atom(&child.conn, name);
+        child
+            .conn
+            .get_property(false, child.window, prop, kind, 0, 16)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .value32()
+            .map(|v| v.collect::<Vec<u32>>())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        read("WM_TRANSIENT_FOR", u32::from(AtomEnum::WINDOW)),
+        [parent.window]
+    );
+    let motif = atom(&child.conn, "_MOTIF_WM_HINTS");
+    assert_eq!(read("_MOTIF_WM_HINTS", motif), [2, 0, 0, 0, 0], "no frame");
+    let modal = atom(&child.conn, "_NET_WM_STATE_MODAL");
+    assert!(read("_NET_WM_STATE", u32::from(AtomEnum::ATOM)).contains(&modal));
+    let dialog = atom(&child.conn, "_NET_WM_WINDOW_TYPE_DIALOG");
+    assert_eq!(
+        read("_NET_WM_WINDOW_TYPE", u32::from(AtomEnum::ATOM)),
+        [dialog]
+    );
+    child.wait_for(|e| *e == WindowEvent::Decorations(Decorations::Client));
+    child.stop();
+    parent.stop();
 }

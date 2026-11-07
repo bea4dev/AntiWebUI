@@ -18,6 +18,7 @@ mod vsync;
 
 use anti_webui_core::settings::{Settings, update_settings};
 use anti_webui_core::view::IntoView;
+pub use anti_webui_core::window::DecorationMode;
 
 type SettingsChange = Box<dyn FnOnce(&mut Settings)>;
 
@@ -33,6 +34,7 @@ pub struct App {
     width: i32,
     height: i32,
     fullscreen: bool,
+    decorations: DecorationMode,
     settings: Vec<SettingsChange>,
 }
 
@@ -50,6 +52,7 @@ impl App {
             width: 800,
             height: 600,
             fullscreen: false,
+            decorations: DecorationMode::Auto,
             settings: Vec::new(),
         }
     }
@@ -77,6 +80,15 @@ impl App {
     /// [`set_window_fullscreen`]: anti_webui_core::view::set_window_fullscreen
     pub fn fullscreen(mut self, on: bool) -> Self {
         self.fullscreen = on;
+        self
+    }
+
+    /// Who draws the frame of the window: the system's where there is one by default. With
+    /// [`DecorationMode::Client`], or where the system has none (GNOME), the window has no title bar
+    /// unless it shows one, like `title_bar` of the standard widgets. See
+    /// [`window_decorations`](anti_webui_core::window::window_decorations).
+    pub fn decorations(mut self, mode: DecorationMode) -> Self {
+        self.decorations = mode;
         self
     }
 

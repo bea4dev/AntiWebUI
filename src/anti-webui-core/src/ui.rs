@@ -83,6 +83,10 @@ enum Scrolled {
 
 pub struct Ui {
     owner: Owner,
+    /// The window it works in (see `crate::window`).
+    pub(crate) window: u64,
+    /// [`Ui::close`] let the window go.
+    closed: bool,
     pub(crate) pointer: Option<PointF>,
     pub(crate) modifiers: Modifiers,
     pub(crate) press: Option<Press>,
@@ -136,6 +140,59 @@ enum PointerKind {
 impl Ui {
     /// Mounts `root` as the window content.
     pub fn new<V: IntoView>(root: impl FnOnce() -> V) -> Self {
+        let window = crate::window::claim_for_ui();
+        Self::mount(window, || root().into_view())
+    }
+
+    /// Opens a window that [`open_window`](crate::window::open_window) or
+    /// [`spawn_window`](crate::window::spawn_window) asked for, on this thread.
+    #[doc(hidden)]
+    pub fn open(request: crate::window::OpenRequest) -> Self {
+        let window = crate::window::claim_new(
+            &request.handle,
+            request.parent.clone(),
+            request.options.modal,
+        );
+        Self::mount(window, request.root)
+    }
+
+    /// Lets the window go: what its root owns is disposed, and its cleanups run.
+    #[doc(hidden)]
+    pub fn close(mut self) {
+        crate::window::activate(self.window);
+        self.owner.dispose();
+        crate::window::close_active();
+        self.closed = true;
+    }
+
+    #[doc(hidden)]
+    pub fn window(&self) -> crate::window::WindowId {
+        crate::window::WindowId::from_raw(self.window)
+    }
+
+    /// Does what a [`WindowHandle`](crate::window::WindowHandle) asked of this window, but for
+    /// closing it, which the app does with [`Ui::close`].
+    #[doc(hidden)]
+    pub fn apply(&mut self, command: crate::window::Command) {
+        use crate::window::Command;
+        crate::window::activate(self.window);
+        match command {
+            Command::Close => with_doc(|d| d.request(PlatformRequest::Close)),
+            Command::RequestClose => crate::window::request_close_window(),
+            Command::SetTitle(title) => crate::window::set_window_title(title),
+            Command::ModalChild(opened) => {
+                let was = crate::window::blocked();
+                crate::window::modal_child(opened);
+                if !was && crate::window::blocked() {
+                    self.cancel_press();
+                    self.end_scroll_gesture();
+                    self.set_hovered(Vec::new());
+                }
+            }
+        }
+    }
+
+    fn mount(window: u64, root: impl FnOnce() -> crate::view::View) -> Self {
         let ((), owner) = create_root(|| {
             let mut node = Node::new(NodeKind::Element);
             node.style.base = Style {
@@ -145,7 +202,7 @@ impl Ui {
                 ..Default::default()
             };
             let root_id = with_doc(|d| d.create(node));
-            let view = root().into_view();
+            let view = root();
             with_doc(|d| {
                 d.root = Some(root_id);
                 d.set_children(root_id, vec![view.0]);
@@ -153,6 +210,8 @@ impl Ui {
         });
         Self {
             owner,
+            window,
+            closed: false,
             pointer: None,
             modifiers: Modifiers::default(),
             press: None,
@@ -174,6 +233,7 @@ impl Ui {
 
     /// Recomputes styles, layout and positions as needed.
     pub fn update(&mut self) {
+        crate::window::activate(self.window);
         crate::view::sync_fullscreen();
         self.start_requested_drag();
         self.do_access_actions();
@@ -383,12 +443,14 @@ impl Ui {
     }
 
     pub fn needs_redraw(&self) -> bool {
+        crate::window::activate(self.window);
         self.animating()
             || with_doc(|d| d.dirty.paint || !d.scrolled.is_empty() || Self::needs_update(d))
     }
 
     /// Whether frames must keep coming even if nothing else changes. See [`Ui::animate`].
     pub fn animating(&self) -> bool {
+        crate::window::activate(self.window);
         self.fling.is_some()
             || self.edge.is_some()
             || animation::frame_requested()
@@ -400,6 +462,7 @@ impl Ui {
     /// Takes in the pictures that have been decoded. Call on the UI thread when the waker says so;
     /// frames do it anyway. See `docs/design/22-images.md`.
     pub fn poll_images(&mut self) {
+        crate::window::activate(self.window);
         let tells = with_doc(crate::images::poll);
         let video_tells = with_doc(|d| crate::video::poll(d, Instant::now()));
         batch(|| {
@@ -417,30 +480,35 @@ impl Ui {
     /// `docs/design/24-video.md`.
     #[doc(hidden)]
     pub fn set_video_timing(&mut self, timing: Option<crate::video::VideoTiming>) {
+        crate::window::activate(self.window);
         with_doc(|d| d.videos.get_mut().set_timing(timing));
     }
 
     /// The GPU that draws, for decoders to work on. Only videos opened after this use it.
     #[doc(hidden)]
     pub fn set_video_render_node(&mut self, node: Option<std::path::PathBuf>) {
+        crate::window::activate(self.window);
         with_doc(|d| d.videos.get_mut().set_render_node(node));
     }
 
     /// The renderer can't read what the decoders leave behind: frames come in memory from now on.
     #[doc(hidden)]
     pub fn video_use_memory(&mut self) {
+        crate::window::activate(self.window);
         with_doc(|d| d.videos.get_mut().use_memory());
     }
 
     /// How many videos there are, and frames waiting to be shown, for tests.
     #[doc(hidden)]
     pub fn video_counts(&mut self) -> (usize, usize) {
+        crate::window::activate(self.window);
         with_doc(|d| d.videos.get_mut().counts())
     }
 
     /// Called from another thread when there are pictures for [`Ui::poll_images`].
     #[doc(hidden)]
     pub fn set_image_waker(&mut self, waker: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        crate::window::activate(self.window);
         crate::channel::set_waker(waker.clone());
         with_doc(|d| {
             d.videos.get_mut().set_waker(waker.clone());
@@ -451,6 +519,7 @@ impl Ui {
     /// Waits for all the pictures that are wanted to arrive, for tests and screenshots: a window
     /// never waits for them. Returns whether there are any.
     pub fn wait_for_images(&mut self, timeout: std::time::Duration) -> bool {
+        crate::window::activate(self.window);
         let end = Instant::now() + timeout;
         loop {
             self.poll_images();
@@ -496,6 +565,7 @@ impl Ui {
 
     /// Advances animations to `now`. Call before [`Ui::update`] when producing a frame.
     pub fn animate(&mut self, now: Instant) {
+        crate::window::activate(self.window);
         self.poll_images();
         animation::run_frame_callbacks(now);
         with_doc(|d| animation::advance_transitions(d, now));
@@ -515,11 +585,13 @@ impl Ui {
 
     /// Produces the window's part of the frame. Call [`Ui::update`] first.
     pub fn paint(&mut self, now: Instant) -> Scene {
+        crate::window::activate(self.window);
         self.paint_frame(now).window
     }
 
     /// Produces the frame. Call [`Ui::update`] first.
     pub fn paint_frame(&mut self, now: Instant) -> Frame {
+        crate::window::activate(self.window);
         with_doc(|d| {
             let frame = paint_document(d, now);
             d.dirty.paint = false;
@@ -619,11 +691,13 @@ impl Ui {
     }
 
     pub fn take_requests(&mut self) -> Vec<PlatformRequest> {
+        crate::window::activate(self.window);
         with_doc(|d| std::mem::take(&mut d.requests))
     }
 
     /// The next time the UI needs to run without input: timers and the blinking caret.
     pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        crate::window::activate(self.window);
         let caret = with_doc(|d| {
             let id = d.state.focused?;
             if !d.state.window_focused {
@@ -649,6 +723,7 @@ impl Ui {
 
     /// Call when a deadline from [`Ui::next_deadline`] passes.
     pub fn tick(&mut self, now: Instant) {
+        crate::window::activate(self.window);
         animation::run_timers(now);
         let tells = with_doc(|d| crate::video::advance(d, now));
         if !tells.is_empty() {
@@ -671,10 +746,27 @@ impl Ui {
     }
 
     pub fn scale(&self) -> Scale {
+        crate::window::activate(self.window);
         with_doc(|d| d.scale)
     }
 
     pub fn handle_event(&mut self, event: WindowEvent) {
+        crate::window::activate(self.window);
+        // A modal window it opened has the input until it closes.
+        if crate::window::blocked()
+            && matches!(
+                event,
+                WindowEvent::PointerMoved { .. }
+                    | WindowEvent::PointerButton { .. }
+                    | WindowEvent::Scroll { .. }
+                    | WindowEvent::Pinch { .. }
+                    | WindowEvent::Key(_)
+                    | WindowEvent::Ime(_)
+                    | WindowEvent::CloseRequested
+            )
+        {
+            return;
+        }
         match event {
             WindowEvent::Resized { size, scale } => self.resize(size, scale),
             WindowEvent::PointerMoved {
@@ -744,6 +836,7 @@ impl Ui {
             WindowEvent::Ime(update) => self.ime(update),
             WindowEvent::Paste { text, .. } => self.paste(text),
             WindowEvent::Focused(focused) => {
+                crate::window::tell_active(focused);
                 with_doc(|d| {
                     d.state.window_focused = focused;
                     if let Some(id) = d.state.focused
@@ -767,7 +860,9 @@ impl Ui {
                 with_doc(|d| d.window_fullscreen_changed(on));
                 crate::view::sync_fullscreen();
             }
-            WindowEvent::CloseRequested => with_doc(|d| d.request(PlatformRequest::Close)),
+            WindowEvent::CloseRequested => crate::window::request_close_window(),
+            WindowEvent::Maximized(on) => crate::window::tell_maximized(on),
+            WindowEvent::Decorations(decorations) => crate::window::tell_decorations(decorations),
             WindowEvent::PopupConfigured { id, origin, size } => {
                 self.popup_configured(id, origin, size)
             }
@@ -2175,7 +2270,10 @@ impl Ui {
 
 impl Drop for Ui {
     fn drop(&mut self) {
-        self.owner.dispose();
+        if !self.closed {
+            self.owner.dispose();
+            crate::window::release(self.window);
+        }
     }
 }
 

@@ -244,16 +244,19 @@ impl World {
     }
 
     /// All that the window says from now until it has said something and then nothing for a while.
+    /// What the window was told, but for who draws its frame: without xdg-decoration it is the
+    /// window itself, which it hears once.
     fn events(&mut self) -> Vec<WindowEvent> {
+        let told = |e: &WindowEvent| !matches!(e, WindowEvent::Decorations(_));
         let mut got = Vec::new();
         self.until("an event", |w| {
-            got.extend(w.events.try_iter());
+            got.extend(w.events.try_iter().filter(told));
             !got.is_empty()
         });
         let end = Instant::now() + Duration::from_millis(50);
         while Instant::now() < end {
             self.pump();
-            got.extend(self.events.try_iter());
+            got.extend(self.events.try_iter().filter(told));
             std::thread::sleep(Duration::from_millis(1));
         }
         got
@@ -290,6 +293,7 @@ fn setup(fullscreen: bool) -> World {
             width: 300,
             height: 200,
             fullscreen,
+            ..Default::default()
         };
         // It ends with an error when the compositor of this test goes away.
         let _ = run(options, window);

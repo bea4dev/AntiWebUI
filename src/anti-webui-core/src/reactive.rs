@@ -53,6 +53,8 @@ struct Node {
     owned: Vec<ReactiveId>,
     cleanups: Vec<Box<dyn FnOnce()>>,
     depth: u32,
+    /// The window it was made in, which it runs in (see `crate::window`).
+    window: u64,
 }
 
 #[derive(Default)]
@@ -85,10 +87,10 @@ impl Runtime {
         compute: Option<Compute>,
     ) -> ReactiveId {
         let owner = self.owner;
-        let depth = owner
-            .and_then(|o| self.nodes.get(o))
-            .map(|n| n.depth + 1)
-            .unwrap_or(0);
+        let (depth, window) = match owner.and_then(|o| self.nodes.get(o)) {
+            Some(o) => (o.depth + 1, o.window),
+            None => (0, crate::window::active_id()),
+        };
         let id = self.nodes.insert(Node {
             kind,
             state: if compute.is_some() {
@@ -105,6 +107,7 @@ impl Runtime {
             owned: Vec::new(),
             cleanups: Vec::new(),
             depth,
+            window,
         });
         if let Some(owner) = owner
             && let Some(o) = self.nodes.get_mut(owner)
@@ -237,13 +240,25 @@ fn dispose_collect(id: ReactiveId) -> Vec<Box<dyn FnOnce()>> {
 }
 
 fn dispose(id: ReactiveId) {
+    let _window = crate::window::Enter::new(window_of(id));
     for cleanup in dispose_collect(id) {
         cleanup();
     }
 }
 
+/// The window a node runs in; 0 if it is gone.
+fn window_of(id: ReactiveId) -> u64 {
+    with_rt(|rt| rt.nodes.get(id).map_or(0, |n| n.window))
+}
+
+/// Whether something reading a value now would be subscribed to it.
+pub(crate) fn is_tracking() -> bool {
+    !UNTRACK.with(|u| u.get()) && with_rt(|rt| rt.observer.is_some())
+}
+
 /// Re-runs the computation `id`.
 fn run(id: ReactiveId) {
+    let _window = crate::window::Enter::new(window_of(id));
     for cleanup in take_owned(id) {
         cleanup();
     }
@@ -388,8 +403,9 @@ impl Owner {
         with_rt(|rt| rt.owner.map(Owner))
     }
 
-    /// Runs `f` with `self` as the current owner (and no tracking observer).
+    /// Runs `f` with `self` as the current owner (and no tracking observer), in its window.
     pub fn with<R>(self, f: impl FnOnce() -> R) -> R {
+        let _window = crate::window::Enter::new(window_of(self.0));
         let prev = with_rt(|rt| (rt.owner.replace(self.0), rt.observer.take()));
         let r = f();
         with_rt(|rt| {

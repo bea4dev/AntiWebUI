@@ -321,16 +321,34 @@ thread_local! {
     static NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// What each window has of its own here; see `crate::window`.
+#[derive(Default)]
+pub(crate) struct Locals {
+    watchers: Vec<(u64, Watcher)>,
+    last: Option<AccessTree>,
+}
+
+/// Trades what the window being worked on has for `other`.
+pub(crate) fn swap_locals(other: &mut Locals) {
+    WATCHERS.with(|w| std::mem::swap(&mut *w.borrow_mut(), &mut other.watchers));
+    LAST.with(|l| std::mem::swap(&mut *l.borrow_mut(), &mut other.last));
+}
+
 /// What [`watch`] gives back: dropping it doesn't stop the watching; [`stop`](Self::stop) does.
 #[derive(Clone, Copy, Debug)]
-pub struct AccessWatch(u64);
+pub struct AccessWatch {
+    id: u64,
+    window: u64,
+}
 
 impl AccessWatch {
     pub fn stop(self) {
-        WATCHERS.with(|w| w.borrow_mut().retain(|(id, _)| *id != self.0));
-        if WATCHERS.with(|w| w.borrow().is_empty()) {
-            LAST.with(|l| l.borrow_mut().take());
-        }
+        crate::window::within(self.window, || {
+            WATCHERS.with(|w| w.borrow_mut().retain(|(id, _)| *id != self.id));
+            if WATCHERS.with(|w| w.borrow().is_empty()) {
+                LAST.with(|l| l.borrow_mut().take());
+            }
+        });
     }
 }
 
@@ -343,7 +361,10 @@ pub fn watch(f: impl Fn(&AccessTree) + 'static) -> AccessWatch {
     LAST.with(|l| *l.borrow_mut() = Some(tree));
     WATCHERS.with(|w| w.borrow_mut().push((id, Rc::new(f))));
     with_doc(|d| d.access_stale = true);
-    AccessWatch(id)
+    AccessWatch {
+        id,
+        window: crate::window::active_id(),
+    }
 }
 
 /// Tells the watchers, if there are any and the tree changed. Called at the end of an update.

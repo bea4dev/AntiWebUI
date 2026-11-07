@@ -62,7 +62,11 @@ pub(crate) struct State {
     pub mapped: bool,
     pub closed: bool,
     pub exposed: bool,
-    fullscreen: Option<bool>,
+    pub(crate) fullscreen: Option<bool>,
+    pub(crate) maximized: bool,
+    pub(crate) decorations: anti_webui_core::window::Decorations,
+    /// The edge the pointer is on, for a window with a frame of its own.
+    pub(crate) border: Option<anti_webui_core::window::ResizeEdge>,
 
     pub kb: Option<Keyboard>,
     ime: Option<Ime>,
@@ -80,8 +84,8 @@ pub(crate) struct State {
     pub pointer: PointF,
     /// Which of our windows the pointer is on, for the cursor.
     pointer_window: Window,
-    cursors: Cursors,
-    cursor: CursorIcon,
+    pub(crate) cursors: Cursors,
+    pub(crate) cursor: CursorIcon,
 
     /// `_NET_WM_SYNC_REQUEST`: the counter, the value asked for, and the value to set after the
     /// next frame of the new size.
@@ -152,6 +156,14 @@ impl State {
             closed: false,
             exposed: false,
             fullscreen: None,
+            maximized: false,
+            decorations: match options.decorations {
+                anti_webui_core::window::DecorationMode::Client => {
+                    anti_webui_core::window::Decorations::Client
+                }
+                _ => anti_webui_core::window::Decorations::Server,
+            },
+            border: None,
             kb: None,
             ime: None,
             ime_wanted: None,
@@ -273,14 +285,40 @@ impl State {
             &protocols,
         )
         .map_err(err)?;
+        let kind = if options.modal {
+            a._NET_WM_WINDOW_TYPE_DIALOG
+        } else {
+            a._NET_WM_WINDOW_TYPE_NORMAL
+        };
         conn.change_property32(
             PropMode::REPLACE,
             window,
             a._NET_WM_WINDOW_TYPE,
             u32::from(AtomEnum::ATOM),
-            &[a._NET_WM_WINDOW_TYPE_NORMAL],
+            &[kind],
         )
         .map_err(err)?;
+        if let Some(parent) = &options.parent {
+            conn.change_property32(
+                PropMode::REPLACE,
+                window,
+                AtomEnum::WM_TRANSIENT_FOR,
+                AtomEnum::WINDOW,
+                &[parent.0],
+            )
+            .map_err(err)?;
+        }
+        if self.decorations == anti_webui_core::window::Decorations::Client {
+            // Motif's hints: the decorations field (flag 2) is set, to none.
+            conn.change_property32(
+                PropMode::REPLACE,
+                window,
+                a._MOTIF_WM_HINTS,
+                a._MOTIF_WM_HINTS,
+                &[2, 0, 0, 0, 0],
+            )
+            .map_err(err)?;
+        }
         let hints = WmSizeHints {
             size: Some((
                 x11rb::properties::WmSizeHintsSpecification::ProgramSpecified,
@@ -290,13 +328,20 @@ impl State {
             ..Default::default()
         };
         hints.set_normal_hints(conn, window).map_err(err)?;
+        let mut states = Vec::new();
         if options.fullscreen {
+            states.push(a._NET_WM_STATE_FULLSCREEN);
+        }
+        if options.modal && options.parent.is_some() {
+            states.push(a._NET_WM_STATE_MODAL);
+        }
+        if !states.is_empty() {
             conn.change_property32(
                 PropMode::REPLACE,
                 window,
                 a._NET_WM_STATE,
                 u32::from(AtomEnum::ATOM),
-                &[a._NET_WM_STATE_FULLSCREEN],
+                &states,
             )
             .map_err(err)?;
         }
@@ -311,6 +356,7 @@ impl State {
             scale: self.scale,
         });
         self.size_announced = Some((self.size, self.scale));
+        self.events.push(WindowEvent::Decorations(self.decorations));
         Ok(())
     }
 
@@ -727,7 +773,7 @@ impl State {
             Event::PropertyNotify(e) => {
                 self.selection_property(e.window, e.atom, selection::deleted(e.state));
                 if e.window == self.window && e.atom == self.atoms._NET_WM_STATE {
-                    self.read_fullscreen();
+                    self.read_states();
                 } else if (e.window == self.root && e.atom == u32::from(AtomEnum::RESOURCE_MANAGER))
                     || (Some(e.window) == self.xsettings
                         && e.atom == self.atoms._XSETTINGS_SETTINGS)
@@ -743,6 +789,10 @@ impl State {
                 self.last_time = e.time;
                 self.drag_release(e.time);
             }
+            Event::XinputMotion(e)
+                if e.event == self.window
+                    && self
+                        .pointer_on_border(input::fp1616(e.event_x), input::fp1616(e.event_y)) => {}
             Event::XinputMotion(e) if self.origin_of(e.event).is_some() => {
                 let position = self.position(e.event, e.event_x, e.event_y);
                 self.pointer = position;
@@ -763,6 +813,13 @@ impl State {
             {
                 let pressed = e.event_type == xinput::BUTTON_PRESS_EVENT;
                 self.last_time = e.time;
+                if e.event == self.window && self.border.is_some() {
+                    if pressed {
+                        let (x, y) = (input::fp1616(e.root_x), input::fp1616(e.root_y));
+                        self.press_on_border(x, y, e.detail);
+                    }
+                    return;
+                }
                 let (x, y) = (input::fp1616(e.event_x), input::fp1616(e.event_y));
                 if pressed && self.press_outside(e.event, x, y) {
                     self.dismiss(&[PopupKind::Menu]);
@@ -797,6 +854,7 @@ impl State {
                     self.events.pop();
                 }
                 self.scroll.forget_positions();
+                self.border = None;
                 self.pointer = self.position(e.event, e.event_x, e.event_y);
                 self.pointer_window = e.event;
                 let cursor = self.cursor;
@@ -804,7 +862,10 @@ impl State {
             }
             Event::XinputLeave(e) if self.origin_of(e.event).is_some() => {
                 // A grab that keeps the pointer on us isn't leaving.
-                if e.mode != xinput::NotifyMode::GRAB && e.mode != xinput::NotifyMode::UNGRAB {
+                if e.mode != xinput::NotifyMode::GRAB
+                    && e.mode != xinput::NotifyMode::UNGRAB
+                    && self.border.take().is_none()
+                {
                     self.events.push(WindowEvent::PointerLeft);
                 }
             }
@@ -944,8 +1005,21 @@ impl State {
         });
     }
 
-    fn read_fullscreen(&mut self) {
+    pub(crate) fn wm_supports(&self, atom: Atom) -> bool {
+        self.wm_supported.contains(&atom)
+    }
+
+    fn read_states(&mut self) {
         let states = self.read_atoms(self.window, self.atoms._NET_WM_STATE);
+        let maximized = crate::decor::maximized(
+            &states,
+            self.atoms._NET_WM_STATE_MAXIMIZED_VERT,
+            self.atoms._NET_WM_STATE_MAXIMIZED_HORZ,
+        );
+        if maximized != self.maximized {
+            self.maximized = maximized;
+            self.events.push(WindowEvent::Maximized(maximized));
+        }
         let on = states.contains(&self.atoms._NET_WM_STATE_FULLSCREEN);
         if self.fullscreen != Some(on) {
             let was = self.fullscreen.replace(on);

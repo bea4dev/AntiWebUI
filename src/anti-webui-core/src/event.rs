@@ -225,6 +225,10 @@ pub enum WindowEvent {
     Focused(bool),
     /// The window went on all of the screen or came off it, for whatever reason.
     Fullscreen(bool),
+    /// The window came to fill the screen but for panels, or stopped.
+    Maximized(bool),
+    /// Who draws the frame of the window, as agreed with the system.
+    Decorations(crate::window::Decorations),
     CloseRequested,
     /// The platform placed a popup. `origin` is its surface's origin in window coordinates, the
     /// coordinates of all pointer events; `size` the logical size granted to its box.

@@ -18,6 +18,7 @@ mod slider;
 mod sortable;
 mod structure;
 mod theme;
+mod title_bar;
 mod toast;
 mod tooltip;
 
@@ -39,5 +40,6 @@ pub use slider::*;
 pub use sortable::*;
 pub use structure::*;
 pub use theme::{Theme, focus_ring, page, set_theme, theme, themed};
+pub use title_bar::*;
 pub use toast::*;
 pub use tooltip::*;

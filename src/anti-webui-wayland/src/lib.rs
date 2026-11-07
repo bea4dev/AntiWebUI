@@ -1,5 +1,6 @@
 //! The Wayland backend (see `docs/design/06-platform-wayland.md`).
 
+mod decor;
 mod drag;
 mod keyboard;
 mod main_device;
@@ -15,6 +16,7 @@ pub use anti_webui_core::platform::{
 use anti_webui_core::event::{ClipboardKind, DragAction, WindowEvent};
 use anti_webui_core::geometry::{PointI, RectI, Scale, SizeI};
 use anti_webui_core::platform::{CursorIcon, DragOffer, ImeState, PopupId, PopupParams};
+use anti_webui_core::window::{DecorationMode, Decorations, ResizeEdge};
 pub use main_device::compositor_main_device;
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
@@ -22,12 +24,13 @@ use raw_window_handle::{
 use rustix::event::{PollFd, PollFlags};
 use state::State;
 pub use state::SurfaceId;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_compositor, wl_seat, wl_subcompositor};
+use wayland_client::protocol::{wl_compositor, wl_seat, wl_shm, wl_subcompositor};
 use wayland_client::{Connection, Proxy};
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1;
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1;
@@ -41,7 +44,8 @@ use wayland_protocols::wp::viewporter::client::wp_viewporter;
 use wayland_protocols::xdg::decoration::zv1::client::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
 };
-use wayland_protocols::xdg::shell::client::xdg_wm_base;
+use wayland_protocols::xdg::dialog::v1::client::xdg_wm_dialog_v1;
+use wayland_protocols::xdg::shell::client::{xdg_toplevel, xdg_wm_base};
 
 #[derive(Debug)]
 pub struct Error(String);
@@ -66,6 +70,26 @@ pub struct WindowOptions {
     pub height: i32,
     /// Whether it opens on all of the screen.
     pub fullscreen: bool,
+    pub decorations: DecorationMode,
+    /// What it stays above.
+    pub parent: Option<ParentLink>,
+    /// Keeps input from the parent, if the compositor supports `xdg-dialog`.
+    pub modal: bool,
+}
+
+impl Default for WindowOptions {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            app_id: String::new(),
+            width: 640,
+            height: 480,
+            fullscreen: false,
+            decorations: DecorationMode::Auto,
+            parent: None,
+            modal: false,
+        }
+    }
 }
 
 /// Callbacks from the event loop.
@@ -174,6 +198,33 @@ impl Ctx<'_> {
 
     pub fn exit(&mut self) {
         *self.exit = true;
+    }
+
+    /// Lets the compositor move the window with the pointer, from the press going on.
+    pub fn start_move(&mut self) {
+        self.state.start_move();
+    }
+
+    /// Lets the compositor resize the window from an edge, from the press going on.
+    pub fn start_resize(&mut self, edge: ResizeEdge) {
+        self.state.start_resize(edge);
+    }
+
+    pub fn minimize(&mut self) {
+        self.state.toplevel.set_minimized();
+    }
+
+    pub fn set_maximized(&mut self, on: bool) {
+        if on {
+            self.state.toplevel.set_maximized();
+        } else {
+            self.state.toplevel.unset_maximized();
+        }
+    }
+
+    /// The compositor's menu for the window, where the pointer is.
+    pub fn show_window_menu(&mut self) {
+        self.state.show_window_menu();
     }
 
     pub fn buffer_size(&self) -> SizeI {
@@ -372,10 +423,232 @@ pub fn can_connect() -> bool {
     Connection::connect_to_env().is_ok()
 }
 
-/// Opens a window and runs the event loop until the handler exits.
-pub fn run<H: WaylandHandler>(options: WindowOptions, mut handler: H) -> Result<(), Error> {
-    let conn = Connection::connect_to_env().map_err(err)?;
-    let (globals, mut queue) = registry_queue_init::<State>(&conn).map_err(err)?;
+/// A window of a [`Session`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WindowKey(u64);
+
+static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
+
+/// What a thread needs to open windows on the connection of another (see
+/// `docs/design/36-multi-window.md`).
+pub struct SessionShare(Connection);
+
+/// A window to open others above, from any thread.
+#[derive(Clone)]
+pub struct ParentLink(xdg_toplevel::XdgToplevel);
+
+/// Who a session's windows call: the handler of each.
+pub trait Handlers {
+    type Handler: WaylandHandler;
+    fn handler(&mut self, key: WindowKey) -> Option<&mut Self::Handler>;
+}
+
+/// One window: its own queue and protocol objects, as if it were alone. Several share a thread's
+/// [`Session`], which reads for all of them.
+struct Instance {
+    key: WindowKey,
+    queue: wayland_client::EventQueue<State>,
+    state: State,
+    paste_rx: mpsc::Receiver<(ClipboardKind, String)>,
+    /// The deadline the session slept until; asking again now would give the one after it.
+    timer_deadline: Option<Instant>,
+    woken: bool,
+    exit: bool,
+}
+
+/// The windows of a thread, on a connection it may share with other threads.
+pub struct Session {
+    conn: Connection,
+    wl_fd: OwnedFd,
+    wake_read: OwnedFd,
+    wake_write: OwnedFd,
+    instances: Vec<Instance>,
+}
+
+impl Session {
+    /// Connects to the compositor.
+    pub fn connect() -> Result<Self, Error> {
+        Self::on(Connection::connect_to_env().map_err(err)?)
+    }
+
+    /// Uses the connection of another thread's session.
+    pub fn join(share: SessionShare) -> Result<Self, Error> {
+        Self::on(share.0)
+    }
+
+    fn on(conn: Connection) -> Result<Self, Error> {
+        let (wake_read, wake_write) = rustix::pipe::pipe_with(
+            rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
+        )
+        .map_err(err)?;
+        let wl_fd = conn.as_fd().try_clone_to_owned().map_err(err)?;
+        Ok(Self {
+            conn,
+            wl_fd,
+            wake_read,
+            wake_write,
+            instances: Vec::new(),
+        })
+    }
+
+    pub fn share(&self) -> SessionShare {
+        SessionShare(self.conn.clone())
+    }
+
+    /// Something another thread can call to wake up the session, which then calls
+    /// [`WaylandHandler::woken`] of every window.
+    pub fn waker(&self) -> Option<impl Fn() + Send + Sync + use<>> {
+        let wake = self.wake_write.try_clone().ok()?;
+        Some(move || {
+            let _ = rustix::io::write(&wake, &[1]);
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.instances.is_empty()
+    }
+
+    /// Opens a window. It shows once its handler presents a first frame.
+    pub fn open(&mut self, options: WindowOptions) -> Result<WindowKey, Error> {
+        let key = WindowKey(NEXT_KEY.fetch_add(1, Ordering::Relaxed));
+        let wake = self.wake_write.try_clone().map_err(err)?;
+        let instance = open_instance(&self.conn, key, options, wake)?;
+        self.instances.push(instance);
+        Ok(key)
+    }
+
+    /// For opening windows above this one, from any thread.
+    pub fn parent_link(&self, key: WindowKey) -> Option<ParentLink> {
+        let i = self.instances.iter().find(|i| i.key == key)?;
+        Some(ParentLink(i.state.toplevel.clone()))
+    }
+
+    /// Closes a window. GPU surfaces on it must go first.
+    pub fn close(&mut self, key: WindowKey) {
+        if let Some(at) = self.instances.iter().position(|i| i.key == key) {
+            let mut instance = self.instances.remove(at);
+            instance.state.destroy();
+            let _ = instance.queue.dispatch_pending(&mut instance.state);
+            let _ = self.conn.flush();
+        }
+    }
+
+    /// The windows whose handlers asked to close them, through [`Ctx::exit`].
+    pub fn exited(&self) -> Vec<WindowKey> {
+        self.instances
+            .iter()
+            .filter(|i| i.exit || i.state.closed)
+            .map(|i| i.key)
+            .collect()
+    }
+
+    /// Hands every window what came for it, and draws those that are due. Doesn't wait.
+    pub fn dispatch<M: Handlers>(&mut self, handlers: &mut M) -> Result<(), Error> {
+        for instance in &mut self.instances {
+            if instance.exit {
+                continue;
+            }
+            let Some(handler) = handlers.handler(instance.key) else {
+                continue;
+            };
+            instance.turn(&self.conn, handler)?;
+        }
+        self.conn.flush().map_err(err)
+    }
+
+    /// Waits until something comes for a window, or one of them has something to do.
+    pub fn wait<M: Handlers>(&mut self, handlers: &mut M) -> Result<(), Error> {
+        let busy = |instances: &[Instance]| {
+            instances
+                .iter()
+                .any(|i| i.exit || !i.state.events.is_empty())
+        };
+        if busy(&self.instances) {
+            return Ok(());
+        }
+        for i in &mut self.instances {
+            i.queue.dispatch_pending(&mut i.state).map_err(err)?;
+        }
+        if busy(&self.instances) {
+            return Ok(());
+        }
+        let Some(guard) = self.conn.prepare_read() else {
+            return Ok(());
+        };
+        // Another thread on the connection may have read for these queues since: from here on it
+        // waits for this one to read too.
+        let mut more = 0;
+        for i in &mut self.instances {
+            more += i.queue.dispatch_pending(&mut i.state).map_err(err)?;
+        }
+        if more > 0 || busy(&self.instances) {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let mut deadline: Option<Instant> = None;
+        let mut earlier = |t: Instant| deadline = Some(deadline.map_or(t, |d| d.min(t)));
+        for i in &mut self.instances {
+            i.timer_deadline = handlers.handler(i.key).and_then(|h| h.deadline(now));
+            if let Some(t) = i.timer_deadline {
+                earlier(t);
+            }
+            if let Some(r) = &i.state.kb.repeat {
+                earlier(r.next);
+            }
+            if let Some(t) = i.state.redraw_at {
+                earlier(t);
+            }
+            if i.state.redraw_requested
+                && let Err(Some(t)) = i.state.frame_wait(now)
+            {
+                earlier(t);
+            }
+        }
+        let timeout = deadline.map(|d| {
+            let dur = d.saturating_duration_since(now);
+            rustix::time::Timespec {
+                tv_sec: dur.as_secs() as _,
+                tv_nsec: dur.subsec_nanos() as _,
+            }
+        });
+        let mut fds = [
+            PollFd::new(&self.wl_fd, PollFlags::IN),
+            PollFd::new(&self.wake_read, PollFlags::IN),
+        ];
+        match rustix::event::poll(&mut fds, timeout.as_ref()) {
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(err(e)),
+        }
+        let wl_ready = fds[0].revents().contains(PollFlags::IN);
+        let wake_ready = fds[1].revents().contains(PollFlags::IN);
+        if wl_ready {
+            if let Err(e) = guard.read()
+                && !matches!(e, wayland_client::backend::WaylandError::Io(ref io) if io.kind() == std::io::ErrorKind::WouldBlock)
+            {
+                return Err(err(e));
+            }
+        } else {
+            drop(guard);
+        }
+        if wake_ready {
+            let mut buf = [0u8; 64];
+            while matches!(rustix::io::read(&self.wake_read, &mut buf), Ok(n) if n > 0) {}
+            for i in &mut self.instances {
+                i.woken = true;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn open_instance(
+    conn: &Connection,
+    key: WindowKey,
+    options: WindowOptions,
+    wake: OwnedFd,
+) -> Result<Instance, Error> {
+    let (globals, mut queue) = registry_queue_init::<State>(conn).map_err(err)?;
     let qh = queue.handle();
 
     let compositor: wl_compositor::WlCompositor = globals.bind(&qh, 4..=6, ()).map_err(err)?;
@@ -385,15 +658,14 @@ pub fn run<H: WaylandHandler>(options: WindowOptions, mut handler: H) -> Result<
     let toplevel = xdg_surface.get_toplevel(&qh, ());
     toplevel.set_title(options.title.clone());
     toplevel.set_app_id(options.app_id.clone());
+    if let Some(parent) = &options.parent {
+        toplevel.set_parent(Some(&parent.0));
+    }
     if options.fullscreen {
         toplevel.set_fullscreen(None);
     }
 
     let (paste_tx, paste_rx) = mpsc::channel();
-    let (wake_read, wake_write) = rustix::pipe::pipe_with(
-        rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
-    )
-    .map_err(err)?;
     let mut state = State::new(
         qh.clone(),
         compositor,
@@ -403,7 +675,7 @@ pub fn run<H: WaylandHandler>(options: WindowOptions, mut handler: H) -> Result<
         toplevel.clone(),
         (options.width, options.height),
         paste_tx,
-        wake_write,
+        wake,
     );
 
     if let Ok(vp) = globals.bind::<wp_viewporter::WpViewporter, _, _>(&qh, 1..=1, ()) {
@@ -413,6 +685,7 @@ pub fn run<H: WaylandHandler>(options: WindowOptions, mut handler: H) -> Result<
     state.subcompositor = globals
         .bind::<wl_subcompositor::WlSubcompositor, _, _>(&qh, 1..=1, ())
         .ok();
+    state.shm = globals.bind::<wl_shm::WlShm, _, _>(&qh, 1..=1, ()).ok();
     if state.viewport.is_some()
         && let Ok(mgr) = globals
             .bind::<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, _, _>(
@@ -423,12 +696,29 @@ pub fn run<H: WaylandHandler>(options: WindowOptions, mut handler: H) -> Result<
     {
         state.fractional = Some(mgr.get_fractional_scale(&surface, &qh, ()));
     }
+    state.decor.wanted = options.decorations;
     if let Ok(mgr) =
         globals.bind::<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _, _>(&qh, 1..=1, ())
     {
         let deco = mgr.get_toplevel_decoration(&toplevel, &qh, ());
-        deco.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
-        state._decoration = Some(deco);
+        deco.set_mode(match options.decorations {
+            DecorationMode::Client => zxdg_toplevel_decoration_v1::Mode::ClientSide,
+            DecorationMode::Auto | DecorationMode::Server => {
+                zxdg_toplevel_decoration_v1::Mode::ServerSide
+            }
+        });
+        state.decor.object = Some(deco);
+    } else {
+        // Nobody draws a frame for it.
+        state.decorations_agreed(Decorations::Client);
+    }
+    if options.modal
+        && options.parent.is_some()
+        && let Ok(mgr) = globals.bind::<xdg_wm_dialog_v1::XdgWmDialogV1, _, _>(&qh, 1..=1, ())
+    {
+        let dialog = mgr.get_xdg_dialog(&toplevel, &qh, ());
+        dialog.set_modal();
+        state.decor.dialog = Some(dialog);
     }
     state.cursor_shape_manager = globals
         .bind::<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, _, _>(&qh, 1..=1, ())
@@ -462,195 +752,125 @@ pub fn run<H: WaylandHandler>(options: WindowOptions, mut handler: H) -> Result<
 
     surface.commit();
     queue.roundtrip(&mut state).map_err(err)?;
+    Ok(Instance {
+        key,
+        queue,
+        state,
+        paste_rx,
+        timer_deadline: None,
+        woken: false,
+        exit: false,
+    })
+}
 
-    let wl_fd = conn.as_fd().try_clone_to_owned().map_err(err)?;
-    let mut lp = Loop {
-        conn: &conn,
-        queue: &mut queue,
-        state: &mut state,
-        paste_rx: &paste_rx,
-        wl_fd: &wl_fd,
-        wake_read: &wake_read,
-    };
-    let result = lp.run(&mut handler);
-    handler.exit();
+/// Opens a window alone and runs until its handler exits.
+pub fn run<H: WaylandHandler>(options: WindowOptions, handler: H) -> Result<(), Error> {
+    struct One<H>(WindowKey, H);
+    impl<H: WaylandHandler> Handlers for One<H> {
+        type Handler = H;
+        fn handler(&mut self, key: WindowKey) -> Option<&mut H> {
+            (key == self.0).then_some(&mut self.1)
+        }
+    }
+    let mut session = Session::connect()?;
+    let key = session.open(options)?;
+    let mut one = One(key, handler);
+    let result = (|| loop {
+        session.dispatch(&mut one)?;
+        if !session.exited().is_empty() {
+            return Ok(());
+        }
+        session.wait(&mut one)?;
+    })();
+    one.1.exit();
+    session.close(key);
     result
 }
 
-struct Loop<'a> {
-    conn: &'a Connection,
-    queue: &'a mut wayland_client::EventQueue<State>,
-    state: &'a mut State,
-    paste_rx: &'a mpsc::Receiver<(ClipboardKind, String)>,
-    wl_fd: &'a std::os::fd::OwnedFd,
-    wake_read: &'a std::os::fd::OwnedFd,
-}
-
-impl Loop<'_> {
-    fn run<H: WaylandHandler>(&mut self, handler: &mut H) -> Result<(), Error> {
-        let Loop {
-            conn,
+impl Instance {
+    /// What one pass of the event loop does for the window.
+    fn turn<H: WaylandHandler>(&mut self, conn: &Connection, handler: &mut H) -> Result<(), Error> {
+        let Instance {
             queue,
             state,
             paste_rx,
-            wl_fd,
-            wake_read,
+            timer_deadline,
+            woken,
+            exit,
+            ..
         } = self;
-        let (conn, paste_rx, wl_fd, wake_read) = (*conn, *paste_rx, *wl_fd, *wake_read);
-        let mut exit = false;
-        let mut timer_deadline: Option<Instant> = None;
-        let mut woken = false;
-        loop {
-            queue.dispatch_pending(*state).map_err(err)?;
+        queue.dispatch_pending(state).map_err(err)?;
 
-            let now = Instant::now();
-            while let Some(keycode) = state.key_repeat_due(now) {
-                if let Some(ev) = state.kb.key_event(keycode, true, true) {
-                    state.events.push(WindowEvent::Key(ev));
-                }
-            }
-            while let Ok((kind, text)) = paste_rx.try_recv() {
-                state.events.push(WindowEvent::Paste { kind, text });
-            }
-            state.take_dropped_data();
-
-            if state.keyboard_focused != state.focus_announced {
-                state.focus_announced = state.keyboard_focused;
-                state
-                    .events
-                    .insert(0, WindowEvent::Focused(state.keyboard_focused));
-            }
-            let mut events = std::mem::take(&mut state.events);
-            // Only the last of consecutive pointer moves matters; high-rate mice send many per
-            // frame.
-            events.dedup_by(|next, prev| {
-                let both = matches!(
-                    (&*prev, &*next),
-                    (
-                        WindowEvent::PointerMoved { .. },
-                        WindowEvent::PointerMoved { .. }
-                    ) | (WindowEvent::DragMoved { .. }, WindowEvent::DragMoved { .. })
-                );
-                if both {
-                    *prev = next.clone();
-                }
-                both
-            });
-            for ev in events {
-                let mut ctx = Ctx {
-                    state,
-                    conn,
-                    exit: &mut exit,
-                };
-                handler.event(&mut ctx, ev);
-            }
-            if std::mem::take(&mut woken) {
-                let mut ctx = Ctx {
-                    state,
-                    conn,
-                    exit: &mut exit,
-                };
-                handler.woken(&mut ctx);
-            }
-            // The deadline we slept until; asking again now would give the one after it.
-            if timer_deadline.is_some_and(|d| d <= Instant::now()) {
-                timer_deadline = None;
-                let mut ctx = Ctx {
-                    state,
-                    conn,
-                    exit: &mut exit,
-                };
-                handler.timer(&mut ctx, Instant::now());
-            }
-            if exit || state.closed {
-                break;
-            }
-
-            if state.redraw_at.is_some_and(|t| t <= Instant::now()) {
-                state.redraw_at = None;
-                state.redraw_requested = true;
-            }
-            if state.configured {
-                let ready = state.frame_wait(Instant::now()).is_ok();
-                let mut ctx = Ctx {
-                    state,
-                    conn,
-                    exit: &mut exit,
-                };
-                if ready {
-                    handler.surfaces_ready(&mut ctx);
-                    // What it committed mustn't wait for the frame that may start below: the
-                    // compositor only takes commits up to some point in a refresh.
-                    conn.flush().map_err(err)?;
-                }
-                if ctx.state.redraw_requested
-                    && (ctx.state.frame_wait(Instant::now()).is_ok()
-                        || handler.may_render_ahead(&mut ctx))
-                {
-                    ctx.state.redraw_requested = false;
-                    handler.frame(&mut ctx);
-                }
-            }
-
-            conn.flush().map_err(err)?;
-
-            // Nothing may come to wake us up for it.
-            if exit {
-                break;
-            }
-            if !state.events.is_empty() {
-                continue;
-            }
-            let Some(guard) = queue.prepare_read() else {
-                continue;
-            };
-            let now = Instant::now();
-            timer_deadline = handler.deadline(now);
-            let mut deadline = timer_deadline;
-            if let Some(r) = &state.kb.repeat {
-                deadline = Some(deadline.map_or(r.next, |d| d.min(r.next)));
-            }
-            if let Some(t) = state.redraw_at {
-                deadline = Some(deadline.map_or(t, |d| d.min(t)));
-            }
-            if state.redraw_requested
-                && let Err(Some(t)) = state.frame_wait(now)
-            {
-                deadline = Some(deadline.map_or(t, |d| d.min(t)));
-            }
-            let timeout = deadline.map(|d| {
-                let dur = d.saturating_duration_since(now);
-                rustix::time::Timespec {
-                    tv_sec: dur.as_secs() as _,
-                    tv_nsec: dur.subsec_nanos() as _,
-                }
-            });
-            let mut fds = [
-                PollFd::new(wl_fd, PollFlags::IN),
-                PollFd::new(wake_read, PollFlags::IN),
-            ];
-            match rustix::event::poll(&mut fds, timeout.as_ref()) {
-                Ok(_) => {}
-                Err(rustix::io::Errno::INTR) => {}
-                Err(e) => return Err(err(e)),
-            }
-            let wl_ready = fds[0].revents().contains(PollFlags::IN);
-            let wake_ready = fds[1].revents().contains(PollFlags::IN);
-            if wl_ready {
-                if let Err(e) = guard.read()
-                    && !matches!(e, wayland_client::backend::WaylandError::Io(ref io) if io.kind() == std::io::ErrorKind::WouldBlock)
-                {
-                    return Err(err(e));
-                }
-            } else {
-                drop(guard);
-            }
-            if wake_ready {
-                let mut buf = [0u8; 64];
-                while matches!(rustix::io::read(wake_read, &mut buf), Ok(n) if n > 0) {}
-                woken = true;
+        let now = Instant::now();
+        while let Some(keycode) = state.key_repeat_due(now) {
+            if let Some(ev) = state.kb.key_event(keycode, true, true) {
+                state.events.push(WindowEvent::Key(ev));
             }
         }
-        Ok(())
+        while let Ok((kind, text)) = paste_rx.try_recv() {
+            state.events.push(WindowEvent::Paste { kind, text });
+        }
+        state.take_dropped_data();
+
+        if state.keyboard_focused != state.focus_announced {
+            state.focus_announced = state.keyboard_focused;
+            state
+                .events
+                .insert(0, WindowEvent::Focused(state.keyboard_focused));
+        }
+        let mut events = std::mem::take(&mut state.events);
+        // Only the last of consecutive pointer moves matters; high-rate mice send many per frame.
+        events.dedup_by(|next, prev| {
+            let both = matches!(
+                (&*prev, &*next),
+                (
+                    WindowEvent::PointerMoved { .. },
+                    WindowEvent::PointerMoved { .. }
+                ) | (WindowEvent::DragMoved { .. }, WindowEvent::DragMoved { .. })
+            );
+            if both {
+                *prev = next.clone();
+            }
+            both
+        });
+        for ev in events {
+            let mut ctx = Ctx { state, conn, exit };
+            handler.event(&mut ctx, ev);
+        }
+        if std::mem::take(woken) {
+            let mut ctx = Ctx { state, conn, exit };
+            handler.woken(&mut ctx);
+        }
+        if timer_deadline.is_some_and(|d| d <= Instant::now()) {
+            *timer_deadline = None;
+            let mut ctx = Ctx { state, conn, exit };
+            handler.timer(&mut ctx, Instant::now());
+        }
+        if *exit || state.closed {
+            return Ok(());
+        }
+
+        if state.redraw_at.is_some_and(|t| t <= Instant::now()) {
+            state.redraw_at = None;
+            state.redraw_requested = true;
+        }
+        if state.configured {
+            let ready = state.frame_wait(Instant::now()).is_ok();
+            let mut ctx = Ctx { state, conn, exit };
+            if ready {
+                handler.surfaces_ready(&mut ctx);
+                // What it committed mustn't wait for the frame that may start below: the
+                // compositor only takes commits up to some point in a refresh.
+                conn.flush().map_err(err)?;
+            }
+            if ctx.state.redraw_requested
+                && (ctx.state.frame_wait(Instant::now()).is_ok()
+                    || handler.may_render_ahead(&mut ctx))
+            {
+                ctx.state.redraw_requested = false;
+                handler.frame(&mut ctx);
+            }
+        }
+        conn.flush().map_err(err)
     }
 }

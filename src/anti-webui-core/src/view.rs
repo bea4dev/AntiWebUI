@@ -53,9 +53,10 @@ pub(crate) fn create_node(node: Node) -> NodeId {
     id
 }
 
-/// A handle to a node that can be attached with `.node_ref()`.
+/// A handle to a node that can be attached with `.node_ref()`. It remembers the window the node is
+/// in, so it can be used from the handlers of another window on the same thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NodeRef(Signal<Option<NodeId>>);
+pub struct NodeRef(Signal<Option<(NodeId, u64)>>);
 
 pub fn node_ref() -> NodeRef {
     NodeRef(signal(None))
@@ -63,129 +64,141 @@ pub fn node_ref() -> NodeRef {
 
 impl NodeRef {
     pub fn get(&self) -> Option<NodeId> {
-        self.0.get()
+        self.0.get().map(|(id, _)| id)
     }
 
     pub(crate) fn id_untracked(&self) -> Option<NodeId> {
-        self.0.get_untracked()
+        self.0.get_untracked().map(|(id, _)| id)
+    }
+
+    pub(crate) fn bind(&self, id: NodeId) {
+        self.0.set(Some((id, crate::window::active_id())));
+    }
+
+    /// Runs `f` with the node, in its window.
+    fn in_window<R>(&self, f: impl FnOnce(NodeId) -> R) -> Option<R> {
+        let (id, window) = self.0.get_untracked()?;
+        Some(crate::window::within(window, || f(id)))
     }
 
     /// Shows the node alone on all of the screen, whatever its style and what it is in: the rest of
     /// the window stays as it is and comes back with [`exit_fullscreen`] or Escape. Unless the window
     /// is already on all of the screen, that takes a moment and the window comes back too.
     pub fn request_fullscreen(&self) {
-        if let Some(id) = self.0.get_untracked() {
+        self.in_window(|id| {
             with_doc(|d| d.request_fullscreen(id));
             sync_fullscreen();
-        }
+        });
     }
 
     /// Whether this is what shows on all of the screen. Reading it tracks it.
     pub fn is_fullscreen(&self) -> bool {
-        let element = fullscreen_signals().1.get();
-        element.is_some() && element == self.0.get()
+        let Some((id, window)) = self.0.get() else {
+            return false;
+        };
+        crate::window::within(window, || fullscreen_signals().1.get() == Some(id))
     }
 
     /// Scrolls what contains the node, after the next layout, until the node is in view.
     pub fn scroll_into_view(&self) {
-        if let Some(id) = self.0.get_untracked() {
+        self.in_window(|id| {
             with_doc(|d| {
                 d.pending_scroll.push(id);
                 d.dirty.paint = true;
-            });
-        }
+            })
+        });
     }
 
     /// The border box in window physical pixels, as of the last layout.
     pub fn rect(&self) -> Option<RectI> {
-        let id = self.0.get_untracked()?;
-        with_doc(|d| d.window_rect(id))
+        self.in_window(|id| with_doc(|d| d.window_rect(id)))?
     }
 
     /// The border box in window logical pixels, as of the last layout. This is what sizes and
     /// places in styles are written in.
     pub fn logical_rect(&self) -> Option<RectF> {
-        let id = self.0.get_untracked()?;
-        with_doc(|d| {
-            let r = d.window_rect(id)?;
-            let l = |v: i32| d.scale.to_logical(v as f32);
-            Some(RectF::new(l(r.x), l(r.y), l(r.width), l(r.height)))
-        })
+        self.in_window(|id| {
+            with_doc(|d| {
+                let r = d.window_rect(id)?;
+                let l = |v: i32| d.scale.to_logical(v as f32);
+                Some(RectF::new(l(r.x), l(r.y), l(r.width), l(r.height)))
+            })
+        })?
     }
 
     /// Where the node's border box is in what an ancestor scrolls (from the ancestor's border box,
     /// as if it hadn't scrolled), in logical pixels, as of the last layout. Unlike
     /// [`rect`](Self::rect), it doesn't change when the ancestor scrolls.
     pub fn offset_in(&self, ancestor: NodeRef) -> Option<PointF> {
-        let (id, top) = (self.0.get_untracked()?, ancestor.0.get_untracked()?);
-        with_doc(|d| {
-            let (mut x, mut y) = (0, 0);
-            let mut at = id;
-            while at != top {
-                let n = d.get(at)?;
-                x += n.rect.x;
-                y += n.rect.y;
-                at = n.parent?;
-                if at != top {
-                    let p = d.get(at)?;
-                    x -= p.scroll.x;
-                    y -= p.scroll.y;
+        let top = ancestor.id_untracked()?;
+        self.in_window(|id| {
+            with_doc(|d| {
+                let (mut x, mut y) = (0, 0);
+                let mut at = id;
+                while at != top {
+                    let n = d.get(at)?;
+                    x += n.rect.x;
+                    y += n.rect.y;
+                    at = n.parent?;
+                    if at != top {
+                        let p = d.get(at)?;
+                        x -= p.scroll.x;
+                        y -= p.scroll.y;
+                    }
                 }
-            }
-            Some(PointF::new(
-                d.scale.to_logical(x as f32),
-                d.scale.to_logical(y as f32),
-            ))
-        })
+                Some(PointF::new(
+                    d.scale.to_logical(x as f32),
+                    d.scale.to_logical(y as f32),
+                ))
+            })
+        })?
     }
 
     /// How far a scrolling node has scrolled, in logical pixels.
     pub fn scroll_offset(&self) -> PointF {
-        self.0
-            .get_untracked()
-            .and_then(|id| {
-                with_doc(|d| {
-                    let n = d.get(id)?;
-                    Some(PointF::new(
-                        d.scale.to_logical(n.scroll.x as f32),
-                        d.scale.to_logical(n.scroll.y as f32),
-                    ))
-                })
+        self.in_window(|id| {
+            with_doc(|d| {
+                let n = d.get(id)?;
+                Some(PointF::new(
+                    d.scale.to_logical(n.scroll.x as f32),
+                    d.scale.to_logical(n.scroll.y as f32),
+                ))
             })
-            .unwrap_or_default()
+        })
+        .flatten()
+        .unwrap_or_default()
     }
 
     /// Scrolls a scrolling node to this offset in logical pixels, as far as it goes.
     pub fn scroll_to(&self, x: f32, y: f32) {
-        let Some(id) = self.0.get_untracked() else {
-            return;
-        };
-        with_doc(|d| {
-            let (x, y) = (d.scale.px(x), d.scale.px(y));
-            let Some(n) = d.get_mut(id) else {
-                return;
-            };
-            let pad = n.padding_abs();
-            let to = PointI::new(
-                x.clamp(0, (n.content_size.width - pad.width).max(0)),
-                y.clamp(0, (n.content_size.height - pad.height).max(0)),
-            );
-            if n.scroll != to {
-                n.scroll = to;
-                d.mark_scrolled(id);
-            }
+        self.in_window(|id| {
+            with_doc(|d| {
+                let (x, y) = (d.scale.px(x), d.scale.px(y));
+                let Some(n) = d.get_mut(id) else {
+                    return;
+                };
+                let pad = n.padding_abs();
+                let to = PointI::new(
+                    x.clamp(0, (n.content_size.width - pad.width).max(0)),
+                    y.clamp(0, (n.content_size.height - pad.height).max(0)),
+                );
+                if n.scroll != to {
+                    n.scroll = to;
+                    d.mark_scrolled(id);
+                }
+            })
         });
     }
 
     /// Scrolls a scrolling node to this offset in physical pixels, after the next layout, so that
     /// content changing size in the same frame moves along with it.
     pub fn scroll_to_after_layout(&self, x: i32, y: i32) {
-        if let Some(id) = self.0.get_untracked() {
+        self.in_window(|id| {
             with_doc(|d| {
                 d.pending_scroll_to.push((id, PointI::new(x, y)));
                 d.dirty.paint = true;
-            });
-        }
+            })
+        });
     }
 
     /// Whether a point of the window, like [`PointerEvent::position`], is on a scrollbar of this
@@ -193,46 +206,44 @@ impl NodeRef {
     ///
     /// [`PointerEvent::position`]: crate::event::PointerEvent::position
     pub fn is_over_scrollbar(&self, position: PointF) -> bool {
-        self.0
-            .get_untracked()
-            .is_some_and(|id| with_doc(|d| crate::ui::scrollbar_hit(d, id, position).is_some()))
+        self.in_window(|id| with_doc(|d| crate::ui::scrollbar_hit(d, id, position).is_some()))
+            .unwrap_or(false)
     }
 
     pub fn focus(&self) {
-        if let Some(id) = self.0.get_untracked() {
-            with_doc(|d| d.pending_focus = Some(Some(id)));
-        }
+        self.in_window(|id| with_doc(|d| d.pending_focus = Some(Some(id))));
     }
 
     pub fn blur(&self) {
-        with_doc(|d| d.pending_focus = Some(None));
+        let window = self.0.get_untracked().map_or(0, |(_, w)| w);
+        crate::window::within(window, || with_doc(|d| d.pending_focus = Some(None)));
     }
 
     /// Replaces the text of a text input and selects from one byte offset of it to another, as
     /// something that checks what is typed does. A signal bound with `value` has to be told the same
     /// text, which then changes nothing more. It isn't something to undo.
     pub fn set_text(&self, text: &str, selection: (usize, usize)) {
-        if let Some(id) = self.0.get_untracked() {
+        self.in_window(|id| {
             with_doc(|d| {
                 if let Some(e) = d.get_mut(id).and_then(Node::edit_mut) {
                     e.set_text(text.to_owned());
                     e.select_range(selection.0, selection.1);
                     d.invalidate_layout(id);
                 }
-            });
-        }
+            })
+        });
     }
 
     /// Puts the caret of a text input after what it has.
     pub fn select_end(&self) {
-        if let Some(id) = self.0.get_untracked() {
+        self.in_window(|id| {
             with_doc(|d| {
                 if let Some(e) = d.get_mut(id).and_then(Node::edit_mut) {
                     e.caret_to_end();
                     d.mark_paint();
                 }
-            });
-        }
+            })
+        });
     }
 }
 
@@ -334,6 +345,19 @@ thread_local! {
     static FULLSCREEN: Cell<Option<FullscreenSignals>> = const { Cell::new(None) };
 }
 
+/// What each window has of its own here; see `crate::window`.
+#[derive(Default)]
+pub(crate) struct Locals {
+    scale: Option<Signal<Scale>>,
+    fullscreen: Option<FullscreenSignals>,
+}
+
+/// Trades what the window being worked on has for `other`.
+pub(crate) fn swap_locals(other: &mut Locals) {
+    WINDOW_SCALE.with(|s| other.scale = s.replace(other.scale));
+    FULLSCREEN.with(|s| other.fullscreen = s.replace(other.fullscreen));
+}
+
 /// Whether the window is on all of the screen, and what shows there alone.
 type FullscreenSignals = (Signal<bool>, Signal<Option<NodeId>>);
 
@@ -369,11 +393,6 @@ pub fn window_fullscreen() -> bool {
 /// [`window_fullscreen`] says when it has happened: the system may have something to say about it.
 pub fn set_window_fullscreen(on: bool) {
     with_doc(|d| d.request(PlatformRequest::SetFullscreen(on)));
-}
-
-/// Closes the window, which ends the program when it is the only one.
-pub fn close_window() {
-    with_doc(|d| d.request(PlatformRequest::Close));
 }
 
 /// Ends what [`NodeRef::request_fullscreen`] started.
@@ -549,7 +568,7 @@ impl ElementConfig {
             });
         }
         for r in self.node_ref {
-            r.0.set(Some(id));
+            r.bind(id);
         }
         id
     }

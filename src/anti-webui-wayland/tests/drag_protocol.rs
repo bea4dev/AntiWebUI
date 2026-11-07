@@ -489,6 +489,7 @@ fn setup() -> World {
             width: 100,
             height: 100,
             fullscreen: false,
+            ..Default::default()
         };
         run(options, client).unwrap();
     });

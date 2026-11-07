@@ -638,45 +638,57 @@ pub struct StackingList {
     pub negative: usize,
 }
 
+impl Default for Document {
+    fn default() -> Self {
+        Document {
+            nodes: SlotMap::with_key(),
+            root: None,
+            state: WindowState::default(),
+            dirty: Dirty::default(),
+            scale: Scale::ONE,
+            viewport: SizeI::default(),
+            requests: Vec::new(),
+            pending_focus: None,
+            layer_contents: HashMap::new(),
+            stale_layers: HashSet::new(),
+            transform_moved: false,
+            settling: false,
+            transitioning: HashSet::new(),
+            list_places: Vec::new(),
+            style_dirty: Vec::new(),
+            style_all: false,
+            reposition: Vec::new(),
+            edits: Vec::new(),
+            editors: Vec::new(),
+            stacked: HashSet::new(),
+            stacking: HashMap::new(),
+            stacking_dirty: false,
+            popups: Vec::new(),
+            drag: None,
+            pending_scroll: Vec::new(),
+            access_stale: false,
+            access_actions: Vec::new(),
+            pending_scroll_to: Vec::new(),
+            scrolled: Vec::new(),
+            resized: Vec::new(),
+            drag_request: None,
+            images: RefCell::default(),
+            videos: RefCell::default(),
+            fullscreen: Fullscreen::default(),
+            videos_failed: Vec::new(),
+            visibility: Default::default(),
+        }
+    }
+}
+
 thread_local! {
-    static DOC: RefCell<Document> = RefCell::new(Document {
-        nodes: SlotMap::with_key(),
-        root: None,
-        state: WindowState::default(),
-        dirty: Dirty::default(),
-        scale: Scale::ONE,
-        viewport: SizeI::default(),
-        requests: Vec::new(),
-        pending_focus: None,
-        layer_contents: HashMap::new(),
-        stale_layers: HashSet::new(),
-        transform_moved: false,
-        settling: false,
-        transitioning: HashSet::new(),
-        list_places: Vec::new(),
-        style_dirty: Vec::new(),
-        style_all: false,
-        reposition: Vec::new(),
-        edits: Vec::new(),
-        editors: Vec::new(),
-        stacked: HashSet::new(),
-        stacking: HashMap::new(),
-        stacking_dirty: false,
-        popups: Vec::new(),
-        drag: None,
-        pending_scroll: Vec::new(),
-        access_stale: false,
-        access_actions: Vec::new(),
-        pending_scroll_to: Vec::new(),
-        scrolled: Vec::new(),
-        resized: Vec::new(),
-        drag_request: None,
-        images: RefCell::default(),
-        videos: RefCell::default(),
-        fullscreen: Fullscreen::default(),
-        videos_failed: Vec::new(),
-        visibility: Default::default(),
-    });
+    /// The document of the window being worked on; see `crate::window`.
+    static DOC: RefCell<Document> = RefCell::new(Document::default());
+}
+
+/// Trades the document of the window being worked on for `other`.
+pub(crate) fn swap_doc(other: &mut Document) {
+    DOC.with(|d| std::mem::swap(&mut *d.borrow_mut(), other));
 }
 
 /// Borrows the document. Never write signals or call user handlers inside `f`.

@@ -36,9 +36,13 @@ impl<T, F: Fn(T)> Inbox for Queue<T, F> {
     }
 }
 
+/// A channel's id, the window it was made in, and where its messages go.
+type Registered = (u64, u64, Rc<dyn Inbox>);
+
 thread_local! {
     static THREAD: Arc<Thread> = Arc::default();
-    static INBOXES: RefCell<Vec<(u64, Rc<dyn Inbox>)>> = const { RefCell::new(Vec::new()) };
+    /// With the window each was made in, where its closure runs (see `crate::window`).
+    static INBOXES: RefCell<Vec<Registered>> = const { RefCell::new(Vec::new()) };
     static NEXT_INBOX: Cell<u64> = const { Cell::new(0) };
 }
 
@@ -94,8 +98,9 @@ pub fn ui_channel<T: Send + 'static>(on_message: impl Fn(T) + 'static) -> UiSend
         queue: queue.clone(),
         on_message,
     });
-    INBOXES.with(|i| i.borrow_mut().push((id, inbox)));
-    on_cleanup(move || INBOXES.with(|i| i.borrow_mut().retain(|(other, _)| *other != id)));
+    let window = crate::window::active_id();
+    INBOXES.with(|i| i.borrow_mut().push((id, window, inbox)));
+    on_cleanup(move || INBOXES.with(|i| i.borrow_mut().retain(|(other, _, _)| *other != id)));
     UiSender {
         queue,
         thread: THREAD.with(Clone::clone),
@@ -104,11 +109,21 @@ pub fn ui_channel<T: Send + 'static>(on_message: impl Fn(T) + 'static) -> UiSend
 
 /// Calls the closures of the channels with what has come. They can make more channels.
 pub(crate) fn drain() {
-    let inboxes: Vec<Rc<dyn Inbox>> =
-        INBOXES.with(|i| i.borrow().iter().map(|(_, inbox)| inbox.clone()).collect());
-    for inbox in inboxes {
-        inbox.drain();
+    let inboxes: Vec<(u64, Rc<dyn Inbox>)> = INBOXES.with(|i| {
+        i.borrow()
+            .iter()
+            .map(|(_, window, inbox)| (*window, inbox.clone()))
+            .collect()
+    });
+    for (window, inbox) in inboxes {
+        crate::window::within(window, || inbox.drain());
     }
+}
+
+/// Says how to wake the UI loop of this thread, before any window does.
+#[doc(hidden)]
+pub fn set_thread_waker(waker: Waker) {
+    set_waker(waker);
 }
 
 pub(crate) fn set_waker(waker: Waker) {

@@ -1,6 +1,7 @@
 //! Pointer cursors from the Xcursor theme.
 
 use anti_webui_core::platform::CursorIcon;
+use anti_webui_core::window::ResizeEdge;
 use std::collections::HashMap;
 use x11rb::NONE;
 use x11rb::connection::Connection;
@@ -26,10 +27,25 @@ pub(crate) fn names(icon: CursorIcon) -> &'static [&'static str] {
     }
 }
 
+/// The cursors for the edges of a window with a frame of its own.
+pub(crate) fn edge_names(edge: ResizeEdge) -> &'static [&'static str] {
+    match edge {
+        ResizeEdge::Top => &["n-resize", "top_side"],
+        ResizeEdge::Bottom => &["s-resize", "bottom_side"],
+        ResizeEdge::Left => &["w-resize", "left_side"],
+        ResizeEdge::Right => &["e-resize", "right_side"],
+        ResizeEdge::TopLeft => &["nw-resize", "top_left_corner"],
+        ResizeEdge::TopRight => &["ne-resize", "top_right_corner"],
+        ResizeEdge::BottomLeft => &["sw-resize", "bottom_left_corner"],
+        ResizeEdge::BottomRight => &["se-resize", "bottom_right_corner"],
+    }
+}
+
 /// Cursors made so far, which stay until the connection closes.
 pub(crate) struct Cursors {
     handle: Option<Handle>,
     made: HashMap<CursorIcon, Cursor>,
+    edges: HashMap<ResizeEdge, Cursor>,
 }
 
 impl Cursors {
@@ -40,7 +56,32 @@ impl Cursors {
         Self {
             handle,
             made: HashMap::new(),
+            edges: HashMap::new(),
         }
+    }
+
+    /// Shows what pressing on an edge of `window` does.
+    pub fn set_edge(&mut self, conn: &impl Connection, window: Window, edge: ResizeEdge) {
+        let cursor = match self.edges.get(&edge) {
+            Some(&c) => c,
+            None => {
+                let c = self.load(conn, edge_names(edge));
+                self.edges.insert(edge, c);
+                c
+            }
+        };
+        let aux = x11rb::protocol::xproto::ChangeWindowAttributesAux::new().cursor(cursor);
+        let _ = conn.change_window_attributes(window, &aux);
+    }
+
+    fn load(&self, conn: &impl Connection, names: &[&str]) -> Cursor {
+        let Some(handle) = &self.handle else {
+            return NONE;
+        };
+        names
+            .iter()
+            .find_map(|name| handle.load_cursor(conn, name).ok().filter(|&c| c != NONE))
+            .unwrap_or(NONE)
     }
 
     /// Shows `icon` over `window`.
@@ -61,13 +102,7 @@ impl Cursors {
         if icon == CursorIcon::None {
             return invisible(conn, window).unwrap_or(NONE);
         }
-        let Some(handle) = &self.handle else {
-            return NONE;
-        };
-        names(icon)
-            .iter()
-            .find_map(|name| handle.load_cursor(conn, name).ok().filter(|&c| c != NONE))
-            .unwrap_or(NONE)
+        self.load(conn, names(icon))
     }
 }
 
