@@ -1,5 +1,5 @@
 //! One window on the main thread: its `NSWindow` and view, and what the handlers ask of it (see
-//! "ウィンドウ" in `docs/design/37-platform-macos.md`). What is drawn when is in `Frames`, on
+//! "ウィンドウ" in `docs/design/38-platform-macos.md`). What is drawn when is in `Frames`, on
 //! whichever thread draws the window.
 
 use crate::frames::{Frames, content_layer};

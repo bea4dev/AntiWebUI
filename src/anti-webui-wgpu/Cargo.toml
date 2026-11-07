@@ -19,6 +19,7 @@ pollster.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 ash.workspace = true
 libc.workspace = true
+libloading.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true

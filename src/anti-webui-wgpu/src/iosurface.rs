@@ -1,5 +1,5 @@
 //! Our own display buffers on macOS: `IOSurface`s that Metal draws to and Core Animation shows (see
-//! "提示" in `docs/design/37-platform-macos.md`).
+//! "提示" in `docs/design/38-platform-macos.md`).
 
 use crate::{Gpu, GpuError, video_features};
 use objc2::rc::Retained;

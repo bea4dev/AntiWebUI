@@ -1,6 +1,6 @@
 //! Drag and drop with other programs: the view is a dragging destination for what comes in, and
 //! the source of the drags it hands to AppKit (see "ドラッグ＆ドロップ" in
-//! `docs/design/37-platform-macos.md`). Drags of ours over our own windows come in the same way.
+//! `docs/design/38-platform-macos.md`). Drags of ours over our own windows come in the same way.
 
 use crate::frames::Sendable;
 use crate::keyboard::modifiers_of;

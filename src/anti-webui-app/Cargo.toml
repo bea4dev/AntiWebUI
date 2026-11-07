@@ -13,7 +13,7 @@ video = ["dep:anti-webui-video"]
 wayland = ["dep:anti-webui-wayland"]
 ## Runs on X servers. See `docs/design/35-platform-x11.md`.
 x11 = ["dep:anti-webui-x11"]
-## Runs on macOS. See `docs/design/37-platform-macos.md`.
+## Runs on macOS. See `docs/design/38-platform-macos.md`.
 macos = ["dep:anti-webui-macos"]
 
 [dependencies]

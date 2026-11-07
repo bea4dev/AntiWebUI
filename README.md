@@ -49,7 +49,7 @@ cargo run -p anti-webui --example showcase --features dynamic_linking
 
 ## 状態
 
-M1（Wayland 上の基本 UI）が動作する段階です。対応 OS は Linux（Wayland、X11）と macOS です（[37-platform-macos](docs/design/37-platform-macos.md)）。ロードマップは [07-roadmap](docs/design/07-roadmap.md) を参照してください。
+M1（Wayland 上の基本 UI）が動作する段階です。対応 OS は Linux（Wayland、X11）と macOS です（[38-platform-macos](docs/design/38-platform-macos.md)）。ロードマップは [07-roadmap](docs/design/07-roadmap.md) を参照してください。
 
 ## ライセンス
 

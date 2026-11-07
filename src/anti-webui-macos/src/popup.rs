@@ -1,5 +1,5 @@
 //! Popups as borderless child windows, placed by us like on X11 (see "ポップアップ" in
-//! `docs/design/37-platform-macos.md`).
+//! `docs/design/38-platform-macos.md`).
 
 use crate::frames::Sendable;
 use crate::state::State;

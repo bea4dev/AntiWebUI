@@ -1,6 +1,6 @@
 //! The view and the window's delegate: what AppKit calls them with becomes `WindowEvent`s in the
 //! window's inbox, which the session hands to the window's handler (see "イベントループ", "入力"
-//! and "IME" in `docs/design/37-platform-macos.md`).
+//! and "IME" in `docs/design/38-platform-macos.md`).
 
 use crate::app;
 use crate::dnd::Dnd;
@@ -769,7 +769,7 @@ impl View {
     }
 
     /// A key went down: to the input method first while text is edited, and to the core as a key
-    /// unless the input method took it (see "IME" in `docs/design/37-platform-macos.md`).
+    /// unless the input method took it (see "IME" in `docs/design/38-platform-macos.md`).
     fn key_pressed(&self, event: &NSEvent) {
         let shared = &self.ivars().shared;
         let modifiers = self.take_modifiers(event);

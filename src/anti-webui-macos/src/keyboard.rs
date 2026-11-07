@@ -1,5 +1,5 @@
 //! Keys: AppKit's key codes and characters to the core's keys (see "入力" in
-//! `docs/design/37-platform-macos.md`).
+//! `docs/design/38-platform-macos.md`).
 
 use anti_webui_core::event::{Key, Modifiers, NamedKey};
 use objc2_app_kit::NSEventModifierFlags;

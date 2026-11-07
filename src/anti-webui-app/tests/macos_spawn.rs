@@ -1,5 +1,5 @@
 //! Windows of `spawn_window` on macOS end to end: AppKit's window on the main thread, the UI and
-//! its drawing on a thread of its own (see "複数ウィンドウ" in `docs/design/37-platform-macos.md`).
+//! its drawing on a thread of its own (see "複数ウィンドウ" in `docs/design/38-platform-macos.md`).
 //! Like `macos.rs`, this has no test harness: `cargo test -p anti-webui-app --test macos_spawn`.
 
 #[cfg(not(target_os = "macos"))]

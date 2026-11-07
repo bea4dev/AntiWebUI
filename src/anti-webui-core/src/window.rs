@@ -8,7 +8,7 @@
 
 use crate::channel::{UiSender, ui_channel};
 use crate::platform::PlatformRequest;
-use crate::reactive::{Signal, batch, create_root, on_cleanup, signal};
+use crate::reactive::{Owner, Signal, batch, create_root, on_cleanup, signal};
 use crate::settings::Settings;
 use crate::tree::{Document, with_doc};
 use crate::view::{IntoView, View};
@@ -94,6 +94,23 @@ pub struct WindowOptions {
     pub top_level: bool,
     /// Opens on all of the screen.
     pub fullscreen: bool,
+    /// What kind of surface it is.
+    pub role: Role,
+}
+
+/// What kind of surface a window is.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum Role {
+    /// A window like any other.
+    #[default]
+    Toplevel,
+    /// A part of a desktop shell, like a bar or a wallpaper: `zwlr_layer_shell_v1` on Wayland,
+    /// nothing elsewhere. See `docs/design/37-wayland-shell.md`.
+    Layer(Box<crate::layer::LayerSpec>),
+    /// What covers an output while the session is locked (`ext_session_lock_v1` on Wayland):
+    /// the output by its connector name. The session stays locked while any of these is open, and
+    /// unlocks when the last one closes. See "画面ロック" in `docs/design/37-wayland-shell.md`.
+    Lock(String),
 }
 
 impl Default for WindowOptions {
@@ -113,6 +130,7 @@ impl WindowOptions {
             decorations: DecorationMode::Auto,
             top_level: false,
             fullscreen: false,
+            role: Role::Toplevel,
         }
     }
 
@@ -159,6 +177,11 @@ impl WindowOptions {
         self.fullscreen = on;
         self
     }
+
+    pub fn role(mut self, role: Role) -> Self {
+        self.role = role;
+        self
+    }
 }
 
 /// What a [`WindowHandle`] asks of the window, on whichever thread it is.
@@ -171,6 +194,8 @@ pub enum Command {
     SetTitle(String),
     /// A modal window it opened came (`true`) or went (`false`).
     ModalChild(bool),
+    /// For a layer surface.
+    Layer(crate::layer::LayerChange),
 }
 
 enum Route {
@@ -237,6 +262,12 @@ impl WindowHandle {
 
     pub fn set_title(&self, title: impl Into<String>) {
         self.send(Command::SetTitle(title.into()));
+    }
+
+    /// Sends what crates above the core ask of the window, like changes to a layer surface.
+    #[doc(hidden)]
+    pub fn command(&self, command: Command) {
+        self.send(command);
     }
 
     pub(crate) fn send(&self, command: Command) {
@@ -374,10 +405,27 @@ impl SpawnRequest {
     }
 }
 
+/// A UI thread with no window, from [`spawn_ui_thread`].
+#[doc(hidden)]
+pub struct ThreadRequest {
+    pub handle: WindowHandle,
+    root: Box<dyn FnOnce() + Send>,
+    settings: Settings,
+}
+
+impl ThreadRequest {
+    /// On the new thread: sets it up like the one that asked, and runs what it was given.
+    pub fn start(self) {
+        crate::settings::adopt(self.settings);
+        start_root(self.handle, self.root);
+    }
+}
+
 #[derive(Default)]
 struct Pending {
     opens: Vec<OpenRequest>,
     spawns: Vec<SpawnRequest>,
+    threads: Vec<ThreadRequest>,
     commands: Vec<(WindowId, Command)>,
 }
 
@@ -391,7 +439,13 @@ thread_local! {
     static PENDING: RefCell<Pending> = RefCell::default();
     /// How other threads reach the windows of this one.
     static THREAD_ROUTE: RefCell<Option<UiSender<(u64, Command)>>> = const { RefCell::new(None) };
+    /// What keeps this thread going without a window: see [`start_root`].
+    static ROOTS: RefCell<Vec<(u64, Owner)>> = const { RefCell::new(Vec::new()) };
 }
+
+/// Every UI thread's way in, for [`quit`].
+static ROUTES: Mutex<Vec<UiSender<(u64, Command)>>> = Mutex::new(Vec::new());
+static QUITTING: AtomicBool = AtomicBool::new(false);
 
 /// The window being worked on.
 pub(crate) fn active_id() -> u64 {
@@ -594,6 +648,9 @@ pub fn start_ui_thread(spawned: bool) {
     let sender = ui_channel(|(id, command): (u64, Command)| {
         PENDING.with(|p| p.borrow_mut().commands.push((WindowId(id), command)));
     });
+    if let Ok(mut routes) = ROUTES.lock() {
+        routes.push(sender.clone());
+    }
     THREAD_ROUTE.with(|r| *r.borrow_mut() = Some(sender));
     crate::settings::join_broadcast();
     if spawned {
@@ -613,6 +670,12 @@ pub fn take_spawns() -> Vec<SpawnRequest> {
     PENDING.with(|p| std::mem::take(&mut p.borrow_mut().spawns))
 }
 
+/// UI threads asked for with [`spawn_ui_thread`] since the last time.
+#[doc(hidden)]
+pub fn take_threads() -> Vec<ThreadRequest> {
+    PENDING.with(|p| std::mem::take(&mut p.borrow_mut().threads))
+}
+
 /// What handles asked of the windows of this thread since the last time.
 #[doc(hidden)]
 pub fn take_commands() -> Vec<(WindowId, Command)> {
@@ -624,8 +687,83 @@ pub fn take_commands() -> Vec<(WindowId, Command)> {
 pub fn has_pending() -> bool {
     PENDING.with(|p| {
         let p = p.borrow();
-        !p.opens.is_empty() || !p.spawns.is_empty() || !p.commands.is_empty()
+        !p.opens.is_empty()
+            || !p.spawns.is_empty()
+            || !p.threads.is_empty()
+            || !p.commands.is_empty()
     })
+}
+
+/// Runs `f` under an owner that keeps the thread going without a window, until [`stop_root`].
+/// It counts as a window with no surface: what it opens closes when it stops.
+#[doc(hidden)]
+pub fn start_root(handle: WindowHandle, f: Box<dyn FnOnce() + '_>) {
+    let id = handle.0.id;
+    let previous = ACTIVE.with(Cell::get);
+    activate(id);
+    OWNED.with(|o| o.borrow_mut().insert(id));
+    handle.attach();
+    INFO.with(|i| i.borrow_mut().link = Some(handle));
+    let ((), owner) = create_root(f);
+    ROOTS.with(|r| r.borrow_mut().push((id, owner)));
+    activate(previous);
+}
+
+/// Stops what [`start_root`] started, if `id` is one of this thread's. Whether it was.
+#[doc(hidden)]
+pub fn stop_root(id: WindowId) -> bool {
+    let Some(owner) = ROOTS.with(|r| {
+        let mut r = r.borrow_mut();
+        let at = r.iter().position(|(other, _)| *other == id.0)?;
+        Some(r.remove(at).1)
+    }) else {
+        return false;
+    };
+    activate(id.0);
+    owner.dispose();
+    close_active();
+    true
+}
+
+/// Whether something from [`start_root`] keeps this thread going.
+#[doc(hidden)]
+pub fn has_roots() -> bool {
+    ROOTS.with(|r| !r.borrow().is_empty())
+}
+
+/// The roots of this thread, for ending them all.
+#[doc(hidden)]
+pub fn roots() -> Vec<WindowId> {
+    ROOTS.with(|r| r.borrow().iter().map(|(id, _)| WindowId(*id)).collect())
+}
+
+/// Does for the roots of this thread what a `Ui` does for its window: takes what came through
+/// channels and runs the timers that are due. Frame callbacks never run in a root.
+#[doc(hidden)]
+pub fn run_roots(now: std::time::Instant) {
+    let roots = roots();
+    if roots.is_empty() {
+        return;
+    }
+    batch(crate::channel::drain);
+    for id in roots {
+        within(id.0, || crate::animation::run_timers(now));
+    }
+}
+
+/// When the next timer of a root of this thread is due.
+#[doc(hidden)]
+pub fn roots_deadline() -> Option<std::time::Instant> {
+    roots()
+        .into_iter()
+        .filter_map(|id| within(id.0, crate::animation::next_timer))
+        .min()
+}
+
+/// Whether [`quit`] was called.
+#[doc(hidden)]
+pub fn quitting() -> bool {
+    QUITTING.load(Ordering::Acquire)
 }
 
 // --- What programs use -------------------------------------------------------------------------
@@ -694,6 +832,57 @@ pub fn spawn_window<V: IntoView>(
         })
     });
     handle
+}
+
+/// A UI thread from [`spawn_ui_thread`]: it can be used from any thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UiThreadHandle(WindowHandle);
+
+impl UiThreadHandle {
+    /// Disposes what the thread runs, which closes the windows it opened; the thread then ends.
+    pub fn stop(&self) {
+        self.0.close();
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.0.is_open()
+    }
+}
+
+/// Starts a UI thread with no window, running `f` under an owner of its own: what `f` opens with
+/// [`open_window`] is on that thread. The thread goes on until [`UiThreadHandle::stop`], or until
+/// the window or thread this was called in closes, and then until its windows close.
+///
+/// ```no_run
+/// use anti_webui_core::prelude::*;
+///
+/// let thread = spawn_ui_thread(|| {
+///     open_window(WindowOptions::new().title("Heavy"), || text("Hello"));
+/// });
+/// ```
+pub fn spawn_ui_thread(f: impl FnOnce() + Send + 'static) -> UiThreadHandle {
+    let handle = WindowHandle::waiting(allocate());
+    INFO.with(|i| i.borrow_mut().children.push(handle.clone()));
+    PENDING.with(|p| {
+        p.borrow_mut().threads.push(ThreadRequest {
+            handle: handle.clone(),
+            root: Box::new(f),
+            settings: crate::settings::settings_untracked(),
+        })
+    });
+    UiThreadHandle(handle)
+}
+
+/// Ends the program: every window on every thread closes without asking [`on_close_request`], and
+/// `run` returns. It can be called from any thread.
+pub fn quit() {
+    QUITTING.store(true, Ordering::Release);
+    PENDING.with(|p| p.borrow_mut().commands.push((WindowId(0), Command::Close)));
+    let routes = ROUTES.lock().map(|r| r.clone()).unwrap_or_default();
+    for route in routes {
+        // The thread wakes and sees that it is quitting.
+        route.send((0, Command::Close));
+    }
 }
 
 /// The window this runs in.

@@ -1,4 +1,4 @@
-//! The macOS backend, on AppKit (see `docs/design/37-platform-macos.md`).
+//! The macOS backend, on AppKit (see `docs/design/38-platform-macos.md`).
 
 #![cfg(target_os = "macos")]
 
@@ -61,6 +61,10 @@ pub struct WindowOptions {
     pub parent: Option<ParentLink>,
     /// The core keeps input from the parent; macOS is told nothing more.
     pub modal: bool,
+    /// A layer surface of a desktop shell, which macOS has no such thing as: opening one fails.
+    pub layer: Option<anti_webui_core::layer::LayerSpec>,
+    /// A lock surface, which needs Wayland too: opening one fails.
+    pub lock: Option<String>,
 }
 
 impl Default for WindowOptions {
@@ -74,6 +78,8 @@ impl Default for WindowOptions {
             decorations: DecorationMode::Auto,
             parent: None,
             modal: false,
+            layer: None,
+            lock: None,
         }
     }
 }
@@ -206,6 +212,11 @@ impl Ctx<'_> {
 
     /// macOS has no menu for windows.
     pub fn show_window_menu(&mut self) {}
+
+    /// Layer surfaces are Wayland's: there are none here.
+    pub fn change_layer(&mut self, _change: anti_webui_core::layer::LayerChange) {}
+
+    pub fn set_layer_content_size(&mut self, _size: SizeI) {}
 
     pub fn set_title(&mut self, title: &str) {
         let title = title.to_owned();
@@ -485,7 +496,7 @@ struct Instance {
 
 /// The windows of a thread. AppKit's windows are all on the main thread; a session of another
 /// thread draws its windows there and has the main thread do the rest (see "複数ウィンドウ" in
-/// `docs/design/37-platform-macos.md`).
+/// `docs/design/38-platform-macos.md`).
 pub struct Session {
     mtm: Option<MainThreadMarker>,
     wake: Waker,
@@ -543,6 +554,12 @@ impl Session {
     }
 
     pub fn open(&mut self, options: WindowOptions) -> Result<WindowKey, Error> {
+        if options.layer.is_some() {
+            return Err(Error("layer surfaces need Wayland".into()));
+        }
+        if options.lock.is_some() {
+            return Err(Error("lock screens need Wayland".into()));
+        }
         let key = WindowKey(NEXT_KEY.fetch_add(1, Ordering::Relaxed));
         let (place, frames, parent) = match (self.mtm, &self.wake.thread) {
             (Some(mtm), _) => {
@@ -639,9 +656,21 @@ impl Session {
     /// Waits until something comes for a window, or one of them has something to do. AppKit's
     /// own loops, like that of a live resize, run [`Session::dispatch`] from inside.
     pub fn wait<M: Handlers>(&mut self, handlers: &mut M) -> Result<(), Error> {
+        self.wait_until(handlers, None)
+    }
+
+    /// As [`Session::wait`], but waking by `until` at the latest.
+    pub fn wait_until<M: Handlers>(
+        &mut self,
+        handlers: &mut M,
+        until: Option<Instant>,
+    ) -> Result<(), Error> {
         let now = Instant::now();
         let mut deadline: Option<Instant> = None;
         let mut earlier = |t: Instant| deadline = Some(deadline.map_or(t, |d| d.min(t)));
+        if let Some(t) = until {
+            earlier(t);
+        }
         for i in &mut self.instances {
             let f = &i.frames;
             let pending = match &i.place {

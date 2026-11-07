@@ -906,6 +906,16 @@ pub fn layout_document(doc: &mut Document, ts: &mut TextSystem) {
         last_letter: None,
     };
     let size = (Some(viewport.width), Some(viewport.height));
+    let (fit_width, fit_height) = engine.doc.fit;
+    if fit_width || fit_height {
+        // What it would take, along the axes that follow it, before it is laid out in what it has.
+        let known = (
+            (!fit_width).then_some(viewport.width),
+            (!fit_height).then_some(viewport.height),
+        );
+        let natural = engine.compute(root, known, known.0, size, false);
+        engine.doc.natural = Some(natural);
+    }
     engine.compute(root, size, Some(viewport.width), size, true);
     engine.doc.nodes[root].rect = RectI::new(0, 0, viewport.width, viewport.height);
     for id in engine.doc.popups.clone() {

@@ -1,5 +1,5 @@
 //! Our own `IOSurface` buffers on macOS, drawn with damage tracking and shown as the contents of a
-//! layer (see "提示" in `docs/design/37-platform-macos.md`). Core Animation takes no damage, so
+//! layer (see "提示" in `docs/design/38-platform-macos.md`). Core Animation takes no damage, so
 //! what this saves is the GPU's work.
 
 use super::{Stats, renderer_target};

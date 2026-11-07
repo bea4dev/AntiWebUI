@@ -1,4 +1,4 @@
-# 37. macOS バックエンド
+# 38. macOS バックエンド
 
 Wayland と X11 でできていることを、macOS でも同じ書き味で動かす。描く仕組み（core、レンダラ、`Runner`、`Presenter`、`Pacing`）はそのまま使い、ウィンドウ、入力、提示、ポップアップ、クリップボード、IME を AppKit につなぐ。
 

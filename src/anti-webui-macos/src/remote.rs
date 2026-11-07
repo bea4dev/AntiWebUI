@@ -1,5 +1,5 @@
 //! Windows of `spawn_window`, drawn on threads of their own (see "複数ウィンドウ" in
-//! `docs/design/37-platform-macos.md`). AppKit's window and views stay on the main thread, which
+//! `docs/design/38-platform-macos.md`). AppKit's window and views stay on the main thread, which
 //! hosts them here and hands their events over; the thread draws to its layers, waits on its own
 //! run loop, and has the display link come there. What it asks of the window goes to the main
 //! thread as a function to run on it.

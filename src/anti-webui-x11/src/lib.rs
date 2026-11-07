@@ -62,6 +62,10 @@ pub struct WindowOptions {
     pub parent: Option<ParentLink>,
     /// Keeps input from the parent (`_NET_WM_STATE_MODAL`).
     pub modal: bool,
+    /// A layer surface of a desktop shell, which X has no such thing as: opening one fails.
+    pub layer: Option<anti_webui_core::layer::LayerSpec>,
+    /// A lock surface, which needs Wayland too: opening one fails.
+    pub lock: Option<String>,
 }
 
 impl Default for WindowOptions {
@@ -75,6 +79,8 @@ impl Default for WindowOptions {
             decorations: DecorationMode::Auto,
             parent: None,
             modal: false,
+            layer: None,
+            lock: None,
         }
     }
 }
@@ -203,6 +209,11 @@ impl Ctx<'_> {
     pub fn show_window_menu(&mut self) {
         self.state.show_window_menu();
     }
+
+    /// Layer surfaces are Wayland's: there are none here.
+    pub fn change_layer(&mut self, _change: anti_webui_core::layer::LayerChange) {}
+
+    pub fn set_layer_content_size(&mut self, _size: SizeI) {}
 
     pub fn set_title(&mut self, title: &str) {
         self.state.set_title(title);
@@ -516,6 +527,12 @@ impl Session {
     }
 
     pub fn open(&mut self, options: WindowOptions) -> Result<WindowKey, Error> {
+        if options.layer.is_some() {
+            return Err(Error("layer surfaces need Wayland".into()));
+        }
+        if options.lock.is_some() {
+            return Err(Error("lock screens need Wayland".into()));
+        }
         let key = WindowKey(NEXT_KEY.fetch_add(1, Ordering::Relaxed));
         let wake = self.wake_write.try_clone().map_err(err)?;
         let state = State::new(&options, wake)?;
@@ -546,6 +563,22 @@ impl Session {
         }
     }
 
+    /// Draws a window soon, as when something on another window of the thread changed it.
+    pub fn request_redraw(&mut self, key: WindowKey) {
+        if let Some(i) = self.instances.iter_mut().find(|i| i.key == key) {
+            let now = Instant::now();
+            i.state.redraw_at = Some(i.state.redraw_at.map_or(now, |r| r.min(now)));
+        }
+    }
+
+    /// Whether a window is already going to be drawn.
+    pub fn redraw_pending(&self, key: WindowKey) -> bool {
+        self.instances
+            .iter()
+            .find(|i| i.key == key)
+            .is_some_and(|i| i.state.redraw_requested || i.state.redraw_at.is_some())
+    }
+
     /// The windows whose handlers asked to close them, through [`Ctx::exit`].
     pub fn exited(&self) -> Vec<WindowKey> {
         self.instances
@@ -570,6 +603,15 @@ impl Session {
 
     /// Waits until something comes for a window, or one of them has something to do.
     pub fn wait<M: Handlers>(&mut self, handlers: &mut M) -> Result<(), Error> {
+        self.wait_until(handlers, None)
+    }
+
+    /// As [`Session::wait`], but waking by `until` at the latest.
+    pub fn wait_until<M: Handlers>(
+        &mut self,
+        handlers: &mut M,
+        until: Option<Instant>,
+    ) -> Result<(), Error> {
         for i in &mut self.instances {
             if i.exit || !i.state.events.is_empty() {
                 return Ok(());
@@ -584,6 +626,9 @@ impl Session {
         let now = Instant::now();
         let mut deadline: Option<Instant> = None;
         let mut earlier = |t: Instant| deadline = Some(deadline.map_or(t, |d| d.min(t)));
+        if let Some(t) = until {
+            earlier(t);
+        }
         for i in &mut self.instances {
             i.timer_deadline = handlers.handler(i.key).and_then(|h| h.deadline(now));
             if let Some(t) = i.timer_deadline {

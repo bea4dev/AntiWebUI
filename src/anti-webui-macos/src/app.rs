@@ -1,6 +1,6 @@
 //! The application: AppKit set up once, the menu, waking the loop from other threads, and the way
 //! back into our loop from AppKit's own (see "イベントループ" in
-//! `docs/design/37-platform-macos.md`).
+//! `docs/design/38-platform-macos.md`).
 
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};

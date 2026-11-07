@@ -1,6 +1,6 @@
 //! Presentation: our own buffers with damage tracking, or a wgpu surface as the fallback (see
 //! `docs/design/05-rendering.md`). Our own buffers are dmabufs on Linux (`06-platform-wayland.md`
-//! and `35-platform-x11.md`) and `IOSurface`s on macOS (`37-platform-macos.md`).
+//! and `35-platform-x11.md`) and `IOSurface`s on macOS (`38-platform-macos.md`).
 
 // Where there are no buffers of our own, what they would do can't be reached.
 #![cfg_attr(

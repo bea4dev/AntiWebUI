@@ -159,8 +159,10 @@ impl State {
             .viewporter
             .as_ref()
             .map(|v| v.get_viewport(&surface, &self.qh, ()));
+        // A lock surface can't be the parent of an xdg popup: its menus are subsurfaces too.
+        let locked = matches!(self.role, crate::state::SurfaceRole::Lock(_));
         let role = match (params.kind, &self.subcompositor, params.position) {
-            (PopupKind::Bubble, Some(sub), Some(_)) => {
+            (kind, Some(sub), Some(_)) if kind == PopupKind::Bubble || locked => {
                 let Some(parent) = self.surface_of(params.parent) else {
                     surface.destroy();
                     return;
@@ -175,12 +177,18 @@ impl State {
                         Some(Role::Xdg { xdg_surface, .. }) => Some(xdg_surface),
                         _ => None,
                     },
-                    None => Some(&self.xdg_surface),
+                    None => self.xdg_surface(),
                 };
                 let xdg_surface = self.wm_base.get_xdg_surface(&surface, &self.qh, tag);
                 let positioner = self.positioner(&params);
                 let popup = xdg_surface.get_popup(parent, &positioner, &self.qh, id);
                 positioner.destroy();
+                // On a layer surface, the popup is given its parent this way.
+                if params.parent.is_none()
+                    && let crate::state::SurfaceRole::Layer(l) = &self.role
+                {
+                    l.object.get_popup(&popup);
+                }
                 if params.kind == PopupKind::Menu
                     && let Some(seat) = &self.seat
                 {

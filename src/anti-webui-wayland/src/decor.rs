@@ -103,26 +103,24 @@ impl State {
     }
 
     pub(crate) fn start_move(&mut self) {
-        if let Some(seat) = &self.seat {
-            self.toplevel._move(seat, self.press_serial);
+        if let (Some(seat), Some(toplevel)) = (&self.seat, self.toplevel()) {
+            toplevel._move(seat, self.press_serial);
         }
     }
 
     pub(crate) fn start_resize(&mut self, edge: ResizeEdge) {
-        if let Some(seat) = &self.seat {
-            self.toplevel
-                .resize(seat, self.press_serial, resize_edge(edge));
+        if let (Some(seat), Some(toplevel)) = (&self.seat, self.toplevel()) {
+            toplevel.resize(seat, self.press_serial, resize_edge(edge));
         }
     }
 
     pub(crate) fn show_window_menu(&mut self) {
-        if let Some(seat) = &self.seat {
+        if let (Some(seat), Some(toplevel)) = (&self.seat, self.toplevel()) {
             let (x, y) = match self.pointer_surface {
                 anti_webui_core::platform::SurfaceId::Window => self.pointer_pos,
                 _ => (0.0, 0.0),
             };
-            self.toplevel
-                .show_window_menu(seat, self.press_serial, x as i32, y as i32);
+            toplevel.show_window_menu(seat, self.press_serial, x as i32, y as i32);
         }
     }
 
@@ -382,8 +380,20 @@ impl State {
         if let Some(v) = self.viewport.take() {
             v.destroy();
         }
-        self.toplevel.destroy();
-        self.xdg_surface.destroy();
+        match &self.role {
+            crate::state::SurfaceRole::Toplevel {
+                xdg_surface,
+                toplevel,
+            } => {
+                toplevel.destroy();
+                xdg_surface.destroy();
+            }
+            crate::state::SurfaceRole::Layer(l) => l.object.destroy(),
+            crate::state::SurfaceRole::Lock(l) => l.destroy(),
+        }
+        if let Some(outputs) = self.outputs.take() {
+            outputs.release();
+        }
         self.surface.destroy();
         self.closed = true;
     }

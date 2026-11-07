@@ -13,6 +13,7 @@ pub mod drag;
 pub mod event;
 pub mod geometry;
 pub mod images;
+pub mod layer;
 #[doc(hidden)]
 pub mod layout;
 #[doc(hidden)]
@@ -30,6 +31,7 @@ pub mod shared;
 pub mod svg;
 #[cfg(feature = "svg")]
 mod svg_file;
+pub mod task;
 pub mod text;
 #[doc(hidden)]
 pub mod tree;
@@ -67,6 +69,7 @@ pub mod prelude {
     pub use crate::shader::{Image, IntoImage, IntoPaint, Shader, ShaderPaint, ShaderParams};
     pub use crate::shared::{SharedSignal, shared_signal};
     pub use crate::svg::{self, Svg, svg};
+    pub use crate::task::{Completer, Task, task};
     pub use crate::text::editor::{DecorateContext, Gutter, LineLook, Row, TextEdit, Widget};
     pub use crate::text::rich::{
         Inline, IntoRuns, RichText, Run, Span, VerticalAlign, inline, rich_text, span,
@@ -84,10 +87,10 @@ pub mod prelude {
         text, text_area, text_editor, text_input, video, window_fullscreen, window_scale,
     };
     pub use crate::window::{
-        CloseRequest, DecorationMode, Decorations, ResizeEdge, WindowHandle, WindowId,
-        WindowOptions, close_window, current_window, minimize_window, on_close_request,
-        open_window, request_close_window, set_window_maximized, set_window_title,
-        show_window_menu, spawn_window, start_window_move, start_window_resize,
+        CloseRequest, DecorationMode, Decorations, ResizeEdge, UiThreadHandle, WindowHandle,
+        WindowId, WindowOptions, close_window, current_window, minimize_window, on_close_request,
+        open_window, quit, request_close_window, set_window_maximized, set_window_title,
+        show_window_menu, spawn_ui_thread, spawn_window, start_window_move, start_window_resize,
         toggle_window_maximized, window_active, window_decorations, window_maximized,
     };
     pub use anti_webui_style::*;

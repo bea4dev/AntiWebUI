@@ -1,5 +1,5 @@
 //! Pointers, scrolling and pinching: AppKit's events to the core's (see "入力" in
-//! `docs/design/37-platform-macos.md`).
+//! `docs/design/38-platform-macos.md`).
 
 use anti_webui_core::event::{PinchPhase, PointerButton, ScrollPhase, ScrollSource};
 use objc2_app_kit::NSEventPhase;

@@ -264,7 +264,7 @@ column((
 
 ## 環境ごとの違い
 
-| | Wayland | X11 | Windows（今後） | macOS（[37](37-platform-macos.md)） |
+| | Wayland | X11 | Windows（今後） | macOS（[38](38-platform-macos.md)） |
 |---|---|---|---|---|
 | ダイアログ（`dialog`、`modal`） | `set_parent` | `WM_TRANSIENT_FOR` | オーナー付きウィンドウ | `addChildWindow` |
 | 位置の指定 | できない（コンポジタが決める） | 今はしない | できる | できる |

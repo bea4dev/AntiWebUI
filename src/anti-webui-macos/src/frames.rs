@@ -1,6 +1,6 @@
 //! What the thread that draws a window keeps of it: the size, when to draw, the display link, and
 //! the layers that show our `IOSurface`s (see "提示" and "複数ウィンドウ" in
-//! `docs/design/37-platform-macos.md`). This is the main thread for the windows it runs, and the
+//! `docs/design/38-platform-macos.md`). This is the main thread for the windows it runs, and the
 //! window's own thread for those of `spawn_window`. Core Animation's layers and display links may
 //! be used from any thread; AppKit's windows and views stay on the main one, in `State`.
 

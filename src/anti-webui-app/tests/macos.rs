@@ -1,6 +1,6 @@
 //! The macOS backend end to end: a real window, with events made by the program and posted to its
 //! own queue, which come in through `sendEvent:` like the user's (see "確かめ方" in
-//! `docs/design/37-platform-macos.md`). AppKit runs on the main thread only, so this has no test
+//! `docs/design/38-platform-macos.md`). AppKit runs on the main thread only, so this has no test
 //! harness: `cargo test -p anti-webui-app --test macos`.
 
 #[cfg(not(target_os = "macos"))]

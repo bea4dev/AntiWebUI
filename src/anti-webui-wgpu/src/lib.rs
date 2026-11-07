@@ -10,6 +10,8 @@ mod drivers;
 #[doc(hidden)]
 pub use drivers::limit_vulkan_drivers;
 mod effects;
+#[cfg(target_os = "linux")]
+mod gbm;
 mod glyph_cache;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]

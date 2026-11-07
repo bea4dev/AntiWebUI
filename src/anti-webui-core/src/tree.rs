@@ -554,6 +554,10 @@ pub struct Document {
     pub dirty: Dirty,
     pub scale: Scale,
     pub viewport: SizeI,
+    /// Which axes of the window follow the max-content size of what is in it, as a layer surface's
+    /// may, and that size in pixels once laid out.
+    pub fit: (bool, bool),
+    pub natural: Option<SizeI>,
     pub requests: Vec<PlatformRequest>,
     /// Programmatic focus change requested through a `NodeRef`.
     pub pending_focus: Option<Option<NodeId>>,
@@ -647,6 +651,8 @@ impl Default for Document {
             dirty: Dirty::default(),
             scale: Scale::ONE,
             viewport: SizeI::default(),
+            fit: (false, false),
+            natural: None,
             requests: Vec::new(),
             pending_focus: None,
             layer_contents: HashMap::new(),
