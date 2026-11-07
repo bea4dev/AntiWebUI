@@ -16,6 +16,22 @@ pdf = ["dep:anti-webui-pdf"]
 pdf-js = ["pdf", "anti-webui-pdf/js"]
 markdown = ["dep:anti-webui-markdown"]
 code = ["dep:anti-webui-code"]
+wayland-shell = ["wayland", "dep:anti-webui-wayland-shell"]
+shell-hyprland = ["wayland-shell", "anti-webui-wayland-shell/hyprland"]
+shell-niri = ["wayland-shell", "anti-webui-wayland-shell/niri"]
+shell-sway = ["wayland-shell", "anti-webui-wayland-shell/sway"]
+shell-network = ["wayland-shell", "anti-webui-wayland-shell/network"]
+shell-battery = ["wayland-shell", "anti-webui-wayland-shell/battery"]
+shell-power-profiles = ["wayland-shell", "anti-webui-wayland-shell/power-profiles"]
+shell-bluetooth = ["wayland-shell", "anti-webui-wayland-shell/bluetooth"]
+shell-media = ["wayland-shell", "anti-webui-wayland-shell/media"]
+shell-notifications = ["wayland-shell", "anti-webui-wayland-shell/notifications"]
+shell-tray = ["wayland-shell", "anti-webui-wayland-shell/tray"]
+shell-session = ["wayland-shell", "anti-webui-wayland-shell/session"]
+shell-audio = ["wayland-shell", "anti-webui-wayland-shell/audio"]
+shell-apps = ["wayland-shell", "anti-webui-wayland-shell/apps"]
+shell-process = ["wayland-shell", "anti-webui-wayland-shell/process"]
+shell-system = ["wayland-shell", "anti-webui-wayland-shell/system"]
 
 [dependencies]
 anti-webui-core.workspace = true
@@ -27,3 +43,4 @@ anti-webui-macros.workspace = true
 anti-webui-pdf = { workspace = true, optional = true }
 anti-webui-markdown = { workspace = true, optional = true }
 anti-webui-code = { workspace = true, optional = true }
+anti-webui-wayland-shell = { workspace = true, optional = true }

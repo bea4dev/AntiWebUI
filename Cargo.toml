@@ -19,6 +19,7 @@ members = [
     "src/anti-webui-code",
     "src/anti-webui-wayland",
     "src/anti-webui-x11",
+    "src/anti-webui-wayland-shell",
     "src/anti-webui-windows",
     "src/anti-webui-macos",
 ]
@@ -46,6 +47,7 @@ anti-webui-markdown = { path = "src/anti-webui-markdown", version = "0.1.0" }
 anti-webui-code = { path = "src/anti-webui-code", version = "0.1.0" }
 anti-webui-wayland = { path = "src/anti-webui-wayland", version = "0.1.0" }
 anti-webui-x11 = { path = "src/anti-webui-x11", version = "0.1.0" }
+anti-webui-wayland-shell = { path = "src/anti-webui-wayland-shell", version = "0.1.0" }
 anti-webui-symbols-outlined = { path = "src/anti-webui-symbols-outlined", version = "0.1.0" }
 
 wgpu = "30"
@@ -56,6 +58,8 @@ icu_properties = "2"
 wayland-client = "0.31.15"
 wayland-backend = { version = "0.3.17", features = ["client_system"] }
 wayland-protocols = { version = "0.32.13", features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+wayland-scanner = "0.31.11"
 xkbcommon = { version = "0.9", features = ["wayland"] }
 raw-window-handle = "0.6.2"
 slotmap = "1.1"

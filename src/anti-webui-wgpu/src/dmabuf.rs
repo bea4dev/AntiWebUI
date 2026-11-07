@@ -1,16 +1,18 @@
 //! Display buffers that we allocate ourselves and share with the compositor as dmabufs (Linux,
 //! Vulkan). See `docs/design/06-platform-wayland.md`.
 //!
-//! Each buffer is a `VkImage` with an explicit DRM format modifier whose memory is exported as
-//! a dmabuf, wrapped as a `wgpu::Texture` for rendering. Around each frame the image's queue
+//! Each buffer is a dmabuf from GBM imported as a `VkImage` with an explicit DRM format modifier,
+//! or where GBM can't, a `VkImage` whose memory is exported as a dmabuf; either is wrapped as a
+//! `wgpu::Texture` for rendering. Around each frame the image's queue
 //! family ownership moves between our queue and `VK_QUEUE_FAMILY_FOREIGN_EXT` (the compositor),
 //! which is also where drivers resolve compression for external readers.
 
-use crate::{Gpu, GpuError};
+use crate::{Gpu, GpuError, gbm};
 use ash::{ext, khr, vk};
 use std::ffi::CStr;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 use wgpu::hal::api::Vulkan;
 
@@ -56,6 +58,10 @@ struct ModifierInfo {
     modifier: u64,
     planes: u32,
     max_extent: (u32, u32),
+    /// Vulkan can allocate images with it and give their memory out.
+    exportable: bool,
+    /// Vulkan can render to a dmabuf of it from elsewhere (GBM).
+    importable: bool,
 }
 
 /// Vulkan objects shared by all dmabuf images of a device.
@@ -71,15 +77,28 @@ pub struct DmabufContext {
     pool: vk::CommandPool,
     modifiers: Vec<ModifierInfo>,
     render_node: Option<PathBuf>,
+    /// What allocates the buffers, when it can. `ANTIWEBUI_ALLOCATOR=vulkan` leaves it out.
+    gbm: Option<Rc<gbm::Device>>,
     /// Images dropped while the GPU may still use them, with the fence that says when it is done.
     graveyard: Vec<Retired>,
 }
 
 struct Retired {
     _texture: wgpu::Texture,
+    _bo: Option<gbm::Bo>,
     commands: [vk::CommandBuffer; 2],
     semaphores: [vk::Semaphore; 2],
     fence: vk::Fence,
+}
+
+/// A new image and its dmabuf, before it is wrapped for wgpu.
+struct Made {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    fd: OwnedFd,
+    modifier: u64,
+    planes: Vec<DmabufPlane>,
+    bo: Option<gbm::Bo>,
 }
 
 /// A display buffer: a wgpu texture whose memory is a dmabuf.
@@ -101,6 +120,8 @@ pub struct DmabufImage {
     fence: vk::Fence,
     /// Never handed to the compositor: still in the layout wgpu created it in.
     fresh: bool,
+    /// What GBM keeps of it, when it came from there.
+    bo: Option<gbm::Bo>,
 }
 
 impl Gpu {
@@ -256,6 +277,12 @@ impl DmabufContext {
         }
         .map_err(vk_err("command pool"))?;
 
+        let gbm = if std::env::var("ANTIWEBUI_ALLOCATOR").is_ok_and(|a| a == "vulkan") {
+            None
+        } else {
+            render_node.as_deref().and_then(gbm::Device::open)
+        };
+
         Ok(Self {
             instance,
             device,
@@ -268,6 +295,7 @@ impl DmabufContext {
             pool,
             modifiers,
             render_node,
+            gbm,
             graveyard: Vec::new(),
         })
     }
@@ -281,10 +309,11 @@ impl DmabufContext {
     pub fn supports_any(&self, modifiers: &[u64]) -> bool {
         self.modifiers
             .iter()
-            .any(|m| modifiers.contains(&m.modifier))
+            .any(|m| modifiers.contains(&m.modifier) && (m.exportable || self.gbm.is_some()))
     }
 
-    /// Allocates an `ARGB8888` image; the driver picks one of `modifiers` (the compositor's).
+    /// Allocates an `ARGB8888` image with one of `modifiers` (the compositor's): from GBM if it
+    /// can, else from Vulkan.
     pub fn allocate(
         &mut self,
         gpu: &Gpu,
@@ -293,24 +322,197 @@ impl DmabufContext {
         modifiers: &[u64],
     ) -> Result<DmabufImage, GpuError> {
         self.reap();
-        let candidates: Vec<u64> = self
-            .modifiers
+        let fits = |m: &&ModifierInfo| {
+            modifiers.contains(&m.modifier) && m.max_extent.0 >= width && m.max_extent.1 >= height
+        };
+        // In the compositor's order: what it can put on the screen comes first.
+        let importable: Vec<u64> = modifiers
             .iter()
+            .copied()
             .filter(|m| {
-                modifiers.contains(&m.modifier)
-                    && m.max_extent.0 >= width
-                    && m.max_extent.1 >= height
+                self.modifiers
+                    .iter()
+                    .filter(fits)
+                    .any(|i| i.modifier == *m && i.importable)
             })
-            .map(|m| m.modifier)
             .collect();
+        let from_gbm = self
+            .gbm
+            .as_ref()
+            .and_then(|g| g.allocate(width, height, DRM_FORMAT_ARGB8888, &importable))
+            .map(|a| self.import(a, width, height));
+        let made = match from_gbm {
+            Some(Ok(made)) => made,
+            other => {
+                if let Some(Err(e)) = other {
+                    log::debug!("importing a GBM buffer failed ({e}); allocating with Vulkan");
+                }
+                let exportable: Vec<u64> = self
+                    .modifiers
+                    .iter()
+                    .filter(fits)
+                    .filter(|m| m.exportable)
+                    .map(|m| m.modifier)
+                    .collect();
+                self.export(&exportable, width, height)?
+            }
+        };
+        let Made {
+            image,
+            memory,
+            fd,
+            modifier,
+            planes,
+            bo,
+        } = made;
+
+        let device = &self.device;
+        let (acquire, release, wait_semaphore, signal_semaphore, fence) =
+            match self.create_sync_objects(image) {
+                Ok(objects) => objects,
+                Err(e) => {
+                    // SAFETY: the image and memory are unused.
+                    unsafe {
+                        device.destroy_image(image, None);
+                        device.free_memory(memory, None);
+                    }
+                    return Err(e);
+                }
+            };
+
+        let texture = self.wrap_texture(gpu, image, memory, width, height);
+        let view = texture.create_view(&Default::default());
+        Ok(DmabufImage {
+            texture,
+            view,
+            fd,
+            planes,
+            modifier,
+            format: DRM_FORMAT_ARGB8888,
+            width,
+            height,
+            acquire,
+            release,
+            wait_semaphore,
+            signal_semaphore,
+            fence,
+            fresh: true,
+            bo,
+        })
+    }
+
+    /// Makes a Vulkan image of a buffer GBM allocated.
+    fn import(&self, a: gbm::Allocated, width: u32, height: u32) -> Result<Made, GpuError> {
+        let device = &self.device;
+        let layouts: Vec<vk::SubresourceLayout> = a
+            .planes
+            .iter()
+            .map(|p| {
+                vk::SubresourceLayout::default()
+                    .offset(p.offset.into())
+                    .row_pitch(p.stride.into())
+            })
+            .collect();
+        let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(a.modifier)
+            .plane_layouts(&layouts);
+        let mut external = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(VK_FORMAT)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut explicit)
+            .push_next(&mut external);
+        // SAFETY: valid create info; destroyed on failure below or by the texture's drop.
+        let image = unsafe { device.create_image(&info, None) }.map_err(vk_err("image"))?;
+        let free_image = || {
+            // SAFETY: nothing else has it yet.
+            unsafe { device.destroy_image(image, None) };
+        };
+        // Vulkan takes this one over; `a.fd` stays ours, for the compositor.
+        let fd = match a.fd.try_clone() {
+            Ok(fd) => fd,
+            Err(e) => {
+                free_image();
+                return Err(GpuError::Dmabuf(format!("duplicating a dmabuf: {e}")));
+            }
+        };
+        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+        // SAFETY: valid image, descriptor and output.
+        let (requirements, known) = unsafe {
+            let requirements = device.get_image_memory_requirements(image);
+            let known = self.memory_fd.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                fd.as_raw_fd(),
+                &mut fd_props,
+            );
+            (requirements, known)
+        };
+        let bits = requirements.memory_type_bits & fd_props.memory_type_bits;
+        if known.is_err() || bits == 0 {
+            free_image();
+            return Err(GpuError::Dmabuf("no memory type for the dmabuf".into()));
+        }
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let raw = fd.into_raw_fd();
+        let mut import = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(raw);
+        let allocate = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(bits.trailing_zeros())
+            .push_next(&mut dedicated)
+            .push_next(&mut import);
+        // SAFETY: valid structures. On success the driver owns the descriptor.
+        let memory = match unsafe { device.allocate_memory(&allocate, None) } {
+            Ok(memory) => memory,
+            Err(e) => {
+                // SAFETY: the import failed, so it is still ours.
+                drop(unsafe { OwnedFd::from_raw_fd(raw) });
+                free_image();
+                return Err(vk_err("importing the dmabuf")(e));
+            }
+        };
+        // SAFETY: both are new, and made for each other.
+        if let Err(e) = unsafe { device.bind_image_memory(image, memory, 0) } {
+            // SAFETY: nothing else has them.
+            unsafe { device.free_memory(memory, None) };
+            free_image();
+            return Err(vk_err("binding memory")(e));
+        }
+        Ok(Made {
+            image,
+            memory,
+            fd: a.fd,
+            modifier: a.modifier,
+            planes: a.planes,
+            bo: Some(a.bo),
+        })
+    }
+
+    /// Makes a Vulkan image whose memory is given out as a dmabuf; the driver picks one of
+    /// `candidates`.
+    fn export(&self, candidates: &[u64], width: u32, height: u32) -> Result<Made, GpuError> {
         if candidates.is_empty() {
             return Err(GpuError::Dmabuf(
                 "no modifier shared with the compositor".into(),
             ));
         }
         let device = &self.device;
-        let mut modifier_list = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
-            .drm_format_modifiers(&candidates);
+        let mut modifier_list =
+            vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(candidates);
         let mut external = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
         let info = vk::ImageCreateInfo::default()
@@ -404,26 +606,13 @@ impl DmabufContext {
             })
             .collect();
 
-        let (acquire, release, wait_semaphore, signal_semaphore, fence) =
-            self.create_sync_objects(image).map_err(destroy)?;
-
-        let texture = self.wrap_texture(gpu, image, memory, width, height);
-        let view = texture.create_view(&Default::default());
-        Ok(DmabufImage {
-            texture,
-            view,
+        Ok(Made {
+            image,
+            memory,
             fd,
-            planes,
             modifier,
-            format: DRM_FORMAT_ARGB8888,
-            width,
-            height,
-            acquire,
-            release,
-            wait_semaphore,
-            signal_semaphore,
-            fence,
-            fresh: true,
+            planes,
+            bo: None,
         })
     }
 
@@ -749,6 +938,7 @@ impl DmabufContext {
     pub fn retire(&mut self, image: DmabufImage) {
         self.graveyard.push(Retired {
             _texture: image.texture,
+            _bo: image.bo,
             commands: [image.acquire, image.release],
             semaphores: [image.wait_semaphore, image.signal_semaphore],
             fence: image.fence,
@@ -790,6 +980,11 @@ impl Drop for DmabufContext {
 }
 
 impl DmabufImage {
+    /// Whether GBM allocated it, rather than Vulkan.
+    pub fn from_gbm(&self) -> bool {
+        self.bo.is_some()
+    }
+
     pub fn fd(&self) -> BorrowedFd<'_> {
         use std::os::fd::AsFd;
         self.fd.as_fd()
@@ -833,14 +1028,17 @@ fn query_modifiers(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Vec<Modi
             unsafe { instance.get_physical_device_image_format_properties2(pd, &info, &mut out) }
                 .ok()?;
             let extent = out.image_format_properties.max_extent;
-            let exportable = ext_props
+            let features = ext_props
                 .external_memory_properties
-                .external_memory_features
-                .contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE);
-            exportable.then_some(ModifierInfo {
+                .external_memory_features;
+            let exportable = features.contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE);
+            let importable = features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
+            (exportable || importable).then_some(ModifierInfo {
                 modifier: e.drm_format_modifier,
                 planes: e.drm_format_modifier_plane_count,
                 max_extent: (extent.width, extent.height),
+                exportable,
+                importable,
             })
         })
         .collect()

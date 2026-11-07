@@ -1,0 +1,64 @@
+[package]
+name = "anti-webui-wayland-shell"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Desktop shells on Wayland with AntiWebUI: layer surfaces, outputs and what a shell shows"
+
+[dependencies]
+anti-webui-core.workspace = true
+anti-webui-app = { workspace = true, features = ["wayland"] }
+anti-webui-wayland.workspace = true
+anti-webui-widgets = { workspace = true, optional = true }
+wayland-client.workspace = true
+wayland-backend.workspace = true
+bitflags = "2"
+wayland-protocols.workspace = true
+wayland-protocols-wlr.workspace = true
+wayland-scanner.workspace = true
+libc.workspace = true
+rustix = { workspace = true, features = ["pipe"] }
+serde_json = { version = "1", optional = true }
+zbus = { version = "5.15", optional = true, default-features = false, features = ["async-io"] }
+async-executor = { version = "1.11", optional = true }
+async-lock = { version = "3.3", optional = true }
+futures-lite = { version = "2.6", optional = true }
+libloading = { workspace = true, optional = true }
+
+[features]
+## Hyprland's IPC, and workspaces from it. See `docs/design/37-wayland-shell.md`.
+hyprland = ["dep:serde_json"]
+## niri's IPC, and workspaces from it.
+niri = ["dep:serde_json"]
+## Sway's (and i3's) IPC, and workspaces from it.
+sway = ["dep:serde_json"]
+## Wi-Fi and wired networks through NetworkManager.
+network = ["dbus"]
+## Batteries, the laptop's and those of mice and headsets, through UPower.
+battery = ["dbus"]
+## Power profiles through power-profiles-daemon.
+power-profiles = ["dbus"]
+## Bluetooth adapters and devices through BlueZ.
+bluetooth = ["dbus"]
+## Media players through MPRIS.
+media = ["dbus"]
+## Being the notification daemon (`org.freedesktop.Notifications`).
+notifications = ["dbus"]
+## The system tray (StatusNotifierItem and dbusmenu).
+tray = ["dbus", "dep:anti-webui-widgets"]
+## Suspending, powering off, locking and the screen's brightness through logind.
+session = ["dbus"]
+## Audio devices and the sound of each program, through PipeWire (loaded when first used).
+audio = ["dep:libloading"]
+## The applications installed (XDG .desktop files), their icons, searching and launching them.
+apps = []
+## Running commands, their output a line at a time.
+process = []
+## CPU, memory, temperatures, disks and network speed, from /proc and /sys.
+system = []
+# What the D-Bus services share. Not to be named directly.
+dbus = ["dep:zbus", "dep:async-executor", "dep:async-lock", "dep:futures-lite"]
+
+[dev-dependencies]
+serde_json = "1"

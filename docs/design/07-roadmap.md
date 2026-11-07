@@ -69,5 +69,6 @@
 - PDF ビュワー（`hayro` を土台に、PDF.js 以上の速度を目標。[26](26-pdf.md) 参照。P4、フォーム、注釈、プレゼンテーションモード、フォームの JavaScript（`pdf-js` feature）まで実装済み）
 - Markdown のビュワーとエディタ（[28](28-markdown.md) 参照。ビュワーと Mermaid（`markdown` feature）、画面から遠いブロックを後回しにする `content-visibility`（[29](29-content-visibility.md)）、Obsidian のようなライブプレビューのエディタ `markdown_editor`、左にソースと右にプレビューの `markdown_split_editor` と、コードブロックの tree-sitter の色分け（[32](32-markdown-split.md)）まで実装済み）
 - コードエディタ（[31](31-code-editor.md) 参照。`text_editor` が見えている行だけを作るようにし、tree-sitter で色分けする `code_editor`（`code` feature、14 言語）を実装済み。Markdown のソースは `markdown_split_editor` の左側として使っている（[32](32-markdown-split.md)））
+- Wayland のシェル（`anti-webui-wayland-shell`。レイヤーサーフェス、ディスプレイごとのスレッド、ワークスペースと IPC、D-Bus の機能。[37](37-wayland-shell.md) 参照。2026-11-07 に L1（レイヤー、ディスプレイごとのスレッド、`shell_bar`）と L2（ワークスペース、ウィンドウ一覧、アイドル、クリップボード、Hyprland・niri・sway の IPC、ウィンドウのサムネイル）と L3（ネットワーク、電池、電源プロファイル、Bluetooth、メディア、通知、トレイ、logind の D-Bus の機能）と L4（PipeWire の音声、アプリと起動、プロセス、システム情報、画面ロック、例 `shell_launcher`）を作った。どれも手での確認待ち）
 
 - WebRTC、画面キャプチャ、通知

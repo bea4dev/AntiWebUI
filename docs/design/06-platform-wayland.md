@@ -91,9 +91,18 @@ wgpu の Surface（Vulkan WSI）を使わず、表示用バッファを自前で
 
 1. `zwp_linux_dmabuf_v1.get_surface_feedback` で、コンポジタが使う GPU（main device）と、受け付ける形式・modifier の一覧（tranche）を受け取る。
 2. main device と同じ GPU の Vulkan アダプタを選ぶ（`VK_EXT_physical_device_drm` で dev_t を照合）。見つからなければ wgpu Surface にフォールバックする。
-3. `ARGB8888`（Vulkan の `B8G8R8A8_UNORM`）で、コンポジタの tranche と Vulkan の対応 modifier の積集合から `VK_EXT_image_drm_format_modifier` で VkImage を作る（どの modifier を使うかはドライバに選ばせる）。
-4. メモリを dmabuf としてエクスポートし（`VK_KHR_external_memory_fd`）、プレーンごとの offset / stride と選ばれた modifier を `zwp_linux_buffer_params_v1` に渡して `wl_buffer` を作る。
-5. 同じ VkImage を wgpu-hal 経由で `wgpu::Texture` として取り込み、通常のレンダラで描く。
+3. `ARGB8888`（Vulkan の `B8G8R8A8_UNORM`）のバッファを GBM で確保する（`gbm_bo_create_with_modifiers2`、`SCANOUT | RENDERING`）。
+   - GBM は main device のレンダーノードで開く。libgbm は実行時に読み込む（libloading）。
+   - modifier の候補は、コンポジタの tranche の順に、Vulkan が描画先として取り込めるもの。どれを使うかは GBM が選ぶ。
+4. その dmabuf を `VK_EXT_image_drm_format_modifier` の explicit な作り方（GBM のプレーンの offset / stride）で VkImage にし、メモリは `VK_KHR_external_memory_fd` で取り込む（dedicated allocation）。
+5. GBM が使えないときや取り込めないときは、今までどおり Vulkan で VkImage を作り、そのメモリを dmabuf としてエクスポートする（modifier はドライバが選ぶ）。`ANTIWEBUI_ALLOCATOR=vulkan` でこちらに固定できる（切り分け用）。
+6. プレーンごとの offset / stride と modifier を `zwp_linux_buffer_params_v1` に渡して `wl_buffer` を作る。
+7. 同じ VkImage を wgpu-hal 経由で `wgpu::Texture` として取り込み、通常のレンダラで描く。
+
+GBM で確保するのは、コンポジタがバッファを合成せずそのまま画面に出せる（direct scanout）ようにするためだ。
+- NVIDIA のプロプライエタリドライバでは、Vulkan で確保してエクスポートしたバッファを画面にそのまま出すと、modifier が同じ（`0x300000000606014`）でも中身が壊れる。ほかのアプリの画面の断片が見えるほどだった。
+- 同じ症状が gamescope（issue #2309）や NeferWL（PR #151）でも報告されており、どちらも GBM での確保に切り替えて直している。wlroots、smithay、Chromium の Ozone も GBM で確保する。
+- 2026-11-08、ShojiWM のロック画面で起きた。合成されるとき（入れ子の ShojiWM など）は起きない。
 
 ### 読み込む Vulkan ドライバ
 
@@ -115,7 +124,11 @@ Vulkan ローダーは、インスタンスを作るときに入っているド�
 - 環境変数はプロセス全体に効くので、Rust 2024 では `unsafe` の `set_var` を使う。ほかのスレッドが環境変数を読んでいる間に書くのを避けるため、スレッドを作る前の `App::run` の最初に呼ぶ。利用者が `App::run` の前に自分でスレッドを作っていても、ローダーを読む前なら影響は無い。
 - `ANTIWEBUI_VULKAN_DRIVERS=all` で絞るのをやめられる（切り分け用）。
 
-バッファは必要に応じて最大 4 枚（保留中のフレームがあればその分を足した枚数）まで増やす。サイズや feedback が変わったら作り直す（古いバッファはコンポジタが返却してから破棄する）。
+バッファは必要に応じて最大 4 枚（保留中のフレームがあればその分を足した枚数）まで増やす。
+- サイズが変わったら作り直す。
+- feedback が変わったときは、今のバッファの修飾子が新しい候補にない場合だけ作り直す。コンポジタは、面を直接画面に出し始めたときもやめたときも feedback を送ってくるからだ。
+- 古いバッファは、コンポジタが返却するまで、wl_buffer もメモリも解放タイムラインも残す。コンポジタがまだ画面に直接出しているかもしれないからだ。
+- 2026-11-08 までは、feedback が変わるたびに、返却前のバッファもその場で壊していた。ShojiWM がロック画面を直接画面に出すと、出しているバッファが毎フレーム壊され、黒や赤や他のテクスチャが混ざって見えた。
 
 ### フレームの流れ
 

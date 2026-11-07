@@ -78,13 +78,24 @@ const HOLD_VERSION: u32 = 3;
 /// How long a popup may hold up the next frame by not getting its frame callback.
 const POPUP_FRAME_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// What the window's surface is to the compositor.
+pub(crate) enum SurfaceRole {
+    Toplevel {
+        xdg_surface: xdg_surface::XdgSurface,
+        toplevel: xdg_toplevel::XdgToplevel,
+    },
+    Layer(crate::layer::LayerRole),
+    Lock(crate::lock::LockRole),
+}
+
 pub struct State {
     pub qh: QueueHandle<State>,
     pub compositor: wl_compositor::WlCompositor,
     pub wm_base: xdg_wm_base::XdgWmBase,
     pub surface: wl_surface::WlSurface,
-    pub xdg_surface: xdg_surface::XdgSurface,
-    pub toplevel: xdg_toplevel::XdgToplevel,
+    pub(crate) role: SurfaceRole,
+    /// The outputs a layer surface can be put on.
+    pub(crate) outputs: Option<crate::layer::Outputs>,
     pub viewporter: Option<wp_viewporter::WpViewporter>,
     pub subcompositor: Option<wl_subcompositor::WlSubcompositor>,
     pub shm: Option<wl_shm::WlShm>,
@@ -184,8 +195,7 @@ impl State {
         compositor: wl_compositor::WlCompositor,
         wm_base: xdg_wm_base::XdgWmBase,
         surface: wl_surface::WlSurface,
-        xdg_surface: xdg_surface::XdgSurface,
-        toplevel: xdg_toplevel::XdgToplevel,
+        role: SurfaceRole,
         logical_size: (i32, i32),
         paste_tx: mpsc::Sender<(ClipboardKind, String)>,
         wake: OwnedFd,
@@ -195,8 +205,8 @@ impl State {
             compositor,
             wm_base,
             surface,
-            xdg_surface,
-            toplevel,
+            role,
+            outputs: None,
             viewporter: None,
             subcompositor: None,
             shm: None,
@@ -277,6 +287,21 @@ impl State {
 
     pub(crate) fn is_fullscreen(&self) -> bool {
         self.fullscreen
+    }
+
+    /// The toplevel, unless the window is something else, like a layer surface.
+    pub(crate) fn toplevel(&self) -> Option<&xdg_toplevel::XdgToplevel> {
+        match &self.role {
+            SurfaceRole::Toplevel { toplevel, .. } => Some(toplevel),
+            SurfaceRole::Layer(_) | SurfaceRole::Lock(_) => None,
+        }
+    }
+
+    pub(crate) fn xdg_surface(&self) -> Option<&xdg_surface::XdgSurface> {
+        match &self.role {
+            SurfaceRole::Toplevel { xdg_surface, .. } => Some(xdg_surface),
+            SurfaceRole::Layer(_) | SurfaceRole::Lock(_) => None,
+        }
     }
 
     /// A position on the pointer's surface in window coordinates.
@@ -376,9 +401,10 @@ impl State {
                 .set_buffer_scale((self.scale.0 / 120).max(1) as i32);
         }
         // Edges to resize from are outside of it.
-        self.xdg_surface
-            .set_window_geometry(0, 0, w.max(1), h.max(1));
-        self.update_borders();
+        if let Some(xdg_surface) = self.xdg_surface() {
+            xdg_surface.set_window_geometry(0, 0, w.max(1), h.max(1));
+            self.update_borders();
+        }
         if self.size_announced != Some((size, self.scale)) {
             self.size_announced = Some((size, self.scale));
             self.events.push(WindowEvent::Resized {

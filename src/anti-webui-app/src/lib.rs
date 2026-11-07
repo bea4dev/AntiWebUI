@@ -109,6 +109,23 @@ impl App {
         }
     }
 
+    /// Runs what `root` opens without a window of its own, until
+    /// [`quit`](anti_webui_core::window::quit): for a desktop shell, through
+    /// `anti-webui-wayland-shell` (see `docs/design/37-wayland-shell.md`).
+    #[doc(hidden)]
+    pub fn run_shell(mut self, root: impl FnOnce()) -> Result<(), Box<dyn std::error::Error>> {
+        self.apply_settings();
+        #[cfg(target_os = "linux")]
+        {
+            runner::run_shell(self, root)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = root;
+            Err("a shell needs Wayland".into())
+        }
+    }
+
     /// Opens the window and runs until it is closed.
     pub fn run<V: IntoView>(
         mut self,

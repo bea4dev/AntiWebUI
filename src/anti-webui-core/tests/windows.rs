@@ -244,3 +244,50 @@ fn the_frame_and_the_state_of_the_window_follow_the_platform() {
     ui.handle_event(WindowEvent::Focused(false));
     assert_eq!(seen.get(), (Decorations::Client, true, false));
 }
+
+#[test]
+fn a_thread_without_a_window_closes_what_it_opened_when_it_stops() {
+    use anti_webui_core::window::{has_roots, stop_root, take_threads};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let cleaned = Arc::new(AtomicBool::new(false));
+    let c = cleaned.clone();
+    let thread = spawn_ui_thread(move || {
+        open_window(WindowOptions::new().title("Bar"), move || {
+            on_cleanup(move || c.store(true, Ordering::Relaxed));
+            text("bar")
+        });
+    });
+    // The app starts it on a thread of its own; here it runs on this one.
+    let mut asked = take_threads();
+    assert_eq!(asked.len(), 1);
+    let id = asked[0].handle.id();
+    asked.remove(0).start();
+    assert!(has_roots() && thread.is_running());
+    let mut bar = open_asked();
+    assert!(take_commands().is_empty());
+
+    thread.stop();
+    let commands = take_commands();
+    assert_eq!(commands, [(id, Command::Close)]);
+    assert!(stop_root(id));
+    assert!(!has_roots() && !thread.is_running());
+    // What it opened is told to close, as the app does it.
+    assert_eq!(take_commands(), [(bar.window(), Command::Close)]);
+    bar.apply(Command::Close);
+    assert!(closes(&mut bar));
+    bar.close();
+    assert!(cleaned.load(Ordering::Relaxed));
+}
+
+#[test]
+fn a_window_can_follow_the_size_of_what_is_in_it() {
+    let mut ui = Ui::new(|| div().w(123.0).h(45.0));
+    ui.set_fit_content(true, true);
+    show(&mut ui);
+    assert_eq!(ui.content_size(), Some(SizeI::new(123, 45)));
+    // Along an axis that doesn't follow, it is what the window has.
+    ui.set_fit_content(false, true);
+    ui.update();
+    assert_eq!(ui.content_size(), Some(SizeI::new(SIZE.width, 45)));
+}

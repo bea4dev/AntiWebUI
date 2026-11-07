@@ -41,6 +41,7 @@ AntiWebUI は WebView に頼らず、wgpu による自前描画とネイティ�
 | 34 | [accessibility](34-accessibility.md) | 読み上げの口：`.access`（役割、呼び名、状態）、`snapshot`、`watch`、`perform`、標準の部品と MD3E の役割。プラットフォームへの橋渡しは別のクレートに任せる |
 | 35 | [platform-x11](35-platform-x11.md) | X11 バックエンド：実行時の選び方、app の `Host` への作り替え、XInput 2、DRI3 と Present での部分描画と明示的同期、ポップアップ、セレクション、XDND、XIM |
 | 36 | [multi-window](36-multi-window.md) | サブウィンドウ：同じスレッドの `open_window` と専用のスレッドの `spawn_window`、ウィンドウごとの状態の入れ替え、`shared_signal`、閉じる前のハンドラ、モーダル、SSD と CSD の取り決め、ウィンドウ操作と CSD の縁、`title_bar` |
+| 37 | [wayland-shell](37-wayland-shell.md) | Wayland のシェル（`anti-webui-wayland-shell`）：レイヤーサーフェス、ディスプレイごとのスレッド（`for_each_output`）、`Task`、汎用ワークスペースと Hyprland・niri・sway の IPC、NetworkManager などの D-Bus の機能、PipeWire、通知、トレイ、画面ロック。X11 は対象外 |
 
 ## 用語
 

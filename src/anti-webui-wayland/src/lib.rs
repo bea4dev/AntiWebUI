@@ -3,6 +3,8 @@
 mod decor;
 mod drag;
 mod keyboard;
+mod layer;
+mod lock;
 mod main_device;
 mod popup;
 mod present;
@@ -15,6 +17,7 @@ pub use anti_webui_core::platform::{
 
 use anti_webui_core::event::{ClipboardKind, DragAction, WindowEvent};
 use anti_webui_core::geometry::{PointI, RectI, Scale, SizeI};
+use anti_webui_core::layer::{LayerChange, LayerSpec};
 use anti_webui_core::platform::{CursorIcon, DragOffer, ImeState, PopupId, PopupParams};
 use anti_webui_core::window::{DecorationMode, Decorations, ResizeEdge};
 pub use main_device::compositor_main_device;
@@ -32,6 +35,7 @@ use std::time::Instant;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_compositor, wl_seat, wl_shm, wl_subcompositor};
 use wayland_client::{Connection, Proxy};
+use wayland_protocols::ext::session_lock::v1::client::ext_session_lock_manager_v1;
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1;
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1;
@@ -46,6 +50,7 @@ use wayland_protocols::xdg::decoration::zv1::client::{
 };
 use wayland_protocols::xdg::dialog::v1::client::xdg_wm_dialog_v1;
 use wayland_protocols::xdg::shell::client::{xdg_toplevel, xdg_wm_base};
+use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1;
 
 #[derive(Debug)]
 pub struct Error(String);
@@ -75,6 +80,12 @@ pub struct WindowOptions {
     pub parent: Option<ParentLink>,
     /// Keeps input from the parent, if the compositor supports `xdg-dialog`.
     pub modal: bool,
+    /// Opens a layer surface of a desktop shell instead of a window. `width` and `height` are
+    /// what it asks for along the axes that follow what is in it.
+    pub layer: Option<LayerSpec>,
+    /// Opens a lock surface over the output of this connector name instead of a window, locking
+    /// the session until the last one closes.
+    pub lock: Option<String>,
 }
 
 impl Default for WindowOptions {
@@ -88,6 +99,8 @@ impl Default for WindowOptions {
             decorations: DecorationMode::Auto,
             parent: None,
             modal: false,
+            layer: None,
+            lock: None,
         }
     }
 }
@@ -185,15 +198,32 @@ impl Ctx<'_> {
     }
 
     pub fn set_title(&mut self, title: &str) {
-        self.state.toplevel.set_title(title.to_owned());
+        if let Some(t) = self.state.toplevel() {
+            t.set_title(title.to_owned());
+        }
     }
 
     pub fn set_fullscreen(&mut self, on: bool) {
-        if on {
-            self.state.toplevel.set_fullscreen(None);
-        } else {
-            self.state.toplevel.unset_fullscreen();
+        match self.state.toplevel() {
+            Some(t) if on => t.set_fullscreen(None),
+            Some(t) => t.unset_fullscreen(),
+            None => {}
         }
+    }
+
+    /// Changes a layer surface. Nothing for a window.
+    pub fn change_layer(&mut self, change: LayerChange) {
+        self.state.change_layer(change);
+    }
+
+    /// The size of what is in a layer surface, along the axes that follow it.
+    pub fn set_layer_content_size(&mut self, size: SizeI) {
+        self.state.set_layer_content_size(size.width, size.height);
+    }
+
+    /// The size of the window in logical pixels.
+    pub fn logical_size(&self) -> SizeI {
+        SizeI::new(self.state.logical_size.0, self.state.logical_size.1)
     }
 
     pub fn exit(&mut self) {
@@ -211,14 +241,16 @@ impl Ctx<'_> {
     }
 
     pub fn minimize(&mut self) {
-        self.state.toplevel.set_minimized();
+        if let Some(t) = self.state.toplevel() {
+            t.set_minimized();
+        }
     }
 
     pub fn set_maximized(&mut self, on: bool) {
-        if on {
-            self.state.toplevel.set_maximized();
-        } else {
-            self.state.toplevel.unset_maximized();
+        match self.state.toplevel() {
+            Some(t) if on => t.set_maximized(),
+            Some(t) => t.unset_maximized(),
+            None => {}
         }
     }
 
@@ -418,9 +450,25 @@ impl Ctx<'_> {
     }
 }
 
+pub use lock::{LockState, lock_state};
+
 /// Whether a compositor can be reached, for choosing the backend.
 pub fn can_connect() -> bool {
     Connection::connect_to_env().is_ok()
+}
+
+/// Whether the compositor can be reached and has layer surfaces (`zwlr_layer_shell_v1`).
+pub fn supports_layer_shell() -> bool {
+    let Ok(conn) = Connection::connect_to_env() else {
+        return false;
+    };
+    let Ok((globals, _)) = registry_queue_init::<State>(&conn) else {
+        return false;
+    };
+    globals.contents().with_list(|list| {
+        list.iter()
+            .any(|g| g.interface == zwlr_layer_shell_v1::ZwlrLayerShellV1::interface().name)
+    })
 }
 
 /// A window of a [`Session`].
@@ -520,7 +568,7 @@ impl Session {
     /// For opening windows above this one, from any thread.
     pub fn parent_link(&self, key: WindowKey) -> Option<ParentLink> {
         let i = self.instances.iter().find(|i| i.key == key)?;
-        Some(ParentLink(i.state.toplevel.clone()))
+        Some(ParentLink(i.state.toplevel()?.clone()))
     }
 
     /// Closes a window. GPU surfaces on it must go first.
@@ -531,6 +579,22 @@ impl Session {
             let _ = instance.queue.dispatch_pending(&mut instance.state);
             let _ = self.conn.flush();
         }
+    }
+
+    /// Draws a window soon, as when something on another window of the thread changed it.
+    pub fn request_redraw(&mut self, key: WindowKey) {
+        if let Some(i) = self.instances.iter_mut().find(|i| i.key == key) {
+            let now = Instant::now();
+            i.state.redraw_at = Some(i.state.redraw_at.map_or(now, |r| r.min(now)));
+        }
+    }
+
+    /// Whether a window is already going to be drawn.
+    pub fn redraw_pending(&self, key: WindowKey) -> bool {
+        self.instances
+            .iter()
+            .find(|i| i.key == key)
+            .is_some_and(|i| i.state.redraw_requested || i.state.redraw_at.is_some())
     }
 
     /// The windows whose handlers asked to close them, through [`Ctx::exit`].
@@ -558,6 +622,15 @@ impl Session {
 
     /// Waits until something comes for a window, or one of them has something to do.
     pub fn wait<M: Handlers>(&mut self, handlers: &mut M) -> Result<(), Error> {
+        self.wait_until(handlers, None)
+    }
+
+    /// As [`Session::wait`], but waking by `until` at the latest.
+    pub fn wait_until<M: Handlers>(
+        &mut self,
+        handlers: &mut M,
+        until: Option<Instant>,
+    ) -> Result<(), Error> {
         let busy = |instances: &[Instance]| {
             instances
                 .iter()
@@ -587,6 +660,9 @@ impl Session {
         let now = Instant::now();
         let mut deadline: Option<Instant> = None;
         let mut earlier = |t: Instant| deadline = Some(deadline.map_or(t, |d| d.min(t)));
+        if let Some(t) = until {
+            earlier(t);
+        }
         for i in &mut self.instances {
             i.timer_deadline = handlers.handler(i.key).and_then(|h| h.deadline(now));
             if let Some(t) = i.timer_deadline {
@@ -654,16 +730,64 @@ fn open_instance(
     let compositor: wl_compositor::WlCompositor = globals.bind(&qh, 4..=6, ()).map_err(err)?;
     let wm_base: xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).map_err(err)?;
     let surface = compositor.create_surface(&qh, SurfaceId::Window);
-    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, SurfaceId::Window);
-    let toplevel = xdg_surface.get_toplevel(&qh, ());
-    toplevel.set_title(options.title.clone());
-    toplevel.set_app_id(options.app_id.clone());
-    if let Some(parent) = &options.parent {
-        toplevel.set_parent(Some(&parent.0));
-    }
-    if options.fullscreen {
-        toplevel.set_fullscreen(None);
-    }
+    let size = (options.width, options.height);
+    let mut outputs = None;
+    let role = match options.layer.clone() {
+        None if options.lock.is_some() => {
+            let name = options.lock.as_deref().unwrap_or_default();
+            let manager: ext_session_lock_manager_v1::ExtSessionLockManagerV1 = globals
+                .bind(&qh, 1..=1, ())
+                .map_err(|_| Error("the compositor can't lock the session".into()))?;
+            let bound = layer::Outputs::bind(conn, &globals)?;
+            let output = bound
+                .find(name)
+                .cloned()
+                .ok_or_else(|| Error(format!("no output named {name} to lock")))?;
+            outputs = Some(bound);
+            state::SurfaceRole::Lock(lock::LockRole::create(&manager, &surface, &output, &qh))
+        }
+        Some(spec) => {
+            let shell: zwlr_layer_shell_v1::ZwlrLayerShellV1 = globals
+                .bind(&qh, 1..=5, ())
+                .map_err(|_| Error("the compositor has no layer shell".into()))?;
+            let output = match &spec.output {
+                Some(name) => {
+                    let bound = layer::Outputs::bind(conn, &globals)?;
+                    let found = bound.find(name).cloned();
+                    if found.is_none() {
+                        eprintln!("[anti-webui] no output named {name}; the compositor chooses");
+                    }
+                    outputs = Some(bound);
+                    found
+                }
+                None => None,
+            };
+            state::SurfaceRole::Layer(layer::LayerRole::create(
+                &shell,
+                &surface,
+                output.as_ref(),
+                spec,
+                size,
+                &qh,
+            ))
+        }
+        None => {
+            let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, SurfaceId::Window);
+            let toplevel = xdg_surface.get_toplevel(&qh, ());
+            toplevel.set_title(options.title.clone());
+            toplevel.set_app_id(options.app_id.clone());
+            if let Some(parent) = &options.parent {
+                toplevel.set_parent(Some(&parent.0));
+            }
+            if options.fullscreen {
+                toplevel.set_fullscreen(None);
+            }
+            state::SurfaceRole::Toplevel {
+                xdg_surface,
+                toplevel,
+            }
+        }
+    };
 
     let (paste_tx, paste_rx) = mpsc::channel();
     let mut state = State::new(
@@ -671,12 +795,13 @@ fn open_instance(
         compositor,
         wm_base,
         surface.clone(),
-        xdg_surface,
-        toplevel.clone(),
-        (options.width, options.height),
+        role,
+        size,
         paste_tx,
         wake,
     );
+    state.outputs = outputs;
+    state.apply_input_region();
 
     if let Ok(vp) = globals.bind::<wp_viewporter::WpViewporter, _, _>(&qh, 1..=1, ()) {
         state.viewport = Some(vp.get_viewport(&surface, &qh, ()));
@@ -697,10 +822,15 @@ fn open_instance(
         state.fractional = Some(mgr.get_fractional_scale(&surface, &qh, ()));
     }
     state.decor.wanted = options.decorations;
-    if let Ok(mgr) =
-        globals.bind::<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _, _>(&qh, 1..=1, ())
+    let toplevel = state.toplevel().cloned();
+    if let Some(toplevel) = &toplevel
+        && let Ok(mgr) = globals.bind::<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _, _>(
+            &qh,
+            1..=1,
+            (),
+        )
     {
-        let deco = mgr.get_toplevel_decoration(&toplevel, &qh, ());
+        let deco = mgr.get_toplevel_decoration(toplevel, &qh, ());
         deco.set_mode(match options.decorations {
             DecorationMode::Client => zxdg_toplevel_decoration_v1::Mode::ClientSide,
             DecorationMode::Auto | DecorationMode::Server => {
@@ -708,15 +838,16 @@ fn open_instance(
             }
         });
         state.decor.object = Some(deco);
-    } else {
+    } else if toplevel.is_some() {
         // Nobody draws a frame for it.
         state.decorations_agreed(Decorations::Client);
     }
-    if options.modal
+    if let Some(toplevel) = &toplevel
+        && options.modal
         && options.parent.is_some()
         && let Ok(mgr) = globals.bind::<xdg_wm_dialog_v1::XdgWmDialogV1, _, _>(&qh, 1..=1, ())
     {
-        let dialog = mgr.get_xdg_dialog(&toplevel, &qh, ());
+        let dialog = mgr.get_xdg_dialog(toplevel, &qh, ());
         dialog.set_modal();
         state.decor.dialog = Some(dialog);
     }
@@ -750,7 +881,11 @@ fn open_instance(
         .bind::<wp_presentation::WpPresentation, _, _>(&qh, 1..=2, ())
         .ok();
 
-    surface.commit();
+    // xdg and layer surfaces commit once to be configured. A lock surface is configured already
+    // and may not commit before it acks that: compositors end the connection for it.
+    if !matches!(state.role, state::SurfaceRole::Lock(_)) {
+        surface.commit();
+    }
     queue.roundtrip(&mut state).map_err(err)?;
     Ok(Instance {
         key,

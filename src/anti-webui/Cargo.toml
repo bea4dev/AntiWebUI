@@ -28,6 +28,57 @@ pdf-js = ["pdf", "anti-webui-internal/pdf-js"]
 markdown = ["anti-webui-internal/markdown"]
 ## A code editor with tree-sitter highlighting for 14 languages. See `docs/design/31-code-editor.md`.
 code = ["anti-webui-internal/code"]
+## Desktop shells on Wayland: bars, wallpapers and launchers as layer surfaces, as
+## `anti_webui::shell`. See `docs/design/37-wayland-shell.md`.
+wayland-shell = ["anti-webui-internal/wayland-shell"]
+## Hyprland's IPC in `anti_webui::shell::hyprland`, and workspaces from it.
+shell-hyprland = ["wayland-shell", "anti-webui-internal/shell-hyprland"]
+## niri's IPC in `anti_webui::shell::niri`, and workspaces from it.
+shell-niri = ["wayland-shell", "anti-webui-internal/shell-niri"]
+## Sway's IPC in `anti_webui::shell::sway`, and workspaces from it.
+shell-sway = ["wayland-shell", "anti-webui-internal/shell-sway"]
+## Wi-Fi and wired networks in `anti_webui::shell`, through NetworkManager.
+shell-network = ["wayland-shell", "anti-webui-internal/shell-network"]
+## Batteries in `anti_webui::shell`, through UPower.
+shell-battery = ["wayland-shell", "anti-webui-internal/shell-battery"]
+## Power profiles in `anti_webui::shell`, through power-profiles-daemon.
+shell-power-profiles = ["wayland-shell", "anti-webui-internal/shell-power-profiles"]
+## Bluetooth in `anti_webui::shell`, through BlueZ.
+shell-bluetooth = ["wayland-shell", "anti-webui-internal/shell-bluetooth"]
+## Media players in `anti_webui::shell`, through MPRIS.
+shell-media = ["wayland-shell", "anti-webui-internal/shell-media"]
+## Being the notification daemon, in `anti_webui::shell`.
+shell-notifications = ["wayland-shell", "anti-webui-internal/shell-notifications"]
+## The system tray in `anti_webui::shell`.
+shell-tray = ["wayland-shell", "anti-webui-internal/shell-tray"]
+## Suspend, power off, lock and brightness in `anti_webui::shell`, through logind.
+shell-session = ["wayland-shell", "anti-webui-internal/shell-session"]
+## Audio devices and the sound of each program in `anti_webui::shell`, through PipeWire.
+shell-audio = ["wayland-shell", "anti-webui-internal/shell-audio"]
+## Installed applications in `anti_webui::shell`: searching, icons, launching.
+shell-apps = ["wayland-shell", "anti-webui-internal/shell-apps"]
+## Running commands in `anti_webui::shell`, their output a line at a time.
+shell-process = ["wayland-shell", "anti-webui-internal/shell-process"]
+## CPU, memory, temperatures, disks and network speed in `anti_webui::shell`.
+shell-system = ["wayland-shell", "anti-webui-internal/shell-system"]
+## Everything for shells.
+shell-all = [
+    "shell-hyprland",
+    "shell-niri",
+    "shell-sway",
+    "shell-network",
+    "shell-battery",
+    "shell-power-profiles",
+    "shell-bluetooth",
+    "shell-media",
+    "shell-notifications",
+    "shell-tray",
+    "shell-session",
+    "shell-audio",
+    "shell-apps",
+    "shell-process",
+    "shell-system",
+]
 ## Link AntiWebUI dynamically for faster incremental builds (development only).
 dynamic_linking = ["dep:anti-webui-dylib"]
 
@@ -37,6 +88,14 @@ anti-webui-dylib = { workspace = true, optional = true }
 
 [dev-dependencies]
 image.workspace = true
+
+[[example]]
+name = "shell_bar"
+required-features = ["wayland-shell"]
+
+[[example]]
+name = "shell_launcher"
+required-features = ["shell-apps"]
 
 [[example]]
 name = "markdown"

@@ -143,6 +143,8 @@ pub enum PlatformRequest {
     SetMaximized(bool),
     /// The system's menu for the window, where the pointer is.
     ShowWindowMenu,
+    /// For a layer surface of a desktop shell.
+    Layer(crate::layer::LayerChange),
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -188,7 +188,7 @@ impl Presenter {
         if let Some(d) = &mut self.dmabuf {
             d.renderer.forget_target(renderer_target(surface));
             if let TargetKind::Dmabuf(mut t) = target.kind {
-                d.drop_slots(&mut t, ctx);
+                d.destroy_slots(&mut t, ctx);
             }
         }
     }
@@ -320,12 +320,17 @@ impl Presenter {
                     return Err(GpuError::Dmabuf("the compositor rejected a buffer".into()));
                 }
                 BufferEvent::Released(id) => {
-                    let slots = targets.iter_mut().flat_map(|t| t.slots.iter_mut());
+                    let slots = targets
+                        .iter_mut()
+                        .flat_map(|t| t.slots.iter_mut().chain(t.retiring.iter_mut()));
                     if let Some(s) = slots.into_iter().find(|s| s.buffer == id) {
                         s.busy = false;
                     }
                 }
             }
+        }
+        for t in &mut targets {
+            d.reap_retiring(t, ctx);
         }
         if let Some(f) = ctx.dmabuf_feedback()
             && f.generation != d.generation
@@ -339,11 +344,19 @@ impl Presenter {
                     modifiers.len()
                 );
             }
+            // Buffers made with a modifier still on the list stay: the compositor sends new
+            // feedback whenever it starts or stops putting the surface on a plane, and making
+            // them again each time would replace the buffer on the screen every frame.
             if modifiers != d.modifiers {
-                d.modifiers = modifiers;
                 for t in &mut targets {
-                    d.drop_slots(t, ctx);
+                    if t.slots
+                        .iter()
+                        .any(|s| !modifiers.contains(&s.image.modifier))
+                    {
+                        d.replace_slots(t, ctx);
+                    }
                 }
+                d.modifiers = modifiers;
             }
         }
         Ok(())
@@ -354,7 +367,7 @@ impl Presenter {
         if let Some(d) = &mut self.dmabuf {
             for target in targets.values_mut() {
                 if let TargetKind::Dmabuf(t) = &mut target.kind {
-                    d.drop_slots(t, ctx);
+                    d.destroy_slots(t, ctx);
                 }
             }
             d.release_protocol_objects(ctx);
@@ -482,6 +495,9 @@ struct DmabufPresenter {
 #[derive(Default)]
 struct DmabufTarget {
     slots: Vec<Slot>,
+    /// Replaced buffers the compositor hasn't released: it may still be showing one, even
+    /// putting it on the screen as it is, so neither it nor its memory may go yet.
+    retiring: Vec<Slot>,
     history: DamageHistory,
     /// Frames rendered so far.
     frame: u64,
@@ -608,7 +624,7 @@ impl DmabufPresenter {
         let size = (scene.width.max(1), scene.height.max(1));
         if size != target.size {
             target.size = size;
-            self.drop_slots(target, ctx);
+            self.replace_slots(target, ctx);
             target.history.clear();
         }
 
@@ -798,6 +814,13 @@ impl DmabufPresenter {
     ) -> Result<usize, GpuError> {
         let (w, h) = target.size;
         let image = self.ctx.borrow_mut().allocate(gpu, w, h, &self.modifiers)?;
+        if debug_enabled() {
+            eprintln!(
+                "[anti-webui] new buffer {w}x{h}, modifier {:#x}, from {}",
+                image.modifier,
+                if image.from_gbm() { "GBM" } else { "Vulkan" }
+            );
+        }
         let planes: Vec<DmabufPlaneDesc<'_>> = image
             .planes
             .iter()
@@ -840,19 +863,46 @@ impl DmabufPresenter {
         Ok(target.slots.len() - 1)
     }
 
-    fn drop_slots(&mut self, target: &mut DmabufTarget, ctx: &mut impl Host) {
+    /// Stops using the buffers, for new ones of another size or modifier. Those the compositor
+    /// still has go once it releases them.
+    fn replace_slots(&mut self, target: &mut DmabufTarget, ctx: &mut impl Host) {
+        target.drop_held();
+        target.unsent = None;
+        target.retiring.append(&mut target.slots);
+        self.reap_retiring(target, ctx);
+    }
+
+    /// Frees the replaced buffers the compositor has released.
+    fn reap_retiring(&mut self, target: &mut DmabufTarget, ctx: &mut impl Host) {
+        let mut i = 0;
+        while i < target.retiring.len() {
+            if self.slot_free(&target.retiring[i], 0) {
+                let slot = target.retiring.swap_remove(i);
+                self.destroy_slot(slot, ctx);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Frees every buffer at once, as when the surface goes.
+    fn destroy_slots(&mut self, target: &mut DmabufTarget, ctx: &mut impl Host) {
         target.held.clear();
         target.unsent = None;
-        for slot in target.slots.drain(..) {
-            ctx.destroy_buffer(slot.buffer);
-            if let Some(r) = slot.release {
-                ctx.destroy_timeline(r.id);
-                if let Sync::Explicit { drm, .. } = &self.sync {
-                    drm.destroy_syncobj(r.handle);
-                }
-            }
-            self.ctx.borrow_mut().retire(slot.image);
+        for slot in target.slots.drain(..).chain(target.retiring.drain(..)) {
+            self.destroy_slot(slot, ctx);
         }
+    }
+
+    fn destroy_slot(&mut self, slot: Slot, ctx: &mut impl Host) {
+        ctx.destroy_buffer(slot.buffer);
+        if let Some(r) = slot.release {
+            ctx.destroy_timeline(r.id);
+            if let Sync::Explicit { drm, .. } = &self.sync {
+                drm.destroy_syncobj(r.handle);
+            }
+        }
+        self.ctx.borrow_mut().retire(slot.image);
     }
 
     fn release_protocol_objects(&mut self, ctx: &mut impl Host) {
@@ -868,7 +918,7 @@ impl Drop for Presenter {
         if let Some(d) = &mut self.dmabuf {
             for target in targets.into_values() {
                 if let TargetKind::Dmabuf(mut t) = target.kind {
-                    for slot in t.slots.drain(..) {
+                    for slot in t.slots.drain(..).chain(t.retiring.drain(..)) {
                         d.ctx.borrow_mut().retire(slot.image);
                     }
                 }

@@ -3,6 +3,7 @@
 
 use anti_webui_core::event::{ClipboardKind, DragAction};
 use anti_webui_core::geometry::{PointI, RectI, SizeI};
+use anti_webui_core::layer::LayerChange;
 use anti_webui_core::platform::{
     BufferEvent, BufferId, CursorIcon, DmabufFeedback, DmabufPlaneDesc, DragOffer, ImeState,
     PopupId, PopupParams, Presentation, SurfaceId, SyncPoints, TimelineId,
@@ -32,6 +33,9 @@ pub(crate) trait Host {
     fn minimize(&mut self);
     fn set_maximized(&mut self, on: bool);
     fn show_window_menu(&mut self);
+    /// For a layer surface; nothing for a window.
+    fn change_layer(&mut self, change: LayerChange);
+    fn set_layer_content_size(&mut self, size: SizeI);
     fn exit(&mut self);
     fn buffer_size(&self) -> SizeI;
 
@@ -138,6 +142,12 @@ macro_rules! host_for {
             }
             fn show_window_menu(&mut self) {
                 self.show_window_menu()
+            }
+            fn change_layer(&mut self, change: LayerChange) {
+                self.change_layer(change)
+            }
+            fn set_layer_content_size(&mut self, size: SizeI) {
+                self.set_layer_content_size(size)
             }
             fn exit(&mut self) {
                 self.exit()

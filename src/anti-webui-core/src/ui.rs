@@ -180,6 +180,7 @@ impl Ui {
             Command::Close => with_doc(|d| d.request(PlatformRequest::Close)),
             Command::RequestClose => crate::window::request_close_window(),
             Command::SetTitle(title) => crate::window::set_window_title(title),
+            Command::Layer(change) => with_doc(|d| d.request(PlatformRequest::Layer(change))),
             Command::ModalChild(opened) => {
                 let was = crate::window::blocked();
                 crate::window::modal_child(opened);
@@ -229,6 +230,48 @@ impl Ui {
             scroll_rest: None,
             pinching: None,
         }
+    }
+
+    /// Makes the axes given follow the max-content size of what is in the window, which
+    /// [`Ui::content_size`] then says.
+    #[doc(hidden)]
+    pub fn set_fit_content(&mut self, width: bool, height: bool) {
+        crate::window::activate(self.window);
+        with_doc(|d| {
+            if d.fit != (width, height) {
+                d.fit = (width, height);
+                d.natural = None;
+                d.dirty.layout = true;
+            }
+        });
+    }
+
+    /// The max-content size of what is in the window, in logical pixels, along the axes of
+    /// [`Ui::set_fit_content`]; the others are as the window is. Up to date after [`Ui::update`].
+    #[doc(hidden)]
+    pub fn content_size(&self) -> Option<SizeI> {
+        crate::window::activate(self.window);
+        with_doc(|d| {
+            let n = d.natural?;
+            let s = d.scale;
+            Some(SizeI::new(
+                s.logical_ceil(n.width).max(1),
+                s.logical_ceil(n.height).max(1),
+            ))
+        })
+    }
+
+    /// The max-content size of what is in the window along both axes, in logical pixels, before it
+    /// has a size: what a surface that follows it asks for at first.
+    #[doc(hidden)]
+    pub fn measure_content(&mut self) -> SizeI {
+        crate::window::activate(self.window);
+        let fit = with_doc(|d| d.fit);
+        self.set_fit_content(true, true);
+        self.update();
+        let size = self.content_size().unwrap_or(SizeI::new(1, 1));
+        self.set_fit_content(fit.0, fit.1);
+        size
     }
 
     /// Recomputes styles, layout and positions as needed.

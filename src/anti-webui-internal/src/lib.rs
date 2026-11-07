@@ -10,6 +10,8 @@ pub use anti_webui_markdown as markdown;
 #[cfg(feature = "pdf")]
 pub use anti_webui_pdf as pdf;
 pub use anti_webui_style as style;
+#[cfg(feature = "wayland-shell")]
+pub use anti_webui_wayland_shell as shell;
 pub use anti_webui_wgpu as wgpu;
 pub use anti_webui_widgets as widgets;
 

@@ -10,11 +10,13 @@ use crate::perf_overlay::{LAST_WORD, OverlayFeed};
 use crate::present::{Presented, Presenter};
 use anti_webui_core::Ui;
 use anti_webui_core::event::WindowEvent;
+use anti_webui_core::geometry::SizeI;
+use anti_webui_core::layer::{LayerChange, LayerSize, LayerSpec};
 use anti_webui_core::platform::{PlatformRequest, PopupId, SurfaceId};
 use anti_webui_core::video::VideoTiming;
 use anti_webui_core::view::IntoView;
 use anti_webui_core::window::{
-    Command, DecorationMode, OpenRequest, SpawnRequest, WindowHandle, WindowId,
+    Command, DecorationMode, OpenRequest, Role, SpawnRequest, ThreadRequest, WindowHandle, WindowId,
 };
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -35,6 +37,11 @@ struct Runner {
     pacing: Pacing,
     /// Decoded pictures say so through the event loop.
     waker_set: bool,
+    /// For a layer surface: the axes that follow what is in it, the size last asked for them, and
+    /// the size the surface has, in logical pixels.
+    fit: (bool, bool),
+    asked: Option<SizeI>,
+    logical: SizeI,
 }
 
 impl Runner {
@@ -48,7 +55,52 @@ impl Runner {
             overlay: OverlayFeed::new(),
             pacing: Pacing::new(),
             waker_set: false,
+            fit: (false, false),
+            asked: None,
+            logical: SizeI::default(),
         }
+    }
+
+    /// Makes the axes given follow what is in the window.
+    fn set_fit(&mut self, fit: (bool, bool)) {
+        self.fit = fit;
+        self.asked = None;
+        self.ui.set_fit_content(fit.0, fit.1);
+    }
+
+    /// Asks for the size of what is in a layer surface when it changed. Whether the frame should
+    /// wait for the surface to have it.
+    fn follow_content(&mut self, ctx: &mut impl Host) -> bool {
+        if !self.fit.0 && !self.fit.1 {
+            return false;
+        }
+        let Some(content) = self.ui.content_size() else {
+            return false;
+        };
+        let want = SizeI::new(
+            if self.fit.0 {
+                content.width
+            } else {
+                self.logical.width
+            },
+            if self.fit.1 {
+                content.height
+            } else {
+                self.logical.height
+            },
+        );
+        if self.asked == Some(want) {
+            return false;
+        }
+        self.asked = Some(want);
+        ctx.set_layer_content_size(want);
+        if want == self.logical {
+            return false;
+        }
+        // The compositor answers with a configure, and the frame comes with that size; if it
+        // gives another one, the frame comes anyway.
+        ctx.request_redraw_after(std::time::Duration::from_millis(100));
+        true
     }
 
     fn set_waker(&mut self, ctx: &mut impl Host) {
@@ -100,6 +152,12 @@ impl Runner {
                 PlatformRequest::Minimize => ctx.minimize(),
                 PlatformRequest::SetMaximized(on) => ctx.set_maximized(on),
                 PlatformRequest::ShowWindowMenu => ctx.show_window_menu(),
+                PlatformRequest::Layer(change) => {
+                    if let LayerChange::Size(w, h) = change {
+                        self.set_fit((w == LayerSize::Content, h == LayerSize::Content));
+                    }
+                    ctx.change_layer(change);
+                }
             }
         }
     }
@@ -152,6 +210,14 @@ impl Runner {
     }
 
     fn on_event(&mut self, ctx: &mut impl Host, event: WindowEvent) {
+        if let WindowEvent::Resized { size, scale } = &event {
+            self.logical = SizeI::new(
+                scale.logical_ceil(size.width),
+                scale.logical_ceil(size.height),
+            );
+            // A size asked for again later is asked for again.
+            self.asked = None;
+        }
         if let (WindowEvent::Resized { .. }, Some(p)) = (&event, &mut self.presenter) {
             p.drop_held(SurfaceId::Window);
         }
@@ -179,6 +245,12 @@ impl Runner {
                     ctx.exit();
                     return;
                 }
+            }
+        }
+        if self.fit.0 || self.fit.1 {
+            self.ui.update();
+            if self.follow_content(ctx) {
+                return;
             }
         }
         self.overlay.update();
@@ -399,6 +471,9 @@ struct Spec {
     modal: bool,
     /// What the system is told the window belongs to, for a dialog.
     parent: Option<WindowId>,
+    layer: Option<LayerSpec>,
+    /// The output a lock surface covers.
+    lock: Option<String>,
 }
 
 impl Spec {
@@ -418,6 +493,14 @@ impl Spec {
                 .as_ref()
                 .filter(|_| o.dialog || o.modal)
                 .map(WindowHandle::id),
+            layer: match &o.role {
+                Role::Layer(spec) => Some((**spec).clone()),
+                _ => None,
+            },
+            lock: match &o.role {
+                Role::Lock(output) => Some(output.clone()),
+                _ => None,
+            },
         }
     }
 }
@@ -454,8 +537,14 @@ trait Platform: Sized + 'static {
     fn link(&self, key: Self::Key) -> Option<Link>;
     fn close(&mut self, key: Self::Key);
     fn exited(&self) -> Vec<Self::Key>;
+    fn request_redraw(&mut self, key: Self::Key);
+    fn redraw_pending(&self, key: Self::Key) -> bool;
     fn dispatch(&mut self, windows: &mut Windows<Self::Key>) -> Result<(), BoxError>;
-    fn wait(&mut self, windows: &mut Windows<Self::Key>) -> Result<(), BoxError>;
+    fn wait(
+        &mut self,
+        windows: &mut Windows<Self::Key>,
+        until: Option<Instant>,
+    ) -> Result<(), BoxError>;
 }
 
 /// The windows of a thread and what runs each.
@@ -519,6 +608,8 @@ macro_rules! platform_for {
                     decorations: spec.decorations,
                     modal: spec.modal,
                     parent,
+                    layer: spec.layer,
+                    lock: spec.lock,
                 };
                 Ok($backend::Session::open(self, options)?)
             }
@@ -531,11 +622,21 @@ macro_rules! platform_for {
             fn exited(&self) -> Vec<Self::Key> {
                 $backend::Session::exited(self)
             }
+            fn request_redraw(&mut self, key: Self::Key) {
+                $backend::Session::request_redraw(self, key)
+            }
+            fn redraw_pending(&self, key: Self::Key) -> bool {
+                $backend::Session::redraw_pending(self, key)
+            }
             fn dispatch(&mut self, windows: &mut Windows<Self::Key>) -> Result<(), BoxError> {
                 Ok($backend::Session::dispatch(self, windows)?)
             }
-            fn wait(&mut self, windows: &mut Windows<Self::Key>) -> Result<(), BoxError> {
-                Ok($backend::Session::wait(self, windows)?)
+            fn wait(
+                &mut self,
+                windows: &mut Windows<Self::Key>,
+                until: Option<Instant>,
+            ) -> Result<(), BoxError> {
+                Ok($backend::Session::wait_until(self, windows, until)?)
             }
         }
     };
@@ -599,10 +700,28 @@ impl<P: Platform> Thread<P> {
     }
 
     fn open(&mut self, request: OpenRequest) {
-        let spec = Spec::of(&request, &self.app_id);
-        let ui = Ui::open(request);
-        if let Err(e) = self.add(ui, spec) {
-            eprintln!("[anti-webui] could not open a window: {e}");
+        let mut spec = Spec::of(&request, &self.app_id);
+        let mut ui = Ui::open(request);
+        let fit = spec.layer.as_ref().map(LayerSpec::fits_content);
+        if let (Some(fit), Some(layer)) = (fit, &spec.layer)
+            && (fit.0 || fit.1)
+        {
+            // What it asks for at first, before it knows how much room it has.
+            let natural = ui.measure_content();
+            if layer.width == LayerSize::Content {
+                spec.width = natural.width;
+            }
+            if layer.height == LayerSize::Content {
+                spec.height = natural.height;
+            }
+        }
+        match self.add(ui, spec) {
+            Ok(key) => {
+                if let (Some(fit), Some(runner)) = (fit, self.windows.find(key)) {
+                    runner.set_fit(fit);
+                }
+            }
+            Err(e) => eprintln!("[anti-webui] could not open a window: {e}"),
         }
     }
 
@@ -622,10 +741,31 @@ impl<P: Platform> Thread<P> {
         error
     }
 
-    /// Runs until the windows are gone. With the first window of the program, they all go with it.
+    /// Closes every window and stops what keeps the thread going without one, for [`quit`].
+    ///
+    /// [`quit`]: anti_webui_core::window::quit
+    fn end(&mut self) {
+        let keys: Vec<_> = self.windows.entries.iter().map(|e| e.key).collect();
+        for key in keys {
+            if let Some(e) = self.close(key) {
+                eprintln!("[anti-webui] a window closed: {e}");
+            }
+        }
+        for root in anti_webui_core::window::roots() {
+            anti_webui_core::window::stop_root(root);
+        }
+    }
+
+    /// Runs until the windows are gone, and what keeps the thread going without one. With the
+    /// first window of the program, they all go with it.
     fn run(&mut self) -> Result<(), BoxError> {
         loop {
+            if anti_webui_core::window::quitting() {
+                self.end();
+                return Ok(());
+            }
             self.session.dispatch(&mut self.windows)?;
+            anti_webui_core::window::run_roots(Instant::now());
             for key in self.session.exited() {
                 let error = self.close(key);
                 if Some(key) == self.first {
@@ -640,11 +780,26 @@ impl<P: Platform> Thread<P> {
                 }
             }
             self.take_requests();
-            if self.windows.entries.is_empty() {
+            if self.windows.entries.is_empty() && !anti_webui_core::window::has_roots() {
                 return Ok(());
             }
+            self.redraw_changed();
             if !anti_webui_core::window::has_pending() {
-                self.session.wait(&mut self.windows)?;
+                let until = anti_webui_core::window::roots_deadline();
+                self.session.wait(&mut self.windows, until)?;
+            }
+        }
+    }
+
+    /// Draws the windows that something else on the thread changed, like a signal written in the
+    /// handler or timer of another window, or of a root.
+    fn redraw_changed(&mut self) {
+        if self.windows.entries.len() < 2 && !anti_webui_core::window::has_roots() {
+            return;
+        }
+        for e in &mut self.windows.entries {
+            if !self.session.redraw_pending(e.key) && e.runner.ui.needs_redraw() {
+                self.session.request_redraw(e.key);
             }
         }
     }
@@ -656,6 +811,9 @@ impl<P: Platform> Thread<P> {
         }
         for request in anti_webui_core::window::take_spawns() {
             self.spawn(request);
+        }
+        for request in anti_webui_core::window::take_threads() {
+            self.spawn_thread(request);
         }
         let mut wake = false;
         let mut commands: std::collections::VecDeque<_> =
@@ -677,6 +835,10 @@ impl<P: Platform> Thread<P> {
     /// Does what a handle asked of a window of this thread. Whether its handlers have to run.
     fn command(&mut self, id: WindowId, command: Command) -> bool {
         let Some(at) = self.windows.entries.iter().position(|e| e.id == id) else {
+            // Not a window, but maybe what keeps the thread going without one.
+            if command == Command::Close {
+                anti_webui_core::window::stop_root(id);
+            }
             return false;
         };
         let key = self.windows.entries[at].key;
@@ -692,13 +854,29 @@ impl<P: Platform> Thread<P> {
     }
 
     fn spawn(&mut self, request: SpawnRequest) {
+        let handle = request.handle.clone();
+        self.start_thread(handle, move |thread| {
+            thread.open(request.start());
+        });
+    }
+
+    fn spawn_thread(&mut self, request: ThreadRequest) {
+        let handle = request.handle.clone();
+        self.start_thread(handle, move |_| request.start());
+    }
+
+    /// A thread with a session of its own on this one's connection, which does `first` and runs.
+    fn start_thread(
+        &mut self,
+        handle: WindowHandle,
+        first: impl FnOnce(&mut Thread<P>) + Send + 'static,
+    ) {
         let share = self.session.share();
         let app_id = self.app_id.clone();
-        let handle = request.handle.clone();
         let thread = std::thread::Builder::new()
             .name("anti-webui window".into())
             .spawn(move || {
-                if let Err(e) = run_spawned::<P>(share, request, app_id) {
+                if let Err(e) = run_spawned::<P>(share, app_id, first) {
                     eprintln!("[anti-webui] a window's thread ended: {e}");
                 }
             });
@@ -716,15 +894,14 @@ impl<P: Platform> Thread<P> {
 /// The body of a thread a window was spawned on.
 fn run_spawned<P: Platform>(
     share: P::Share,
-    request: SpawnRequest,
     app_id: String,
+    first: impl FnOnce(&mut Thread<P>),
 ) -> Result<(), BoxError> {
     #[cfg(feature = "video")]
     anti_webui_video::install();
     anti_webui_core::window::start_ui_thread(true);
-    let request = request.start();
     let mut thread = Thread::new(P::join(share)?, app_id);
-    thread.open(request);
+    first(&mut thread);
     thread.run()
 }
 
@@ -756,12 +933,39 @@ fn run_on<P: Platform, V: IntoView>(app: App, root: impl FnOnce() -> V) -> Resul
         decorations: app.decorations,
         modal: false,
         parent: None,
+        layer: None,
+        lock: None,
     };
     let key = thread.add(ui, spec)?;
     thread.first = Some(key);
     let result = thread.run();
     end_threads();
     result
+}
+
+/// Runs what `root` opens, with no window of its own, until [`quit`]. Wayland only: what it is for
+/// are layer surfaces (see `docs/design/37-wayland-shell.md`).
+///
+/// [`quit`]: anti_webui_core::window::quit
+pub fn run_shell(app: App, root: impl FnOnce()) -> Result<(), BoxError> {
+    #[cfg(feature = "wayland")]
+    {
+        limit_vulkan_drivers(anti_webui_wayland::compositor_main_device());
+        #[cfg(feature = "video")]
+        anti_webui_video::install();
+        anti_webui_core::window::start_ui_thread(false);
+        let mut thread = Thread::new(anti_webui_wayland::Session::connect()?, app.app_id);
+        let handle = anti_webui_core::window::current_window();
+        anti_webui_core::window::start_root(handle, Box::new(root));
+        let result = thread.run();
+        end_threads();
+        result
+    }
+    #[cfg(not(feature = "wayland"))]
+    {
+        let _ = (app, root);
+        Err("a shell needs Wayland, which isn't built in".into())
+    }
 }
 
 pub fn run<V: IntoView>(app: App, root: impl FnOnce() -> V) -> Result<(), BoxError> {
