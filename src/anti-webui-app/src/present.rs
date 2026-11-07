@@ -1,12 +1,13 @@
-//! Presentation on Wayland: our own dmabuf buffers with damage tracking, or a wgpu surface as
-//! the fallback (see `docs/design/05-rendering.md` and `06-platform-wayland.md`).
+//! Presentation: our own dmabuf buffers with damage tracking, or a wgpu surface as the fallback
+//! (see `docs/design/05-rendering.md`, `06-platform-wayland.md` and `35-platform-x11.md`).
 
+use crate::host::Host;
 use crate::pacing::PresentTrace;
 use anti_webui_core::damage::{self, Damage, DamageHistory};
-use anti_webui_core::scene::Scene;
-use anti_webui_wayland::{
-    BufferEvent, BufferId, Ctx, DmabufFeedback, DmabufPlaneDesc, SurfaceId, SyncPoints, TimelineId,
+use anti_webui_core::platform::{
+    BufferEvent, BufferId, DmabufFeedback, DmabufPlaneDesc, SurfaceId, SyncPoints, TimelineId,
 };
+use anti_webui_core::scene::Scene;
 use anti_webui_wgpu::dmabuf::{DRM_FORMAT_ARGB8888, DmabufContext, DmabufImage};
 use anti_webui_wgpu::linux_sync::{self, DrmDevice};
 use anti_webui_wgpu::{FrameResult, Gpu, GpuError, Renderer, WindowRenderer, wgpu};
@@ -55,7 +56,7 @@ fn renderer_target(surface: SurfaceId) -> u64 {
 }
 
 impl Presenter {
-    pub fn new(ctx: &mut Ctx<'_>) -> Result<Self, GpuError> {
+    pub fn new(ctx: &mut impl Host) -> Result<Self, GpuError> {
         let debug = debug_enabled();
         let force_surface = std::env::var("ANTIWEBUI_PRESENT").is_ok_and(|v| v == "surface");
         if !force_surface {
@@ -116,7 +117,7 @@ impl Presenter {
     }
 
     /// Commits the oldest frame held back. Returns what the frame was traced as, and when.
-    pub fn commit_held(&mut self, ctx: &mut Ctx<'_>, surface: SurfaceId) -> Option<(u64, i64)> {
+    pub fn commit_held(&mut self, ctx: &mut impl Host, surface: SurfaceId) -> Option<(u64, i64)> {
         let d = self.dmabuf.as_mut()?;
         let TargetKind::Dmabuf(t) = &mut self.targets.get_mut(&surface)?.kind else {
             return None;
@@ -177,7 +178,7 @@ impl Presenter {
     }
 
     /// Frees what is kept for a surface. To call before the surface goes.
-    pub fn forget(&mut self, ctx: &mut Ctx<'_>, surface: SurfaceId) {
+    pub fn forget(&mut self, ctx: &mut impl Host, surface: SurfaceId) {
         let Some(target) = self.targets.remove(&surface) else {
             return;
         };
@@ -191,7 +192,7 @@ impl Presenter {
 
     /// Presents the scene if it differs from the last one on this surface. Returns whether a
     /// buffer was committed, and whether the frame must be retried.
-    pub fn present(&mut self, ctx: &mut Ctx<'_>, surface: SurfaceId, scene: Scene) -> Presented {
+    pub fn present(&mut self, ctx: &mut impl Host, surface: SurfaceId, scene: Scene) -> Presented {
         if let Err(e) = self.update_buffers(ctx) {
             return self.failed(ctx, e);
         }
@@ -215,6 +216,9 @@ impl Presenter {
             self.targets.insert(surface, Target { kind, prev: None });
         }
         let target = self.targets.get_mut(&surface).expect("just inserted");
+        if ctx.take_exposed(surface) {
+            target.prev = None;
+        }
         let damage = match &target.prev {
             Some(prev) => damage::diff(prev, &scene),
             None => Damage::full(scene.width, scene.height),
@@ -291,14 +295,14 @@ impl Presenter {
         }
     }
 
-    fn failed(&mut self, ctx: &mut Ctx<'_>, e: GpuError) -> Presented {
+    fn failed(&mut self, ctx: &mut impl Host, e: GpuError) -> Presented {
         eprintln!("[anti-webui] dmabuf presentation failed ({e}); using a wgpu surface");
         self.fall_back(ctx);
         Presented::Retry
     }
 
     /// Takes in what happened to the buffers, on whichever surface.
-    fn update_buffers(&mut self, ctx: &mut Ctx<'_>) -> Result<(), GpuError> {
+    fn update_buffers(&mut self, ctx: &mut impl Host) -> Result<(), GpuError> {
         let Some(d) = &mut self.dmabuf else {
             return Ok(());
         };
@@ -342,7 +346,7 @@ impl Presenter {
         Ok(())
     }
 
-    fn fall_back(&mut self, ctx: &mut Ctx<'_>) {
+    fn fall_back(&mut self, ctx: &mut impl Host) {
         let mut targets = std::mem::take(&mut self.targets);
         if let Some(d) = &mut self.dmabuf {
             for target in targets.values_mut() {
@@ -384,7 +388,7 @@ pub(crate) enum Presented {
     Retry,
 }
 
-fn surface_gpu(ctx: &mut Ctx<'_>) -> Result<(Gpu, WindowRenderer), GpuError> {
+fn surface_gpu(ctx: &mut impl Host) -> Result<(Gpu, WindowRenderer), GpuError> {
     let (display, window) = ctx.raw_handles(SurfaceId::Window);
     let size = ctx.buffer_size();
     // SAFETY: the Wayland connection and surface outlive the presenter.
@@ -517,7 +521,7 @@ fn wanted_modifiers(feedback: &DmabufFeedback, ctx: &DmabufContext) -> Vec<u64> 
 }
 
 impl DmabufPresenter {
-    fn new(ctx: &mut Ctx<'_>) -> Result<(Gpu, Self), GpuError> {
+    fn new(ctx: &mut impl Host) -> Result<(Gpu, Self), GpuError> {
         let feedback = ctx
             .dmabuf_feedback()
             .ok_or_else(|| GpuError::Dmabuf("the compositor sent no dmabuf feedback".into()))?;
@@ -557,7 +561,7 @@ impl DmabufPresenter {
     fn present(
         &mut self,
         gpu: &Gpu,
-        ctx: &mut Ctx<'_>,
+        ctx: &mut impl Host,
         surface: SurfaceId,
         target: &mut DmabufTarget,
         scene: &Scene,
@@ -674,7 +678,7 @@ impl DmabufPresenter {
     /// Hands a finished frame to the compositor.
     fn commit(
         &mut self,
-        ctx: &mut Ctx<'_>,
+        ctx: &mut impl Host,
         surface: SurfaceId,
         target: &mut DmabufTarget,
         frame: HeldFrame,
@@ -723,7 +727,7 @@ impl DmabufPresenter {
     fn free_slot(
         &mut self,
         gpu: &Gpu,
-        ctx: &mut Ctx<'_>,
+        ctx: &mut impl Host,
         target: &mut DmabufTarget,
         may_wait: bool,
     ) -> Result<Option<usize>, GpuError> {
@@ -752,7 +756,7 @@ impl DmabufPresenter {
     fn allocate(
         &mut self,
         gpu: &Gpu,
-        ctx: &mut Ctx<'_>,
+        ctx: &mut impl Host,
         target: &mut DmabufTarget,
     ) -> Result<usize, GpuError> {
         let (w, h) = target.size;
@@ -799,7 +803,7 @@ impl DmabufPresenter {
         Ok(target.slots.len() - 1)
     }
 
-    fn drop_slots(&mut self, target: &mut DmabufTarget, ctx: &mut Ctx<'_>) {
+    fn drop_slots(&mut self, target: &mut DmabufTarget, ctx: &mut impl Host) {
         target.held.clear();
         target.unsent = None;
         for slot in target.slots.drain(..) {
@@ -814,7 +818,7 @@ impl DmabufPresenter {
         }
     }
 
-    fn release_protocol_objects(&mut self, ctx: &mut Ctx<'_>) {
+    fn release_protocol_objects(&mut self, ctx: &mut impl Host) {
         if let Sync::Explicit { acquire_id, .. } = &self.sync {
             ctx.destroy_timeline(*acquire_id);
         }
@@ -836,7 +840,7 @@ impl Drop for Presenter {
     }
 }
 
-fn setup_explicit_sync(ctx: &mut Ctx<'_>, dctx: &DmabufContext) -> Option<Sync> {
+fn setup_explicit_sync(ctx: &mut impl Host, dctx: &DmabufContext) -> Option<Sync> {
     if std::env::var("ANTIWEBUI_SYNC").is_ok_and(|v| v == "implicit")
         || !ctx.explicit_sync_available()
     {

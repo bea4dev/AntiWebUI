@@ -39,6 +39,7 @@ AntiWebUI は WebView に頼らず、wgpu による自前描画とネイティ�
 | 32 | [markdown-split](32-markdown-split.md) | 左にソース、右にプレビューの `markdown_split_editor`、左右のスクロールの同期、コードブロックの tree-sitter の色分け、ほかのエディタとの比較 |
 | 33 | [customization](33-customization.md) | フォークせずに部品を変える段階（テーマ、外側、部品ごと、見た目を丸ごと）、動きと見た目の分離（`x_with`、`styled_x`）、`Binding`、部品を作る道具、MD3E の載せ直し、公開範囲 |
 | 34 | [accessibility](34-accessibility.md) | 読み上げの口：`.access`（役割、呼び名、状態）、`snapshot`、`watch`、`perform`、標準の部品と MD3E の役割。プラットフォームへの橋渡しは別のクレートに任せる |
+| 35 | [platform-x11](35-platform-x11.md) | X11 バックエンド：実行時の選び方、app の `Host` への作り替え、XInput 2、DRI3 と Present での部分描画と明示的同期、ポップアップ、セレクション、XDND、XIM |
 
 ## 用語
 

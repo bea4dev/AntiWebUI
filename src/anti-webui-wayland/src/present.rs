@@ -1,7 +1,11 @@
 //! Presenting our own buffers: linux-dmabuf feedback and buffers, explicit sync timelines, and
 //! damage (see `docs/design/06-platform-wayland.md`).
 
-use crate::state::{State, SurfaceId};
+use crate::state::State;
+use anti_webui_core::platform::{
+    BufferEvent, BufferId, DmabufFeedback, DmabufPlaneDesc, DmabufTranche, Presentation, Shown,
+    SurfaceId, SyncPoints, TimelineId,
+};
 use std::collections::HashMap;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::fs::FileExt;
@@ -16,112 +20,12 @@ use wayland_protocols::wp::linux_drm_syncobj::v1::client::{
 };
 use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
 
-/// What the compositor can use, from `zwp_linux_dmabuf_feedback_v1`.
-#[derive(Clone, Debug, Default)]
-pub struct DmabufFeedback {
-    /// `dev_t` of the device the compositor composites with.
-    pub main_device: u64,
-    /// In order of preference.
-    pub tranches: Vec<DmabufTranche>,
-    /// Increases whenever the compositor sends new feedback.
-    pub generation: u64,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DmabufTranche {
-    pub device: u64,
-    /// `(DRM fourcc, modifier)` pairs.
-    pub formats: Vec<(u32, u64)>,
-    /// Buffers in this tranche can be scanned out directly.
-    pub scanout: bool,
-}
-
-impl DmabufFeedback {
-    /// Modifiers for `format` on the main device, most preferred tranche first.
-    pub fn modifiers(&self, format: u32) -> Vec<u64> {
-        let mut out = Vec::new();
-        for t in self
-            .tranches
-            .iter()
-            .filter(|t| t.device == self.main_device)
-        {
-            for &(f, m) in &t.formats {
-                if f == format && !out.contains(&m) {
-                    out.push(m);
-                }
-            }
-        }
-        out
-    }
-
-    /// Modifiers for `format` that the compositor can put on the screen as they are, if that is what
-    /// it would like most.
-    pub fn scanout_modifiers(&self, format: u32) -> Vec<u64> {
-        let first = self
-            .tranches
-            .iter()
-            .find(|t| t.device == self.main_device && t.formats.iter().any(|&(f, _)| f == format));
-        first.filter(|t| t.scanout).map_or(Vec::new(), |t| {
-            let of_format = t.formats.iter().filter(|&&(f, _)| f == format);
-            of_format.map(|&(_, m)| m).collect()
-        })
-    }
-}
-
 #[derive(Default)]
 pub(crate) struct PendingFeedback {
     table: Vec<(u32, u64)>,
     main_device: u64,
     tranches: Vec<DmabufTranche>,
     tranche: DmabufTranche,
-}
-
-/// One plane of a dmabuf to wrap in a `wl_buffer`.
-#[derive(Clone, Copy, Debug)]
-pub struct DmabufPlaneDesc<'a> {
-    pub fd: BorrowedFd<'a>,
-    pub offset: u32,
-    pub stride: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct BufferId(u64);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BufferEvent {
-    /// The compositor no longer reads the buffer (implicit sync only).
-    Released(BufferId),
-    /// The compositor rejected the buffer.
-    Failed(BufferId),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct TimelineId(u64);
-
-/// Explicit synchronization points for one commit.
-#[derive(Clone, Copy, Debug)]
-pub struct SyncPoints {
-    pub acquire: (TimelineId, u64),
-    pub release: (TimelineId, u64),
-}
-
-/// What the compositor says became of a commit (`wp_presentation`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Presentation {
-    /// What [`crate::Ctx::request_presentation`] was given.
-    pub token: u64,
-    /// `None` if the content never reached the screen.
-    pub shown: Option<Shown>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Shown {
-    /// In the clock of [`crate::Ctx::presentation_clock`].
-    pub time_ns: i64,
-    /// The time until the next refresh; 0 if the output has no constant rate.
-    pub refresh_ns: u32,
-    /// `wp_presentation_feedback.kind`.
-    pub flags: u32,
 }
 
 #[derive(Default)]

@@ -6,8 +6,13 @@ authors.workspace = true
 license.workspace = true
 
 [features]
+default = ["wayland", "x11"]
 ## Plays videos with an FFmpeg found at run time.
 video = ["dep:anti-webui-video"]
+## Runs on Wayland compositors.
+wayland = ["dep:anti-webui-wayland"]
+## Runs on X servers. See `docs/design/35-platform-x11.md`.
+x11 = ["dep:anti-webui-x11"]
 
 [dependencies]
 anti-webui-core.workspace = true
@@ -24,4 +29,6 @@ image.workspace = true
 moxcms.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-anti-webui-wayland.workspace = true
+anti-webui-wayland = { workspace = true, optional = true }
+anti-webui-x11 = { workspace = true, optional = true }
+raw-window-handle.workspace = true

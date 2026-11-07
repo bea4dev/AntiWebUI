@@ -61,7 +61,8 @@
 ## M3: 多言語・多プラットフォーム
 
 - `anti-webui-ffi`（C ABI）、C++ / C# バインディング
-- Windows / macOS / X11 バックエンド（それぞれの presenter でダメージトラッキング。[05](05-rendering.md) 参照）
+- Windows / macOS バックエンド（それぞれの presenter でダメージトラッキング。[05](05-rendering.md) 参照）
+- X11 バックエンド：2026-11-07 に作った（DRI3 と Present でダメージトラッキング。[35](35-platform-x11.md)）
 
 ## M4: おまけ機能
 

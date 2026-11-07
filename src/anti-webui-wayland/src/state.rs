@@ -72,14 +72,7 @@ pub struct PointerFrame {
     pub time: u32,
 }
 
-/// One of the surfaces that show something.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SurfaceId {
-    Window,
-    Popup(PopupId),
-    /// What shows with the pointer during a drag.
-    DragIcon,
-}
+pub use anti_webui_core::platform::SurfaceId;
 
 /// `zwp_pointer_gestures_v1.get_hold_gesture` came in this version.
 const HOLD_VERSION: u32 = 3;

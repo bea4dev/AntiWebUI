@@ -6,3 +6,25 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+anti-webui-core.workspace = true
+x11rb = { version = "0.14", features = [
+    "allow-unsafe-code",
+    "cursor",
+    "resource_manager",
+    "dri3",
+    "present",
+    "randr",
+    "shape",
+    "sync",
+    "xfixes",
+    "xinput",
+    "xkb",
+] }
+xkbcommon = { workspace = true, features = ["x11"] }
+xim = { version = "0.6", default-features = false, features = ["client", "x11rb-client", "x11rb-xcb"] }
+raw-window-handle.workspace = true
+rustix = { workspace = true, features = ["fs"] }
+log.workspace = true
+
+[dev-dependencies]
+x11rb = { version = "0.14", features = ["allow-unsafe-code", "xtest"] }

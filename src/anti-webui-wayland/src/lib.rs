@@ -7,7 +7,7 @@ mod popup;
 mod present;
 mod state;
 
-pub use present::{
+pub use anti_webui_core::platform::{
     BufferEvent, BufferId, DmabufFeedback, DmabufPlaneDesc, DmabufTranche, Presentation, Shown,
     SyncPoints, TimelineId,
 };
@@ -348,6 +348,12 @@ impl Ctx<'_> {
         }
     }
 
+    /// Whether the surface has to be drawn again in full. Never on Wayland: the compositor keeps
+    /// what was shown.
+    pub fn take_exposed(&mut self, _surface: SurfaceId) -> bool {
+        false
+    }
+
     /// Raw handles for creating a GPU surface. Valid until the surface closes.
     pub fn raw_handles(&self, surface: SurfaceId) -> (RawDisplayHandle, RawWindowHandle) {
         let display =
@@ -359,6 +365,11 @@ impl Ctx<'_> {
             RawWindowHandle::Wayland(WaylandWindowHandle::new(surface)),
         )
     }
+}
+
+/// Whether a compositor can be reached, for choosing the backend.
+pub fn can_connect() -> bool {
+    Connection::connect_to_env().is_ok()
 }
 
 /// Opens a window and runs the event loop until the handler exits.

@@ -1,9 +1,10 @@
 //! When frames are produced: what became of the last ones, and whether to render ahead of the
 //! compositor (see `docs/design/10-frame-pacing.md`).
 
+use crate::host::Host;
 use crate::vsync::FrameClock;
+use anti_webui_core::platform::{Presentation, SurfaceId};
 use anti_webui_core::settings::{FrameAdvance, settings};
-use anti_webui_wayland::{Ctx, Presentation, SurfaceId};
 use anti_webui_wgpu::linux_sync;
 use std::collections::VecDeque;
 use std::os::fd::{AsFd, OwnedFd};
@@ -391,7 +392,7 @@ impl Pacing {
 
     /// To call first thing in a frame. Passes to `finished` the frames nothing more will be
     /// learned about.
-    pub fn begin_frame(&mut self, ctx: &mut Ctx<'_>, mut finished: impl FnMut(&FrameRecord)) {
+    pub fn begin_frame(&mut self, ctx: &mut impl Host, mut finished: impl FnMut(&FrameRecord)) {
         self.collect(ctx, &mut finished);
         self.started = linux_sync::monotonic_ns();
         let (instant, ns) = self.base;
@@ -437,7 +438,7 @@ impl Pacing {
 
     /// How long until the frame callback that would come if something had been committed, going
     /// by the last one. `None` before there has been one, or if the refresh isn't known.
-    pub fn until_next_refresh(&self, ctx: &mut Ctx<'_>, now: Instant) -> Option<Duration> {
+    pub fn until_next_refresh(&self, ctx: &mut impl Host, now: Instant) -> Option<Duration> {
         let last = ctx.last_frame_callback(SurfaceId::Window)?;
         let refresh = self.refresh?;
         Some(next_refresh(last, refresh, now).saturating_duration_since(now))
@@ -479,7 +480,7 @@ impl Pacing {
         }
     }
 
-    fn collect(&mut self, ctx: &mut Ctx<'_>, finished: &mut impl FnMut(&FrameRecord)) {
+    fn collect(&mut self, ctx: &mut impl Host, finished: &mut impl FnMut(&FrameRecord)) {
         if self.presentation_offset.is_none()
             && let Some(clock) = ctx.presentation_clock()
             && let Ok(theirs) = linux_sync::clock_ns(clock)
