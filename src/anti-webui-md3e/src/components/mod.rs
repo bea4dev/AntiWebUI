@@ -50,7 +50,7 @@ pub use card::{
 pub use carousel::{Keylines, carousel, multi_browse_keylines};
 pub use checkbox::{
     CheckState, CheckboxStyle, RadioStyle, checkbox, radio_button, styled_checkbox,
-    styled_radio_button, tri_state_checkbox,
+    styled_radio_button, styled_tri_state_checkbox, tri_state_checkbox,
 };
 pub use chip::{
     ChipStyle, assist_chip, filter_chip, input_chip, selectable_input_chip, styled_assist_chip,

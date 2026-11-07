@@ -1,6 +1,6 @@
 //! What only shows something.
 
-use crate::theme::{Theme, keep_time, shared, theme};
+use crate::theme::{Theme, theme, themed};
 use anti_webui_core::prelude::*;
 
 /// A vertically scrolling container.
@@ -21,7 +21,7 @@ pub fn card() -> Div {
         .p(16.0)
         .rounded(8.0)
         .border(1.0)
-        .sheet(|| shared(card_sheet))
+        .sheet(|| themed(card_sheet))
 }
 
 pub fn heading(label: impl IntoTextSource) -> Text {
@@ -42,13 +42,13 @@ fn divider_sheet(t: &Theme) -> Sheet {
 
 /// A thin horizontal line.
 pub fn divider() -> Div {
-    div().h(1.0).flex_none().sheet(|| shared(divider_sheet))
+    div().h(1.0).flex_none().sheet(|| themed(divider_sheet))
 }
 
 fn link_sheet(t: &Theme) -> Sheet {
     Sheet::new(|s| s.text_color(t.accent_text).cursor(CursorIcon::Pointer))
         .hover(|s| s.underline())
-        .focus_visible(|s| crate::theme::ring(s, t).rounded(2.0))
+        .focus_visible(|s| crate::theme::focus_ring(s, t).rounded(2.0))
         .disabled(|s| s.text_color(t.text_disabled).cursor(CursorIcon::Default))
         .accent_text()
 }
@@ -58,7 +58,7 @@ pub fn link(label: impl IntoTextSource) -> Div {
     div()
         .focusable()
         .select_none()
-        .sheet(|| shared(link_sheet))
+        .sheet(|| themed(link_sheet))
         .child(text(label))
 }
 
@@ -104,7 +104,7 @@ pub fn toned_badge(label: impl IntoTextSource, tone: Tone) -> Div {
         .font_weight(FontWeight::MEDIUM)
         .select_none()
         .sheet(move || {
-            shared(match tone {
+            themed(match tone {
                 Tone::Neutral => |t| badge_sheet(t, Tone::Neutral),
                 Tone::Accent => |t| badge_sheet(t, Tone::Accent),
                 Tone::Success => |t| badge_sheet(t, Tone::Success),
@@ -137,34 +137,40 @@ fn track() -> Div {
         .min_w(40.0)
         .rounded(3.0)
         .overflow_clip()
-        .sheet(|| shared(track_sheet))
+        .sheet(|| themed(track_sheet))
 }
 
 /// How far something has come, from `0.0` to `1.0`.
 pub fn progress_bar(value: impl Fn() -> f32 + 'static) -> Div {
-    track().child(
-        div()
-            .h_full()
-            .rounded(3.0)
-            .sheet(|| shared(bar_sheet))
-            .transition_of([Prop::Width], Transition::ms(200).ease_out())
-            .dyn_style(move |s| s.w(pct(value().clamp(0.0, 1.0) * 100.0))),
-    )
+    let value = std::rc::Rc::new(value);
+    let told = value.clone();
+    track()
+        .access(move |a| {
+            a.role(Role::ProgressBar)
+                .value(told().clamp(0.0, 1.0) as f64, 0.0, 1.0)
+        })
+        .child(
+            div()
+                .h_full()
+                .rounded(3.0)
+                .sheet(|| themed(bar_sheet))
+                .transition_of([Prop::Width], Transition::ms(200).ease_out())
+                .dyn_style(move |s| s.w(pct(value().clamp(0.0, 1.0) * 100.0))),
+        )
 }
 
 /// That something is going on, without knowing how far it is.
 pub fn indeterminate_progress_bar() -> Div {
-    let time = signal(0.0f32);
-    keep_time(time);
+    let time = clock();
     const WIDTH: f32 = 30.0;
-    track().child(
+    track().access(|a| a.role(Role::ProgressBar)).child(
         div()
             .absolute()
             .top(0.0)
             .bottom(0.0)
             .w(pct(WIDTH))
             .rounded(3.0)
-            .sheet(|| shared(bar_sheet))
+            .sheet(|| themed(bar_sheet))
             .dyn_style(move |s| {
                 let t = (time.get() / 1.4).fract();
                 s.left(pct(-WIDTH + t * (100.0 + WIDTH)))
@@ -180,8 +186,7 @@ pub fn spinner() -> Div {
 /// That something is going on, in a circle of this size. A ring is turned with a quarter of it
 /// shown stronger, as a transform of one layer: nothing is laid out or drawn again.
 pub fn sized_spinner(size: f32) -> Div {
-    let time = signal(0.0f32);
-    keep_time(time);
+    let time = clock();
     let width = (size / 8.0).max(2.0);
     let ring = move || {
         div()
@@ -208,7 +213,7 @@ pub fn sized_spinner(size: f32) -> Div {
                 .w(size / 2.0)
                 .h(size / 2.0)
                 .overflow_clip()
-                .child(ring().sheet(|| shared(arc_sheet))),
+                .child(ring().sheet(|| themed(arc_sheet))),
         )
 }
 

@@ -210,6 +210,7 @@ impl Entry {
 
 /// Pictures in use and those kept in case they are of use again. It lives in the document and is
 /// only touched on the UI thread.
+#[doc(hidden)]
 pub struct ImageStore {
     entries: HashMap<ImageSource, Entry>,
     reply: Arc<Reply>,

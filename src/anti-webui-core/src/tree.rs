@@ -277,6 +277,8 @@ pub struct Node {
     pub(crate) remembered: Option<(crate::layout::WidthInputs, SizeI)>,
     /// What its contents were estimated to need, until something in them changes.
     pub(crate) estimated: Option<(crate::layout::WidthInputs, SizeI)>,
+    /// What it says to assistive technology. See `docs/design/34-accessibility.md`.
+    pub(crate) access: Option<Box<crate::access::Access>>,
 }
 
 impl Node {
@@ -330,6 +332,7 @@ impl Node {
             held: false,
             remembered: None,
             estimated: None,
+            access: None,
         }
     }
 
@@ -590,6 +593,10 @@ pub struct Document {
     pub(crate) drag: Option<crate::paint::DragVisual>,
     /// Nodes to bring into view after the next layout.
     pub pending_scroll: Vec<NodeId>,
+    /// What assistive technology sees may have changed since it was last told.
+    pub(crate) access_stale: bool,
+    /// What assistive technology asked for, done in the next update.
+    pub(crate) access_actions: Vec<(NodeId, crate::access::AccessAction)>,
     /// Scrolling nodes to move after the next layout, and where to.
     pub(crate) pending_scroll_to: Vec<(NodeId, PointI)>,
     /// Nodes that scrolled and have someone waiting to hear about it.
@@ -658,6 +665,8 @@ thread_local! {
         popups: Vec::new(),
         drag: None,
         pending_scroll: Vec::new(),
+        access_stale: false,
+        access_actions: Vec::new(),
         pending_scroll_to: Vec::new(),
         scrolled: Vec::new(),
         resized: Vec::new(),
@@ -962,6 +971,7 @@ impl Document {
     /// Styles need recomputing. Layout runs only if a layout-affecting property changed.
     /// The style inputs of `id` changed.
     pub fn mark_style_of(&mut self, id: NodeId) {
+        self.access_stale = true;
         let Some(n) = self.nodes.get_mut(id) else {
             return;
         };
@@ -975,6 +985,7 @@ impl Document {
 
     /// Something every style depends on changed.
     pub fn mark_style_all(&mut self) {
+        self.access_stale = true;
         self.style_all = true;
         self.dirty.style = true;
         self.dirty.paint = true;
@@ -1019,6 +1030,7 @@ impl Document {
 
     /// Marks `id` and its ancestors for re-layout; clean subtrees keep their cached layout.
     pub fn invalidate_layout(&mut self, id: NodeId) {
+        self.access_stale = true;
         let mut cur = Some(id);
         while let Some(i) = cur {
             let Some(n) = self.nodes.get_mut(i) else {
@@ -1036,6 +1048,7 @@ impl Document {
 
     /// Discards every cached layout result.
     pub fn invalidate_all_layout(&mut self) {
+        self.access_stale = true;
         for (_, n) in self.nodes.iter_mut() {
             n.layout_dirty = true;
             n.measure_cache.clear();
@@ -1045,6 +1058,7 @@ impl Document {
     }
 
     pub fn mark_layout(&mut self) {
+        self.access_stale = true;
         self.dirty.layout = true;
         self.dirty.paint = true;
         self.dirty.content = true;
@@ -1078,6 +1092,7 @@ impl Document {
     }
 
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
+        self.access_stale = true;
         self.detach(child);
         self.stacking_dirty = true;
         if let Some(c) = self.nodes.get_mut(child) {
@@ -1137,6 +1152,7 @@ impl Document {
     /// Removes a single node. Its children are detached, not removed: they belong to owners
     /// that remove them on their own.
     pub fn remove(&mut self, id: NodeId) {
+        self.access_stale = true;
         if !self.nodes.contains_key(id) {
             return;
         }

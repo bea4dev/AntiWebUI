@@ -1,7 +1,6 @@
 //! Badges. Sizes and colors are those of Jetpack Compose, which doesn't animate them: here they
 //! pop in and out with a spring. See `docs/design/20-md3e-components.md`.
 
-use super::surface::following;
 use crate::color::color_scheme;
 use crate::motion::fast_spatial;
 use crate::typography::TextStyle;
@@ -25,7 +24,7 @@ pub fn badge() -> Div {
 pub fn text_badge(label: impl Fn() -> String + 'static) -> Div {
     let label = Rc::new(label);
     let empty = label.clone();
-    let shown = following(
+    let shown = follow(
         move || if empty().is_empty() { 0.0f32 } else { 1.0 },
         fast_spatial(),
     );

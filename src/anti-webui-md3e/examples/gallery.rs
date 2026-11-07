@@ -99,22 +99,16 @@ fn main() {
                             "Save",
                             ButtonStyle::filled().icon(icons::SAVE),
                         ))
-                        .child(
-                            toggle_button("Bold", move || bold.get())
-                                .on_click(move |_| bold.update(|b| *b = !*b)),
-                        )
+                        .child(toggle_button("Bold", bold))
                         .child(icon_button(icons::SEARCH))
                         .child(filled_icon_button(icons::ADD))
                         .child(tonal_icon_button(icons::EDIT))
                         .child(outlined_icon_button(icons::DELETE))
-                        .child(
-                            icon_toggle_button(
-                                icons::FAVORITE,
-                                move || liked.get(),
-                                IconButtonStyle::standard(),
-                            )
-                            .on_click(move |_| liked.update(|l| *l = !*l)),
-                        ),
+                        .child(icon_toggle_button(
+                            icons::FAVORITE,
+                            liked,
+                            IconButtonStyle::standard(),
+                        )),
                 )
                 .child(
                     row()

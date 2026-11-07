@@ -30,6 +30,7 @@ mod over {
 type OnChange = Rc<dyn Fn(&str)>;
 type OnScrolled = Rc<dyn Fn(PointF)>;
 type OnKey = Rc<dyn Fn(&KeyboardEvent)>;
+type OnSelect = Rc<dyn Fn(usize, usize)>;
 
 /// A text version and caret, and the brackets found at them.
 type BracketsAt = (u64, usize, Option<(usize, usize)>);
@@ -44,6 +45,7 @@ pub struct CodeEditor {
     on_change: Option<OnChange>,
     on_scrolled: Option<OnScrolled>,
     on_key_down: Option<OnKey>,
+    on_select: Option<OnSelect>,
     editor_ref: Option<EditorRef>,
     read_only: bool,
     wrap: bool,
@@ -62,6 +64,7 @@ pub fn code_editor(text: impl Into<String>) -> CodeEditor {
         on_change: None,
         on_scrolled: None,
         on_key_down: None,
+        on_select: None,
         editor_ref: None,
         read_only: false,
         wrap: false,
@@ -111,6 +114,13 @@ impl CodeEditor {
     /// from doing anything with it.
     pub fn on_key_down(mut self, f: impl Fn(&KeyboardEvent) + 'static) -> Self {
         self.on_key_down = Some(Rc::new(f));
+        self
+    }
+
+    /// Told of the selection, as its anchor and focus in bytes, whenever it moves or the text
+    /// changes.
+    pub fn on_select(mut self, f: impl Fn(usize, usize) + 'static) -> Self {
+        self.on_select = Some(Rc::new(f));
         self
     }
 
@@ -1006,6 +1016,9 @@ impl IntoView for CodeEditor {
         }
         if let Some(f) = self.on_scrolled {
             te = te.on_scrolled(move |p| f(p));
+        }
+        if let Some(f) = self.on_select {
+            te = te.on_select(move |a, b| f(a, b));
         }
         if !self.wrap {
             te = te.whitespace_nowrap();

@@ -1,11 +1,10 @@
 //! Time pickers. Sizes, colors and timing are those of Jetpack Compose. See
 //! `docs/design/20-md3e-components.md`.
 
-use super::surface::{Corners, Surface, When, focus_ring, following, round, surface};
+use super::surface::{Corners, Surface, When, focus_ring, round, surface};
 use crate::color::color_scheme;
 use crate::motion::{default_effects, default_spatial};
 use crate::typography::TextStyle;
-use anti_webui::core::tree::with_doc;
 use anti_webui::prelude::*;
 use std::cell::Cell;
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
@@ -127,7 +126,7 @@ pub fn time_picker(
         }
     };
     let inner_for_hand = inner_now.clone();
-    let hand_length = following(
+    let hand_length = follow(
         move || if inner_for_hand() { INNER } else { OUTER },
         default_spatial(),
     );
@@ -137,7 +136,7 @@ pub fn time_picker(
         let time = time.clone();
         let on_change = on_change.clone();
         Rc::new(move |e: &GrabEvent, snap: bool| {
-            let scale = with_doc(|d| d.scale.as_f64() as f32);
+            let scale = untrack(window_scale).as_f64() as f32;
             let x = e.local.x - e.rect.width as f32 / 2.0;
             let y = e.local.y - e.rect.height as f32 / 2.0;
             let to_top = (y.atan2(x) + FRAC_PI_2).rem_euclid(TAU);
@@ -179,7 +178,7 @@ pub fn time_picker(
 
     let number = move |label: String, offset: (f32, f32), shown: Rc<dyn Fn() -> bool>| {
         let (x, y) = offset;
-        let visible = following(
+        let visible = follow(
             move || if shown() { 1.0f32 } else { 0.0 },
             default_effects(),
         );

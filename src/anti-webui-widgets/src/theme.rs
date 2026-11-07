@@ -167,9 +167,10 @@ pub fn set_theme(theme: Theme) {
     theme_signal().set(theme);
 }
 
-/// The sheet of a kind of element under the current theme. There is one for all elements of that
-/// kind. Reading it tracks the theme.
-pub(crate) fn shared(build: fn(&Theme) -> Sheet) -> Rc<Sheet> {
+/// The sheet of a kind of element under the current theme, made by `build` once for every element
+/// of that kind until the theme changes. Reading it tracks the theme. For a control of one's own
+/// that follows the theme: `div().sheet(|| themed(my_sheet))`.
+pub fn themed(build: fn(&Theme) -> Sheet) -> Rc<Sheet> {
     let t = theme();
     SHEETS.with(|s| {
         s.borrow_mut()
@@ -190,8 +191,8 @@ pub(crate) fn smooth(s: Style) -> Style {
     )
 }
 
-/// What is around a control that has the focus from the keyboard.
-pub(crate) fn ring(s: Style, t: &Theme) -> Style {
+/// What is around a control that has the focus from the keyboard, in the theme's colors.
+pub fn focus_ring(s: Style, t: &Theme) -> Style {
     s.outline(2.0)
         .outline_offset(1.0)
         .outline_color(t.focus_ring)
@@ -199,28 +200,7 @@ pub(crate) fn ring(s: Style, t: &Theme) -> Style {
 
 /// Goes from 0 to 1 and back with `open`, for as long as `QUICK`.
 pub(crate) fn fade(open: impl Fn() -> bool + 'static) -> Animated<f32> {
-    let shown = animated(if untrack(&open) { 1.0f32 } else { 0.0 });
-    let last = Cell::new(untrack(&open));
-    effect(move || {
-        let now = open();
-        if last.replace(now) != now {
-            untrack(|| shown.to(if now { 1.0 } else { 0.0 }, QUICK));
-        }
-    });
-    shown
-}
-
-/// Keeps `time` at the seconds since now, from frame to frame, for as long as it exists.
-pub(crate) fn keep_time(time: Signal<f32>) {
-    fn tick(time: Signal<f32>, start: std::time::Instant) {
-        request_frame(move |now| {
-            if time.is_alive() {
-                time.set(now.saturating_duration_since(start).as_secs_f32());
-                tick(time, start);
-            }
-        });
-    }
-    tick(time, std::time::Instant::now());
+    follow(move || if open() { 1.0f32 } else { 0.0 }, QUICK)
 }
 
 fn page_sheet(t: &Theme) -> Sheet {
@@ -240,6 +220,6 @@ pub fn page() -> Div {
         .size_full()
         .flex()
         .flex_col()
-        .sheet(|| shared(page_sheet))
+        .sheet(|| themed(page_sheet))
         .child(crate::toast_host())
 }

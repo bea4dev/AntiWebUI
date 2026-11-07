@@ -2,9 +2,11 @@
 //! fonts are shaped at their physical size, line boxes are whole pixels, glyph x positions keep
 //! sub-pixel precision.
 
+#[doc(hidden)]
 pub mod edit;
 pub mod editor;
 pub mod rich;
+#[doc(hidden)]
 pub mod selection;
 
 use crate::geometry::{RectI, Scale, SizeI};
@@ -25,10 +27,12 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
+#[doc(hidden)]
 pub use parley::{Affinity, Cursor, Selection as LayoutSelection};
 
 /// The brush stored in parley layouts. It is a span index, so color changes never require
 /// reshaping: the actual color is looked up at paint time.
+#[doc(hidden)]
 pub type Brush = u32;
 
 /// Fonts of the same metrics, from what fontconfig has in `30-metric-aliases.conf`.
@@ -43,6 +47,7 @@ const STAND_INS: &[(&str, &str)] = &[
     ("cambria", "Caladea"),
 ];
 
+#[doc(hidden)]
 pub struct TextSystem {
     pub fcx: FontContext,
     pub lcx: LayoutContext<Brush>,
@@ -301,12 +306,14 @@ fn register(
     Ok(names)
 }
 
+#[doc(hidden)]
 pub fn with_text<R>(f: impl FnOnce(&mut TextSystem) -> R) -> R {
     TEXT.with(|t| f(&mut t.borrow_mut()))
 }
 
 /// Every property that affects shaping or line breaking, already in physical units.
 #[derive(Clone, Debug, PartialEq)]
+#[doc(hidden)]
 pub struct ShapeStyle {
     pub family: FontFamily,
     pub size: f32,
@@ -499,6 +506,7 @@ fn parley_style(style: FontStyle) -> parley::FontStyle {
 
 /// A shaped paragraph that can be re-broken at different widths cheaply.
 #[derive(Default)]
+#[doc(hidden)]
 pub struct TextLayout {
     pub layout: Layout<Brush>,
     key: Option<ShapeKey>,

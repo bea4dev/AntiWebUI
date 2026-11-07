@@ -31,12 +31,13 @@ pub use image::*;
 pub use layout::*;
 pub use long::*;
 pub use menu::{
-    MenuEntry, MenuItem, context_menu, dropdown_button, menu, menu_item, menu_separator, submenu,
+    MenuChoice, MenuEntry, MenuItem, MenuOptions, MenuParts, MenuState, context_menu,
+    dropdown_button, menu, menu_item, menu_separator, menu_with, styled_menu, submenu,
 };
 pub use select::*;
 pub use slider::*;
 pub use sortable::*;
 pub use structure::*;
-pub use theme::{Theme, page, set_theme, theme};
+pub use theme::{Theme, focus_ring, page, set_theme, theme, themed};
 pub use toast::*;
 pub use tooltip::*;

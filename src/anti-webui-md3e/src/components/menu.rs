@@ -2,9 +2,7 @@
 //! those of Jetpack Compose. See `docs/design/20-md3e-components.md`.
 
 use super::icon::sized_icon;
-use super::surface::{
-    Corners, Ink, When, elevation_shadows, focus_ring, following, progress_of, round, when,
-};
+use super::surface::{Corners, Ink, When, elevation_shadows, focus_ring, progress_of, round, when};
 use crate::color::color_scheme;
 use crate::icons::{self, Symbol};
 use crate::motion::{fast_effects, fast_spatial};
@@ -127,6 +125,8 @@ impl MenuStyle {
     }
 }
 
+/// The behavior is the standard menu's (`menu_with`): the keys go through the items past the
+/// disabled ones, and choosing one closes the menu.
 pub fn styled_menu(
     open: impl Fn() -> bool + 'static,
     on_dismiss: impl Fn() + 'static,
@@ -134,27 +134,6 @@ pub fn styled_menu(
     style: MenuStyle,
 ) -> Show {
     crate::ensure_ready();
-    let open: When = Rc::new(open);
-    let on_dismiss: Rc<dyn Fn()> = Rc::new(on_dismiss);
-    let fade_open = open.clone();
-    let fade = following(
-        move || if fade_open() { 1.0f32 } else { 0.0 },
-        fast_effects(),
-    );
-    let size_open = open.clone();
-    let size = following(
-        move || if size_open() { 1.0f32 } else { 0.8 },
-        fast_spatial(),
-    );
-    // What the platform closed can't come back, so it goes at once and gets built again.
-    let gone = signal(false);
-    let reset = open.clone();
-    effect(move || {
-        if reset() {
-            gone.set(false);
-        }
-    });
-    let wanted = open.clone();
     let origin = match style.placement {
         Placement::BelowStart | Placement::RightStart => (0.0, 0.0),
         Placement::BelowEnd | Placement::LeftStart => (1.0, 0.0),
@@ -163,48 +142,40 @@ pub fn styled_menu(
         Placement::BelowCenter => (0.5, 0.0),
         Placement::AboveCenter => (0.5, 1.0),
     };
-    show(
-        move || wanted() || (fade.get() > 0.0 && !gone.get()),
+    let mut options = MenuOptions::new()
+        .placement(style.placement)
+        .gap(4)
+        .not_modal();
+    if let Some(anchor) = style.anchor {
+        options = options.anchor(anchor);
+    }
+    if style.match_width {
+        options = options.match_anchor_width();
+    }
+    let vibrant = style.vibrant;
+    menu_with(open, on_dismiss, options, move |m| {
+        let fade = follow(move || if m.open() { 1.0f32 } else { 0.0 }, fast_effects());
+        let size = follow(move || if m.open() { 1.0f32 } else { 0.8 }, fast_spatial());
+        m.hold_while(move || fade.get() > 0.0);
         move || {
-            let dismiss = on_dismiss.clone();
             let groups = groups.clone();
-            let mut surface = popup()
-                .placement(style.placement)
-                .gap(4)
-                .on_dismiss(move || {
-                    gone.set(true);
-                    dismiss();
-                });
-            if let Some(anchor) = style.anchor {
-                surface = surface.anchor(anchor);
-            }
-            if style.match_width {
-                surface = surface.match_anchor_width();
-            }
             let count = groups.len();
-            let vibrant = style.vibrant;
-            let refs: Rc<Vec<NodeRef>> =
-                Rc::new(groups.iter().flatten().map(|_| node_ref()).collect());
             let next = Rc::new(Cell::new(0usize));
-            surface.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(2.0)
-                    .transform_origin(origin.0, origin.1)
-                    .dyn_style(move |s| s.opacity(fade.get().clamp(0.0, 1.0)).scale(size.get()))
-                    .children(
-                        groups
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, items)| {
-                                group(i, count, items, vibrant, refs.clone(), next.clone())
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
-            )
-        },
-    )
+            div()
+                .flex()
+                .flex_col()
+                .gap(2.0)
+                .transform_origin(origin.0, origin.1)
+                .dyn_style(move |s| s.opacity(fade.get().clamp(0.0, 1.0)).scale(size.get()))
+                .children(
+                    groups
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, items)| group(m, i, count, items, vibrant, next.clone()))
+                        .collect::<Vec<_>>(),
+                )
+        }
+    })
 }
 
 /// The corners of a group by its place among the groups, or of an item by its place in the group.
@@ -221,11 +192,11 @@ fn place_corners(i: usize, count: usize, outer: f32, inner: f32) -> Corners {
 }
 
 fn group(
+    m: MenuState,
     i: usize,
     count: usize,
     items: Vec<MenuItem>,
     vibrant: bool,
-    refs: Rc<Vec<NodeRef>>,
     next: Rc<Cell<usize>>,
 ) -> Div {
     let [a, b, c, d] = if count <= 1 {
@@ -256,13 +227,7 @@ fn group(
                 .map(|(j, item)| {
                     let at = next.get();
                     next.set(at + 1);
-                    item_view(
-                        item,
-                        place_corners(j, total, 12.0, 4.0),
-                        vibrant,
-                        refs.clone(),
-                        at,
-                    )
+                    item_view(m, item, place_corners(j, total, 12.0, 4.0), vibrant, at)
                 })
                 .collect::<Vec<_>>(),
         );
@@ -274,13 +239,7 @@ fn group(
     node
 }
 
-fn item_view(
-    item: MenuItem,
-    corners: Corners,
-    vibrant: bool,
-    refs: Rc<Vec<NodeRef>>,
-    at: usize,
-) -> Div {
+fn item_view(m: MenuState, item: MenuItem, corners: Corners, vibrant: bool, at: usize) -> Div {
     let MenuItem {
         label,
         supporting,
@@ -292,10 +251,11 @@ fn item_view(
         on_click,
     } = item;
     let selects = selected.is_some();
+    let can_be_off = disabled.is_some();
     let is_on = when(selected);
     let is_off = when(disabled);
     let (on, off) = (is_on.clone(), is_off.clone());
-    let background = following(
+    let background = follow(
         move || {
             let c = color_scheme();
             match (vibrant, on() && !off()) {
@@ -345,7 +305,9 @@ fn item_view(
         }
     });
     let ink = Ink::new(move |_| layer().0, is_off.clone());
+    // The menu has the focus; the item the keys are on shows it.
     let focused = ink.focused;
+    effect(move || focused.set(m.is_lit(at) && m.keyed()));
 
     let lead = match icon {
         Some(symbol) => Some(
@@ -375,10 +337,16 @@ fn item_view(
         }
         None => None,
     };
-    let keys = refs.clone();
     let root_off = is_off.clone();
-    let disabled_off = is_off;
-    let run = on_click;
+    let mut choice = MenuChoice::new(move || {
+        if let Some(run) = &on_click {
+            run();
+        }
+    });
+    if can_be_off {
+        let off = is_off.clone();
+        choice = choice.disabled_when(move || off());
+    }
     let node = ink.paint(
         ink.listen(
             div()
@@ -391,8 +359,6 @@ fn item_view(
                 .px(12.0)
                 .py(if supporting.is_some() { 6.0 } else { 0.0 })
                 .select_none()
-                .focusable()
-                .node_ref(refs[at])
                 .dyn_style(move |s| {
                     let [a, b, c, d] = radii.map(|r| r.get());
                     let mut s = s
@@ -408,20 +374,6 @@ fn item_view(
                     s.radius_bottom_right = Some(c);
                     s.radius_bottom_left = Some(d);
                     focus_ring(s, focused.get(), &color_scheme())
-                })
-                .on_click(move |_| {
-                    if let Some(run) = &run {
-                        run();
-                    }
-                })
-                .on_key_down(move |e| {
-                    let to = match e.key {
-                        Key::Named(NamedKey::ArrowDown) => at + 1,
-                        Key::Named(NamedKey::ArrowUp) => at + keys.len() - 1,
-                        _ => return,
-                    };
-                    e.prevent_default();
-                    keys[to % keys.len()].focus();
                 })
                 .children(lead)
                 .child(
@@ -442,5 +394,5 @@ fn item_view(
                 .children(trailing_icon.map(|symbol| sized_icon(symbol, 20.0).ml(8.0))),
         ),
     );
-    node.disabled(move || disabled_off())
+    m.item(at, node, choice)
 }

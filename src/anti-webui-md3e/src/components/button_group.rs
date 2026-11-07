@@ -2,8 +2,6 @@
 
 use super::button::{ButtonStyle, Joined, styled_toggle_button};
 use crate::motion::fast_spatial;
-use anti_webui::core::geometry::Scale;
-use anti_webui::core::tree::with_doc;
 use anti_webui::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -66,9 +64,7 @@ pub fn button_group(items: impl IntoIterator<Item = Div>) -> Div {
             Rc::new(move |pressed: bool| {
                 // A press on the way back keeps what it had: the width has changed by then.
                 if pressed && items[i].pressed.get_untracked() <= 0.0 {
-                    let width = place
-                        .rect()
-                        .map_or(0.0, |r| with_doc(|d| d.scale.to_logical(r.width as f32)));
+                    let width = place.logical_rect().map_or(0.0, |r| r.width);
                     // Between two neighbors, each of them gives half.
                     let neighbors = (i > 0) as usize + (i + 1 < count) as usize;
                     let reach = if neighbors == 0 {
@@ -106,7 +102,7 @@ pub fn button_group(items: impl IntoIterator<Item = Div>) -> Div {
                 }
             })
             .dyn_style(move |s| {
-                let scale = with_doc(|d| d.scale);
+                let scale = window_scale();
                 let (more_left, more_right) = padding_change(&shown, i, scale);
                 // Whole physical pixels, which layout rounds back to the same.
                 let side =
@@ -147,10 +143,12 @@ pub fn connected_button_group<L: IntoTextSource>(
         };
         let checked = is_checked.clone();
         let select = on_select.clone();
-        group = group.child(
-            styled_toggle_button(label, move || checked(i), style.clone().joined(joined))
-                .on_click(move |_| select(i)),
-        );
+        let on = Binding::new(move || checked(i), move |_| select(i));
+        group = group.child(styled_toggle_button(
+            label,
+            on,
+            style.clone().joined(joined),
+        ));
     }
     group
 }

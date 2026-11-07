@@ -3,12 +3,11 @@
 
 use super::card::divider;
 use super::icon::sized_icon;
-use super::surface::{When, following};
+use super::surface::When;
 use crate::color::color_scheme;
 use crate::icons::{self, Symbol};
 use crate::motion::{default_spatial, fast_effects, slow_spatial};
 use crate::typography::TextStyle;
-use anti_webui::core::tree::with_doc;
 use anti_webui::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -181,7 +180,7 @@ pub fn search_bar(
         }
     });
     let content_open = open.clone();
-    let content_fade = following(
+    let content_fade = follow(
         move || if content_open() { 1.0f32 } else { 0.0 },
         fast_effects(),
     );
@@ -257,15 +256,9 @@ pub fn search_bar(
                                 let progress = v.min(1.0);
                                 let (window_w, window_h) = window.get();
                                 // Where it is as of the last layout, also if that was the first.
-                                let rect = bar.rect().map_or((0.0, 0.0, MIN_WIDTH), |r| {
-                                    with_doc(|d| {
-                                        (
-                                            d.scale.to_logical(r.x as f32),
-                                            d.scale.to_logical(r.y as f32),
-                                            d.scale.to_logical(r.width as f32),
-                                        )
-                                    })
-                                });
+                                let rect = bar
+                                    .logical_rect()
+                                    .map_or((0.0, 0.0, MIN_WIDTH), |r| (r.x, r.y, r.width));
                                 let (left, top, w, h, corner) = if full_screen {
                                     (
                                         rect.0 * (1.0 - progress),

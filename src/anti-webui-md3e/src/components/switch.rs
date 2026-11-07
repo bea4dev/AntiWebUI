@@ -66,13 +66,18 @@ fn handle(checked: bool, pressed: bool, has_icon: bool) -> (f32, f32) {
     (size, x)
 }
 
-/// A switch whose state follows `checked`, which the program changes in `on_click`.
-pub fn switch(checked: impl Fn() -> bool + 'static) -> Div {
-    styled_switch(checked, SwitchStyle::new())
+/// A switch bound to `on`, which it flips when it is clicked. The behavior is the standard
+/// switch's (`switch_with`).
+pub fn switch(on: impl Into<Binding<bool>>) -> Div {
+    styled_switch(on, SwitchStyle::new())
 }
 
-pub fn styled_switch(checked: impl Fn() -> bool + 'static, style: SwitchStyle) -> Div {
-    let checked: When = Rc::new(checked);
+pub fn styled_switch(on: impl Into<Binding<bool>>, style: SwitchStyle) -> Div {
+    switch_with(on, move |state| look(state, style))
+}
+
+fn look(state: SwitchState, style: SwitchStyle) -> Div {
+    let checked: When = Rc::new(move || state.on());
     let SwitchStyle {
         on_icon,
         off_icon,
@@ -223,8 +228,6 @@ pub fn styled_switch(checked: impl Fn() -> bool + 'static, style: SwitchStyle) -
             .items_center()
             .w(WIDTH)
             .h(TOUCH)
-            .select_none()
-            .focusable()
             .dyn_style(move |s| {
                 s.cursor(if root_off() {
                     CursorIcon::Default

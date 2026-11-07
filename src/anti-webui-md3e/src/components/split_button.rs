@@ -3,7 +3,7 @@
 
 use super::button::{ButtonKind, ButtonSize, colors as kind_colors, elevations};
 use super::icon::sized_icon;
-use super::surface::{Surface, When, following, surface};
+use super::surface::{Surface, When, surface};
 use crate::color::ColorScheme;
 use crate::icons;
 use crate::icons::Symbol;
@@ -139,7 +139,7 @@ pub fn split_button(
     let full = m.height / 2.0;
     let open: When = Rc::new(open);
     let turn_open = open.clone();
-    let turn = following(
+    let turn = follow(
         move || if turn_open() { 180.0f32 } else { 0.0 },
         Spring::from_ratio(1500.0, 1.0),
     );

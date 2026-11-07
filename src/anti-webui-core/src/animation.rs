@@ -527,6 +527,58 @@ impl<T: Animatable> Animated<T> {
     }
 }
 
+/// How an [`Animated`] goes somewhere: a [`Spring`] or a [`Transition`].
+pub trait Timing: Copy + 'static {
+    fn go<T: Animatable>(self, value: &Animated<T>, target: T);
+}
+
+impl Timing for Spring {
+    fn go<T: Animatable>(self, value: &Animated<T>, target: T) {
+        value.spring_to(target, self);
+    }
+}
+
+impl Timing for Transition {
+    fn go<T: Animatable>(self, value: &Animated<T>, target: T) {
+        value.to(target, self);
+    }
+}
+
+/// A value that goes to what `target` returns whenever that changes, starting from what it is now.
+/// What stays as it is starts nothing. `timing` is a [`Spring`] or a [`Transition`].
+///
+/// ```ignore
+/// let shown = follow(move || if open.get() { 1.0 } else { 0.0 }, Transition::ms(120));
+/// ```
+pub fn follow<T: Animatable>(target: impl Fn() -> T + 'static, timing: impl Timing) -> Animated<T> {
+    let first = crate::reactive::untrack(&target);
+    let value = animated(first);
+    let last = Cell::new(first);
+    crate::reactive::effect(move || {
+        let wanted = target();
+        if last.replace(wanted) != wanted {
+            crate::reactive::untrack(|| timing.go(&value, wanted));
+        }
+    });
+    value
+}
+
+/// The seconds since it was made, which go on frame by frame for as long as its owner lives. For
+/// what moves all the time, like a spinner or a wave.
+pub fn clock() -> Signal<f32> {
+    fn tick(time: Signal<f32>, start: Instant) {
+        request_frame(move |now| {
+            if time.is_alive() {
+                time.set(now.saturating_duration_since(start).as_secs_f32());
+                tick(time, start);
+            }
+        });
+    }
+    let time = signal(0.0f32);
+    tick(time, Instant::now());
+    time
+}
+
 impl Run {
     /// Where it is at `now`, and whether it is still on its way.
     fn step(&mut self, current: [f32; 4], now: Instant) -> ([f32; 4], bool) {

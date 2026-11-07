@@ -1,7 +1,7 @@
 //! Lists whose items can be put in another order by moving them. While that goes on only transforms
 //! change: the list is laid out once, when it is let go. See `docs/design/23-drag-and-drop.md`.
 
-use crate::theme::{QUICK, ring, theme};
+use crate::theme::{QUICK, focus_ring, theme};
 use anti_webui_core::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -371,7 +371,7 @@ where
 fn look() -> SortLook {
     SortLook {
         held: Rc::new(|s| s.bg(theme().surface).shadow_md()),
-        focused: Rc::new(|s| ring(s, &theme())),
+        focused: Rc::new(|s| focus_ring(s, &theme())),
         make_room: Rc::new(|at, to| at.to(to, QUICK)),
         settle: Rc::new(|at| at.to(0.0, QUICK)),
     }

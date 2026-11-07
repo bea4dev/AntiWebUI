@@ -6,7 +6,6 @@ use crate::color::ColorScheme;
 use crate::icons::Symbol;
 use crate::motion::{default_effects, fast_effects, fast_spatial};
 use crate::typography::TextStyle;
-use anti_webui::core::tree::with_doc;
 use anti_webui::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -176,9 +175,7 @@ pub fn styled_extended_fab(
             if open == 1.0 {
                 return s;
             }
-            let width = inner
-                .rect()
-                .map_or(0.0, |r| with_doc(|d| d.scale.to_logical(r.width as f32)));
+            let width = inner.logical_rect().map_or(0.0, |r| r.width);
             s.w((width * open).max(0.0))
         })
         .child(

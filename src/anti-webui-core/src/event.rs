@@ -86,6 +86,7 @@ pub struct KeyEvent {
 
 /// Input-method state changes, delivered atomically (text-input-v3 `done`).
 #[derive(Clone, Debug, Default, PartialEq)]
+#[doc(hidden)]
 pub struct ImeUpdate {
     /// New pre-edit text and the cursor range inside it (byte offsets). `None` clears it.
     pub preedit: Option<(String, Option<(usize, usize)>)>,
@@ -105,6 +106,7 @@ pub enum ClipboardKind {
 
 /// Logical pixels the content moves per unit of a Wayland touchpad axis. Chosen by feel on real
 /// hardware: GTK's and Chromium's newer 2.5 felt slow, and 6 too fast.
+#[doc(hidden)]
 pub const AXIS_MOTION_GAIN: f32 = 5.0;
 
 /// What produced a scroll.

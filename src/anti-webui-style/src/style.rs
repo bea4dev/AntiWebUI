@@ -16,6 +16,7 @@ macro_rules! define_style {
 
         /// A style with every property resolved, still in logical pixels.
         #[derive(Clone, Debug, PartialEq)]
+        #[doc(hidden)]
         pub struct ComputedStyle {
             $( $(#[$m])* pub $name: $ty, )*
         }

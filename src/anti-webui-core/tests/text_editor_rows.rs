@@ -338,3 +338,36 @@ fn some_lines_can_fold_into_one_row() {
     );
     assert_eq!(r.with(|e| e.line_of(e.focus)).unwrap(), 7);
 }
+
+/// Far down, with the estimates above learned again all at once (the lines wrap at another
+/// width): the line at the top stays there. Before, the rows were chosen by where the view was
+/// among the old estimates, so the rows that showed went and nothing held the view.
+#[test]
+fn the_line_at_the_top_stays_when_the_estimates_change() {
+    let text: String = (0..3000)
+        .map(|i| format!("{i} {}\n", "word ".repeat(i * 37 % 90)))
+        .collect();
+    let scroller = node_ref();
+    let r = editor_ref();
+    let width = signal(500.0f32);
+    let mut ui = mount(move || {
+        editor(text, scroller)
+            .editor_ref(r)
+            .dyn_style(move |s| s.w(width.get()))
+    });
+    r.scroll_to_line(2000.0);
+    for _ in 0..3 {
+        ui.update();
+    }
+    let before = r.top_line().unwrap();
+    assert!((before - 2000.0).abs() < 1.0, "at line {before}");
+    width.set(380.0);
+    for _ in 0..4 {
+        ui.update();
+    }
+    let after = r.top_line().unwrap();
+    assert!(
+        (after - before).abs() < 1.0,
+        "the top went from line {before} to {after}"
+    );
+}

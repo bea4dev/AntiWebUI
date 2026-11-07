@@ -2,7 +2,7 @@
 //! values and handles move with the springs of the motion scheme. See
 //! `docs/design/20-md3e-components.md`.
 
-use super::surface::{When, focus_ring, following, when};
+use super::surface::{When, focus_ring, when};
 use crate::color::color_scheme;
 use crate::motion::{fast_effects, fast_spatial};
 use crate::typography::TextStyle;
@@ -148,42 +148,46 @@ impl SliderStyle {
     }
 }
 
-/// A slider that shows `value`; `on_change` gets what it should become.
-pub fn slider(value: impl Fn() -> f32 + 'static, on_change: impl Fn(f32) + 'static) -> Div {
-    styled_slider(value, on_change, SliderStyle::new())
+impl SliderStyle {
+    /// The range and the options of the standard slider's behavior.
+    fn behavior(&self) -> (f32, f32, SliderOptions) {
+        let (min, max) = (*self.range.start(), *self.range.end());
+        let mut options = SliderOptions::new().inset(INSET);
+        if self.steps > 0 {
+            options = options.step((max - min) / (self.steps + 1) as f32);
+        }
+        if self.vertical {
+            options = options.vertical();
+        }
+        (min, max, options)
+    }
 }
 
-pub fn styled_slider(
-    value: impl Fn() -> f32 + 'static,
-    on_change: impl Fn(f32) + 'static,
-    style: SliderStyle,
-) -> Div {
-    build(
-        Rc::new(move || (f32::NAN, value())),
-        Rc::new(move |(_, end)| on_change(end)),
-        false,
-        style,
-    )
+/// A slider bound to `value`. The behavior is the standard slider's (`slider_with`).
+pub fn slider(value: impl Into<Binding<f32>>) -> Div {
+    styled_slider(value, SliderStyle::new())
 }
 
-/// A slider with two handles, that shows `(start, end)`; `on_change` gets what they should become.
+pub fn styled_slider(value: impl Into<Binding<f32>>, style: SliderStyle) -> Div {
+    let (min, max, options) = style.behavior();
+    slider_with(value, min, max, options, move |s| look(s, style))
+}
+
+/// A slider with two handles for a range from `start` to `end`, which don't pass each other. The
+/// behavior is the standard range slider's (`range_slider_with`).
 pub fn range_slider(
-    values: impl Fn() -> (f32, f32) + 'static,
-    on_change: impl Fn((f32, f32)) + 'static,
+    start: impl Into<Binding<f32>>,
+    end: impl Into<Binding<f32>>,
     style: SliderStyle,
 ) -> Div {
-    build(Rc::new(values), Rc::new(on_change), true, style)
+    let (min, max, options) = style.behavior();
+    range_slider_with(start, end, min, max, options, move |s| look(s, style))
 }
 
-fn build(
-    values: Rc<dyn Fn() -> (f32, f32)>,
-    on_change: Rc<dyn Fn((f32, f32))>,
-    two: bool,
-    style: SliderStyle,
-) -> Div {
+fn look(state: SliderState, style: SliderStyle) -> Div {
     crate::ensure_ready();
     let SliderStyle {
-        range,
+        range: _,
         steps,
         track,
         corner,
@@ -195,54 +199,31 @@ fn build(
         label,
         disabled,
     } = style;
-    let (min, max) = (*range.start(), *range.end());
-    let span = (max - min).max(f32::EPSILON);
+    let two = state.count() == 2;
     let disabled = when(disabled);
     let corner = corner.unwrap_or(track / 2.0);
+    // Here the handles are 0 and 1, and one alone is 1, as in the shader.
+    let held = move || state.held().map(|i| if two { i } else { 1 });
+    let keyed = move |i: usize| state.focus_visible_of(i);
 
-    let to_fraction = move |v: f32| ((v - min) / span).clamp(0.0, 1.0);
-    let from_fraction = move |t: f32| {
-        let t = t.clamp(0.0, 1.0);
-        let t = if steps > 0 {
-            let n = (steps + 1) as f32;
-            (t * n).round() / n
+    let fractions_now = move || {
+        if two {
+            [state.fraction_of(0), state.fraction_of(1)]
         } else {
-            t
-        };
-        min + span * t
-    };
-
-    // Which handle is being dragged. While it is, it stays with the pointer.
-    let dragging = signal(None::<usize>);
-    let hover = signal(false);
-    let keyed = [signal(false), signal(false)];
-    let thumbs = [node_ref(), node_ref()];
-
-    let fractions_now = {
-        let values = values.clone();
-        move || {
-            let (start, end) = values();
-            [
-                if start.is_nan() {
-                    0.0
-                } else {
-                    to_fraction(start)
-                },
-                to_fraction(end),
-            ]
+            [0.0, state.fraction()]
         }
     };
-    let first = untrack(&fractions_now);
+    let first = untrack(fractions_now);
     let fractions = first.map(animated);
     let last = Cell::new(first);
     effect(move || {
         let now = fractions_now();
         let before = last.replace(now);
-        let held = dragging.get_untracked();
+        let holding = untrack(held);
         untrack(|| {
             for i in 0..2 {
                 if now[i] != before[i] {
-                    if held == Some(i) && steps == 0 {
+                    if holding == Some(i) && steps == 0 {
                         fractions[i].set(now[i]);
                     } else {
                         fractions[i].spring_to(now[i], fast_spatial());
@@ -252,9 +233,9 @@ fn build(
         });
     });
     let handles = [0, 1].map(|i| {
-        following(
+        follow(
             move || {
-                if dragging.get() == Some(i) || keyed[i].get() {
+                if held() == Some(i) || keyed(i) {
                     HANDLE_NARROW
                 } else {
                     HANDLE
@@ -264,157 +245,84 @@ fn build(
         )
     });
 
-    let change = {
-        let values = values.clone();
-        let on_change = on_change.clone();
-        move |i: usize, value: f32| {
-            let (start, end) = untrack(|| values());
-            let next = match i {
-                0 => (value.min(end), end),
-                _ => (start, if two { value.max(start) } else { value }),
-            };
-            if next != (start, end) {
-                on_change(next);
-            }
-        }
-    };
-    let press_off = disabled.clone();
-    let press_values = values.clone();
-    let press_change = change.clone();
-    let along = move |g: &GrabEvent| {
-        let scale = with_scale();
-        let inset = INSET * scale;
-        if vertical {
-            let h = g.rect.height as f32;
-            (h - g.local.y - inset) / (h - inset * 2.0).max(1.0)
-        } else {
-            let w = g.rect.width as f32;
-            (g.local.x - inset) / (w - inset * 2.0).max(1.0)
-        }
-    };
-    let move_change = change.clone();
-
     let paint_off = disabled.clone();
-    let thumb =
-        move |i: usize, change: Rc<dyn Fn(usize, f32)>, values: Rc<dyn Fn() -> (f32, f32)>| {
-            let off = disabled.clone();
-            let value_of = move || {
-                let (start, end) = values();
-                if i == 0 { start } else { end }
-            };
-            let key_value = value_of.clone();
-            let label_value = value_of.clone();
-            let label = label.clone();
-            let fraction = fractions[i];
-            let is_keyed = keyed[i];
-            let shown = following(
-                move || {
-                    if dragging.get() == Some(i) || is_keyed.get() || (hover.get() && !two) {
-                        1.0f32
-                    } else {
-                        0.0
-                    }
-                },
-                fast_effects(),
-            );
-            let size = following(
-                move || {
-                    if dragging.get() == Some(i) || is_keyed.get() || (hover.get() && !two) {
-                        1.0f32
-                    } else {
-                        0.8
-                    }
-                },
-                fast_spatial(),
-            );
-            let bubble = label.map(|label| {
-                show(
-                    move || shown.get() > 0.0,
-                    move || {
-                        let label = label.clone();
-                        let value = label_value.clone();
-                        let text_of = move || label(value());
-                        let bubble = TextStyle::BODY_SMALL.apply(
-                            div()
-                                .flex_none()
-                                .min_w(40.0)
-                                .h(24.0)
-                                .px(8.0)
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(4.0)
-                                .transform_origin(0.5, 1.0)
-                                .dyn_style(move |s| {
-                                    let c = color_scheme();
-                                    s.bg(c.inverse_surface)
-                                        .text_color(c.inverse_on_surface)
-                                        .opacity(shown.get().clamp(0.0, 1.0))
-                                        .scale(size.get())
-                                })
-                                .child(text(text_of)),
-                        );
-                        div()
-                            .absolute()
-                            .flex()
-                            .justify_center()
-                            .items_end()
-                            .w(LABEL_BOX)
-                            .pointer_events_none()
-                            .left((HANDLE - LABEL_BOX) / 2.0)
-                            .bottom(handle_height + 4.0)
-                            .child(bubble)
-                    },
-                )
-            });
-            div()
-                .absolute()
-                .focusable()
-                .node_ref(thumbs[i])
-                .rounded(HANDLE / 2.0)
-                .dyn_style(move |s| {
-                    let t = fraction.get();
-                    let across = (TOUCH - handle_height) / 2.0;
-                    // The track starts and ends half a handle in from the box.
-                    let s = if vertical {
-                        s.w(handle_height)
-                            .h(HANDLE)
-                            .left(across)
-                            .bottom(pct(t * 100.0))
-                            .mb(INSET - INSET * 2.0 * t - HANDLE / 2.0)
-                    } else {
-                        s.h(handle_height)
-                            .w(HANDLE)
-                            .top(across)
-                            .left(pct(t * 100.0))
-                            .ml(INSET - INSET * 2.0 * t - HANDLE / 2.0)
-                    };
-                    focus_ring(s, is_keyed.get(), &color_scheme())
-                })
-                .on_focus_visible(move |on| is_keyed.set(on))
-                .on_key_down(move |e| {
-                    if off() {
-                        return;
-                    }
-                    let step = if steps > 0 {
-                        span / (steps + 1) as f32
-                    } else {
-                        span / 20.0
-                    };
-                    let now = untrack(&key_value);
-                    let to = match e.key {
-                        Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowDown) => now - step,
-                        Key::Named(NamedKey::ArrowRight | NamedKey::ArrowUp) => now + step,
-                        Key::Named(NamedKey::Home) => min,
-                        Key::Named(NamedKey::End) => max,
-                        _ => return,
-                    };
-                    e.prevent_default();
-                    change(i, from_fraction(to_fraction(to)));
-                })
-                .children(bubble)
+    let thumb = move |i: usize| {
+        let value_of = move || {
+            if two {
+                state.value_of(i)
+            } else {
+                state.value()
+            }
         };
-    let change_rc: Rc<dyn Fn(usize, f32)> = Rc::new(change);
+        let label = label.clone();
+        let fraction = fractions[i];
+        let up = move || held() == Some(i) || keyed(i) || (state.hovered() && !two);
+        let shown = follow(move || if up() { 1.0f32 } else { 0.0 }, fast_effects());
+        let size = follow(move || if up() { 1.0f32 } else { 0.8 }, fast_spatial());
+        let bubble = label.map(|label| {
+            show(
+                move || shown.get() > 0.0,
+                move || {
+                    let label = label.clone();
+                    let text_of = move || label(value_of());
+                    let bubble = TextStyle::BODY_SMALL.apply(
+                        div()
+                            .flex_none()
+                            .min_w(40.0)
+                            .h(24.0)
+                            .px(8.0)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(4.0)
+                            .transform_origin(0.5, 1.0)
+                            .dyn_style(move |s| {
+                                let c = color_scheme();
+                                s.bg(c.inverse_surface)
+                                    .text_color(c.inverse_on_surface)
+                                    .opacity(shown.get().clamp(0.0, 1.0))
+                                    .scale(size.get())
+                            })
+                            .child(text(text_of)),
+                    );
+                    div()
+                        .absolute()
+                        .flex()
+                        .justify_center()
+                        .items_end()
+                        .w(LABEL_BOX)
+                        .pointer_events_none()
+                        .left((HANDLE - LABEL_BOX) / 2.0)
+                        .bottom(handle_height + 4.0)
+                        .child(bubble)
+                },
+            )
+        });
+        let handle = div()
+            .absolute()
+            .rounded(HANDLE / 2.0)
+            .dyn_style(move |s| {
+                let t = fraction.get();
+                let across = (TOUCH - handle_height) / 2.0;
+                // The track starts and ends half a handle in from the box.
+                let s = if vertical {
+                    s.w(handle_height)
+                        .h(HANDLE)
+                        .left(across)
+                        .bottom(pct(t * 100.0))
+                        .mb(INSET - INSET * 2.0 * t - HANDLE / 2.0)
+                } else {
+                    s.h(handle_height)
+                        .w(HANDLE)
+                        .top(across)
+                        .left(pct(t * 100.0))
+                        .ml(INSET - INSET * 2.0 * t - HANDLE / 2.0)
+                };
+                focus_ring(s, keyed(i), &color_scheme())
+            })
+            .children(bubble);
+        state.thumb(if two { i } else { 0 }, handle)
+    };
 
     let kind = if two {
         1.0
@@ -423,17 +331,14 @@ fn build(
     } else {
         0.0
     };
-    let root = div()
-        .relative()
-        .flex_none()
-        .select_none()
-        .cursor(CursorIcon::Pointer);
+    let root = div().relative().flex_none().cursor(CursorIcon::Pointer);
     let root = if vertical {
         root.w(TOUCH).h(LENGTH)
     } else {
         root.w(LENGTH).h(TOUCH)
     };
     let cursor_off = paint_off.clone();
+    let root_off = paint_off.clone();
     let root = root
         .dyn_style(move |s| {
             if cursor_off() {
@@ -442,6 +347,7 @@ fn build(
                 s
             }
         })
+        .disabled(move || root_off())
         .fill(move || {
             let c = color_scheme();
             let off = paint_off();
@@ -484,46 +390,7 @@ fn build(
                 stops: if stops { 1.0 } else { 0.0 },
                 vertical: if vertical { 1.0 } else { 0.0 },
             })
-        })
-        .on_hover(move |on| hover.set(on))
-        .grab_threshold(0.0)
-        .on_grab(move |g| match g.phase {
-            GrabPhase::Start => {
-                if press_off() {
-                    return;
-                }
-                let t = along(g).clamp(0.0, 1.0);
-                let i = if two {
-                    let (start, end) = untrack(|| press_values());
-                    let (a, b) = (to_fraction(start), to_fraction(end));
-                    if (t - a).abs() < (t - b).abs() || (t < a && a == b) {
-                        0
-                    } else {
-                        1
-                    }
-                } else {
-                    1
-                };
-                dragging.set(Some(i));
-                thumbs[i].focus();
-                press_change(i, from_fraction(t));
-            }
-            GrabPhase::Move => {
-                if let Some(i) = dragging.get_untracked() {
-                    move_change(i, from_fraction(along(g)));
-                }
-            }
-            GrabPhase::End | GrabPhase::Cancel => dragging.set(None),
         });
-    let root = if two {
-        root.child(thumb(0, change_rc.clone(), values.clone()))
-    } else {
-        root
-    };
-    root.child(thumb(1, change_rc, values))
-}
-
-/// The scale of the window, which pointer events are measured in.
-fn with_scale() -> f32 {
-    anti_webui::core::tree::with_doc(|d| d.scale.as_f64() as f32)
+    let root = if two { root.child(thumb(0)) } else { root };
+    root.child(thumb(1))
 }

@@ -327,40 +327,9 @@ impl Ink {
     }
 }
 
-/// A value that follows `target` like a spring, starting from what that is now. What stays as it
-/// is starts no animation.
-pub(super) fn following<T>(target: impl Fn() -> T + 'static, spring: Spring) -> Animated<T>
-where
-    T: Animatable + PartialEq + Copy + 'static,
-{
-    let first = untrack(&target);
-    let value = animated(first);
-    let last = Cell::new(first);
-    effect(move || {
-        let wanted = target();
-        if last.replace(wanted) != wanted {
-            untrack(|| value.spring_to(wanted, spring));
-        }
-    });
-    value
-}
-
 /// 0 or 1, following whether something is so.
 pub(super) fn progress_of(on: When, spring: Spring) -> Animated<f32> {
-    following(move || if on() { 1.0 } else { 0.0 }, spring)
-}
-
-/// Keeps `time` at the seconds since now, from frame to frame, for as long as it exists.
-pub(super) fn keep_time(time: Signal<f32>) {
-    fn tick(time: Signal<f32>, start: Instant) {
-        request_frame(move |now| {
-            if time.is_alive() {
-                time.set(now.saturating_duration_since(start).as_secs_f32());
-                tick(time, start);
-            }
-        });
-    }
-    tick(time, Instant::now());
+    follow(move || if on() { 1.0 } else { 0.0 }, spring)
 }
 
 /// A box that is only there for its state layer: a circle of this diameter around the center of
@@ -496,6 +465,7 @@ pub(super) fn surface(surface: Surface) -> Div {
         .select_none()
         .cursor(CursorIcon::Pointer)
         .focusable()
+        .access(|a| a.role(Role::Button))
         .dyn_style(move |s| {
             let c = color_scheme();
             let (background, content, border) = colors(&c, looks_checked());

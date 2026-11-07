@@ -137,13 +137,22 @@ impl MarkdownView {
 /// keeping the two sides of a split editor in step.
 #[derive(Default)]
 pub(crate) struct Anchors {
-    /// In the order of the document: the line each block starts on, its key and the room above
-    /// it in logical pixels.
-    pub blocks: RefCell<Vec<(usize, EntryKey, f32)>>,
+    /// In the order of the document.
+    pub blocks: RefCell<Vec<Anchor>>,
     /// The box of each block that is shown, by its key.
     pub boxes: RefCell<HashMap<EntryKey, NodeRef>>,
     /// How many lines the source has.
     pub lines: std::cell::Cell<usize>,
+}
+
+/// A block at the top of a document, as `Anchors` keeps it.
+#[derive(Clone, Copy)]
+pub(crate) struct Anchor {
+    /// The line it starts on, and the line after its last.
+    pub lines: (usize, usize),
+    pub key: EntryKey,
+    /// The room above it in its box, in logical pixels.
+    pub gap: f32,
 }
 
 /// The colors of code blocks by their grammars, unless they are given otherwise.
@@ -890,7 +899,19 @@ impl Ctx {
             *n += 1;
             let key = (hash, *n, gap.to_bits());
             if anchors.is_some() {
-                lines.push((line, key, gap));
+                // Counted on from where the block starts to its last line, once.
+                let first = line;
+                let last = top.range.end.saturating_sub(1).max(counted);
+                line += source.as_bytes()[counted..last]
+                    .iter()
+                    .filter(|&&b| b == b'\n')
+                    .count();
+                counted = last;
+                lines.push(Anchor {
+                    lines: (first, line + 1),
+                    key,
+                    gap,
+                });
             }
             out.push(Rc::new(Entry {
                 key,
@@ -907,7 +928,7 @@ impl Ctx {
                 + 1;
             a.lines.set(total);
             // The boxes of blocks that go are forgotten; those of new ones come as they are made.
-            let keys: std::collections::HashSet<EntryKey> = lines.iter().map(|l| l.1).collect();
+            let keys: std::collections::HashSet<EntryKey> = lines.iter().map(|l| l.key).collect();
             a.boxes.borrow_mut().retain(|k, _| keys.contains(k));
             *a.blocks.borrow_mut() = lines;
         }

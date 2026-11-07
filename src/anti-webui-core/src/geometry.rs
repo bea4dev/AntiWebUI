@@ -89,6 +89,34 @@ impl PointF {
     }
 }
 
+/// A rectangle in logical pixels, as what is measured is told to programs.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RectF {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl RectF {
+    pub const fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    pub fn right(&self) -> f32 {
+        self.x + self.width
+    }
+
+    pub fn bottom(&self) -> f32 {
+        self.y + self.height
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SizeI {
     pub width: i32,

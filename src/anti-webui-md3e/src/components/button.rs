@@ -268,19 +268,21 @@ pub fn styled_button(label: impl IntoTextSource, style: ButtonStyle) -> Div {
     build(label, style, None)
 }
 
-/// A filled button that stays on or off: what it shows follows `checked`, which the program changes
-/// in `on_click`.
-pub fn toggle_button(label: impl IntoTextSource, checked: impl Fn() -> bool + 'static) -> Div {
-    styled_toggle_button(label, checked, ButtonStyle::filled())
+/// A filled button that stays on or off, bound to `on`, which it flips when it is clicked. The
+/// behavior is the standard one's (`toggle_with`).
+pub fn toggle_button(label: impl IntoTextSource, on: impl Into<Binding<bool>>) -> Div {
+    styled_toggle_button(label, on, ButtonStyle::filled())
 }
 
 /// A toggle button of any kind and size.
 pub fn styled_toggle_button(
     label: impl IntoTextSource,
-    checked: impl Fn() -> bool + 'static,
+    on: impl Into<Binding<bool>>,
     style: ButtonStyle,
 ) -> Div {
-    build(label, style, Some(Rc::new(checked)))
+    toggle_with(on, move |t| {
+        build(label, style, Some(Rc::new(move || t.on())))
+    })
 }
 
 fn build(

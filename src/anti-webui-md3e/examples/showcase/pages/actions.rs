@@ -55,18 +55,12 @@ fn buttons() -> Div {
         )
         .child(
             row()
-                .child(
-                    toggle_button("Bold", move || bold.get())
-                        .on_click(move |_| bold.update(|v| *v = !*v)),
-                )
-                .child(
-                    styled_toggle_button(
-                        "Notify",
-                        move || notify.get(),
-                        ButtonStyle::tonal().icon(icons::NOTIFICATIONS),
-                    )
-                    .on_click(move |_| notify.update(|v| *v = !*v)),
-                ),
+                .child(toggle_button("Bold", bold))
+                .child(styled_toggle_button(
+                    "Notify",
+                    notify,
+                    ButtonStyle::tonal().icon(icons::NOTIFICATIONS),
+                )),
         )
 }
 
@@ -100,10 +94,7 @@ fn icon_buttons() -> Div {
                 ]
                 .into_iter()
                 .zip(liked)
-                .map(|(style, on)| {
-                    icon_toggle_button(icons::FAVORITE, move || on.get(), style)
-                        .on_click(move |_| on.update(|v| *v = !*v))
-                })
+                .map(|(style, on)| icon_toggle_button(icons::FAVORITE, on, style))
                 .collect::<Vec<_>>(),
             ),
         )

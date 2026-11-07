@@ -157,14 +157,16 @@ pub fn styled_icon_button(symbol: &'static Symbol, style: IconButtonStyle) -> Di
     build(symbol, style, None)
 }
 
-/// An icon button that stays on or off: what it shows follows `checked`, which the program changes
-/// in `on_click`. Its icon fills in while it is on.
+/// An icon button that stays on or off, bound to `on`, which it flips when it is clicked. Its icon
+/// fills in while it is on. The behavior is the standard one's (`toggle_with`).
 pub fn icon_toggle_button(
     symbol: &'static Symbol,
-    checked: impl Fn() -> bool + 'static,
+    on: impl Into<Binding<bool>>,
     style: IconButtonStyle,
 ) -> Div {
-    build(symbol, style, Some(Rc::new(checked)))
+    toggle_with(on, move |t| {
+        build(symbol, style, Some(Rc::new(move || t.on())))
+    })
 }
 
 fn build(

@@ -2,14 +2,17 @@
 
 mod custom_shader;
 #[cfg(target_os = "linux")]
+#[doc(hidden)]
 pub mod dmabuf;
 #[cfg(target_os = "linux")]
 mod drivers;
 #[cfg(target_os = "linux")]
+#[doc(hidden)]
 pub use drivers::limit_vulkan_drivers;
 mod effects;
 mod glyph_cache;
 #[cfg(target_os = "linux")]
+#[doc(hidden)]
 pub mod linux_sync;
 mod path;
 mod renderer;
@@ -21,6 +24,9 @@ use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, RawDisplayHandle, RawWindowHandle,
 };
 pub use renderer::Renderer;
+/// The wgpu crate this one is built on, for tests and tools that render offscreen. Which version it
+/// is follows this crate and is not part of what semver promises.
+#[doc(hidden)]
 pub use wgpu;
 
 #[derive(Debug)]
@@ -82,6 +88,7 @@ pub struct Gpu {
 }
 
 /// A window surface and its renderer.
+#[doc(hidden)]
 pub struct WindowRenderer {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
@@ -359,6 +366,7 @@ impl Offscreen {
 
 /// The outcome of presenting a frame.
 #[derive(Debug, PartialEq, Eq)]
+#[doc(hidden)]
 pub enum FrameResult {
     Presented,
     /// Nothing was presented; try again on the next frame.

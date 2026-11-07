@@ -61,6 +61,7 @@ pub struct VideoSettings {
 
 /// How the numbers of a frame become colors.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[doc(hidden)]
 pub enum YuvMatrix {
     Bt601,
     #[default]
@@ -70,6 +71,7 @@ pub enum YuvMatrix {
 
 /// What the numbers of a frame mean as light.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[doc(hidden)]
 pub enum VideoTransfer {
     /// As it is on any other screen.
     #[default]
@@ -79,6 +81,7 @@ pub enum VideoTransfer {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[doc(hidden)]
 pub struct VideoColor {
     pub matrix: YuvMatrix,
     /// Black is 0 rather than 16.
@@ -88,6 +91,7 @@ pub struct VideoColor {
 
 /// What the texels of a plane are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[doc(hidden)]
 pub enum PlaneFormat {
     R8,
     Rg8,
@@ -109,6 +113,7 @@ impl PlaneFormat {
 
 /// A plane in memory.
 #[derive(Clone, Copy, Debug)]
+#[doc(hidden)]
 pub struct MemoryPlane {
     pub format: PlaneFormat,
     pub size: (u32, u32),
@@ -147,6 +152,7 @@ impl MemoryPlane {
 /// A plane in a dmabuf, as the GPU decoder left it.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
+#[doc(hidden)]
 pub struct DmabufPlane {
     pub format: PlaneFormat,
     pub size: (u32, u32),
@@ -158,6 +164,7 @@ pub struct DmabufPlane {
 }
 
 #[derive(Debug)]
+#[doc(hidden)]
 pub enum VideoPixels {
     /// One plane of luma and one or two of chroma.
     Memory(Vec<MemoryPlane>),
@@ -166,6 +173,7 @@ pub enum VideoPixels {
 }
 
 /// A picture of a video, for as long as something still shows it.
+#[doc(hidden)]
 pub struct VideoFrame {
     /// Tells it from all other frames.
     pub id: u64,
@@ -196,6 +204,7 @@ impl std::fmt::Debug for VideoFrame {
 
 /// What a stream has to say since the last time.
 #[derive(Clone, Debug, PartialEq)]
+#[doc(hidden)]
 pub enum VideoEvent {
     /// How big it is, after rotating, in pixels, and how long, in seconds if that is known.
     Opened {
@@ -209,6 +218,7 @@ pub enum VideoEvent {
 
 /// What it takes to open a stream.
 #[derive(Clone)]
+#[doc(hidden)]
 pub struct VideoRequest {
     pub source: String,
     pub settings: VideoSettings,
@@ -224,6 +234,7 @@ pub struct VideoRequest {
 
 /// What is known about the refreshes of the screen, for showing frames evenly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
 pub struct VideoTiming {
     /// How long a refresh takes.
     pub refresh: Duration,
@@ -232,6 +243,7 @@ pub struct VideoTiming {
 }
 
 /// A video being played, as the UI thread sees it. All of this returns at once.
+#[doc(hidden)]
 pub trait VideoStream {
     fn poll(&mut self) -> Vec<VideoEvent>;
     /// What should be on the screen at the frame that starts at `now`.
@@ -254,6 +266,7 @@ pub trait VideoStream {
 }
 
 /// What makes streams.
+#[doc(hidden)]
 pub trait VideoBackend {
     fn open(&self, request: VideoRequest) -> Box<dyn VideoStream>;
     /// Whether there is something to decode with, and which.
@@ -268,6 +281,7 @@ thread_local! {
 
 /// Says what decodes videos on this thread. `App` does this when it was built with the feature
 /// `video`.
+#[doc(hidden)]
 pub fn set_video_backend(backend: Rc<dyn VideoBackend>) {
     BACKEND.with(|b| *b.borrow_mut() = Some(backend));
 }
@@ -372,12 +386,15 @@ impl VideoPlayer {
 }
 
 /// Told how big a video is, in logical pixels, and how long, in seconds, or `NaN`.
+#[doc(hidden)]
 pub type LoadListener = Rc<dyn Fn(f32, f32, f64)>;
 /// Told why a video can't be shown.
+#[doc(hidden)]
 pub type VideoErrorListener = Rc<dyn Fn(&VideoError)>;
 
 /// What a `video` shows.
 #[derive(Default)]
+#[doc(hidden)]
 pub struct VideoData {
     pub source: Option<String>,
     /// In pixels, once that is known.
@@ -404,6 +421,7 @@ const TIME_UPDATE: Duration = Duration::from_millis(250);
 
 /// The videos of a document.
 #[derive(Default)]
+#[doc(hidden)]
 pub struct VideoStore {
     streams: HashMap<NodeId, Playing>,
     /// What to open at the next chance. The window comes after the tree, and what decodes wants to

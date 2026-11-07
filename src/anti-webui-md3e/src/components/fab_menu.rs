@@ -2,7 +2,7 @@
 //! `docs/design/20-md3e-components.md`.
 
 use super::icon::sized_icon;
-use super::surface::{Ink, When, elevation_shadows, focus_ring, following, progress_of, when};
+use super::surface::{Ink, When, elevation_shadows, focus_ring, progress_of, when};
 use crate::color::color_scheme;
 use crate::icons::{self, Symbol};
 use crate::motion::{fast_effects, fast_spatial, slow_effects};
@@ -47,7 +47,7 @@ pub fn fab_menu(
     let count = items.len();
     // Steps up to the number of items and back: the items follow one by one.
     let stagger_open = open.clone();
-    let stagger = following(
+    let stagger = follow(
         move || if stagger_open() { count as f32 } else { 0.0 },
         slow_effects(),
     );

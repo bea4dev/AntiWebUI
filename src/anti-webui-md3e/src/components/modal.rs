@@ -3,7 +3,7 @@
 //! `docs/design/20-md3e-components.md`.
 
 use super::icon::sized_icon;
-use super::surface::{When, following};
+use super::surface::When;
 use crate::color::color_scheme;
 use crate::icons::Symbol;
 use crate::motion::{default_effects, default_spatial, fast_effects};
@@ -54,62 +54,33 @@ impl Modal {
         }
     }
 
-    /// The scrim and what is on it, in a portal for as long as something is to be seen.
+    /// The scrim and what is on it, for as long as something is to be seen. The behavior is the
+    /// standard one (`modal_with`): Tab stays inside, and Escape and the scrim dismiss.
     fn view(self, content: impl Fn() -> Div + 'static) -> Show {
         let Self {
             open,
             dismiss,
             shown,
         } = self;
-        let wanted = open.clone();
-        let scrim_on = open.clone();
-        let scrim = following(
-            move || if scrim_on() { 1.0f32 } else { 0.0 },
-            default_effects(),
-        );
-        show(
-            move || wanted() || shown.get() > 0.0 || scrim.get() > 0.0,
-            move || {
-                let root = node_ref();
-                let scrim_click = dismiss.clone();
-                let key_dismiss = dismiss.clone();
-                let view = portal()
-                    .modal()
-                    .child(
-                        div()
-                            .absolute()
-                            .left(0.0)
-                            .top(0.0)
-                            .right(0.0)
-                            .bottom(0.0)
-                            .dyn_style(move |s| {
-                                s.bg(color_scheme()
-                                    .scrim
-                                    .with_alpha(SCRIM * scrim.get().clamp(0.0, 1.0)))
-                            })
-                            .on_click(move |_| scrim_click()),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .left(0.0)
-                            .top(0.0)
-                            .right(0.0)
-                            .bottom(0.0)
-                            .focusable()
-                            .node_ref(root)
-                            .pointer_events_none()
-                            .on_key_down(move |e| {
-                                if matches!(e.key, Key::Named(NamedKey::Escape)) {
-                                    e.prevent_default();
-                                    key_dismiss();
-                                }
-                            })
-                            .child(content()),
-                    )
-                    .into_view();
-                root.focus();
-                view
+        modal_with(
+            move || open(),
+            move || dismiss(),
+            move |m| {
+                let scrim = follow(
+                    move || if m.open() { 1.0f32 } else { 0.0 },
+                    default_effects(),
+                );
+                m.hold_while(move || shown.get() > 0.0 || scrim.get() > 0.0);
+                move || {
+                    div()
+                        .size_full()
+                        .child(m.scrim(div().absolute().inset(0.0).dyn_style(move |s| {
+                            s.bg(color_scheme()
+                                .scrim
+                                .with_alpha(SCRIM * scrim.get().clamp(0.0, 1.0)))
+                        })))
+                        .child(div().absolute().inset(0.0).child(content()))
+                }
             },
         )
     }
@@ -168,7 +139,7 @@ pub fn dialog(
     let modal = Modal::new(open, on_dismiss, default_spatial(), fast_effects());
     let shown = modal.shown;
     let fade_open = modal.open.clone();
-    let fade = following(
+    let fade = follow(
         move || if fade_open() { 1.0f32 } else { 0.0 },
         fast_effects(),
     );

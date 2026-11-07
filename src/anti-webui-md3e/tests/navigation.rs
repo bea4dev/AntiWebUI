@@ -160,11 +160,9 @@ fn a_wide_rail_opens_and_its_items_change_layout() {
 fn the_tab_indicator_moves_to_what_is_selected() {
     let selected = signal(0usize);
     let mut ui = start_ui(move || {
-        div().w(600.0).child(tabs(
-            vec![tab("One"), tab("Two"), tab("Three")],
-            move || selected.get(),
-            move |i| selected.set(i),
-        ))
+        div()
+            .w(600.0)
+            .child(tabs(vec![tab("One"), tab("Two"), tab("Three")], selected))
     });
     let scene = settle(&mut ui);
     let mark = colored(&scene, C.primary).pop().expect("the indicator");
@@ -184,8 +182,7 @@ fn the_indicator_of_secondary_tabs_is_as_wide_as_the_tab() {
     let mut ui = start_ui(|| {
         div().w(600.0).child(styled_tabs(
             vec![tab("One"), tab("Two")],
-            || 1,
-            |_| {},
+            signal(1),
             TabsStyle::secondary(),
         ))
     });
@@ -202,8 +199,7 @@ fn scrollable_tabs_bring_the_selected_one_into_view() {
         div().w(300.0).child(
             styled_tabs(
                 (0..10).map(|i| tab(format!("Tab {i}"))).collect(),
-                move || selected.get(),
-                |_| {},
+                selected,
                 TabsStyle::primary().scrollable(),
             )
             .node_ref(place),
@@ -436,4 +432,22 @@ fn a_drawer_item_shows_what_is_selected() {
         .expect("selected");
     assert_eq!(item.rect.height, 56);
     assert_eq!(item.radii, [28.0; 4]);
+}
+
+#[test]
+fn tabs_are_one_stop_and_go_with_the_arrow_keys() {
+    let selected = signal(0usize);
+    let mut ui = start_ui(move || {
+        div()
+            .w(600.0)
+            .child(tabs(vec![tab("One"), tab("Two"), tab("Three")], selected))
+    });
+    key(&mut ui, anti_webui::core::event::NamedKey::Tab);
+    key(&mut ui, anti_webui::core::event::NamedKey::ArrowRight);
+    assert_eq!(selected.get(), 1);
+    key(&mut ui, anti_webui::core::event::NamedKey::ArrowLeft);
+    key(&mut ui, anti_webui::core::event::NamedKey::ArrowLeft);
+    assert_eq!(selected.get(), 2, "around the start");
+    key(&mut ui, anti_webui::core::event::NamedKey::Home);
+    assert_eq!(selected.get(), 0);
 }

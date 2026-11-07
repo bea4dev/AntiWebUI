@@ -2,7 +2,7 @@
 //! `docs/design/20-md3e-components.md`.
 
 use super::fab::{FabColor, FabSize, FabStyle, styled_fab};
-use super::surface::{When, elevation_shadows, following, progress_of};
+use super::surface::{When, elevation_shadows, progress_of};
 use crate::color::color_scheme;
 use crate::icons::Symbol;
 use crate::motion::fast_spatial;
@@ -132,7 +132,7 @@ pub fn floating_toolbar_with_fab(
         Some(f) => f,
         None => Rc::new(|| true),
     };
-    let e = following(
+    let e = follow(
         {
             let open = open.clone();
             move || if open() { 1.0f32 } else { 0.0 }

@@ -1,6 +1,6 @@
 //! Fields to type in.
 
-use crate::theme::{Theme, shared, smooth};
+use crate::theme::{Theme, smooth, themed};
 use anti_webui_core::prelude::*;
 
 fn field_look(s: Style, t: &Theme) -> Style {
@@ -36,7 +36,7 @@ fn field_style(input: TextInput) -> TextInput {
         .py(5.0)
         .rounded(6.0)
         .border(1.0)
-        .sheet(|| shared(field_sheet))
+        .sheet(|| themed(field_sheet))
 }
 
 /// A single-line text field bound to `value`.
@@ -70,7 +70,7 @@ fn field_box(focused: Signal<bool>) -> Div {
         .rounded(6.0)
         .border(1.0)
         .sheet(move || {
-            shared(if focused.get() {
+            themed(if focused.get() {
                 focused_box_sheet
             } else {
                 box_sheet
@@ -105,7 +105,7 @@ fn inner_button(label: &str) -> Div {
         .items_center()
         .justify_center()
         .select_none()
-        .sheet(|| shared(inner_button_sheet))
+        .sheet(|| themed(inner_button_sheet))
         .child(text(label.to_owned()).line_height(LineHeight::Relative(1.0)))
 }
 

@@ -4,7 +4,7 @@
 use super::card::divider;
 use super::icon::sized_icon;
 use super::modal::dialog;
-use super::surface::{Ink, When, focus_ring, following, when};
+use super::surface::{Ink, When, focus_ring, when};
 use crate::color::color_scheme;
 use crate::icons;
 use crate::motion::{default_effects, default_spatial};
@@ -157,7 +157,7 @@ fn day_cell(
     let on: When = Rc::new(move || selected() == Some(date));
     let off: When = Rc::new(move || !allowed);
     let (bg_on, text_on, ring_on, layer_on) = (on.clone(), on.clone(), on.clone(), on);
-    let background = following(
+    let background = follow(
         move || {
             if bg_on() {
                 let c = color_scheme();
@@ -172,7 +172,7 @@ fn day_cell(
         },
         default_effects(),
     );
-    let content = following(
+    let content = follow(
         move || {
             let c = color_scheme();
             let base = if text_on() {
@@ -324,12 +324,12 @@ pub fn date_picker(
     let month = signal(index(start.year, start.month));
     // Where the strip of months is, in months from the first: small numbers stay precise.
     let base = month.get_untracked();
-    let position = following(
+    let position = follow(
         move || (month.get() - base) as f32,
         Spring::from_ratio(1500.0, 1.0),
     );
     let year_list = signal(false);
-    let list_height = following(
+    let list_height = follow(
         move || {
             if year_list.get() {
                 CELL * 7.0 - 1.0
@@ -339,7 +339,7 @@ pub fn date_picker(
         },
         default_effects(),
     );
-    let turn = following(
+    let turn = follow(
         move || if year_list.get() { 180.0f32 } else { 0.0 },
         default_spatial(),
     );
@@ -587,7 +587,7 @@ pub fn date_picker(
 
 fn year_cell(year: i32, on: When, is_current: bool, node: NodeRef, f: impl Fn() + 'static) -> Div {
     let (bg_on, text_on, ring_on, layer_on) = (on.clone(), on.clone(), on.clone(), on);
-    let background = following(
+    let background = follow(
         move || {
             if bg_on() {
                 color_scheme().primary
@@ -597,7 +597,7 @@ fn year_cell(year: i32, on: When, is_current: bool, node: NodeRef, f: impl Fn() 
         },
         default_effects(),
     );
-    let content = following(
+    let content = follow(
         move || {
             let c = color_scheme();
             if text_on() {

@@ -96,7 +96,8 @@ fn lists() -> Div {
                             "Wi-Fi",
                             ListItemStyle::new()
                                 .interactive()
-                                .trailing(switch(move || wifi.get())),
+                                // The row flips it; the switch only shows it.
+                                .trailing(switch(Binding::new(move || wifi.get(), |_| {}))),
                         )
                         .on_click(move |_| wifi.update(|v| *v = !*v)),
                     )

@@ -1,7 +1,7 @@
 //! List items, with the shapes that change of Expressive. Sizes, colors and timing are those of
 //! Jetpack Compose. See `docs/design/20-md3e-components.md`.
 
-use super::surface::{Corners, Ink, When, focus_ring, following, round, when};
+use super::surface::{Corners, Ink, When, focus_ring, round, when};
 use crate::color::{ColorScheme, color_scheme};
 use crate::motion::{default_effects, fast_spatial};
 use crate::typography::TextStyle;
@@ -119,21 +119,21 @@ pub fn styled_list_item(headline: impl IntoTextSource, style: ListItemStyle) -> 
     };
     let (selected_now, off_now) = (is_selected.clone(), is_off.clone());
     let palette = move || colors(&color_scheme(), selected_now(), off_now());
-    let background = following(
+    let background = follow(
         {
             let palette = palette.clone();
             move || palette().0
         },
         default_effects(),
     );
-    let main = following(
+    let main = follow(
         {
             let palette = palette.clone();
             move || palette().1
         },
         default_effects(),
     );
-    let rest = following(move || palette().2, default_effects());
+    let rest = follow(move || palette().2, default_effects());
 
     let words = div()
         .flex()
@@ -226,20 +226,26 @@ pub fn styled_list_item(headline: impl IntoTextSource, style: ListItemStyle) -> 
     });
     let looks_off = is_off.clone();
     let disabled_off = is_off;
-    ink.paint(ink.listen(row.focusable().dyn_style(move |s| {
-        let [a, b, c, d] = radii.map(|r| r.get());
-        let mut s = s.bg(background.get());
-        s.radius_top_left = Some(a);
-        s.radius_top_right = Some(b);
-        s.radius_bottom_right = Some(c);
-        s.radius_bottom_left = Some(d);
-        let s = s.cursor(if looks_off() {
-            CursorIcon::Default
-        } else {
-            CursorIcon::Pointer
-        });
-        focus_ring(s, focused.get(), &color_scheme())
-    })))
+    ink.paint(
+        ink.listen(
+            row.focusable()
+                .access(|a| a.role(Role::Button))
+                .dyn_style(move |s| {
+                    let [a, b, c, d] = radii.map(|r| r.get());
+                    let mut s = s.bg(background.get());
+                    s.radius_top_left = Some(a);
+                    s.radius_top_right = Some(b);
+                    s.radius_bottom_right = Some(c);
+                    s.radius_bottom_left = Some(d);
+                    let s = s.cursor(if looks_off() {
+                        CursorIcon::Default
+                    } else {
+                        CursorIcon::Pointer
+                    });
+                    focus_ring(s, focused.get(), &color_scheme())
+                }),
+        ),
+    )
     .disabled(move || disabled_off())
 }
 

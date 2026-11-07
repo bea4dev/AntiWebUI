@@ -1,7 +1,7 @@
 //! Short messages that go away by themselves.
 
 use crate::display::Tone;
-use crate::theme::{QUICK, Theme, shared, theme};
+use crate::theme::{QUICK, Theme, theme, themed};
 use anti_webui_core::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -48,18 +48,93 @@ impl Toast {
     }
 }
 
-#[derive(Clone)]
-struct Entry {
-    id: u64,
-    toast: Toast,
+/// What a toast's action does.
+pub type ToastAction = Rc<dyn Fn()>;
+
+/// Messages that come and go, in the order they came: what toasts and snackbars are made from. It
+/// is a handle: copy it to where messages are shown from, and show [`list`](Self::list) somewhere.
+pub struct MessageQueue<T: 'static> {
+    entries: Signal<Vec<(u64, T)>>,
+    next: Signal<u64>,
+}
+
+impl<T> Clone for MessageQueue<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for MessageQueue<T> {}
+
+/// A queue of messages, owned where it is made.
+pub fn message_queue<T: Clone + 'static>() -> MessageQueue<T> {
+    MessageQueue {
+        entries: signal(Vec::new()),
+        next: signal(0),
+    }
+}
+
+impl<T: Clone + 'static> MessageQueue<T> {
+    /// Adds a message at the end, and gives what it is known by.
+    pub fn push(&self, message: T) -> u64 {
+        let id = self.next.get_untracked();
+        self.next.set(id + 1);
+        self.entries.update(|all| all.push((id, message)));
+        id
+    }
+
+    pub fn close(&self, id: u64) {
+        self.entries.update(|all| all.retain(|(i, _)| *i != id));
+    }
+
+    /// Closes the first message, so that the next comes if only one is shown at a time.
+    pub fn close_first(&self) {
+        self.entries.update(|all| {
+            if !all.is_empty() {
+                all.remove(0);
+            }
+        });
+    }
+
+    /// The messages, oldest first. Reading it tracks it.
+    pub fn list(&self) -> Vec<(u64, T)> {
+        self.entries.get()
+    }
+
+    /// Closes message `id` after `lasts`, which the pointer on `el` makes wait for as long as it
+    /// is there. Without a time it stays until it is closed. What it waits for goes with `el`.
+    pub fn timed(&self, id: u64, lasts: Option<Duration>, el: Div) -> Div {
+        let Some(after) = lasts else {
+            return el;
+        };
+        let queue = *self;
+        let timer: Rc<Cell<Option<Timeout>>> = Rc::default();
+        let start: Rc<dyn Fn()> = {
+            let timer = timer.clone();
+            Rc::new(move || timer.set(Some(set_timeout(after, move || queue.close(id)))))
+        };
+        start();
+        let cleanup = timer.clone();
+        on_cleanup(move || {
+            if let Some(running) = cleanup.take() {
+                running.cancel();
+            }
+        });
+        el.on_hover(move |inside| {
+            if let Some(running) = timer.take() {
+                running.cancel();
+            }
+            if !inside {
+                start();
+            }
+        })
+    }
 }
 
 /// What is up, and whether anything ever was: there is no portal before that.
 #[derive(Clone, Copy)]
 struct Queue {
-    entries: Signal<Vec<Entry>>,
+    messages: MessageQueue<Toast>,
     used: Signal<bool>,
-    next: Signal<u64>,
 }
 
 thread_local! {
@@ -71,9 +146,8 @@ fn queue() -> Queue {
         q.get().unwrap_or_else(|| {
             // Under a root of its own: it outlives whatever asks for it first.
             let (queue, _) = create_root(|| Queue {
-                entries: signal(Vec::new()),
+                messages: message_queue(),
                 used: signal(false),
-                next: signal(0),
             });
             q.set(Some(queue));
             queue
@@ -90,14 +164,37 @@ pub fn toast(text: impl Into<String>) {
 /// Shows a message with more to it.
 pub fn toast_with(toast: Toast) {
     let q = queue();
-    let id = q.next.get_untracked();
-    q.next.set(id + 1);
     q.used.set_if_changed(true);
-    q.entries.update(|all| all.push(Entry { id, toast }));
+    q.messages.push(toast);
+}
+
+/// The queue the toasts are in, for a host of one's own ([`toast_host_with`]).
+pub fn toasts() -> MessageQueue<Toast> {
+    queue().messages
+}
+
+impl Toast {
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn tone_of(&self) -> Tone {
+        self.tone
+    }
+
+    /// The label of what can be done, and what that does.
+    pub fn action_of(&self) -> Option<(&str, ToastAction)> {
+        self.action.as_ref().map(|(l, f)| (l.as_str(), f.clone()))
+    }
+
+    /// How long it stays.
+    pub fn lasts(&self) -> Option<Duration> {
+        self.lasts
+    }
 }
 
 fn close(id: u64) {
-    queue().entries.update(|all| all.retain(|e| e.id != id));
+    queue().messages.close(id);
 }
 
 fn toast_sheet(t: &Theme) -> Sheet {
@@ -109,25 +206,8 @@ fn toast_sheet(t: &Theme) -> Sheet {
     })
 }
 
-fn view(entry: Entry) -> Div {
-    let Entry { id, toast } = entry;
-    let timer: Rc<Cell<Option<Timeout>>> = Rc::default();
-    let start: Rc<dyn Fn()> = {
-        let timer = timer.clone();
-        let lasts = toast.lasts;
-        Rc::new(move || {
-            if let Some(after) = lasts {
-                timer.set(Some(set_timeout(after, move || close(id))));
-            }
-        })
-    };
-    start();
-    let cleanup = timer.clone();
-    on_cleanup(move || {
-        if let Some(running) = cleanup.take() {
-            running.cancel();
-        }
-    });
+fn view(id: u64, toast: Toast) -> Div {
+    let lasts = toast.lasts;
     let tone = toast.tone;
     let action = toast.action.map(|(name, f)| {
         crate::link(name).on_click(move |_| {
@@ -135,7 +215,8 @@ fn view(entry: Entry) -> Div {
             close(id);
         })
     });
-    div()
+    let el = div()
+        .access(|a| a.role(Role::Status))
         .flex()
         .flex_row()
         .items_center()
@@ -147,16 +228,7 @@ fn view(entry: Entry) -> Div {
         .rounded(8.0)
         .border(1.0)
         .pointer_events_auto()
-        .sheet(|| shared(toast_sheet))
-        .on_hover(move |inside| {
-            if inside {
-                if let Some(running) = timer.take() {
-                    running.cancel();
-                }
-            } else {
-                start();
-            }
-        })
+        .sheet(|| themed(toast_sheet))
         .children((tone != Tone::Neutral).then(|| {
             div()
                 .flex_none()
@@ -176,16 +248,25 @@ fn view(entry: Entry) -> Div {
                 .px(6.0)
                 .py(0.0)
                 .on_click(move |_| close(id)),
-        )
+        );
+    queue().messages.timed(id, lasts, el)
 }
 
 /// Where toasts show: the lower right of the window, above everything. [`page`](crate::page) has
 /// one.
 pub fn toast_host() -> Show {
+    toast_host_with(view)
+}
+
+/// A host of toasts that look like whatever `look` builds from what each one is known by and says.
+/// They come up from the lower right; [`MessageQueue::timed`] on [`toasts`] makes one go by itself.
+pub fn toast_host_with(look: impl Fn(u64, Toast) -> Div + 'static) -> Show {
     let q = queue();
+    let look = Rc::new(look);
     show(
         move || q.used.get(),
         move || {
+            let look = look.clone();
             portal().child(
                 div()
                     .absolute()
@@ -197,11 +278,15 @@ pub fn toast_host() -> Show {
                     .gap(8.0)
                     .pointer_events_none()
                     .child(
-                        for_each(move || q.entries.get(), |e| e.id, view)
-                            .enter(|s| s.opacity(0.0).translate_y(8.0))
-                            .exit(|s| s.opacity(0.0))
-                            .moves(QUICK)
-                            .transition(QUICK),
+                        for_each(
+                            move || q.messages.list(),
+                            |(id, _)| *id,
+                            move |(id, toast)| look(id, toast),
+                        )
+                        .enter(|s| s.opacity(0.0).translate_y(8.0))
+                        .exit(|s| s.opacity(0.0))
+                        .moves(QUICK)
+                        .transition(QUICK),
                     ),
             )
         },

@@ -233,7 +233,7 @@ pub fn carousel<V: IntoView>(count: usize, preferred: f32, item: impl Fn(usize) 
             } else {
                 e.delta_y
             };
-            let scale = anti_webui::core::tree::with_doc(|d| d.scale.as_f64() as f32);
+            let scale = untrack(window_scale).as_f64() as f32;
             scroll.set((scroll.get_untracked() + delta / scale).clamp(0.0, untrack(max_scroll)));
             if let Some(running) = waiting.take() {
                 running.cancel();

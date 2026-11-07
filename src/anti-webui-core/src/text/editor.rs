@@ -165,6 +165,9 @@ pub type Blocks = dyn Fn(&DecorateContext) -> Vec<(usize, Row)>;
 /// Told of each change to the text.
 pub type OnEdit = dyn Fn(&TextEdit);
 
+/// Told of the selection, as its anchor and focus, whenever it moves or the text changes.
+pub type OnSelect = dyn Fn(usize, usize);
+
 /// Where the text changed, in bytes and in (line, byte in the line), as tree-sitter's `InputEdit`
 /// wants it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -467,6 +470,7 @@ pub struct EditorData {
     pub(crate) decorate_lines: Option<Rc<DecorateLines>>,
     pub(crate) blocks: Option<Rc<Blocks>>,
     pub(crate) on_edit: Option<Rc<OnEdit>>,
+    pub(crate) on_select: Option<Rc<OnSelect>>,
     pub(crate) gutter: Option<Gutter>,
     /// Edits not yet told to `on_edit`.
     edits: Vec<TextEdit>,
@@ -558,6 +562,7 @@ impl EditorData {
             decorate_lines: None,
             blocks: None,
             on_edit: None,
+            on_select: None,
             gutter: None,
             edits: Vec::new(),
             touched: None,
@@ -2179,6 +2184,15 @@ fn measure(d: &mut Document, host: NodeId) -> (bool, bool) {
     char_ws.sort_by(f32::total_cmp);
     let char_w = char_ws.get(char_ws.len() / 2).copied();
     let window = e.window.clone();
+    // A row that shows, and where the rows' coordinates put it now: when what it learned moves the
+    // estimates above it, the view is still about that row.
+    let pin = e
+        .rows
+        .iter()
+        .find(|r| crate::visibility::is_in_view(d, r.div))
+        .map(|r| e.structure.row_of_line(r.first))
+        .filter(|&row| row < e.heights.tops.len())
+        .map(|row| (row, e.heights.tops[row]));
 
     let scale = d.scale;
     let e = d
@@ -2272,7 +2286,16 @@ fn measure(d: &mut Document, host: NodeId) -> (bool, bool) {
     let (Some(top), false) = (top, visible.is_empty()) else {
         return (resync, relaid);
     };
-    let (y0, y1) = ((visible.y - top) as i64, (visible.bottom() - top) as i64);
+    let (mut y0, mut y1) = ((visible.y - top) as i64, (visible.bottom() - top) as i64);
+    // The row that shows keeps its place among the rows, wherever the estimates above it put it
+    // now. Otherwise the rows wanted would be about other lines, the rows that show would go, and
+    // nothing would hold the view in place.
+    if let Some((row, before)) = pin
+        && let Some(&now) = e.heights.tops.get(row)
+    {
+        y0 += now - before;
+        y1 += now - before;
+    }
     let view = (y1 - y0).max(1);
     let s = &e.structure;
     let hs = &e.heights;
@@ -2495,23 +2518,29 @@ pub(crate) fn after_edit(host: NodeId, outcome: EditorOutcome) {
         });
     }
     sync(host);
-    if !outcome.changed {
-        return;
+    if outcome.changed
+        && let Some((value, handler, text)) = with_doc(|d| {
+            let e = d.get(host)?.editor()?;
+            Some((e.value, e.on_change.clone(), e.text.clone()))
+        })
+    {
+        batch(|| {
+            if let Some(v) = value {
+                v.set_if_changed((*text).clone());
+            }
+            if let Some(h) = handler {
+                h(&text);
+            }
+        });
     }
-    let Some((value, handler, text)) = with_doc(|d| {
+    // After the text is told, so that what follows the selection has the same text.
+    let selected = with_doc(|d| {
         let e = d.get(host)?.editor()?;
-        Some((e.value, e.on_change.clone(), e.text.clone()))
-    }) else {
-        return;
-    };
-    batch(|| {
-        if let Some(v) = value {
-            v.set_if_changed((*text).clone());
-        }
-        if let Some(h) = handler {
-            h(&text);
-        }
+        Some((e.on_select.clone()?, e.anchor, e.focus))
     });
+    if let Some((f, anchor, focus)) = selected {
+        untrack(|| f(anchor, focus));
+    }
 }
 
 /// Disposes of what the rows were made under.

@@ -1064,11 +1064,13 @@ impl Renderer {
 
     /// Selects what the next frames are for. The layer textures of other targets stay as they
     /// are, however many frames go by.
+    #[doc(hidden)]
     pub fn set_target(&mut self, target: u64) {
         self.target = target;
     }
 
     /// Frees what was kept for a target that is gone.
+    #[doc(hidden)]
     pub fn forget_target(&mut self, target: u64) {
         self.layers.retain(|_, c| c.owner != target);
         self.canvases.remove(&target);
@@ -1082,22 +1084,26 @@ impl Renderer {
 
     /// Lets frames of videos be read where the decoder left them.
     #[cfg(target_os = "linux")]
+    #[doc(hidden)]
     pub fn set_video_importer(&mut self, importer: crate::dmabuf::VideoImporter) {
         self.video.set_importer(importer);
     }
 
     /// How much the edges of shapes take, in bytes.
+    #[doc(hidden)]
     pub fn path_store_used(&self) -> u32 {
         self.paths.store_used()
     }
 
     /// A frame of a video couldn't be read where it is, since this was last asked. Frames have to
     /// come in memory then: see [`anti_webui_core::Ui::video_use_memory`].
+    #[doc(hidden)]
     pub fn take_video_import_failed(&mut self) -> bool {
         self.video.take_import_failed()
     }
 
     /// How many videos are on the GPU, and how many frames were read where they are, for tests.
+    #[doc(hidden)]
     pub fn video_counts(&self) -> (usize, u64) {
         self.video.counts()
     }
@@ -1150,6 +1156,7 @@ impl Renderer {
     }
 
     /// Forgets all layer textures, so the next frame redraws their content from scratch.
+    #[doc(hidden)]
     pub fn clear_layer_caches(&mut self) {
         self.layers.clear();
     }

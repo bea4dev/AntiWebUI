@@ -45,13 +45,11 @@ fn main() {
             };
             let toggle = |i: usize, label: &'static str, style: ButtonStyle| {
                 let on = toggles[i];
-                styled_toggle_button(label, move || on.get(), style.icon(icons::FAVORITE))
-                    .on_click(move |_| on.update(|v| *v = !*v))
+                styled_toggle_button(label, on, style.icon(icons::FAVORITE))
             };
             let icon_toggle = |i: usize, style: IconButtonStyle| {
                 let on = icon_toggles[i];
-                icon_toggle_button(icons::FAVORITE, move || on.get(), style)
-                    .on_click(move |_| on.update(|v| *v = !*v))
+                icon_toggle_button(icons::FAVORITE, on, style)
             };
             div()
                 .flex()

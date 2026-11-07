@@ -61,21 +61,19 @@ impl TabsStyle {
     }
 }
 
-/// A row of tabs that all get the same width.
-pub fn tabs(
-    labels: Vec<Tab>,
-    selected: impl Fn() -> usize + 'static,
-    on_select: impl Fn(usize) + 'static,
-) -> Div {
-    styled_tabs(labels, selected, on_select, TabsStyle::primary())
+/// A row of tabs that all get the same width, bound to the index of the chosen one. The behavior
+/// is the standard tabs' (`tabs_with`): the row is one stop for Tab and the arrow keys go through
+/// the tabs.
+pub fn tabs(labels: Vec<Tab>, selected: impl Into<Binding<usize>>) -> Div {
+    styled_tabs(labels, selected, TabsStyle::primary())
 }
 
-pub fn styled_tabs(
-    labels: Vec<Tab>,
-    selected: impl Fn() -> usize + 'static,
-    on_select: impl Fn(usize) + 'static,
-    style: TabsStyle,
-) -> Div {
+pub fn styled_tabs(labels: Vec<Tab>, selected: impl Into<Binding<usize>>, style: TabsStyle) -> Div {
+    let count = labels.len().max(1);
+    tabs_with(selected, count, move |state| look(labels, state, style))
+}
+
+fn look(labels: Vec<Tab>, state: TabsState, style: TabsStyle) -> Div {
     crate::ensure_ready();
     let TabsStyle {
         secondary,
@@ -84,8 +82,7 @@ pub fn styled_tabs(
     let count = labels.len().max(1);
     let tall = labels.iter().any(|t| t.icon.is_some() && t.label.is_some());
     let height = if tall { 72.0 } else { 48.0 };
-    let selected: Rc<dyn Fn() -> usize> = Rc::new(selected);
-    let on_select: Rc<dyn Fn(usize)> = Rc::new(on_select);
+    let selected: Rc<dyn Fn() -> usize> = Rc::new(move || state.selected());
     let row_width = signal(0.0f32);
     let tab_widths: Vec<Signal<f32>> = (0..count).map(|_| signal(0.0)).collect();
     let content_widths: Vec<Signal<f32>> = (0..count).map(|_| signal(0.0)).collect();
@@ -154,12 +151,11 @@ pub fn styled_tabs(
         .into_iter()
         .enumerate()
         .map(|(i, tab)| {
-            let chosen = selected.clone();
-            let on: When = Rc::new(move || chosen() == i);
-            let on_select = on_select.clone();
+            let on: When = Rc::new(move || state.is_selected(i));
+            let keyed = move || state.is_selected(i) && state.focus_visible();
             let (tab_width, content_width) = (tab_widths[i], content_widths[i]);
-            let node = one_tab(tab, on, secondary, height, content_width)
-                .on_click(move |_| on_select(i))
+            let node = state
+                .tab(i, one_tab(tab, on, keyed, secondary, height, content_width))
                 .on_resized(move |w, _| tab_width.set(w));
             if scrollable {
                 node.flex_none().min_w(SCROLLABLE_MIN)
@@ -217,7 +213,14 @@ pub fn styled_tabs(
     }
 }
 
-fn one_tab(tab: Tab, on: When, secondary: bool, height: f32, content_width: Signal<f32>) -> Div {
+fn one_tab(
+    tab: Tab,
+    on: When,
+    keyed: impl Fn() -> bool + 'static,
+    secondary: bool,
+    height: f32,
+    content_width: Signal<f32>,
+) -> Div {
     let colored = on.clone();
     let wanted = move || {
         let c = color_scheme();
@@ -253,7 +256,9 @@ fn one_tab(tab: Tab, on: When, secondary: bool, height: f32, content_width: Sign
         },
         Rc::new(|| false),
     );
+    // The row has the focus; the chosen tab shows it.
     let focused = ink.focused;
+    effect(move || focused.set(keyed()));
     let inner = div()
         .flex()
         .flex_col()
@@ -274,7 +279,6 @@ fn one_tab(tab: Tab, on: When, secondary: bool, height: f32, content_width: Sign
                 .justify_center()
                 .h(height)
                 .px(16.0)
-                .focusable()
                 .cursor(CursorIcon::Pointer)
                 .dyn_style(move |s| {
                     focus_ring(s.text_color(in_color.get()), focused.get(), &color_scheme())

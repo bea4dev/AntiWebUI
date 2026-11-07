@@ -17,6 +17,7 @@ pub enum ImePurpose {
 
 /// The input-method state for the focused editable node.
 #[derive(Clone, Debug, PartialEq)]
+#[doc(hidden)]
 pub struct ImeState {
     /// Text around the cursor (at most ~4000 bytes).
     pub surrounding: String,
@@ -31,6 +32,7 @@ pub struct ImeState {
 
 /// Identifies a popup between the core and the platform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[doc(hidden)]
 pub struct PopupId(pub u64);
 
 /// What a popup is for, which decides how it behaves (see
@@ -90,6 +92,7 @@ pub struct PopupParams {
 
 /// What a drag offers to whoever it is dragged to.
 #[derive(Clone, Debug, PartialEq)]
+#[doc(hidden)]
 pub struct DragOffer {
     /// The formats, with the data of each.
     pub items: Vec<(String, Arc<[u8]>)>,

@@ -1,6 +1,5 @@
 //! The wavy progress bar. See `docs/design/15-md3e.md`.
 
-use super::surface::{following, keep_time};
 use crate::color::color_scheme;
 use crate::motion::default_effects;
 use anti_webui::prelude::*;
@@ -100,21 +99,26 @@ pub fn wavy_progress(progress: impl Fn() -> f32 + 'static) -> Div {
             keep_moving(phase, wave, ticking, start);
         }
     });
-    div().w(WIDTH).h(HEIGHT).flex_none().fill(move || {
-        let c = color_scheme();
-        WAVE.params(Wave {
-            line: c.primary,
-            track: c.secondary_container,
-            progress: value.get(),
-            wave: wave.get(),
-            phase: phase.get(),
-            stroke: STROKE,
-            amplitude: AMPLITUDE,
-            wavelength: WAVELENGTH,
-            gap: GAP,
-            stop: STOP,
+    div()
+        .access(move |a| told_progress(a, value.get()))
+        .w(WIDTH)
+        .h(HEIGHT)
+        .flex_none()
+        .fill(move || {
+            let c = color_scheme();
+            WAVE.params(Wave {
+                line: c.primary,
+                track: c.secondary_container,
+                progress: value.get(),
+                wave: wave.get(),
+                phase: phase.get(),
+                stroke: STROKE,
+                amplitude: AMPLITUDE,
+                wavelength: WAVELENGTH,
+                gap: GAP,
+                stop: STOP,
+            })
         })
-    })
 }
 
 const FLAT_HEIGHT: f32 = 4.0;
@@ -186,32 +190,39 @@ pub(super) fn check_more_shaders() -> Result<(), String> {
 /// A straight progress bar, for a value from 0 to 1.
 pub fn linear_progress(progress: impl Fn() -> f32 + 'static) -> Div {
     crate::ensure_ready();
-    let value = following(move || progress().clamp(0.0, 1.0), slow());
-    div().w(WIDTH).h(FLAT_HEIGHT).flex_none().fill(move || {
-        let c = color_scheme();
-        let p = value.get().clamp(0.0, 1.0);
-        // The gap goes with the ends, which are round: 8 of the 240 by default.
-        let gap = 8.0 / WIDTH;
-        LINE.params(Line {
-            line: c.primary,
-            track: c.secondary_container,
-            tail0: 0.0,
-            head0: p,
-            tail1: 0.0,
-            head1: 0.0,
-            piece0_a: p + p.min(gap),
-            piece0_b: 1.0,
-            piece1_a: 0.0,
-            piece1_b: 0.0,
-            piece2_a: 0.0,
-            piece2_b: 0.0,
-            stroke: FLAT_HEIGHT,
-            amplitude: 0.0,
-            wavelength: WAVELENGTH,
-            phase: 0.0,
-            stop: FLAT_HEIGHT,
+    let progress = Rc::new(progress);
+    let told = progress.clone();
+    let value = follow(move || progress().clamp(0.0, 1.0), slow());
+    div()
+        .access(move |a| told_progress(a, told()))
+        .w(WIDTH)
+        .h(FLAT_HEIGHT)
+        .flex_none()
+        .fill(move || {
+            let c = color_scheme();
+            let p = value.get().clamp(0.0, 1.0);
+            // The gap goes with the ends, which are round: 8 of the 240 by default.
+            let gap = 8.0 / WIDTH;
+            LINE.params(Line {
+                line: c.primary,
+                track: c.secondary_container,
+                tail0: 0.0,
+                head0: p,
+                tail1: 0.0,
+                head1: 0.0,
+                piece0_a: p + p.min(gap),
+                piece0_b: 1.0,
+                piece1_a: 0.0,
+                piece1_b: 0.0,
+                piece2_a: 0.0,
+                piece2_b: 0.0,
+                stroke: FLAT_HEIGHT,
+                amplitude: 0.0,
+                wavelength: WAVELENGTH,
+                phase: 0.0,
+                stop: FLAT_HEIGHT,
+            })
         })
-    })
 }
 
 /// How far a value that moves from `delay` for `duration`, both in milliseconds, has got at `ms`.
@@ -221,8 +232,7 @@ fn eased_from(ms: f32, delay: f32, duration: f32) -> f32 {
 
 fn indeterminate_line(height: f32, amplitude: f32, wavelength: f32) -> Div {
     crate::ensure_ready();
-    let time = signal(0.0f32);
-    keep_time(time);
+    let time = clock();
     div().w(WIDTH).h(height).flex_none().fill(move || {
         let c = color_scheme();
         let seconds = time.get();
@@ -306,9 +316,9 @@ fn determinate_circle(progress: impl Fn() -> f32 + 'static, size: f32, wavy: boo
         });
         value
     } else {
-        following(move || target().clamp(0.0, 1.0), slow())
+        follow(move || target().clamp(0.0, 1.0), slow())
     };
-    let wave = following(
+    let wave = follow(
         move || {
             if wavy && waves_at(value.get()) {
                 1.0f32
@@ -318,30 +328,32 @@ fn determinate_circle(progress: impl Fn() -> f32 + 'static, size: f32, wavy: boo
         },
         default_effects(),
     );
-    let time = signal(0.0f32);
-    if wavy {
-        keep_time(time);
-    }
+    let time = if wavy { clock() } else { signal(0.0f32) };
     let waves = (std::f32::consts::TAU * (size / 2.0 - 2.0) / CIRCLE_WAVELENGTH)
         .round()
         .max(5.0);
-    div().w(size).h(size).flex_none().fill(move || {
-        let c = color_scheme();
-        let sweep = value.get().clamp(0.0, 1.0) * std::f32::consts::TAU;
-        let gap = gap_sweep(size).min(sweep);
-        CIRCULAR.params(Circular {
-            line: c.primary,
-            track: c.secondary_container,
-            start: TOP,
-            sweep,
-            track_start: TOP + sweep + gap,
-            track_sweep: (std::f32::consts::TAU - sweep - gap * 2.0).max(0.0),
-            stroke: 4.0,
-            amplitude: CIRCLE_AMPLITUDE * wave.get().clamp(0.0, 1.0),
-            waves,
-            phase: time.get() * std::f32::consts::TAU / waves,
+    div()
+        .access(move |a| told_progress(a, value.get()))
+        .w(size)
+        .h(size)
+        .flex_none()
+        .fill(move || {
+            let c = color_scheme();
+            let sweep = value.get().clamp(0.0, 1.0) * std::f32::consts::TAU;
+            let gap = gap_sweep(size).min(sweep);
+            CIRCULAR.params(Circular {
+                line: c.primary,
+                track: c.secondary_container,
+                start: TOP,
+                sweep,
+                track_start: TOP + sweep + gap,
+                track_sweep: (std::f32::consts::TAU - sweep - gap * 2.0).max(0.0),
+                stroke: 4.0,
+                amplitude: CIRCLE_AMPLITUDE * wave.get().clamp(0.0, 1.0),
+                waves,
+                phase: time.get() * std::f32::consts::TAU / waves,
+            })
         })
-    })
 }
 
 /// A circular progress indicator, for a value from 0 to 1.
@@ -370,8 +382,7 @@ fn spinning(seconds: f32) -> (f32, f32) {
 
 fn indeterminate_circle(size: f32, wavy: bool) -> Div {
     crate::ensure_ready();
-    let time = signal(0.0f32);
-    keep_time(time);
+    let time = clock();
     let waves = (std::f32::consts::TAU * (size / 2.0 - 2.0) / CIRCLE_WAVELENGTH)
         .round()
         .max(5.0);
@@ -407,4 +418,10 @@ pub fn indeterminate_circular_progress() -> Div {
 /// A wavy circular progress indicator for something that takes as long as it takes.
 pub fn indeterminate_circular_wavy_progress() -> Div {
     indeterminate_circle(WAVY_CIRCLE, true)
+}
+
+/// What a progress indicator says to assistive technology.
+fn told_progress(a: Access, value: f32) -> Access {
+    a.role(Role::ProgressBar)
+        .value(value.clamp(0.0, 1.0) as f64, 0.0, 1.0)
 }

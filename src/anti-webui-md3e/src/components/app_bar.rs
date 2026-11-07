@@ -1,7 +1,6 @@
 //! App bars, with what they do while the content scrolls. Sizes, colors and timing are those of
 //! Jetpack Compose. See `docs/design/20-md3e-components.md`.
 
-use super::surface::following;
 use crate::color::color_scheme;
 use crate::motion::{default_effects, fast_spatial};
 use crate::typography::TextStyle;
@@ -214,7 +213,7 @@ fn bar_view(bar: TopAppBar, offset: Signal<f32>, overlapped: Signal<bool>) -> Di
     let limit = (open - COLLAPSED).max(1.0);
     // 0 open, 1 collapsed.
     let f = move || (offset.get() / limit).clamp(0.0, 1.0);
-    let color_now = following(
+    let color_now = follow(
         move || {
             let c = color_scheme();
             if overlapped.get() {
@@ -364,7 +363,7 @@ pub fn bottom_app_bar(actions: Vec<Div>, fab: Option<Div>) -> Div {
 /// returns true.
 pub fn flexible_bottom_app_bar(items: Vec<Div>, hidden: impl Fn() -> bool + 'static) -> Div {
     crate::ensure_ready();
-    let height = following(
+    let height = follow(
         move || if hidden() { 0.0f32 } else { COLLAPSED },
         fast_spatial(),
     );

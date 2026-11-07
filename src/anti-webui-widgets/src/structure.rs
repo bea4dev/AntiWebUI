@@ -1,6 +1,6 @@
 //! What organizes the rest: tabs, parts that open, toolbars.
 
-use crate::theme::{QUICK, Theme, ring, shared, theme};
+use crate::theme::{QUICK, Theme, focus_ring, theme, themed};
 use anti_webui_core::prelude::*;
 use std::rc::Rc;
 
@@ -42,7 +42,7 @@ fn current_tab_sheet(t: &Theme) -> Sheet {
 
 fn ringed_tab_sheet(t: &Theme) -> Sheet {
     Sheet::new(|s| {
-        ring(crate::theme::smooth(s), t)
+        focus_ring(crate::theme::smooth(s), t)
             .rounded(4.0)
             .text_color(t.text)
             .border_color(t.accent)
@@ -51,76 +51,190 @@ fn ringed_tab_sheet(t: &Theme) -> Sheet {
     .accent_border()
 }
 
+/// What the look of a row of tabs gets to see. Reading it tracks it.
+#[derive(Clone, Copy)]
+pub struct TabsState {
+    selected: Binding<usize>,
+    count: usize,
+    keyed: Signal<bool>,
+}
+
+impl TabsState {
+    /// The index of the chosen tab.
+    pub fn selected(&self) -> usize {
+        self.selected.get()
+    }
+
+    pub fn is_selected(&self, i: usize) -> bool {
+        self.selected.get() == i
+    }
+
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// The row has the focus from the keyboard. The chosen tab is the one to show it on.
+    pub fn focus_visible(&self) -> bool {
+        self.keyed.get()
+    }
+
+    /// Makes `el` tab `i`: clicking it chooses it.
+    pub fn tab(&self, i: usize, el: Div) -> Div {
+        let selected = self.selected;
+        el.access(move |a| a.role(Role::Tab).selected(selected.get() == i))
+            .on_click(move |_| selected.set(i))
+    }
+}
+
+type TabsPart = Rc<dyn Fn(Div, TabsState) -> Div>;
+type TabPart = Rc<dyn Fn(Div, TabsState, usize) -> Div>;
+
+/// Changes to the parts of the standard tabs. Each gets the part with its standard styles on and
+/// returns it; what it says goes above the theme in every state.
+#[derive(Clone, Default)]
+pub struct TabsParts {
+    row: Option<TabsPart>,
+    tab: Option<TabPart>,
+    panel: Option<TabsPart>,
+}
+
+impl TabsParts {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The row of tabs, which is the stop for Tab.
+    pub fn row(mut self, f: impl Fn(Div, TabsState) -> Div + 'static) -> Self {
+        self.row = Some(Rc::new(f));
+        self
+    }
+
+    /// Each tab, with its index.
+    pub fn tab(mut self, f: impl Fn(Div, TabsState, usize) -> Div + 'static) -> Self {
+        self.tab = Some(Rc::new(f));
+        self
+    }
+
+    /// What holds the chosen tab's content.
+    pub fn panel(mut self, f: impl Fn(Div, TabsState) -> Div + 'static) -> Self {
+        self.panel = Some(Rc::new(f));
+        self
+    }
+}
+
 /// Tabs, bound to the index of the one that is chosen. They are one stop for Tab, and the arrow
 /// keys go through them.
-pub fn tabs(selected: Signal<usize>, items: Vec<Tab>) -> Div {
+pub fn tabs(selected: impl Into<Binding<usize>>, items: Vec<Tab>) -> Div {
+    styled_tabs(selected, items, TabsParts::new())
+}
+
+/// Tabs with the standard look, with their parts changed by `parts`.
+pub fn styled_tabs(selected: impl Into<Binding<usize>>, items: Vec<Tab>, parts: TabsParts) -> Div {
+    let selected = selected.into();
     let count = items.len();
-    let keyed = signal(false);
     let contents: Vec<_> = items.iter().map(|t| t.content.clone()).collect();
-    let heads = items
-        .into_iter()
-        .enumerate()
-        .map(|(i, item)| {
-            div()
-                .flex_none()
-                .px(12.0)
-                .py(6.0)
-                .border_b(2.0)
-                .select_none()
-                .sheet(move || {
-                    shared(if selected.get() != i {
-                        tab_sheet
-                    } else if keyed.get() {
-                        ringed_tab_sheet
-                    } else {
-                        current_tab_sheet
+    let panel_part = parts.panel.clone();
+    let mut state = None;
+    let row = tabs_with(selected, count, |s| {
+        state = Some(s);
+        let heads = items
+            .into_iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let head = div()
+                    .flex_none()
+                    .px(12.0)
+                    .py(6.0)
+                    .border_b(2.0)
+                    .select_none()
+                    .sheet(move || {
+                        themed(if !s.is_selected(i) {
+                            tab_sheet
+                        } else if s.focus_visible() {
+                            ringed_tab_sheet
+                        } else {
+                            current_tab_sheet
+                        })
                     })
-                })
-                .on_click(move |_| selected.set(i))
-                .child(text(item.label))
-        })
-        .collect::<Vec<_>>();
-    div()
+                    .child(text(item.label));
+                let head = s.tab(i, head);
+                match &parts.tab {
+                    Some(f) => f(head, s, i),
+                    None => head,
+                }
+            })
+            .collect::<Vec<_>>();
+        let row = div()
+            .flex()
+            .flex_row()
+            .flex_none()
+            .border_b(1.0)
+            .dyn_style(|s| s.border_color(theme().border))
+            .children(heads);
+        match &parts.row {
+            Some(f) => f(row, s),
+            None => row,
+        }
+    });
+    let s = state.expect("the look is built at once");
+    let panel = div()
         .flex()
         .flex_col()
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .flex_none()
-                .border_b(1.0)
-                .focusable()
-                .dyn_style(|s| s.border_color(theme().border))
-                .on_focus_visible(move |v| keyed.set(v))
-                .on_key_down(move |e| {
-                    let at = selected.get_untracked();
-                    let next = match e.key {
-                        Key::Named(NamedKey::ArrowRight) => (at + 1) % count.max(1),
-                        Key::Named(NamedKey::ArrowLeft) => (at + count - 1) % count.max(1),
-                        Key::Named(NamedKey::Home) => 0,
-                        Key::Named(NamedKey::End) => count.saturating_sub(1),
-                        _ => return,
-                    };
-                    e.prevent_default();
-                    selected.set(next);
-                })
-                .children(heads),
-        )
-        .child(div().flex().flex_col().flex_1().min_h(0.0).child(for_each(
+        .flex_1()
+        .min_h(0.0)
+        .access(|a| a.role(Role::TabPanel))
+        .child(for_each(
             move || vec![selected.get()],
             |i| *i,
             move |i| match contents.get(i) {
                 Some(content) => content(),
                 None => fragment(Vec::<View>::new()),
             },
-        )))
+        ));
+    let panel = match &panel_part {
+        Some(f) => f(panel, s),
+        None => panel,
+    };
+    div().flex().flex_col().child(row).child(panel)
+}
+
+/// A row of tabs that looks like whatever `look` builds; `look` makes each tab with
+/// [`TabsState::tab`]. The row is one stop for Tab: the arrow keys go through the tabs, around
+/// at the ends, and Home and End go to the first and the last. Only the row is made: what each tab
+/// shows is up to the program.
+pub fn tabs_with(
+    selected: impl Into<Binding<usize>>,
+    count: usize,
+    look: impl FnOnce(TabsState) -> Div,
+) -> Div {
+    let state = TabsState {
+        selected: selected.into(),
+        count,
+        keyed: signal(false),
+    };
+    look(state)
+        .focusable()
+        .access(|a| a.role(Role::TabList))
+        .on_focus_visible(move |v| state.keyed.set(v))
+        .on_key_down(move |e| {
+            let at = state.selected.get_untracked();
+            let next = match e.key {
+                Key::Named(NamedKey::ArrowRight) => (at + 1) % count.max(1),
+                Key::Named(NamedKey::ArrowLeft) => (at + count - 1) % count.max(1),
+                Key::Named(NamedKey::Home) => 0,
+                Key::Named(NamedKey::End) => count.saturating_sub(1),
+                _ => return,
+            };
+            e.prevent_default();
+            state.selected.set(next);
+        })
 }
 
 fn head_sheet(t: &Theme) -> Sheet {
     Sheet::new(|s| s.cursor(CursorIcon::Pointer).text_color(t.text))
         .hover(|s| s.bg(t.hover))
         .active(|s| s.bg(t.pressed))
-        .focus_visible(|s| ring(s, t).rounded(4.0))
+        .focus_visible(|s| focus_ring(s, t).rounded(4.0))
         .disabled(|s| s.text_color(t.text_disabled).cursor(CursorIcon::Default))
 }
 
@@ -177,7 +291,7 @@ fn disclosure_of(
                 .select_none()
                 .font_weight(FontWeight::MEDIUM)
                 .focusable()
-                .sheet(|| shared(head_sheet))
+                .sheet(|| themed(head_sheet))
                 .on_click(move |_| press())
                 .child(
                     text("▸")

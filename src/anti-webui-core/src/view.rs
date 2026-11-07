@@ -7,7 +7,7 @@ use crate::animation::{ListPlaces, request_frame};
 use crate::drag::{DragData, DropConfig, DropEvent, GestureConfig, GrabEvent};
 use crate::event::DragResult;
 use crate::event::{ClipboardKind, KeyboardEvent, PinchEvent, PointerEvent, ScrollEvent};
-use crate::geometry::{PointF, PointI, RectI, Scale};
+use crate::geometry::{PointF, PointI, RectF, RectI, Scale};
 use crate::images::Bitmap;
 use crate::platform::{ImePurpose, Placement, PlatformRequest, PopupKind};
 use crate::reactive::{
@@ -100,6 +100,17 @@ impl NodeRef {
     pub fn rect(&self) -> Option<RectI> {
         let id = self.0.get_untracked()?;
         with_doc(|d| d.window_rect(id))
+    }
+
+    /// The border box in window logical pixels, as of the last layout. This is what sizes and
+    /// places in styles are written in.
+    pub fn logical_rect(&self) -> Option<RectF> {
+        let id = self.0.get_untracked()?;
+        with_doc(|d| {
+            let r = d.window_rect(id)?;
+            let l = |v: i32| d.scale.to_logical(v as f32);
+            Some(RectF::new(l(r.x), l(r.y), l(r.width), l(r.height)))
+        })
     }
 
     /// Where the node's border box is in what an ancestor scrolls (from the ancestor's border box,
@@ -360,6 +371,11 @@ pub fn set_window_fullscreen(on: bool) {
     with_doc(|d| d.request(PlatformRequest::SetFullscreen(on)));
 }
 
+/// Closes the window, which ends the program when it is the only one.
+pub fn close_window() {
+    with_doc(|d| d.request(PlatformRequest::Close));
+}
+
 /// Ends what [`NodeRef::request_fullscreen`] started.
 pub fn exit_fullscreen() {
     with_doc(Document::exit_fullscreen);
@@ -375,6 +391,53 @@ fn window_scale_signal() -> Signal<Scale> {
             signal
         })
     })
+}
+
+/// What the pointer and the keyboard are doing to a box, for building a look from: put it on the
+/// box with `.interaction(i)`. Reading it tracks it.
+#[derive(Clone, Copy)]
+pub struct Interaction {
+    pub(crate) hovered: Signal<bool>,
+    pub(crate) pressed: Signal<bool>,
+    pub(crate) focused: Signal<bool>,
+    pub(crate) focus_visible: Signal<bool>,
+}
+
+impl Default for Interaction {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Interaction {
+    pub fn new() -> Self {
+        Self {
+            hovered: signal(false),
+            pressed: signal(false),
+            focused: signal(false),
+            focus_visible: signal(false),
+        }
+    }
+
+    /// The pointer is over the box.
+    pub fn hovered(&self) -> bool {
+        self.hovered.get()
+    }
+
+    /// The box (or something in it) is being pressed.
+    pub fn pressed(&self) -> bool {
+        self.pressed.get()
+    }
+
+    /// The box has the focus.
+    pub fn focused(&self) -> bool {
+        self.focused.get()
+    }
+
+    /// The box has the focus and it should show: it came from the keyboard (CSS `:focus-visible`).
+    pub fn focus_visible(&self) -> bool {
+        self.focus_visible.get()
+    }
 }
 
 /// The scale of the window. Reading it tracks it.
@@ -408,6 +471,7 @@ pub(crate) struct ElementConfig {
     pub(crate) focusable: bool,
     pub(crate) disabled: Option<Box<dyn Fn() -> bool>>,
     pub(crate) node_ref: Vec<NodeRef>,
+    pub(crate) access: Vec<crate::access::AccessFn>,
 }
 
 impl ElementConfig {
@@ -465,6 +529,22 @@ impl ElementConfig {
                         d.pending_focus = Some(None);
                     }
                     d.mark_style_of(id);
+                });
+            });
+        }
+        if !self.access.is_empty() {
+            let access = self.access;
+            effect(move || {
+                let said = access
+                    .iter()
+                    .fold(crate::access::Access::default(), |a, f| f(a));
+                with_doc(|d| {
+                    if let Some(n) = d.get_mut(id)
+                        && n.access.as_deref() != Some(&said)
+                    {
+                        n.access = Some(Box::new(said));
+                        d.access_stale = true;
+                    }
                 });
             });
         }
@@ -574,6 +654,15 @@ macro_rules! element_methods {
         pub fn on_active(mut self, f: impl Fn(bool) + 'static) -> Self {
             self.cfg.listeners.active = also_bool(self.cfg.listeners.active.take(), f);
             self
+        }
+
+        /// Keeps `i` up to date with what is done to the node: hovered, pressed, focused and
+        /// focused from the keyboard. For building a control's look from those.
+        pub fn interaction(self, i: crate::view::Interaction) -> Self {
+            self.on_hover(move |v| i.hovered.set(v))
+                .on_active(move |v| i.pressed.set(v))
+                .on_focus_change(move |v| i.focused.set(v))
+                .on_focus_visible(move |v| i.focus_visible.set(v))
         }
 
         /// Called while the node is moved with the primary button held, wherever the pointer goes.
@@ -702,14 +791,26 @@ macro_rules! element_methods {
         /// pixels. Unlike `on_scroll` it doesn't depend on input, and comes before the next frame
         /// is laid out.
         pub fn on_scrolled(mut self, f: impl Fn(PointF) + 'static) -> Self {
-            self.cfg.listeners.scrolled = Some(Rc::new(f));
+            self.cfg.listeners.scrolled = Some(match self.cfg.listeners.scrolled.take() {
+                Some(old) => Rc::new(move |p| {
+                    old(p);
+                    f(p);
+                }),
+                None => Rc::new(f),
+            });
             self
         }
 
         /// Called with the node's width and height in logical pixels when it first gets a size and
         /// whenever that changes, before anything is painted with it.
         pub fn on_resized(mut self, f: impl Fn(f32, f32) + 'static) -> Self {
-            self.cfg.listeners.resized = Some(Rc::new(f));
+            self.cfg.listeners.resized = Some(match self.cfg.listeners.resized.take() {
+                Some(old) => Rc::new(move |w, h| {
+                    old(w, h);
+                    f(w, h);
+                }),
+                None => Rc::new(f),
+            });
             self
         }
 
@@ -719,9 +820,28 @@ macro_rules! element_methods {
             self
         }
 
-        /// Disables pointer and keyboard handlers while `f` returns true.
+        /// Disables pointer and keyboard handlers while `f` returns true. Given more than once, it
+        /// is disabled while any of them says so.
         pub fn disabled(mut self, f: impl Fn() -> bool + 'static) -> Self {
-            self.cfg.disabled = Some(Box::new(f));
+            self.cfg.disabled = Some(match self.cfg.disabled.take() {
+                Some(old) => Box::new(move || old() || f()),
+                None => Box::new(f),
+            });
+            self
+        }
+
+        /// Says what the node is to assistive technology, like a screen reader: its role, label and
+        /// state. `f` runs again when what it reads changes. Given more than once, they run in
+        /// order, so that what is said later goes above. See `docs/design/34-accessibility.md`.
+        ///
+        /// ```ignore
+        /// div().access(move |a| a.role(Role::Checkbox).checked(on.get()))
+        /// ```
+        pub fn access(
+            mut self,
+            f: impl Fn(crate::access::Access) -> crate::access::Access + 'static,
+        ) -> Self {
+            self.cfg.access.push(std::rc::Rc::new(f));
             self
         }
 
@@ -1182,6 +1302,12 @@ pub enum TextSource {
 
 pub trait IntoTextSource {
     fn into_text_source(self) -> TextSource;
+}
+
+impl IntoTextSource for TextSource {
+    fn into_text_source(self) -> TextSource {
+        self
+    }
 }
 
 impl IntoTextSource for &str {
@@ -2091,6 +2217,7 @@ pub struct TextEditor {
     decorate_lines: Option<Rc<crate::text::editor::DecorateLines>>,
     blocks: Option<Rc<crate::text::editor::Blocks>>,
     on_edit: Option<Rc<crate::text::editor::OnEdit>>,
+    on_select: Option<Rc<crate::text::editor::OnSelect>>,
     gutter: Option<crate::text::editor::Gutter>,
     editor_ref: Option<EditorRef>,
     read_only: bool,
@@ -2106,6 +2233,7 @@ pub fn text_editor() -> TextEditor {
         decorate_lines: None,
         blocks: None,
         on_edit: None,
+        on_select: None,
         gutter: None,
         editor_ref: None,
         read_only: false,
@@ -2184,6 +2312,13 @@ impl TextEditor {
         self
     }
 
+    /// Told of the selection, as its anchor and focus in bytes, whenever it moves or the text
+    /// changes.
+    pub fn on_select(mut self, f: impl Fn(usize, usize) + 'static) -> Self {
+        self.on_select = Some(Rc::new(f));
+        self
+    }
+
     /// Line numbers on the left, which stay there when the text scrolls across.
     pub fn gutter(mut self, gutter: crate::text::editor::Gutter) -> Self {
         self.gutter = Some(gutter);
@@ -2219,6 +2354,7 @@ impl IntoView for TextEditor {
         data.decorate_lines = self.decorate_lines;
         data.blocks = self.blocks;
         data.on_edit = self.on_edit;
+        data.on_select = self.on_select;
         data.gutter = self.gutter;
         data.read_only = self.read_only;
         data.owner = Owner::current();

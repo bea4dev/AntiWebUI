@@ -1,7 +1,7 @@
 //! What is too long to build all of: lists, trees and tables, of which only the rows that show
 //! exist. See `docs/design/21-widgets.md`.
 
-use crate::theme::{Theme, ring, shared, theme};
+use crate::theme::{Theme, focus_ring, theme, themed};
 use anti_webui_core::prelude::*;
 use std::cell::Cell;
 use std::cmp::Ordering;
@@ -179,7 +179,7 @@ fn flatten<K: Clone + Eq + Hash>(
 
 fn long_box_sheet(t: &Theme) -> Sheet {
     Sheet::new(|s| s.bg(t.surface).border_color(t.border))
-        .focus_visible(|s| ring(s, t))
+        .focus_visible(|s| focus_ring(s, t))
         .disabled(|s| s.bg(t.surface_muted).text_color(t.text_disabled))
 }
 
@@ -196,12 +196,128 @@ fn picked_sheet(t: &Theme) -> Sheet {
 
 const TREE_ROW: f32 = 26.0;
 
+/// A row of a tree as its look gets to see it.
+pub struct TreeRowState<K: 'static> {
+    key: K,
+    label: String,
+    depth: usize,
+    opens: bool,
+    is_open: bool,
+    selected: Binding<Option<K>>,
+    open: Signal<HashSet<K>>,
+}
+
+impl<K: Clone + Eq + Hash + 'static> TreeRowState<K> {
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// How far in it is: 0 for what is at the top.
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// It has children.
+    pub fn opens(&self) -> bool {
+        self.opens
+    }
+
+    /// Its children show. The row is made again when this changes.
+    pub fn is_open(&self) -> bool {
+        self.is_open
+    }
+
+    /// It is the selected one. Reading it tracks it.
+    pub fn is_selected(&self) -> bool {
+        self.selected.get().as_ref() == Some(&self.key)
+    }
+
+    /// Makes `el` what opens and closes the row when it is clicked, like its chevron. The click
+    /// doesn't select the row.
+    pub fn toggle(&self, el: Div) -> Div {
+        let (open, key, opens) = (self.open, self.key.clone(), self.opens);
+        el.on_click(move |e| {
+            if opens {
+                e.stop_propagation();
+                open.update(|o| {
+                    if !o.remove(&key) {
+                        o.insert(key.clone());
+                    }
+                });
+            }
+        })
+    }
+}
+
 /// A tree of `items`, bound to the key of what is selected. What is closed costs nothing, and only
 /// the rows that show exist.
 pub fn tree_view<K: Clone + Eq + Hash + 'static>(
     items: Vec<TreeItem<K>>,
-    selected: Signal<Option<K>>,
+    selected: impl Into<Binding<Option<K>>>,
 ) -> Div {
+    tree_view_with(items, selected, TREE_ROW, |row| {
+        let opens = row.opens();
+        let chevron = match (opens, row.is_open()) {
+            (false, _) => "",
+            (true, false) => "▸",
+            (true, true) => "▾",
+        };
+        let picked = memo({
+            let selected = row.selected;
+            let key = row.key.clone();
+            move || selected.get().as_ref() == Some(&key)
+        });
+        div()
+            .h_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .pl(4.0 + row.depth() as f32 * 16.0)
+            .pr(8.0)
+            .gap(2.0)
+            .sheet(move || {
+                themed(if picked.get() {
+                    picked_sheet
+                } else {
+                    row_sheet
+                })
+            })
+            .child(
+                row.toggle(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .w(16.0)
+                        .h(16.0)
+                        .text_size(13.0)
+                        .dyn_style(|s| s.text_color(theme().text_muted))
+                        .child(text(chevron)),
+                ),
+            )
+            .child(text(row.label().to_owned()).whitespace_nowrap())
+    })
+    .rounded(6.0)
+    .border(1.0)
+    .sheet(|| themed(long_box_sheet))
+}
+
+/// A tree whose rows look like whatever `row` builds, each `row_height` high. Only the rows that
+/// show exist. Clicking a row selects it; [`TreeRowState::toggle`] makes what opens it. The box
+/// that comes back gets the focus: Up and Down select, Right opens or goes in, Left closes or goes
+/// out, Enter and Space open and close.
+pub fn tree_view_with<K: Clone + Eq + Hash + 'static>(
+    items: Vec<TreeItem<K>>,
+    selected: impl Into<Binding<Option<K>>>,
+    row_height: f32,
+    row: impl Fn(TreeRowState<K>) -> Div + 'static,
+) -> Div {
+    let selected = selected.into();
     let open = signal(HashSet::<K>::new());
     let items = Rc::new(items);
     let rows = {
@@ -227,72 +343,49 @@ pub fn tree_view<K: Clone + Eq + Hash + 'static>(
             }
         })
     };
-    let row_key = selected;
     rows_in(
         move || rows.with(Vec::len),
         move || version.get(),
-        TREE_ROW,
+        row_height,
         move |i| {
-            let Some(row) = rows.with_untracked(|r| r.get(i).cloned()) else {
+            let Some(r) = rows.with_untracked(|r| r.get(i).cloned()) else {
                 return div();
             };
-            let (key, chevron_key, mine) = (row.key.clone(), row.key.clone(), row.key.clone());
-            let is_open = open.with_untracked(|o| o.contains(&row.key));
-            div()
-                .h_full()
-                .flex()
-                .flex_row()
-                .items_center()
-                .pl(4.0 + row.depth as f32 * 16.0)
-                .pr(8.0)
-                .gap(2.0)
-                .sheet(move || {
-                    shared(if row_key.with(|s| s.as_ref() == Some(&mine)) {
-                        picked_sheet
-                    } else {
-                        row_sheet
-                    })
+            let key = r.key.clone();
+            let (r_opens, r_depth) = (r.opens, r.depth);
+            let r_open = open.with_untracked(|o| o.contains(&r.key));
+            let state = TreeRowState {
+                is_open: open.with_untracked(|o| o.contains(&r.key)),
+                key: r.key,
+                label: r.label,
+                depth: r.depth,
+                opens: r.opens,
+                selected,
+                open,
+            };
+            let (told, opens, open_now, level) = (key.clone(), r_opens, r_open, r_depth + 1);
+            row(state)
+                .access(move |a| {
+                    let a = a
+                        .role(Role::TreeItem)
+                        .level(level as u32)
+                        .selected(selected.get().as_ref() == Some(&told));
+                    if opens { a.expanded(open_now) } else { a }
                 })
                 .on_click(move |_| selected.set(Some(key.clone())))
-                .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .justify_center()
-                        .w(16.0)
-                        .h(16.0)
-                        .text_size(13.0)
-                        .dyn_style(|s| s.text_color(theme().text_muted))
-                        .on_click(move |e| {
-                            if row.opens {
-                                e.stop_propagation();
-                                flip(&chevron_key);
-                            }
-                        })
-                        .child(text(match (row.opens, is_open) {
-                            (false, _) => "",
-                            (true, false) => "▸",
-                            (true, true) => "▾",
-                        })),
-                )
-                .child(text(row.label).whitespace_nowrap())
         },
         |s| s,
         |_| {},
     )
-    .rounded(6.0)
-    .border(1.0)
     .select_none()
     .focusable()
+    .access(|a| a.role(Role::Tree))
     .node_ref(list)
-    .sheet(|| shared(long_box_sheet))
     .on_key_down(move |e| {
+        let now = selected.get_untracked();
         let at = rows.with_untracked(|r| {
-            selected.with_untracked(|s| {
-                s.as_ref()
-                    .and_then(|key| r.iter().position(|row| row.key == *key))
-            })
+            now.as_ref()
+                .and_then(|key| r.iter().position(|row| row.key == *key))
         });
         let last = rows.with_untracked(Vec::len).saturating_sub(1);
         let row_at = |i: usize| rows.with_untracked(|r| r.get(i).cloned());
@@ -341,7 +434,7 @@ pub fn tree_view<K: Clone + Eq + Hash + 'static>(
         e.prevent_default();
         if let Some(row) = row_at(next) {
             selected.set(Some(row.key));
-            scroll_row_into_view(list, next, TREE_ROW);
+            scroll_row_into_view(list, next, row_height);
         }
     })
 }
@@ -527,7 +620,7 @@ pub fn table<R: Clone + 'static>(
                             let drag_from = Cell::new(MIN_COLUMN);
                             let mut head = cell_frame(c, col.fill, col.align_end)
                                 .gap(4.0)
-                                .sheet(|| shared(header_cell_sheet))
+                                .sheet(|| themed(header_cell_sheet))
                                 .child(text(col.title.clone()).whitespace_nowrap())
                                 .child(
                                     text(move || match sorting.get() {
@@ -544,7 +637,7 @@ pub fn table<R: Clone + 'static>(
                                         .top(0.0)
                                         .bottom(0.0)
                                         .w(5.0)
-                                        .sheet(|| shared(handle_sheet))
+                                        .sheet(|| themed(handle_sheet))
                                         .on_click(|e| e.stop_propagation())
                                         .grab_threshold(0.0)
                                         .on_grab(move |g| match g.phase {
@@ -603,7 +696,7 @@ pub fn table<R: Clone + 'static>(
                 .w_full()
                 .border_b(1.0)
                 .sheet(move || {
-                    shared(if selected.get() == Some(index) {
+                    themed(if selected.get() == Some(index) {
                         table_picked_sheet
                     } else {
                         table_row_sheet
@@ -657,7 +750,7 @@ pub fn table<R: Clone + 'static>(
         .border(1.0)
         .overflow_clip()
         .select_none()
-        .sheet(|| shared(long_box_sheet))
+        .sheet(|| themed(long_box_sheet))
         .child(header)
         .child(body)
 }

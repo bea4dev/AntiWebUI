@@ -1,7 +1,7 @@
 //! Checkboxes and radio buttons. Sizes, colors and timing are those of Jetpack Compose. See
 //! `docs/design/20-md3e-components.md`.
 
-use super::surface::{Ink, When, focus_ring, following, halo, when};
+use super::surface::{Ink, When, focus_ring, halo, when};
 use crate::color::color_scheme;
 use crate::motion::{default_effects, default_spatial, fast_effects, fast_spatial};
 use anti_webui::prelude::*;
@@ -33,15 +33,8 @@ pub(super) fn check_shader() -> Result<(), String> {
     anti_webui::wgpu::check_shader(&CHECK)
 }
 
-/// What a checkbox shows.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CheckState {
-    #[default]
-    Off,
-    On,
-    /// Partly: some of what it stands for is on. It shows a bar.
-    Indeterminate,
-}
+/// What a checkbox shows: the standard one, where a bar shows `Mixed`.
+pub use anti_webui::widgets::CheckState;
 
 /// How a checkbox looks.
 #[derive(Clone, Default)]
@@ -68,27 +61,30 @@ impl CheckboxStyle {
     }
 }
 
-/// A checkbox whose state follows `checked`, which the program changes in `on_click`.
-pub fn checkbox(checked: impl Fn() -> bool + 'static) -> Div {
-    styled_checkbox(
-        move || {
-            if checked() {
-                CheckState::On
-            } else {
-                CheckState::Off
-            }
-        },
-        CheckboxStyle::new(),
-    )
+/// A checkbox bound to `checked`, which it flips when it is clicked. The behavior is the
+/// standard checkbox's (`checkbox_with`).
+pub fn checkbox(checked: impl Into<Binding<bool>>) -> Div {
+    styled_checkbox(checked, CheckboxStyle::new())
 }
 
-/// A checkbox that can also show that it is partly on.
-pub fn tri_state_checkbox(state: impl Fn() -> CheckState + 'static) -> Div {
-    styled_checkbox(state, CheckboxStyle::new())
+pub fn styled_checkbox(checked: impl Into<Binding<bool>>, style: CheckboxStyle) -> Div {
+    checkbox_with(checked, move |s| checkbox_look(s, style))
 }
 
-pub fn styled_checkbox(state: impl Fn() -> CheckState + 'static, style: CheckboxStyle) -> Div {
-    let state = Rc::new(state);
+/// A checkbox that can also show that it is partly on. Pressing it makes a mix on, and on off.
+pub fn tri_state_checkbox(state: impl Into<Binding<CheckState>>) -> Div {
+    styled_tri_state_checkbox(state, CheckboxStyle::new())
+}
+
+pub fn styled_tri_state_checkbox(
+    state: impl Into<Binding<CheckState>>,
+    style: CheckboxStyle,
+) -> Div {
+    tri_checkbox_with(state, move |s| checkbox_look(s, style))
+}
+
+fn checkbox_look(box_state: CheckboxState, style: CheckboxStyle) -> Div {
+    let state = Rc::new(move || box_state.state());
     let error = when(style.error);
     let disabled = when(style.disabled);
 
@@ -99,7 +95,7 @@ pub fn styled_checkbox(state: impl Fn() -> CheckState + 'static, style: Checkbox
     } else {
         1.0
     });
-    let gravity = animated(if first == CheckState::Indeterminate {
+    let gravity = animated(if first == CheckState::Mixed {
         1.0f32
     } else {
         0.0
@@ -115,15 +111,11 @@ pub fn styled_checkbox(state: impl Fn() -> CheckState + 'static, style: Checkbox
         untrack(|| match (before, now) {
             (CheckState::Off, _) => {
                 fraction.set(0.0);
-                gravity.set(if now == CheckState::Indeterminate {
-                    1.0
-                } else {
-                    0.0
-                });
+                gravity.set(if now == CheckState::Mixed { 1.0 } else { 0.0 });
                 fraction.spring_to(1.0, default_spatial());
             }
             (_, CheckState::Off) => {}
-            (_, CheckState::Indeterminate) => gravity.spring_to(1.0, default_spatial()),
+            (_, CheckState::Mixed) => gravity.spring_to(1.0, default_spatial()),
             (_, CheckState::On) => gravity.spring_to(0.0, default_spatial()),
         });
     });
@@ -202,7 +194,6 @@ pub fn styled_checkbox(state: impl Fn() -> CheckState + 'static, style: Checkbox
             .w(TOUCH)
             .h(TOUCH)
             .select_none()
-            .focusable()
             .dyn_style(move |s| {
                 s.cursor(if root_off() {
                     CursorIcon::Default
@@ -258,22 +249,34 @@ impl RadioStyle {
     }
 }
 
-/// A radio button whose state follows `selected`, which the program changes in `on_click`.
-pub fn radio_button(selected: impl Fn() -> bool + 'static) -> Div {
-    styled_radio_button(selected, RadioStyle::new())
+/// A radio button that sets `selected` to `value` when it is clicked. The behavior is the
+/// standard radio button's (`radio_with`).
+pub fn radio_button<T: Clone + PartialEq + 'static>(
+    selected: impl Into<Binding<T>>,
+    value: T,
+) -> Div {
+    styled_radio_button(selected, value, RadioStyle::new())
 }
 
-pub fn styled_radio_button(selected: impl Fn() -> bool + 'static, style: RadioStyle) -> Div {
-    let selected: When = Rc::new(selected);
+pub fn styled_radio_button<T: Clone + PartialEq + 'static>(
+    selected: impl Into<Binding<T>>,
+    value: T,
+    style: RadioStyle,
+) -> Div {
+    radio_with(selected, value, move |s| radio_look(s, style))
+}
+
+fn radio_look(radio: RadioState, style: RadioStyle) -> Div {
+    let selected: When = Rc::new(move || radio.selected());
     let disabled = when(style.disabled);
     let dot_selected = selected.clone();
-    let dot = following(
+    let dot = follow(
         move || if dot_selected() { 1.0f32 } else { 0.0 },
         fast_spatial(),
     );
     let color_selected = selected.clone();
     let color_off = disabled.clone();
-    let color = following(
+    let color = follow(
         move || {
             let c = color_scheme();
             if color_off() {
@@ -309,7 +312,6 @@ pub fn styled_radio_button(selected: impl Fn() -> bool + 'static, style: RadioSt
             .w(TOUCH)
             .h(TOUCH)
             .select_none()
-            .focusable()
             .dyn_style(move |s| {
                 s.cursor(if root_off() {
                     CursorIcon::Default

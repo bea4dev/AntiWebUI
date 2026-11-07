@@ -24,33 +24,26 @@ pub fn page() -> Div {
 
 fn switches() -> Div {
     let flags = [signal(false), signal(true), signal(false), signal(true)];
-    let toggle = |on: Signal<bool>| move |_: &PointerEvent| on.update(|v| *v = !*v);
     section("Switch").child(
         row()
-            .child(switch(move || flags[0].get()).on_click(toggle(flags[0])))
-            .child(switch(move || flags[1].get()).on_click(toggle(flags[1])))
-            .child(
-                styled_switch(
-                    move || flags[2].get(),
-                    SwitchStyle::new().on_icon(icons::CHECK),
-                )
-                .on_click(toggle(flags[2])),
-            )
-            .child(
-                styled_switch(
-                    move || flags[3].get(),
-                    SwitchStyle::new()
-                        .on_icon(icons::CHECK)
-                        .off_icon(icons::CLOSE),
-                )
-                .on_click(toggle(flags[3])),
-            )
+            .child(switch(flags[0]))
+            .child(switch(flags[1]))
             .child(styled_switch(
-                || false,
+                flags[2],
+                SwitchStyle::new().on_icon(icons::CHECK),
+            ))
+            .child(styled_switch(
+                flags[3],
+                SwitchStyle::new()
+                    .on_icon(icons::CHECK)
+                    .off_icon(icons::CLOSE),
+            ))
+            .child(styled_switch(
+                signal(false),
                 SwitchStyle::new().disabled_when(|| true),
             ))
             .child(styled_switch(
-                || true,
+                signal(true),
                 SwitchStyle::new().disabled_when(|| true),
             )),
     )
@@ -58,45 +51,33 @@ fn switches() -> Div {
 
 fn checkboxes() -> Div {
     let items = [signal(true), signal(false), signal(true)];
-    let all = move || {
-        let on = items.iter().filter(|i| i.get()).count();
-        match on {
+    // One that stands for the others: it shows what they are and sets them all.
+    let all = Binding::new(
+        move || match items.iter().filter(|i| i.get()).count() {
             0 => CheckState::Off,
             3 => CheckState::On,
-            _ => CheckState::Indeterminate,
-        }
-    };
-    let error = signal(false);
+            _ => CheckState::Mixed,
+        },
+        move |state| {
+            for item in items {
+                item.set(state == CheckState::On);
+            }
+        },
+    );
     section("Checkbox").child(
         row()
-            .child(tri_state_checkbox(all).on_click(move |_| {
-                let to = untrack(all) != CheckState::On;
-                for item in items {
-                    item.set(to);
-                }
-            }))
-            .children(items.map(|item| {
-                checkbox(move || item.get()).on_click(move |_| item.update(|v| *v = !*v))
-            }))
-            .child(
-                styled_checkbox(
-                    move || {
-                        if error.get() {
-                            CheckState::On
-                        } else {
-                            CheckState::Off
-                        }
-                    },
-                    CheckboxStyle::new().error_when(|| true),
-                )
-                .on_click(move |_| error.update(|v| *v = !*v)),
-            )
+            .child(tri_state_checkbox(all))
+            .children(items.map(checkbox))
             .child(styled_checkbox(
-                || CheckState::On,
+                signal(false),
+                CheckboxStyle::new().error_when(|| true),
+            ))
+            .child(styled_checkbox(
+                signal(true),
                 CheckboxStyle::new().disabled_when(|| true),
             ))
             .child(styled_checkbox(
-                || CheckState::Off,
+                signal(false),
                 CheckboxStyle::new().disabled_when(|| true),
             )),
     )
@@ -106,17 +87,15 @@ fn radios() -> Div {
     let chosen = signal(1);
     section("Radio button").child(
         row()
-            .children(
-                [0, 1, 2].map(|i| {
-                    radio_button(move || chosen.get() == i).on_click(move |_| chosen.set(i))
-                }),
-            )
+            .children([0, 1, 2].map(|i| radio_button(chosen, i)))
             .child(styled_radio_button(
-                || true,
+                signal(true),
+                true,
                 RadioStyle::new().disabled_when(|| true),
             ))
             .child(styled_radio_button(
-                || false,
+                signal(false),
+                true,
                 RadioStyle::new().disabled_when(|| true),
             )),
     )
@@ -127,7 +106,7 @@ fn sliders() -> Div {
     let labelled = signal(30.0f32);
     let stepped = signal(4.0f32);
     let centered = signal(0.2f32);
-    let range = signal((20.0f32, 70.0f32));
+    let (from, to) = (signal(20.0f32), signal(70.0f32));
     let thick = signal(0.6f32);
     let upright = signal(0.5f32);
     section("Slider").child(
@@ -140,11 +119,10 @@ fn sliders() -> Div {
                     .flex()
                     .flex_col()
                     .gap(8.0)
-                    .child(slider(move || plain.get(), move |v| plain.set(v)).w(320.0))
+                    .child(slider(plain).w(320.0))
                     .child(
                         styled_slider(
-                            move || labelled.get(),
-                            move |v| labelled.set(v),
+                            labelled,
                             SliderStyle::new()
                                 .range(0.0..=100.0)
                                 .label(|v| format!("{v:.0}")),
@@ -152,33 +130,17 @@ fn sliders() -> Div {
                         .w(320.0),
                     )
                     .child(
-                        styled_slider(
-                            move || stepped.get(),
-                            move |v| stepped.set(v),
-                            SliderStyle::new().range(0.0..=10.0).steps(9),
-                        )
-                        .w(320.0),
+                        styled_slider(stepped, SliderStyle::new().range(0.0..=10.0).steps(9))
+                            .w(320.0),
                     )
                     .child(
-                        styled_slider(
-                            move || centered.get(),
-                            move |v| centered.set(v),
-                            SliderStyle::new().range(-1.0..=1.0).centered(),
-                        )
-                        .w(320.0),
+                        styled_slider(centered, SliderStyle::new().range(-1.0..=1.0).centered())
+                            .w(320.0),
                     )
-                    .child(
-                        range_slider(
-                            move || range.get(),
-                            move |v| range.set(v),
-                            SliderStyle::new().range(0.0..=100.0),
-                        )
-                        .w(320.0),
-                    )
+                    .child(range_slider(from, to, SliderStyle::new().range(0.0..=100.0)).w(320.0))
                     .child(
                         styled_slider(
-                            move || thick.get(),
-                            move |v| thick.set(v),
+                            thick,
                             SliderStyle::new()
                                 .track(36.0)
                                 .corner(12.0)
@@ -188,15 +150,11 @@ fn sliders() -> Div {
                         .h(56.0),
                     )
                     .child(
-                        styled_slider(|| 0.3, |_| {}, SliderStyle::new().disabled_when(|| true))
+                        styled_slider(signal(0.3), SliderStyle::new().disabled_when(|| true))
                             .w(320.0),
                     ),
             )
-            .child(styled_slider(
-                move || upright.get(),
-                move |v| upright.set(v),
-                SliderStyle::new().vertical(),
-            )),
+            .child(styled_slider(upright, SliderStyle::new().vertical())),
     )
 }
 
@@ -223,20 +181,15 @@ fn chips() -> Div {
         )
         .child(
             row()
-                .children(["Mine", "Shared", "Recent"].into_iter().zip(filters).map(
-                    |(label, on)| {
-                        filter_chip(label, move || on.get())
-                            .on_click(move |_| on.update(|v| *v = !*v))
-                    },
-                ))
+                .children(
+                    ["Mine", "Shared", "Recent"]
+                        .into_iter()
+                        .zip(filters)
+                        .map(|(label, on)| filter_chip(label, on)),
+                )
                 .child({
                     let on = signal(false);
-                    styled_filter_chip(
-                        "Favorite",
-                        move || on.get(),
-                        ChipStyle::new().icon(icons::FAVORITE),
-                    )
-                    .on_click(move |_| on.update(|v| *v = !*v))
+                    styled_filter_chip("Favorite", on, ChipStyle::new().icon(icons::FAVORITE))
                 }),
         )
         .child(

@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 /// The type of a shader parameter in WGSL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
 pub enum ParamType {
     F32,
     I32,
@@ -43,6 +44,7 @@ impl ParamType {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
 pub struct ParamField {
     pub name: &'static str,
     pub ty: ParamType,
@@ -50,6 +52,7 @@ pub struct ParamField {
 
 /// Lays out values the way WGSL does in a uniform buffer.
 #[derive(Default)]
+#[doc(hidden)]
 pub struct ParamWriter {
     bytes: Vec<u8>,
 }
@@ -74,6 +77,7 @@ impl ParamWriter {
 }
 
 /// What can be a field of [`ShaderParams`].
+#[doc(hidden)]
 pub trait ParamValue {
     const TYPE: ParamType;
     fn write(&self, out: &mut ParamWriter);
@@ -151,6 +155,7 @@ impl ShaderParams for () {
 
 /// What the renderer needs to compile a shader.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct ShaderSource {
     /// Shown in error messages.
     pub name: &'static str,
@@ -228,6 +233,7 @@ impl<P: ShaderParams> Shader<P> {
 static PRELOADS: Mutex<Vec<&'static ShaderSource>> = Mutex::new(Vec::new());
 
 /// The shaders asked to be compiled ahead, from `start` on.
+#[doc(hidden)]
 pub fn preloads_from(start: usize) -> Vec<&'static ShaderSource> {
     let list = PRELOADS.lock().expect("nothing panics while holding it");
     list.get(start..).map(<[_]>::to_vec).unwrap_or_default()
@@ -285,6 +291,7 @@ impl PartialEq for ShaderPaint {
 }
 
 /// How many inputs a shader can read.
+#[doc(hidden)]
 pub const MAX_INPUTS: usize = 4;
 
 /// The standard deviation, in texels, of a blur that goes down this many times and back.
@@ -293,6 +300,7 @@ const BLUR_SIGMAS: [f32; 8] = [1.68, 3.76, 7.71, 15.52, 31.08, 62.19, 124.4, 248
 /// How a blur of standard deviation `sigma` in texels is done: how many times to go down, and how
 /// much of the last step to use. Zero times means computing the gaussian: going down blurs more
 /// than that already. See `docs/design/16-filters.md`.
+#[doc(hidden)]
 pub fn blur_levels(sigma: f32) -> (u32, f32) {
     if sigma <= BLUR_SIGMAS[0] {
         return (0, 1.0);
@@ -309,6 +317,7 @@ pub fn blur_levels(sigma: f32) -> (u32, f32) {
 }
 
 /// How far a blur reads: what lies further away has too little weight to see.
+#[doc(hidden)]
 pub fn blur_reach(sigma: f32) -> i32 {
     (sigma.min(BLUR_SIGMAS[BLUR_SIGMAS.len() - 1]) * 3.0).ceil() as i32
 }

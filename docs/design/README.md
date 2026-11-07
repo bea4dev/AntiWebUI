@@ -37,6 +37,8 @@ AntiWebUI は WebView に頼らず、wgpu による自前描画とネイティ�
 | 30 | [performance-overlay](30-performance-overlay.md) | fps、CPU と GPU の時間、遅延、先行描画の状態を右上に出すデバッグ用のオーバーレイ |
 | 31 | [code-editor](31-code-editor.md) | ノードを軽くする、`text_editor` の見えている行だけ作る仕組み、tree-sitter の色分け、`code_editor`、ほかのエディタとの比較 |
 | 32 | [markdown-split](32-markdown-split.md) | 左にソース、右にプレビューの `markdown_split_editor`、左右のスクロールの同期、コードブロックの tree-sitter の色分け、ほかのエディタとの比較 |
+| 33 | [customization](33-customization.md) | フォークせずに部品を変える段階（テーマ、外側、部品ごと、見た目を丸ごと）、動きと見た目の分離（`x_with`、`styled_x`）、`Binding`、部品を作る道具、MD3E の載せ直し、公開範囲 |
+| 34 | [accessibility](34-accessibility.md) | 読み上げの口：`.access`（役割、呼び名、状態）、`snapshot`、`watch`、`perform`、標準の部品と MD3E の役割。プラットフォームへの橋渡しは別のクレートに任せる |
 
 ## 用語
 

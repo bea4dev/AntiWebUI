@@ -22,9 +22,7 @@ fn handle(scene: &anti_webui::core::scene::Scene, color: Color) -> (i32, i32) {
 #[test]
 fn a_switch_has_the_handle_of_its_state() {
     let on = signal(false);
-    let mut ui = start_ui(move || {
-        div().child(switch(move || on.get()).on_click(move |_| on.update(|v| *v = !*v)))
-    });
+    let mut ui = start_ui(move || div().child(switch(on)));
     let scene = settle(&mut ui);
     assert_eq!(handle(&scene, C.outline), (8, 16));
     // Pressed it is as big as it gets, wherever it is.
@@ -46,7 +44,7 @@ fn a_switch_has_the_handle_of_its_state() {
 fn an_icon_makes_the_handle_of_a_switch_as_big_as_when_it_is_on() {
     let mut ui = start_ui(|| {
         div().child(styled_switch(
-            || false,
+            signal(false),
             SwitchStyle::new().off_icon(icons::CLOSE),
         ))
     });
@@ -57,7 +55,7 @@ fn an_icon_makes_the_handle_of_a_switch_as_big_as_when_it_is_on() {
 #[test]
 fn the_handle_of_a_switch_bounces_on_its_way() {
     let on = signal(false);
-    let mut ui = start_ui(move || div().child(switch(move || on.get())));
+    let mut ui = start_ui(move || div().child(switch(on)));
     settle(&mut ui);
     on.set(true);
     let mut furthest = 0;
@@ -70,20 +68,22 @@ fn the_handle_of_a_switch_bounces_on_its_way() {
 #[test]
 fn a_disabled_switch_does_not_react() {
     let clicks = signal(0);
+    let on = signal(false);
     let mut ui = start_ui(move || {
         div().child(
-            styled_switch(|| false, SwitchStyle::new().disabled_when(|| true))
+            styled_switch(on, SwitchStyle::new().disabled_when(|| true))
                 .on_click(move |_| clicks.update(|c| *c += 1)),
         )
     });
     click(&mut ui, 20.0, 24.0);
     assert_eq!(clicks.get(), 0);
+    assert!(!on.get());
 }
 
 #[test]
 fn a_checkbox_shows_a_mark_only_while_it_is_on() {
     let state = signal(CheckState::Off);
-    let mut ui = start_ui(move || div().child(tri_state_checkbox(move || state.get())));
+    let mut ui = start_ui(move || div().child(tri_state_checkbox(state)));
     let scene = settle(&mut ui);
     assert!(shaders(&scene).is_empty());
     let boxed = boxes(&scene).pop().expect("the box");
@@ -93,7 +93,7 @@ fn a_checkbox_shows_a_mark_only_while_it_is_on() {
     let scene = settle(&mut ui);
     assert_eq!(shaders(&scene).len(), 1);
     assert_eq!(colored(&scene, C.primary).len(), 1);
-    state.set(CheckState::Indeterminate);
+    state.set(CheckState::Mixed);
     let scene = settle(&mut ui);
     assert_eq!(shaders(&scene).len(), 1);
     state.set(CheckState::Off);
@@ -106,11 +106,11 @@ fn a_checkbox_has_the_colors_of_its_state() {
     let mut ui = start_ui(|| {
         div()
             .child(styled_checkbox(
-                || CheckState::On,
+                signal(true),
                 CheckboxStyle::new().error_when(|| true),
             ))
             .child(styled_checkbox(
-                || CheckState::Off,
+                signal(false),
                 CheckboxStyle::new().disabled_when(|| true),
             ))
     });
@@ -121,26 +121,28 @@ fn a_checkbox_has_the_colors_of_its_state() {
 }
 
 #[test]
-fn clicking_a_checkbox_or_a_radio_button_goes_through_on_click() {
+fn clicking_a_checkbox_or_a_radio_button_changes_what_it_is_bound_to() {
     let checked = signal(false);
-    let chosen = signal(false);
+    let chosen = signal(0);
     let mut ui = start_ui(move || {
         div()
             .flex()
             .flex_row()
-            .child(checkbox(move || checked.get()).on_click(move |_| checked.set(true)))
-            .child(radio_button(move || chosen.get()).on_click(move |_| chosen.set(true)))
+            .child(checkbox(checked))
+            .child(radio_button(chosen, 1))
     });
     click(&mut ui, 24.0, 24.0);
     assert!(checked.get());
     click(&mut ui, 72.0, 24.0);
-    assert!(chosen.get());
+    assert_eq!(chosen.get(), 1);
+    click(&mut ui, 24.0, 24.0);
+    assert!(!checked.get(), "and back");
 }
 
 #[test]
 fn a_radio_button_has_a_dot_while_selected() {
     let on = signal(false);
-    let mut ui = start_ui(move || div().child(radio_button(move || on.get())));
+    let mut ui = start_ui(move || div().child(radio_button(on, true)));
     let scene = settle(&mut ui);
     assert!(colored(&scene, C.primary).is_empty());
     on.set(true);
@@ -155,7 +157,8 @@ fn a_radio_button_has_a_dot_while_selected() {
 fn a_disabled_radio_button_is_faded() {
     let mut ui = start_ui(|| {
         div().child(styled_radio_button(
-            || true,
+            signal(1),
+            1,
             RadioStyle::new().disabled_when(|| true),
         ))
     });
@@ -167,7 +170,7 @@ fn a_disabled_radio_button_is_faded() {
 #[test]
 fn a_slider_follows_the_pointer_and_the_keys() {
     let value = signal(0.5f32);
-    let mut ui = start_ui(move || div().child(slider(move || value.get(), move |v| value.set(v))));
+    let mut ui = start_ui(move || div().child(slider(value)));
     // The track is 236 from 2 to 238.
     pointer_at(&mut ui, 61.0, 24.0);
     pointer(&mut ui, 61.0, 24.0, true);
@@ -193,8 +196,7 @@ fn a_slider_snaps_to_its_steps_and_stays_in_its_range() {
     let value = signal(0.0f32);
     let mut ui = start_ui(move || {
         div().child(styled_slider(
-            move || value.get(),
-            move |v| value.set(v),
+            value,
             SliderStyle::new().range(10.0..=20.0).steps(4),
         ))
     });
@@ -210,37 +212,32 @@ fn a_slider_snaps_to_its_steps_and_stays_in_its_range() {
 
 #[test]
 fn a_range_slider_moves_the_closest_handle_and_never_past_the_other() {
-    let values = signal((20.0f32, 80.0f32));
+    let (start, end) = (signal(20.0f32), signal(80.0f32));
+    let values = move || (start.get(), end.get());
     let mut ui = start_ui(move || {
         div().child(range_slider(
-            move || values.get(),
-            move |v| values.set(v),
+            start,
+            end,
             SliderStyle::new().range(0.0..=100.0),
         ))
     });
     pointer_at(&mut ui, 61.0, 24.0);
     pointer(&mut ui, 61.0, 24.0, true);
-    assert_eq!(values.get().1, 80.0);
-    assert!((values.get().0 - 25.0).abs() < 0.01);
+    assert_eq!(values().1, 80.0);
+    assert!((values().0 - 25.0).abs() < 0.01);
     pointer_at(&mut ui, 220.0, 24.0);
-    assert_eq!(values.get().0, 80.0, "up to the other and no further");
+    assert_eq!(values().0, 80.0, "up to the other and no further");
     pointer(&mut ui, 220.0, 24.0, false);
     pointer_at(&mut ui, 200.0, 24.0);
     pointer(&mut ui, 200.0, 24.0, true);
-    assert!(values.get().1 > 80.0);
-    assert_eq!(values.get().0, 80.0);
+    assert!(values().1 > 80.0);
+    assert_eq!(values().0, 80.0);
 }
 
 #[test]
 fn a_vertical_slider_goes_up() {
     let value = signal(0.5f32);
-    let mut ui = start_ui(move || {
-        div().child(styled_slider(
-            move || value.get(),
-            move |v| value.set(v),
-            SliderStyle::new().vertical(),
-        ))
-    });
+    let mut ui = start_ui(move || div().child(styled_slider(value, SliderStyle::new().vertical())));
     pointer_at(&mut ui, 24.0, 61.0);
     pointer(&mut ui, 24.0, 61.0, true);
     assert!((value.get() - 0.75).abs() < 0.001, "{}", value.get());
@@ -251,8 +248,7 @@ fn a_disabled_slider_does_not_change() {
     let value = signal(0.5f32);
     let mut ui = start_ui(move || {
         div().child(styled_slider(
-            move || value.get(),
-            move |v| value.set(v),
+            value,
             SliderStyle::new().disabled_when(|| true),
         ))
     });
@@ -265,8 +261,7 @@ fn a_disabled_slider_does_not_change() {
 fn the_label_of_a_slider_shows_while_it_is_held() {
     let mut ui = start_ui(|| {
         div().pt(100.0).child(styled_slider(
-            || 50.0,
-            |_| {},
+            signal(50.0),
             SliderStyle::new()
                 .range(0.0..=100.0)
                 .label(|v| format!("{v:.0}")),
@@ -309,11 +304,7 @@ fn chips_have_the_room_of_compose() {
 fn a_filter_chip_grows_a_check_while_selected() {
     let on = signal(false);
     let place = node_ref();
-    let mut ui = start_ui(move || {
-        div()
-            .flex()
-            .child(filter_chip("Word", move || on.get()).node_ref(place))
-    });
+    let mut ui = start_ui(move || div().flex().child(filter_chip("Word", on).node_ref(place)));
     settle(&mut ui);
     let before = place.rect().unwrap().width;
     on.set(true);
@@ -358,11 +349,22 @@ fn the_trailing_icon_of_an_input_chip_does_its_own_thing() {
 fn nothing_here_asks_for_frames_at_rest() {
     let mut ui = start_ui(|| {
         div()
-            .child(switch(|| true))
-            .child(checkbox(|| true))
-            .child(radio_button(|| true))
-            .child(slider(|| 0.5, |_| {}))
-            .child(filter_chip("Word", || true))
+            .child(switch(signal(true)))
+            .child(checkbox(signal(true)))
+            .child(radio_button(signal(true), true))
+            .child(slider(signal(0.5)))
+            .child(filter_chip("Word", signal(true)))
     });
     assert_at_rest(&mut ui);
+}
+
+#[test]
+fn a_slider_goes_by_pages_too() {
+    let value = signal(0.5f32);
+    let mut ui = start_ui(move || div().child(slider(value)));
+    key(&mut ui, NamedKey::Tab);
+    key(&mut ui, NamedKey::PageUp);
+    assert!((value.get() - 0.75).abs() < 0.001, "{}", value.get());
+    key(&mut ui, NamedKey::PageDown);
+    assert!((value.get() - 0.5).abs() < 0.001, "{}", value.get());
 }

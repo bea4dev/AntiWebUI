@@ -107,6 +107,32 @@ enum Side {
     Preview,
 }
 
+/// Where a block is: its lines in the source (the first, and the one after its last) and its
+/// top and bottom on the right, in logical pixels from the top of what scrolls there.
+#[derive(Clone, Copy)]
+struct Place {
+    lines: (f64, f64),
+    y: (f32, f32),
+}
+
+/// The value at `x` of the line through `a` and `b`, which `x` is between.
+fn lerp(x: f64, a: (f64, f32), b: (f64, f32)) -> f32 {
+    if b.0 <= a.0 {
+        return a.1;
+    }
+    let part = ((x - a.0) / (b.0 - a.0)).clamp(0.0, 1.0);
+    a.1 + (b.1 - a.1) * part as f32
+}
+
+/// The other way: the `x` where the line through `a` and `b` is at `y`.
+fn unlerp(y: f32, a: (f64, f32), b: (f64, f32)) -> f64 {
+    if b.1 <= a.1 {
+        return a.0;
+    }
+    let part = ((y - a.1) / (b.1 - a.1)).clamp(0.0, 1.0);
+    a.0 + (b.0 - a.0) * part as f64
+}
+
 /// Where the blocks shown are, to go from a line of the source to a height on the right and back.
 struct Places {
     anchors: Rc<Anchors>,
@@ -116,76 +142,105 @@ struct Places {
 }
 
 impl Places {
-    /// The line each block starts on and how far down its top is on the right, for block `i`, and
-    /// for the end after the last one. The first block starts where both sides start, so that
-    /// the top of the source shows the top of the right side, room above the first block and all.
-    fn at(&self, i: usize) -> Option<(f64, f32)> {
-        if i == 0 {
-            return Some((0.0, 0.0));
-        }
-        let blocks = self.anchors.blocks.borrow();
-        let Some(&(line, key, gap)) = blocks.get(i) else {
-            return Some((self.anchors.lines.get() as f64, self.height.get()));
-        };
-        let r = *self.anchors.boxes.borrow().get(&key)?;
-        Some((line as f64, r.offset_in(self.preview)?.y + gap))
-    }
-
     fn count(&self) -> usize {
         self.anchors.blocks.borrow().len()
     }
 
-    /// How far down the right side shows a line of the source: between the tops of the blocks
-    /// around it, as far as the line is between their first lines (as VS Code does).
-    fn height_of(&self, line: f64) -> Option<f32> {
-        let n = self.count();
-        if n == 0 {
-            return None;
-        }
-        let i = {
-            let blocks = self.anchors.blocks.borrow();
-            blocks.partition_point(|b| b.0 as f64 <= line)
-        };
-        let (l0, y0) = match i.checked_sub(1) {
-            Some(i) => self.at(i)?,
-            None => (0.0, 0.0),
-        };
-        let (l1, y1) = self.at(i)?;
-        let part = if l1 > l0 {
-            ((line - l0) / (l1 - l0)).clamp(0.0, 1.0)
-        } else {
+    /// Where block `i` is, as of the last layout. For scrolling (`scroll`), the first block starts
+    /// where the right side does when it starts on the first line, so that the top of the source
+    /// shows the top of the right side, room above the first block and all.
+    fn place(&self, i: usize, scroll: bool) -> Option<Place> {
+        let a = *self.anchors.blocks.borrow().get(i)?;
+        let r = *self.anchors.boxes.borrow().get(&a.key)?;
+        let top = r.offset_in(self.preview)?.y;
+        let height = untrack(window_scale).to_logical(r.rect()?.height as f32);
+        let start = if scroll && i == 0 && a.lines.0 == 0 {
             0.0
+        } else {
+            top + a.gap
         };
-        Some(y0 + (y1 - y0) * part as f32)
+        Some(Place {
+            lines: (a.lines.0 as f64, a.lines.1 as f64),
+            y: (start, top + height),
+        })
     }
 
-    /// The line of the source a height on the right shows: the other way.
-    fn line_at(&self, y: f32) -> Option<f64> {
-        let n = self.count();
-        if n == 0 {
-            return None;
+    /// Where what follows block `i` starts: the next block, or the end.
+    fn next(&self, i: usize, scroll: bool) -> Option<(f64, f32)> {
+        if i + 1 < self.count() {
+            let p = self.place(i + 1, scroll)?;
+            Some((p.lines.0, p.y.0))
+        } else {
+            Some((self.anchors.lines.get() as f64, self.height.get()))
         }
-        // The first block whose top is below `y`, looking at as few as it can.
-        let (mut lo, mut hi) = (0, n);
+    }
+
+    /// The last block that starts on `line` or before it.
+    fn by_line(&self, line: f64) -> Option<usize> {
+        let blocks = self.anchors.blocks.borrow();
+        blocks
+            .partition_point(|b| b.lines.0 as f64 <= line)
+            .checked_sub(1)
+    }
+
+    /// The last block whose top is at `y` or above it, looking at as few as it can.
+    fn by_height(&self, y: f32, scroll: bool) -> Option<Option<usize>> {
+        let (mut lo, mut hi) = (0, self.count());
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if self.at(mid)?.1 <= y {
+            if self.place(mid, scroll)?.y.0 <= y {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
-        let (l0, y0) = match lo.checked_sub(1) {
-            Some(i) => self.at(i)?,
-            None => (0.0, 0.0),
+        Some(lo.checked_sub(1))
+    }
+
+    /// How far down the right side shows a line of the source: in a block, as far as the line is
+    /// through the block's lines, and between blocks, as far through the room between them (as
+    /// VS Code does).
+    fn height_of(&self, line: f64, scroll: bool) -> Option<f32> {
+        if self.count() == 0 {
+            return None;
+        }
+        let Some(i) = self.by_line(line) else {
+            let first = self.place(0, scroll)?;
+            return Some(lerp(line, (0.0, 0.0), (first.lines.0, first.y.0)));
         };
-        let (l1, y1) = self.at(lo)?;
-        let part = if y1 > y0 {
-            ((y - y0) / (y1 - y0)).clamp(0.0, 1.0)
-        } else {
-            0.0
+        let p = self.place(i, scroll)?;
+        if line < p.lines.1 {
+            return Some(lerp(line, (p.lines.0, p.y.0), (p.lines.1, p.y.1)));
+        }
+        Some(lerp(line, (p.lines.1, p.y.1), self.next(i, scroll)?))
+    }
+
+    /// The line of the source a height on the right shows: the other way.
+    fn line_at(&self, y: f32, scroll: bool) -> Option<f64> {
+        if self.count() == 0 {
+            return None;
+        }
+        let Some(i) = self.by_height(y, scroll)? else {
+            let first = self.place(0, scroll)?;
+            return Some(unlerp(y, (0.0, 0.0), (first.lines.0, first.y.0)));
         };
-        Some(l0 + (l1 - l0) * part as f64)
+        let p = self.place(i, scroll)?;
+        if y < p.y.1 {
+            return Some(unlerp(y, (p.lines.0, p.y.0), (p.lines.1, p.y.1)));
+        }
+        Some(unlerp(y, (p.lines.1, p.y.1), self.next(i, scroll)?))
+    }
+
+    /// Where on the right a line of the source is shown, top and bottom: its part of the block it
+    /// is in. Nothing for a line between blocks.
+    fn span_of(&self, line: usize) -> Option<(f32, f32)> {
+        let line = line as f64;
+        let p = self.place(self.by_line(line)?, false)?;
+        if line >= p.lines.1 {
+            return None;
+        }
+        let (a, b) = ((p.lines.0, p.y.0), (p.lines.1, p.y.1));
+        Some((lerp(line, a, b), lerp(line + 1.0, a, b)))
     }
 }
 
@@ -194,6 +249,7 @@ impl IntoView for MarkdownSplitEditor {
         let source = self.source;
         let editor = self.editor_ref.unwrap_or_else(editor_ref);
         let preview = node_ref();
+        let page = node_ref();
         let anchors = Rc::new(Anchors::default());
         let places = Rc::new(Places {
             anchors: anchors.clone(),
@@ -203,6 +259,8 @@ impl IntoView for MarkdownSplitEditor {
         let leader = Rc::new(Cell::new(Side::Source));
         let split = signal(self.split);
         let width = Rc::new(Cell::new(0.0f32));
+        // Where the caret's line is shown on the right, from the top of the page.
+        let mark = signal(None::<(f32, f32)>);
 
         let follow_source = {
             let (places, leader) = (places.clone(), leader.clone());
@@ -210,7 +268,7 @@ impl IntoView for MarkdownSplitEditor {
                 if leader.get() != Side::Source {
                     return;
                 }
-                if let Some(y) = editor.top_line().and_then(|l| places.height_of(l)) {
+                if let Some(y) = editor.top_line().and_then(|l| places.height_of(l, true)) {
                     preview.scroll_to(0.0, y);
                 }
             })
@@ -221,10 +279,21 @@ impl IntoView for MarkdownSplitEditor {
                 if leader.get() != Side::Preview {
                     return;
                 }
-                if let Some(line) = places.line_at(preview.scroll_offset().y) {
+                if let Some(line) = places.line_at(preview.scroll_offset().y, true) {
                     editor.scroll_to_line(line);
                 }
             }
+        };
+        let show_caret = {
+            let places = places.clone();
+            Rc::new(move || {
+                let at = editor
+                    .with(|e| e.line_of(e.focus))
+                    .and_then(|line| places.span_of(line))
+                    .zip(page.offset_in(preview))
+                    .map(|((a, b), p)| (a - p.y, b - p.y));
+                mark.set_if_changed(at);
+            })
         };
         let lead = |side: Side| {
             let leader = leader.clone();
@@ -234,6 +303,7 @@ impl IntoView for MarkdownSplitEditor {
         let source_side = {
             let (l1, l2, l3) = (lead(Side::Source), lead(Side::Source), lead(Side::Source));
             let follow = follow_source.clone();
+            let show = show_caret.clone();
             div()
                 .h_full()
                 .min_w(0.0)
@@ -252,6 +322,13 @@ impl IntoView for MarkdownSplitEditor {
                         .line_numbers(self.line_numbers)
                         .editor_ref(editor)
                         .on_scrolled(move |_| follow())
+                        .on_select(move |_, _| {
+                            // Now for a move, and once the right side is laid out again for an
+                            // edit.
+                            show();
+                            let show = show.clone();
+                            request_frame(move |_| show());
+                        })
                         .on_key_down(move |e| {
                             l3();
                             list_keys(editor, e);
@@ -297,10 +374,30 @@ impl IntoView for MarkdownSplitEditor {
         if let Some(f) = self.emoji {
             view = view.emoji(move |u| f(u));
         }
+        let accent = self
+            .theme
+            .link
+            .color
+            .unwrap_or(Color::from_rgb(0x0969da))
+            .with_alpha(0.6);
+        // A bar left of the text, along the caret's line.
+        let caret_bar = div()
+            .absolute()
+            .left(-14.0)
+            .w(3.0)
+            .rounded(1.5)
+            .bg(accent)
+            .select_none()
+            .dyn_style(move |s| match mark.get() {
+                Some((a, b)) => s.top(a).h((b - a).max(2.0)),
+                None => s.top(0.0).h(0.0),
+            });
         let preview_side = {
             let (l1, l2) = (lead(Side::Preview), lead(Side::Preview));
             let follow = follow_source.clone();
-            let places = places.clone();
+            let show = show_caret.clone();
+            let p1 = places.clone();
+            let p2 = places.clone();
             div()
                 .flex_1()
                 .min_w(0.0)
@@ -311,6 +408,29 @@ impl IntoView for MarkdownSplitEditor {
                 .on_pointer_down(move |_| l1())
                 .on_scroll(move |_| l2())
                 .on_scrolled(move |_| follow_preview())
+                // A double click takes the source to the line clicked, as in VS Code.
+                .on_click(move |p| {
+                    if p.click_count != 2 {
+                        return;
+                    }
+                    let y = untrack(window_scale).to_logical(p.local.y) + preview.scroll_offset().y;
+                    let Some(line) = p2.line_at(y, false) else {
+                        return;
+                    };
+                    let at = editor.with(|e| {
+                        let last = e.line_count().saturating_sub(1);
+                        e.line((line as usize).min(last)).start
+                    });
+                    if let Some(at) = at {
+                        // The source shows what the right side shows, so that the line lands
+                        // about where it was clicked.
+                        if let Some(top) = p2.line_at(preview.scroll_offset().y, true) {
+                            editor.scroll_to_line(top);
+                        }
+                        editor.select(at, at);
+                        editor.focus();
+                    }
+                })
                 .child(
                     // What is shown changes size as it is edited, or as blocks far away are laid
                     // out for the first time: the source is followed again.
@@ -318,12 +438,21 @@ impl IntoView for MarkdownSplitEditor {
                         .px(32.0)
                         .py(24.0)
                         .on_resized(move |_, h| {
-                            places.height.set(h);
+                            p1.height.set(h);
                             follow();
+                            show();
                         })
                         .flex()
                         .justify_center()
-                        .child(view.w_full().max_w(900.0)),
+                        .child(
+                            div()
+                                .relative()
+                                .w_full()
+                                .max_w(900.0)
+                                .node_ref(page)
+                                .child(view.w_full())
+                                .child(caret_bar),
+                        ),
                 )
         };
 

@@ -112,8 +112,7 @@ fn tab_rows() -> Div {
     section("Tabs")
         .child(frame(480.0).child(tabs(
             vec![tab("Flights"), tab("Trips"), tab("Explore")],
-            move || one.get(),
-            move |i| one.set(i),
+            one,
         )))
         .child(frame(480.0).child(tabs(
             vec![
@@ -121,19 +120,16 @@ fn tab_rows() -> Div {
                 icon_tab(icons::LUGGAGE, "Trips"),
                 icon_tab(icons::EXPLORE, "Explore"),
             ],
-            move || two.get(),
-            move |i| two.set(i),
+            two,
         )))
         .child(frame(480.0).child(styled_tabs(
             vec![tab("Overview"), tab("Specifications"), tab("Reviews")],
-            move || three.get(),
-            move |i| three.set(i),
+            three,
             TabsStyle::secondary(),
         )))
         .child(frame(480.0).child(styled_tabs(
             (1..=10).map(|i| tab(format!("Tab number {i}"))).collect(),
-            move || four.get(),
-            move |i| four.set(i),
+            four,
             TabsStyle::primary().scrollable(),
         )))
 }

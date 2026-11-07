@@ -18,11 +18,11 @@ cargo run --release -p anti-webui-md3e --example showcase [actions|selection|com
 | 移動 | `navigation_bar`、`short_navigation_bar`、`navigation_rail`、`wide_navigation_rail`、`drawer_item`、`tabs`、`styled_tabs`、`top_app_bar`、`top_app_bar_over`、`bottom_app_bar`、`flexible_bottom_app_bar`、`floating_toolbar`、`floating_toolbar_with_fab` |
 | 入力 | `text_field`、`outlined_text_field`、`dropdown_field`、`search_bar`、`menu`、`fab_menu`、`split_button`、`date_picker`、`date_picker_dialog`、`time_picker`、`time_picker_dialog` |
 
-どの部品も、状態は値を読むクロージャで受け、変更はアプリが行う（[19](19-buttons.md) のトグルと同じ）。
+スイッチ、チェックボックス、ラジオボタン、スライダー、タブ、ツールチップ、ダイアログとシートは、標準の部品の動き（`switch_with` など）の上に MD3E の見た目を載せている（[33](33-customization.md)）。値は `Binding`（`Signal` をそのまま渡せる）で受け、変更も部品がする。そのほかの部品は、状態を値を読むクロージャで受け、変更はアプリが行う（[19](19-buttons.md) のトグルと同じ）。
 
 ```rust
-switch(move || on.get()).on_click(move |_| on.update(|v| *v = !*v))
-slider(move || volume.get(), move |v| volume.set(v))
+switch(on)
+slider(volume)
 filter_chip("Mine", move || mine.get()).on_click(move |_| mine.update(|v| *v = !*v))
 text_field(name, TextFieldStyle::new().label("Name").supporting(|| "Required".into()))
 alert_dialog(move || open.get(), move || open.set(false), AlertDialog::new().title("Delete?"))
@@ -78,7 +78,7 @@ alert_dialog(move || open.get(), move || open.set(false), AlertDialog::new().tit
 
 `surface.rs` から状態レイヤーとリップルを `Ink` として切り出した。**動きを受ける箱と描く箱を分けられる**ので、スイッチのように「ルートでホバーを受け、つまみの周りの 40 の円に描く」部品が書ける。
 
-`following(target, spring)` は、目標が変わったときだけばねを始める値。止まっているときにフレームを要求しないという、[15](15-md3e.md) の約束をここで守る。
+core の `follow(target, spring)` は、目標が変わったときだけばねを始める値（以前はこのクレートの `following`）。止まっているときにフレームを要求しないという、[15](15-md3e.md) の約束をここで守る。
 
 ## 選択
 

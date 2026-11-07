@@ -59,39 +59,32 @@ impl Snackbar {
 }
 
 /// Where snackbars show, one at a time, in the order they came. It is copied around to show them
-/// from anywhere; its [`view`](Snackbars::view) goes once somewhere in the tree.
+/// from anywhere; its [`view`](Snackbars::view) goes once somewhere in the tree. The queue is the
+/// standard one (`MessageQueue`): the pointer on a snackbar makes it wait.
 #[derive(Clone, Copy)]
 pub struct Snackbars {
-    queue: Signal<Vec<(u64, Snackbar)>>,
-    next: Signal<u64>,
+    queue: MessageQueue<Snackbar>,
 }
 
 /// Makes a place for snackbars.
 pub fn snackbars() -> Snackbars {
     Snackbars {
-        queue: signal(Vec::new()),
-        next: signal(0),
+        queue: message_queue(),
     }
 }
 
 impl Snackbars {
     pub fn show(&self, snackbar: Snackbar) {
-        let id = self.next.get_untracked();
-        self.next.set(id + 1);
-        self.queue.update(|q| q.push((id, snackbar)));
+        self.queue.push(snackbar);
     }
 
     /// Closes the one that is showing, and the next comes.
     pub fn dismiss(&self) {
-        self.queue.update(|q| {
-            if !q.is_empty() {
-                q.remove(0);
-            }
-        });
+        self.queue.close_first();
     }
 
     fn remove(&self, id: u64) {
-        self.queue.update(|q| q.retain(|(i, _)| *i != id));
+        self.queue.close(id);
     }
 
     /// The place itself: above everything, at the bottom of the window.
@@ -100,7 +93,7 @@ impl Snackbars {
         let this = *self;
         let showing = move || {
             this.queue
-                .get()
+                .list()
                 .into_iter()
                 .take(1)
                 .collect::<Vec<(u64, Snackbar)>>()
@@ -138,9 +131,6 @@ impl Snackbars {
             closable,
             lasts,
         } = item;
-        if let Some(lasts) = lasts {
-            set_timeout(lasts, move || this.remove(id));
-        }
         let action = action.map(|(label, f)| {
             let ink = Ink::new(|c| c.inverse_primary, when(None));
             ink.paint(
@@ -195,7 +185,9 @@ impl Snackbars {
             .justify_center()
             .child(
                 TextStyle::BODY_MEDIUM.apply(
-                    div()
+                    this.queue
+                        .timed(id, lasts, div())
+                        .access(|a| a.role(Role::Status))
                         .flex()
                         .flex_row()
                         .items_center()

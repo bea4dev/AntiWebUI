@@ -1,6 +1,6 @@
 //! What arranges the rest: panes that share room, and ways through pages.
 
-use crate::theme::{Theme, ring, shared, theme};
+use crate::theme::{Theme, focus_ring, theme, themed};
 use anti_webui_core::prelude::*;
 use std::rc::Rc;
 
@@ -8,7 +8,7 @@ fn handle_sheet(t: &Theme) -> Sheet {
     Sheet::new(|s| s.bg(t.border))
         .hover(|s| s.bg(t.accent))
         .active(|s| s.bg(t.accent))
-        .focus_visible(|s| ring(s, t))
+        .focus_visible(|s| focus_ring(s, t))
         .accent_background()
 }
 
@@ -22,7 +22,7 @@ fn split(horizontal: bool, ratio: Signal<f32>, first: View, second: View) -> Div
         .flex_none()
         .focusable()
         .select_none()
-        .sheet(|| shared(handle_sheet))
+        .sheet(|| themed(handle_sheet))
         .cursor(if horizontal {
             CursorIcon::EwResize
         } else {
@@ -181,7 +181,7 @@ fn page_sheet(t: &Theme) -> Sheet {
     })
     .hover(|s| s.bg(t.hover))
     .active(|s| s.bg(t.pressed))
-    .focus_visible(|s| ring(s, t))
+    .focus_visible(|s| focus_ring(s, t))
     .disabled(|s| s.text_color(t.text_disabled).cursor(CursorIcon::Default))
 }
 
@@ -193,7 +193,7 @@ fn current_page_sheet(t: &Theme) -> Sheet {
             .text_color(t.on_accent)
             .cursor(CursorIcon::Pointer)
     })
-    .focus_visible(|s| ring(s, t))
+    .focus_visible(|s| focus_ring(s, t))
     .accent_background()
     .accent_border()
 }
@@ -227,7 +227,7 @@ pub fn pagination(page: Signal<usize>, count: impl Fn() -> usize + 'static) -> D
         .gap(2.0)
         .child(
             page_button("‹".to_owned())
-                .sheet(|| shared(page_sheet))
+                .sheet(|| themed(page_sheet))
                 .disabled(move || page.get() == 0)
                 .on_click(move |_| page.update(|p| *p = p.saturating_sub(1))),
         )
@@ -245,7 +245,7 @@ pub fn pagination(page: Signal<usize>, count: impl Fn() -> usize + 'static) -> D
                 match p {
                     Some(i) => page_button((i + 1).to_string())
                         .sheet(move || {
-                            shared(if page.get() == i {
+                            themed(if page.get() == i {
                                 current_page_sheet
                             } else {
                                 page_sheet
@@ -266,7 +266,7 @@ pub fn pagination(page: Signal<usize>, count: impl Fn() -> usize + 'static) -> D
         ))
         .child(
             page_button("›".to_owned())
-                .sheet(|| shared(page_sheet))
+                .sheet(|| themed(page_sheet))
                 .disabled({
                     let count = next_count.clone();
                     move || page.get() + 1 >= count()

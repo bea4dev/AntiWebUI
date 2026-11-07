@@ -2123,9 +2123,11 @@ impl Engine<'_> {
             };
             let mut min_main = min_s.resolve(main_base);
             let max_main = max_s.resolve(main_base);
-            // Lines are decided by what an item can't go below, which a basis of its own can be
-            // under. A basis from the content can't be, so that one saves the measuring.
-            if multi_line && min_main.is_none() && !cr.flex_basis.is_auto() {
+            // An item doesn't go below its min-content size (CSS's `min-width: auto` for flex
+            // items), which decides the lines too. A basis of its own can be under that; a basis
+            // from the content can't be, so that one saves the measuring. What scrolls has no
+            // such minimum.
+            if min_main.is_none() && !cr.flex_basis.is_auto() {
                 let visible = if row {
                     self.doc.nodes[c].computed.overflow_x == Overflow::Visible
                 } else {

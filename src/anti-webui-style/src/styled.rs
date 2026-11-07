@@ -39,6 +39,17 @@ pub trait Styled: Sized {
         self
     }
 
+    /// `flex: 1`, which is `flex: 1 1 0%` as in CSS: the item takes its share of the room there
+    /// is, whatever it holds, and doesn't go below its min-content size unless a minimum is given
+    /// or it scrolls (`min_w(0.0)` / `min_h(0.0)` let it).
+    fn flex_1(mut self) -> Self {
+        let style = self.style_mut();
+        style.flex_grow = Some(1.0);
+        style.flex_shrink = Some(1.0);
+        style.flex_basis = Some(Length::Percent(0.0));
+        self
+    }
+
     /// Sets an axis of a variable font, in the units of the font: `.font_axis(b"GRAD", 50.0)`. A
     /// font without it ignores it. The other axes stay as they are.
     fn font_axis(mut self, axis: impl Into<FontAxis>, value: f32) -> Self {
@@ -204,8 +215,6 @@ pub trait Styled: Sized {
         flex_wrap => flex_wrap = FlexWrap::Wrap;
         flex_wrap_reverse => flex_wrap = FlexWrap::WrapReverse;
         flex_nowrap => flex_wrap = FlexWrap::NoWrap;
-        /// `flex: 1 1 0`
-        flex_1 => flex_grow = 1.0;
         flex_none => flex_shrink = 0.0;
         items_start => align_items = AlignItems::Start;
         items_end => align_items = AlignItems::End;

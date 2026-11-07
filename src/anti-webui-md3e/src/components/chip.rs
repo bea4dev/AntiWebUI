@@ -83,18 +83,21 @@ pub fn styled_suggestion_chip(label: impl IntoTextSource, style: ChipStyle) -> D
     build(Kind::Suggestion, label, style, None)
 }
 
-/// A chip that is on or off, following `selected`, which the program changes in `on_click`. Without
-/// an icon of its own, a check grows in front of the label while it is on.
-pub fn filter_chip(label: impl IntoTextSource, selected: impl Fn() -> bool + 'static) -> Div {
+/// A chip that is on or off, bound to `selected`, which it flips when it is clicked. Without an icon
+/// of its own, a check grows in front of the label while it is on. The behavior is the standard
+/// one's (`toggle_with`).
+pub fn filter_chip(label: impl IntoTextSource, selected: impl Into<Binding<bool>>) -> Div {
     styled_filter_chip(label, selected, ChipStyle::new())
 }
 
 pub fn styled_filter_chip(
     label: impl IntoTextSource,
-    selected: impl Fn() -> bool + 'static,
+    selected: impl Into<Binding<bool>>,
     style: ChipStyle,
 ) -> Div {
-    build(Kind::Filter, label, style, Some(Rc::new(selected)))
+    toggle_with(selected, move |t| {
+        build(Kind::Filter, label, style, Some(Rc::new(move || t.on())))
+    })
 }
 
 /// A chip for something that was put in, like a person to send something to.
@@ -102,13 +105,15 @@ pub fn input_chip(label: impl IntoTextSource, style: ChipStyle) -> Div {
     build(Kind::Input, label, style, None)
 }
 
-/// An input chip that is on or off, following `selected`.
+/// An input chip that is on or off, bound to `selected`, which it flips when it is clicked.
 pub fn selectable_input_chip(
     label: impl IntoTextSource,
-    selected: impl Fn() -> bool + 'static,
+    selected: impl Into<Binding<bool>>,
     style: ChipStyle,
 ) -> Div {
-    build(Kind::Input, label, style, Some(Rc::new(selected)))
+    toggle_with(selected, move |t| {
+        build(Kind::Input, label, style, Some(Rc::new(move || t.on())))
+    })
 }
 
 /// Background, label, leading icon, trailing icon and outline.

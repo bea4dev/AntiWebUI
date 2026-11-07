@@ -176,11 +176,58 @@ impl Ui {
     pub fn update(&mut self) {
         crate::view::sync_fullscreen();
         self.start_requested_drag();
+        self.do_access_actions();
         self.apply_pending_focus();
         self.report_scrolled();
         self.update_layout_and_reports();
         self.sync_ime();
         self.sync_popups();
+        crate::access::tell_watchers();
+    }
+
+    /// Does what assistive technology asked for since the last update.
+    fn do_access_actions(&mut self) {
+        use crate::access::AccessAction;
+        let actions = with_doc(|d| std::mem::take(&mut d.access_actions));
+        for (id, action) in actions {
+            if !with_doc(|d| d.get(id).is_some_and(|n| !n.is_disabled())) {
+                continue;
+            }
+            match action {
+                AccessAction::Focus => {
+                    self.focus_by_keyboard = true;
+                    self.set_focus(Some(id));
+                }
+                AccessAction::Click => {
+                    self.ensure_layout();
+                    let rect = with_doc(|d| d.window_rect(id).unwrap_or_default());
+                    let center = PointF::new(
+                        rect.x as f32 + rect.width as f32 / 2.0,
+                        rect.y as f32 + rect.height as f32 / 2.0,
+                    );
+                    self.dispatch_pointer(PointerKind::Click, id, center, None, 1);
+                }
+                AccessAction::Increment | AccessAction::Decrement => {
+                    self.focus_by_keyboard = true;
+                    self.set_focus(Some(id));
+                    let up = action == AccessAction::Increment;
+                    for pressed in [true, false] {
+                        self.handle_event(WindowEvent::Key(crate::event::KeyEvent {
+                            key: Key::Named(if up {
+                                NamedKey::ArrowUp
+                            } else {
+                                NamedKey::ArrowDown
+                            }),
+                            text: None,
+                            modifiers: Modifiers::default(),
+                            pressed,
+                            repeat: false,
+                        }));
+                    }
+                }
+                AccessAction::ScrollIntoView => with_doc(|d| d.pending_scroll.push(id)),
+            }
+        }
     }
 
     fn update_layout_and_reports(&mut self) {
@@ -303,7 +350,12 @@ impl Ui {
 
     /// Tells those who wait for it where things scrolled to, in time to react in this frame.
     fn report_scrolled(&mut self) {
-        let scrolled = with_doc(|d| std::mem::take(&mut d.scrolled));
+        let scrolled = with_doc(|d| {
+            if !d.scrolled.is_empty() {
+                d.access_stale = true;
+            }
+            std::mem::take(&mut d.scrolled)
+        });
         for id in scrolled {
             let found = with_doc(|d| {
                 let n = d.get(id)?;
@@ -363,26 +415,31 @@ impl Ui {
 
     /// What is known about the refreshes of the screen, for showing video frames evenly. See
     /// `docs/design/24-video.md`.
+    #[doc(hidden)]
     pub fn set_video_timing(&mut self, timing: Option<crate::video::VideoTiming>) {
         with_doc(|d| d.videos.get_mut().set_timing(timing));
     }
 
     /// The GPU that draws, for decoders to work on. Only videos opened after this use it.
+    #[doc(hidden)]
     pub fn set_video_render_node(&mut self, node: Option<std::path::PathBuf>) {
         with_doc(|d| d.videos.get_mut().set_render_node(node));
     }
 
     /// The renderer can't read what the decoders leave behind: frames come in memory from now on.
+    #[doc(hidden)]
     pub fn video_use_memory(&mut self) {
         with_doc(|d| d.videos.get_mut().use_memory());
     }
 
     /// How many videos there are, and frames waiting to be shown, for tests.
+    #[doc(hidden)]
     pub fn video_counts(&mut self) -> (usize, usize) {
         with_doc(|d| d.videos.get_mut().counts())
     }
 
     /// Called from another thread when there are pictures for [`Ui::poll_images`].
+    #[doc(hidden)]
     pub fn set_image_waker(&mut self, waker: std::sync::Arc<dyn Fn() + Send + Sync>) {
         crate::channel::set_waker(waker.clone());
         with_doc(|d| {
@@ -1466,6 +1523,7 @@ impl Ui {
             }
             d.state.focused = next;
             d.state.focus_visible = keyboard;
+            d.access_stale = true;
             let mut handlers = Vec::new();
             for (id, focused) in [(prev, false), (next, true)] {
                 let Some(n) = id.and_then(|id| d.get(id)) else {
@@ -2170,6 +2228,7 @@ impl Document {
 
     /// `id` scrolled. Nothing moves in a scroll root's content; a scroller inside of one is part
     /// of that content.
+    #[doc(hidden)]
     pub fn mark_scrolled(&mut self, id: NodeId) {
         self.dirty.paint = true;
         self.visibility.check = true;

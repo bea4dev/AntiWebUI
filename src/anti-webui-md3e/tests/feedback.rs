@@ -310,3 +310,15 @@ fn a_determinate_circle_starts_at_the_top_and_goes_clockwise() {
         "the lower left"
     );
 }
+
+#[test]
+fn a_tooltip_shows_for_the_focus_from_the_keyboard() {
+    let mut ui = start_ui(|| {
+        div()
+            .p(100.0)
+            .child(tooltip(div().w(40.0).h(40.0).focusable(), "Tip"))
+    });
+    popups_shown(&mut ui);
+    key(&mut ui, anti_webui::core::event::NamedKey::Tab);
+    assert_eq!(popups_shown(&mut ui).len(), 1, "at once");
+}

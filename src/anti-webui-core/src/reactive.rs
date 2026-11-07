@@ -410,6 +410,7 @@ impl Owner {
 }
 
 /// Creates a new owner as a child of the current one and runs `f` inside it.
+#[doc(hidden)]
 pub fn create_child_owner<R>(f: impl FnOnce() -> R) -> (R, Owner) {
     let id = with_rt(|rt| rt.create(Kind::Root, None, None));
     let owner = Owner(id);
@@ -589,6 +590,84 @@ impl<T: 'static> Memo<T> {
     }
 }
 
+/// A value that a control shows and changes: a [`Signal`], or a pair of functions for a value that
+/// comes from somewhere else (a checkbox that stands for a group, say). Controls take
+/// `impl Into<Binding<T>>`, so a signal can be passed as it is. See `docs/design/33-customization.md`.
+pub struct Binding<T: 'static> {
+    inner: BindingInner<T>,
+}
+
+enum BindingInner<T: 'static> {
+    Signal(Signal<T>),
+    Functions {
+        get: Signal<Rc<dyn Fn() -> T>>,
+        set: Signal<Rc<dyn Fn(T)>>,
+    },
+}
+
+impl<T> Clone for BindingInner<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for BindingInner<T> {}
+
+impl<T> Clone for Binding<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for Binding<T> {}
+
+impl<T: 'static> Binding<T> {
+    /// A value that `get` reads and `set` is told to change. `get` is read where the control
+    /// shows it, so what it reads is tracked.
+    pub fn new(get: impl Fn() -> T + 'static, set: impl Fn(T) + 'static) -> Self {
+        let get: Rc<dyn Fn() -> T> = Rc::new(get);
+        let set: Rc<dyn Fn(T)> = Rc::new(set);
+        Self {
+            inner: BindingInner::Functions {
+                get: signal(get),
+                set: signal(set),
+            },
+        }
+    }
+
+    /// Reads the value, tracking the read.
+    pub fn get(&self) -> T
+    where
+        T: Clone,
+    {
+        match self.inner {
+            BindingInner::Signal(s) => s.get(),
+            BindingInner::Functions { get, .. } => get.get_untracked()(),
+        }
+    }
+
+    pub fn get_untracked(&self) -> T
+    where
+        T: Clone,
+    {
+        untrack(|| self.get())
+    }
+
+    /// Asks for the value to become `value`.
+    pub fn set(&self, value: T) {
+        match self.inner {
+            BindingInner::Signal(s) => s.set(value),
+            BindingInner::Functions { set, .. } => set.get_untracked()(value),
+        }
+    }
+}
+
+impl<T: 'static> From<Signal<T>> for Binding<T> {
+    fn from(signal: Signal<T>) -> Self {
+        Self {
+            inner: BindingInner::Signal(signal),
+        }
+    }
+}
+
 /// Runs `f` now and again whenever a reactive value it read changes.
 pub fn effect(f: impl Fn() + 'static) {
     let compute: Compute = Rc::new(move |_| {
@@ -600,6 +679,7 @@ pub fn effect(f: impl Fn() + 'static) {
 }
 
 /// Like [`effect`], but passes the previous return value to the next run.
+#[doc(hidden)]
 pub fn effect_with<T: 'static>(f: impl Fn(Option<T>) -> T + 'static) {
     let prev: Rc<RefCell<Option<T>>> = Rc::new(RefCell::new(None));
     effect(move || {

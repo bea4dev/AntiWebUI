@@ -136,6 +136,7 @@ pub enum Prop {
 
 /// The value of an animatable property.
 #[derive(Clone, Debug, PartialEq)]
+#[doc(hidden)]
 pub enum AnimatedValue {
     Number(f32),
     Color(Color),
@@ -242,6 +243,7 @@ pub fn mix_premultiplied(a: Color, b: Color, t: f32) -> Color {
 }
 
 /// One animatable property of [`ComputedStyle`].
+#[doc(hidden)]
 pub struct AnimatedField {
     pub prop: Prop,
     pub get: fn(&ComputedStyle) -> AnimatedValue,
@@ -252,6 +254,7 @@ pub struct AnimatedField {
 macro_rules! animated_fields {
     ($( $prop:ident : $($field:ident as $kind:ident),+ ;)*) => {
         /// Every animatable property.
+        #[doc(hidden)]
         pub const ANIMATED_FIELDS: &[AnimatedField] = &[
             $($(AnimatedField {
                 prop: Prop::$prop,

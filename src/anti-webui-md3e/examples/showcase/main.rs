@@ -69,14 +69,11 @@ fn app_at(current: Signal<usize>, dark_at_start: bool) -> Div {
         move |i| {
             let bar = TopAppBar::new(AppBarKind::LargeFlexible, PAGES[i].1)
                 .subtitle("Material 3 Expressive on AntiWebUI")
-                .action(
-                    icon_toggle_button(
-                        icons::DARK_MODE,
-                        move || dark.get(),
-                        IconButtonStyle::standard(),
-                    )
-                    .on_click(move |_| dark.update(|v| *v = !*v)),
-                )
+                .action(icon_toggle_button(
+                    icons::DARK_MODE,
+                    dark,
+                    IconButtonStyle::standard(),
+                ))
                 .action(icon_button(icons::MORE_VERT));
             top_app_bar_over(
                 bar,

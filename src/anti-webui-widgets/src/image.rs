@@ -1,6 +1,6 @@
 //! Pictures. See `docs/design/22-images.md`.
 
-use crate::theme::{Theme, shared};
+use crate::theme::{Theme, themed};
 use anti_webui_core::prelude::*;
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ pub fn image_view(source: impl IntoImageSource, alt: impl Into<String>) -> Img {
     img(source)
         .object_fit(ObjectFit::Cover)
         .select_none()
-        .sheet(|| shared(image_sheet))
+        .sheet(|| themed(image_sheet))
         .transition_of([Prop::ImageOpacity], FADE)
         .dyn_style(move |s| s.image_opacity(if shown.get() { 1.0 } else { 0.0 }))
         .on_decoded(move || {
@@ -85,7 +85,7 @@ pub fn avatar(name: impl Into<String>) -> Div {
         .flex_none()
         .size(AVATAR)
         .rounded(AVATAR)
-        .sheet(|| shared(avatar_sheet))
+        .sheet(|| themed(avatar_sheet))
         .child(avatar_initials(&name.into()))
 }
 
@@ -99,7 +99,7 @@ pub fn image_avatar(source: impl IntoImageSource, name: impl Into<String>) -> Im
         .size(AVATAR)
         .rounded(AVATAR)
         .object_fit(ObjectFit::Cover)
-        .sheet(|| shared(avatar_sheet))
+        .sheet(|| themed(avatar_sheet))
         .on_decoded(move || shown.set(true))
         .on_error(move |_| shown.set(false))
         .child(show(move || !shown.get(), move || avatar_initials(&name)))
@@ -117,7 +117,7 @@ pub fn media_card(source: impl IntoImageSource, alt: impl Into<String>) -> Div {
         .rounded(8.0)
         .border(1.0)
         .overflow_hidden()
-        .sheet(|| shared(media_card_sheet))
+        .sheet(|| themed(media_card_sheet))
         .child(image_view(source, alt).w_full().h(160.0).flex_none())
 }
 

@@ -3,7 +3,7 @@
 
 use super::icon::sized_icon;
 use super::menu::{MenuItem, MenuStyle, styled_menu};
-use super::surface::{When, following, when};
+use super::surface::{When, when};
 use crate::color::{ColorScheme, color_scheme};
 use crate::icons;
 use crate::motion::{fast_effects, fast_spatial, slow_effects};
@@ -226,7 +226,7 @@ fn build(
     let focused = signal(false);
     let empty = move || value.with(|v| v.is_empty());
 
-    let floated = following(
+    let floated = follow(
         move || {
             if focused.get() || !empty() {
                 1.0f32
@@ -248,14 +248,14 @@ fn build(
     };
     let line_color = {
         let colors = colors.clone();
-        following(move || colors().line, fast_effects())
+        follow(move || colors().line, fast_effects())
     };
     let label_color = {
         let colors = colors.clone();
-        following(move || colors().label, fast_effects())
+        follow(move || colors().label, fast_effects())
     };
     let thick_off = is_off.clone();
-    let thickness = following(
+    let thickness = follow(
         move || {
             if focused.get() && !thick_off() {
                 2.0f32
@@ -266,7 +266,7 @@ fn build(
         fast_spatial(),
     );
     // In the field it stays out of the way until the label has made room.
-    let hint = following(
+    let hint = follow(
         move || {
             if !empty() {
                 0.0f32
@@ -282,7 +282,7 @@ fn build(
             slow_effects()
         },
     );
-    let affix = following(
+    let affix = follow(
         move || {
             if focused.get() || !empty() || !has_label {
                 1.0f32
@@ -317,9 +317,14 @@ fn build(
     input = TextStyle::BODY_LARGE.apply(input);
     let input_off = is_off.clone();
     let input_colors = colors.clone();
+    let told = label.clone();
     let mut input = input
         .value(value)
         .read_only(read_only)
+        .access(move |a| match &told {
+            Some(label) => a.label(label.clone()),
+            None => a,
+        })
         .flex_grow(1.0)
         .flex_basis(0.0)
         .min_w(0.0)
@@ -516,7 +521,7 @@ pub fn dropdown_field(
     outlined: bool,
 ) -> Div {
     let open = signal(false);
-    let turn = following(
+    let turn = follow(
         move || if open.get() { 180.0f32 } else { 0.0 },
         fast_spatial(),
     );

@@ -221,7 +221,7 @@ fn a_toggle_button_has_the_colors_of_its_state() {
                     .bg(Color::WHITE)
                     .size_full()
                     .flex()
-                    .child(styled_toggle_button("Toggle", move || checked, style()))
+                    .child(styled_toggle_button("Toggle", signal(checked), style()))
             })
         };
         let Some(unchecked) = at(false) else {
@@ -240,12 +240,7 @@ fn a_toggle_button_has_the_colors_of_its_state() {
 #[test]
 fn a_toggle_button_changes_shape_with_its_state_and_bounces() {
     let checked = signal(false);
-    let mut ui = start_ui(move || {
-        div().flex().child(
-            toggle_button("Toggle", move || checked.get())
-                .on_click(move |_| checked.update(|c| *c = !*c)),
-        )
-    });
+    let mut ui = start_ui(move || div().flex().child(toggle_button("Toggle", checked)));
     let round = the_box(&settle(&mut ui)).radii[0];
     assert_eq!(round, 20.0);
     pointer_at(&mut ui, 30.0, 20.0);
@@ -269,7 +264,7 @@ fn a_toggle_button_changes_shape_with_its_state_and_bounces() {
 
 #[test]
 fn pressing_a_checked_toggle_button_takes_the_shape_of_a_press() {
-    let mut ui = start_ui(|| div().flex().child(toggle_button("Toggle", || true)));
+    let mut ui = start_ui(|| div().flex().child(toggle_button("Toggle", signal(true))));
     assert_eq!(the_box(&settle(&mut ui)).radii[0], 12.0);
     pointer_at(&mut ui, 30.0, 20.0);
     pointer(&mut ui, 30.0, 20.0, true);
@@ -281,7 +276,7 @@ fn square_goes_the_other_way() {
     let mut ui = start_ui(|| {
         div().flex().child(styled_toggle_button(
             "Toggle",
-            || false,
+            signal(false),
             ButtonStyle::filled().square(),
         ))
     });
@@ -290,7 +285,7 @@ fn square_goes_the_other_way() {
         let mut ui = start_ui(|| {
             div().flex().child(styled_toggle_button(
                 "Toggle",
-                || true,
+                signal(true),
                 ButtonStyle::filled().square(),
             ))
         });
@@ -301,7 +296,7 @@ fn square_goes_the_other_way() {
 
 #[test]
 fn a_toggle_button_that_starts_checked_starts_in_shape_and_asks_for_nothing() {
-    let mut ui = start_ui(|| div().flex().child(toggle_button("Toggle", || true)));
+    let mut ui = start_ui(|| div().flex().child(toggle_button("Toggle", signal(true))));
     let scene = ui.paint(Instant::now());
     assert_eq!(the_box(&scene).radii[0], 12.0);
     assert!(!ui.needs_redraw());
@@ -312,10 +307,9 @@ fn an_outlined_toggle_button_stays_as_wide_when_checked() {
     let checked = signal(false);
     let place = node_ref();
     let mut ui = start_ui(move || {
-        div().flex().child(
-            styled_toggle_button("Toggle", move || checked.get(), ButtonStyle::outlined())
-                .node_ref(place),
-        )
+        div()
+            .flex()
+            .child(styled_toggle_button("Toggle", checked, ButtonStyle::outlined()).node_ref(place))
     });
     let _ = settle(&mut ui);
     let before = place.rect().unwrap();
@@ -345,7 +339,7 @@ fn the_icon_of_a_toggle_fills_in_when_checked() {
     let mut ui = start_ui(move || {
         div().flex().child(styled_toggle_button(
             "Toggle",
-            move || checked.get(),
+            checked,
             ButtonStyle::filled().icon(icons::FAVORITE),
         ))
     });
@@ -467,7 +461,7 @@ fn an_icon_toggle_takes_the_color_of_the_checked_state() {
             let mut ui = start_ui(move || {
                 div()
                     .flex()
-                    .child(icon_toggle_button(icons::ADD, move || checked, style()))
+                    .child(icon_toggle_button(icons::ADD, signal(checked), style()))
             });
             boxes(&settle(&mut ui))
                 .first()
@@ -493,7 +487,7 @@ fn an_icon_toggle_does_not_bounce_and_its_icon_fills_in() {
     let mut ui = start_ui(move || {
         div().flex().child(icon_toggle_button(
             icons::FAVORITE,
-            move || checked.get(),
+            checked,
             IconButtonStyle::filled(),
         ))
     });
@@ -990,11 +984,11 @@ fn a_page_of_all_of_them_at_rest_asks_for_no_frames() {
             .flex()
             .flex_col()
             .child(styled_button("A", ButtonStyle::filled().icon(icons::ADD)))
-            .child(toggle_button("B", || true))
+            .child(toggle_button("B", signal(true)))
             .child(icon_button(icons::ADD))
             .child(icon_toggle_button(
                 icons::ADD,
-                || true,
+                signal(true),
                 IconButtonStyle::filled(),
             ))
             .child(fab(icons::ADD))

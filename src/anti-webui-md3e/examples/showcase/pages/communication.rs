@@ -25,7 +25,7 @@ pub fn page() -> Div {
 fn progress() -> Div {
     let value = signal(0.6f32);
     section("Progress")
-        .child(slider(move || value.get(), move |v| value.set(v)).w(320.0))
+        .child(slider(value).w(320.0))
         .child(
             row()
                 .gap(24.0)

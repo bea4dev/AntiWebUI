@@ -21,6 +21,7 @@ use std::sync::Arc;
 pub use crate::svg_file::parse;
 
 pub use crate::geometry::Affine as Transform;
+#[doc(hidden)]
 pub use kurbo;
 
 /// How a `view_box` goes in the box when their proportions differ.

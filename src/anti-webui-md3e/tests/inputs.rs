@@ -556,3 +556,31 @@ fn the_items_of_a_fab_menu_open_to_the_width_of_their_labels() {
         .unwrap();
     assert!(step < full / 3, "in one movement: {widths:?}");
 }
+
+#[test]
+fn the_keys_go_through_a_menu_past_what_is_disabled_and_choosing_closes_it() {
+    let open = signal(false);
+    let chosen = signal("");
+    let mut ui = start_ui(move || {
+        div().w(100.0).h(40.0).child(menu(
+            move || open.get(),
+            move || open.set(false),
+            vec![vec![
+                menu_item("One").on_click(move || chosen.set("one")),
+                menu_item("Off")
+                    .disabled_when(|| true)
+                    .on_click(move || chosen.set("off")),
+                menu_item("Three").on_click(move || chosen.set("three")),
+            ]],
+        ))
+    });
+    settle(&mut ui);
+    open.set(true);
+    open_menu(&mut ui);
+    settle(&mut ui);
+    key(&mut ui, NamedKey::ArrowDown);
+    key(&mut ui, NamedKey::ArrowDown);
+    key(&mut ui, NamedKey::Enter);
+    assert_eq!(chosen.get(), "three", "past what is disabled");
+    assert!(!open.get(), "choosing closes it");
+}

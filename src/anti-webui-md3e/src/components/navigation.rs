@@ -2,7 +2,7 @@
 //! and selected icons fill in on top of that. See `docs/design/20-md3e-components.md`.
 
 use super::badge::{badged, text_badge};
-use super::surface::{Ink, When, filling_icon, focus_ring, following, progress_of};
+use super::surface::{Ink, When, filling_icon, focus_ring, progress_of};
 use crate::color::{ColorScheme, color_scheme};
 use crate::icons::Symbol;
 use crate::motion::{default_effects, default_spatial, fast_effects, fast_spatial};
@@ -72,7 +72,7 @@ fn item_state(
 ) -> ItemState {
     let disabled = super::surface::when(disabled);
     let (on, off) = (selected.clone(), disabled.clone());
-    let icon_color = following(
+    let icon_color = follow(
         move || {
             let c = color_scheme();
             if off() {
@@ -86,7 +86,7 @@ fn item_state(
         default_effects(),
     );
     let (on, off) = (selected.clone(), disabled.clone());
-    let label_color = following(
+    let label_color = follow(
         move || {
             let c = color_scheme();
             if off() {
@@ -153,6 +153,8 @@ fn indicator(state: &ItemState, w: f32, h: f32, from_middle: bool) -> Div {
 }
 
 fn listening(state: &ItemState, node: Div) -> Div {
+    let on = state.selected.clone();
+    let node = node.access(move |a| a.role(Role::Button).selected(on()));
     let off = state.disabled.clone();
     let disabled = state.disabled.clone();
     let focused = state.ink.focused;
@@ -432,7 +434,7 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 
 fn wide_item(item: NavItem, selected: When, q: Animated<f32>) -> Div {
     let label_on = selected.clone();
-    let label_color = following(
+    let label_color = follow(
         move || {
             let c = color_scheme();
             match (label_on(), q.get() < 0.5) {
@@ -544,7 +546,7 @@ pub fn drawer_item(
 ) -> Div {
     let selected: When = Rc::new(selected);
     let on = selected.clone();
-    let background = following(
+    let background = follow(
         move || {
             if on() {
                 color_scheme().secondary_container
@@ -555,7 +557,7 @@ pub fn drawer_item(
         fast_effects(),
     );
     let on = selected.clone();
-    let content = following(
+    let content = follow(
         move || {
             let c = color_scheme();
             if on() {
