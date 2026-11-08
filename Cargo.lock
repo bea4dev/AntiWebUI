@@ -85,6 +85,7 @@ dependencies = [
  "anti-webui-video",
  "anti-webui-wayland",
  "anti-webui-wgpu",
+ "anti-webui-windows",
  "anti-webui-x11",
  "image",
  "libc",
@@ -314,6 +315,12 @@ dependencies = [
 [[package]]
 name = "anti-webui-windows"
 version = "0.1.0"
+dependencies = [
+ "anti-webui-core",
+ "raw-window-handle",
+ "windows",
+ "windows-core",
+]
 
 [[package]]
 name = "anti-webui-x11"

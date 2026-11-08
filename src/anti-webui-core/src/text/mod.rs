@@ -76,6 +76,7 @@ impl TextSystem {
             .filter(|s| !s.is_empty())
             .or_else(|| std::env::var("LC_CTYPE").ok().filter(|s| !s.is_empty()))
             .or_else(|| std::env::var("LANG").ok())
+            .or_else(user_locale)
             .and_then(|l| {
                 let tag = l.split(['.', '@']).next()?.replace('_', "-");
                 parley::Language::parse(&tag).ok()
@@ -171,8 +172,35 @@ impl TextSystem {
         else {
             return;
         };
-        if !FallbackKey::new(script, self.locale.as_ref()).is_tracked() {
+        let with_locale = FallbackKey::new(script, self.locale.as_ref());
+        if !with_locale.is_tracked() {
             let _ = self.fcx.collection.fallback_families(script);
+        }
+        #[cfg(windows)]
+        {
+            self.add_symbol_fallbacks(FallbackKey::from(script));
+            if with_locale.is_tracked() {
+                self.add_symbol_fallbacks(with_locale);
+            }
+        }
+    }
+
+    /// DirectWrite gives one family for a script, where fontconfig gives a list: Segoe UI for
+    /// Latin, which has none of the arrows, shapes and symbols that text has in any script. Those go
+    /// after it, as Chromium does on Windows (see "フォールバック" in `docs/design/04-text.md`).
+    #[cfg(windows)]
+    fn add_symbol_fallbacks(&mut self, key: FallbackKey) {
+        const SYMBOLS: [&str; 3] = ["Segoe UI Symbol", "Segoe UI Emoji", "Cambria Math"];
+        let collection = &mut self.fcx.collection;
+        // The system's first: what is set for a key is all there is, and it isn't asked after.
+        let have: Vec<_> = collection.fallback_families(key).collect();
+        let add: Vec<_> = SYMBOLS
+            .iter()
+            .filter_map(|name| collection.family_id(name))
+            .filter(|id| !have.contains(id))
+            .collect();
+        if !add.is_empty() {
+            collection.append_fallbacks(key, add.into_iter());
         }
     }
 
@@ -233,6 +261,27 @@ impl TextSystem {
         }
         out
     }
+}
+
+/// The user's locale where it isn't in the environment: Windows sets no `LANG`, and without it
+/// Japanese text would get Chinese forms of its kanji.
+#[cfg(windows)]
+fn user_locale() -> Option<String> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetUserDefaultLocaleName(name: *mut u16, len: i32) -> i32;
+    }
+    // LOCALE_NAME_MAX_LENGTH.
+    let mut buf = [0u16; 85];
+    // SAFETY: a buffer of the length given.
+    let n = unsafe { GetUserDefaultLocaleName(buf.as_mut_ptr(), buf.len() as i32) };
+    // The length counts the terminating zero.
+    (n > 1).then(|| String::from_utf16_lossy(&buf[..n as usize - 1]))
+}
+
+#[cfg(not(windows))]
+fn user_locale() -> Option<String> {
+    None
 }
 
 thread_local! {
@@ -982,6 +1031,11 @@ mod tests {
             .collection
             .fallback_families(FallbackKey::new(han, ts.locale.as_ref()))
             .collect();
-        assert_eq!(own, after);
+        // On Windows the symbol fonts go after it.
+        if cfg!(windows) {
+            assert!(after.starts_with(&own), "{own:?} first in {after:?}");
+        } else {
+            assert_eq!(own, after);
+        }
     }
 }

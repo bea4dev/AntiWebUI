@@ -245,3 +245,25 @@ fn paint_only_changes_skip_layout() {
     });
     ui.update();
 }
+
+#[test]
+fn empty_text_takes_no_width() {
+    // As in a checkbox: a mark next to text that is empty while the mark shows.
+    let t = node_ref();
+    let m = node_ref();
+    let _ui = mount((400, 100), Scale(210), move || {
+        div()
+            .w(16.0)
+            .h(16.0)
+            .border(1.0)
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(12.0)
+            .child(div().node_ref(t).child(text(String::new())))
+            .child(div().w(8.0).h(2.0).node_ref(m))
+    });
+    assert_eq!(rect(t).width, 0);
+    // 16 x 1.75 = 28 wide, and the 14 of the mark in the middle.
+    assert_eq!(rect(m).x, 7);
+}

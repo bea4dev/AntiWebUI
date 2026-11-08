@@ -1837,7 +1837,13 @@ impl Engine<'_> {
             Some(w) => w,
             None => {
                 data.layout.break_lines(None);
-                let max = data.layout.size().width;
+                // parley lays out empty text as a space, for the height of its line. Like an
+                // empty text node in a browser, it takes no width.
+                let max = if data.text.is_empty() {
+                    0
+                } else {
+                    data.layout.size().width
+                };
                 match avail_w {
                     // What doesn't wrap is as wide as it is, and sticks out if it has to.
                     Some(a) if a < max && wraps => {

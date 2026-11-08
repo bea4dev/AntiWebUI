@@ -1,5 +1,6 @@
 //! Runs the UI on whichever backend there is: Wayland or X11 (see "バックエンドの選び方" in
-//! `docs/design/35-platform-x11.md`), or AppKit on macOS (`38-platform-macos.md`), with as many
+//! `docs/design/35-platform-x11.md`), AppKit on macOS (`38-platform-macos.md`), or Win32 on Windows
+//! (`39-platform-windows.md`), with as many
 //! windows as the program opens, on the threads it chooses (see `docs/design/36-multi-window.md`).
 
 use super::App;
@@ -414,6 +415,8 @@ handler_for!(
 handler_for!(anti_webui_x11::X11Handler, anti_webui_x11::Ctx<'_>);
 #[cfg(all(target_os = "macos", feature = "macos"))]
 handler_for!(anti_webui_macos::MacHandler, anti_webui_macos::Ctx<'_>);
+#[cfg(all(windows, feature = "windows"))]
+handler_for!(anti_webui_windows::WinHandler, anti_webui_windows::Ctx<'_>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Backend {
@@ -423,6 +426,21 @@ enum Backend {
     X11,
     #[cfg(all(target_os = "macos", feature = "macos"))]
     MacOS,
+    #[cfg(all(windows, feature = "windows"))]
+    Windows,
+}
+
+/// Win32 on Windows, which has nothing else.
+#[cfg(windows)]
+fn choose_backend() -> Result<Backend, BoxError> {
+    match std::env::var("ANTIWEBUI_BACKEND").ok().as_deref() {
+        None | Some("" | "windows") => {}
+        Some(other) => return Err(format!("ANTIWEBUI_BACKEND={other} isn't built in").into()),
+    }
+    #[cfg(feature = "windows")]
+    return Ok(Backend::Windows);
+    #[cfg(not(feature = "windows"))]
+    Err("the windows feature is off".into())
 }
 
 /// AppKit on macOS, which has nothing else.
@@ -538,6 +556,8 @@ enum Link {
     X11(anti_webui_x11::ParentLink),
     #[cfg(all(target_os = "macos", feature = "macos"))]
     MacOS(anti_webui_macos::ParentLink),
+    #[cfg(all(windows, feature = "windows"))]
+    Windows(anti_webui_windows::ParentLink),
 }
 
 /// The open windows of every thread, for the windows that open above them.
@@ -697,6 +717,10 @@ platform_for!(x11, X11);
 use anti_webui_macos as macos;
 #[cfg(all(target_os = "macos", feature = "macos"))]
 platform_for!(macos, MacOS);
+#[cfg(all(windows, feature = "windows"))]
+use anti_webui_windows as windows;
+#[cfg(all(windows, feature = "windows"))]
+platform_for!(windows, Windows);
 
 /// The loop of a thread with windows: it ends when they are all closed, or with the first window
 /// of the program.
@@ -1001,6 +1025,7 @@ fn run_on<P: Platform, V: IntoView>(app: App, root: impl FnOnce() -> V) -> Resul
 /// are layer surfaces (see `docs/design/37-wayland-shell.md`).
 ///
 /// [`quit`]: anti_webui_core::window::quit
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn run_shell(app: App, root: impl FnOnce()) -> Result<(), BoxError> {
     #[cfg(all(target_os = "linux", feature = "wayland"))]
     {
@@ -1024,6 +1049,15 @@ pub fn run_shell(app: App, root: impl FnOnce()) -> Result<(), BoxError> {
 }
 
 pub fn run<V: IntoView>(app: App, root: impl FnOnce() -> V) -> Result<(), BoxError> {
+    // The main thread has 1 MiB on Windows, and 8 on Linux and macOS: the UI gets as much, on this
+    // thread (see "スタック" in `docs/design/39-platform-windows.md`).
+    #[cfg(all(windows, feature = "windows"))]
+    return anti_webui_windows::with_stack(anti_webui_windows::UI_STACK, || run_here(app, root));
+    #[cfg(not(all(windows, feature = "windows")))]
+    run_here(app, root)
+}
+
+fn run_here<V: IntoView>(app: App, root: impl FnOnce() -> V) -> Result<(), BoxError> {
     // While the platform and the window are set up.
     anti_webui_core::text::prepare_system_fonts();
     let backend = choose_backend()?;
@@ -1034,6 +1068,8 @@ pub fn run<V: IntoView>(app: App, root: impl FnOnce() -> V) -> Result<(), BoxErr
         Backend::X11 => anti_webui_x11::server_main_device(),
         #[cfg(all(target_os = "macos", feature = "macos"))]
         Backend::MacOS => None,
+        #[cfg(all(windows, feature = "windows"))]
+        Backend::Windows => None,
     });
     #[cfg(feature = "video")]
     anti_webui_video::install();
@@ -1045,5 +1081,7 @@ pub fn run<V: IntoView>(app: App, root: impl FnOnce() -> V) -> Result<(), BoxErr
         Backend::X11 => run_on::<anti_webui_x11::Session, V>(app, root),
         #[cfg(all(target_os = "macos", feature = "macos"))]
         Backend::MacOS => run_on::<anti_webui_macos::Session, V>(app, root),
+        #[cfg(all(windows, feature = "windows"))]
+        Backend::Windows => run_on::<anti_webui_windows::Session, V>(app, root),
     }
 }

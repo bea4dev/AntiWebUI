@@ -100,6 +100,13 @@ impl Presenter {
             }
         }
         let (gpu, window) = surface_gpu(ctx)?;
+        if debug {
+            let info = gpu.adapter.get_info();
+            eprintln!(
+                "[anti-webui] wgpu surface on {} ({:?}, {})",
+                info.name, info.backend, info.driver
+            );
+        }
         Ok(Self {
             targets: HashMap::from([(
                 SurfaceId::Window,
@@ -265,8 +272,8 @@ impl Presenter {
                     ctx.request_presentation(surface, t.token);
                 }
                 ctx.prepare_commit(surface);
-                match window.present(&self.gpu, &scene) {
-                    FrameResult::Presented => {
+                match window.present_damaged(&self.gpu, &scene, &damage) {
+                    (FrameResult::Presented, drawn) => {
                         ctx.committed(surface);
                         if let Some(t) = &mut trace {
                             t.buffer_ready = t.diff_done;
@@ -275,9 +282,12 @@ impl Presenter {
                             t.submitted = now;
                             t.committed = now;
                         }
-                        Ok(Some(full_stats(&scene)))
+                        Ok(Some(Stats {
+                            repaint: drawn,
+                            ..full_stats(&scene)
+                        }))
                     }
-                    FrameResult::Skipped => Ok(None),
+                    (FrameResult::Skipped, _) => Ok(None),
                 }
             }
             TargetKind::Own(t) => self

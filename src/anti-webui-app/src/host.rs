@@ -5,12 +5,11 @@ use anti_webui_core::event::{ClipboardKind, DragAction};
 use anti_webui_core::geometry::{PointI, RectI, SizeI};
 use anti_webui_core::layer::LayerChange;
 use anti_webui_core::platform::{
-    BufferEvent, BufferId, CursorIcon, DmabufFeedback, DmabufPlaneDesc, DragOffer, ImeState,
-    PopupId, PopupParams, Presentation, SurfaceId, SyncPoints, TimelineId,
+    BorrowedFd, BufferEvent, BufferId, CursorIcon, DmabufFeedback, DmabufPlaneDesc, DragOffer,
+    ImeState, PopupId, PopupParams, Presentation, SurfaceId, SyncPoints, TimelineId,
 };
 use anti_webui_core::window::ResizeEdge;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
-use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -293,3 +292,5 @@ host_for!(anti_webui_wayland::Ctx<'_>);
 host_for!(anti_webui_x11::Ctx<'_>);
 #[cfg(all(target_os = "macos", feature = "macos"))]
 host_for!(anti_webui_macos::Ctx<'_>);
+#[cfg(all(windows, feature = "windows"))]
+host_for!(anti_webui_windows::Ctx<'_>);

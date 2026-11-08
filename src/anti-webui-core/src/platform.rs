@@ -3,8 +3,29 @@
 use crate::event::{ClipboardKind, DragAction, DragActions};
 use crate::geometry::{PointI, RectI, SizeI};
 pub use anti_webui_style::CursorIcon;
-use std::os::fd::BorrowedFd;
 use std::sync::Arc;
+
+/// A file descriptor, for what is about dmabufs and their synchronization.
+#[doc(hidden)]
+#[cfg(unix)]
+pub use std::os::fd::BorrowedFd;
+
+/// Where there are no file descriptors, like Windows: nothing can make one, so that what is about
+/// dmabufs reads the same on every OS and is never called.
+#[doc(hidden)]
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug)]
+pub struct BorrowedFd<'a> {
+    never: std::convert::Infallible,
+    _fd: std::marker::PhantomData<&'a ()>,
+}
+
+#[cfg(not(unix))]
+impl BorrowedFd<'_> {
+    pub fn never(self) -> ! {
+        match self.never {}
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ImePurpose {

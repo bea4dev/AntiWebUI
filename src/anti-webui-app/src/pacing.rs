@@ -7,7 +7,11 @@ use crate::vsync::FrameClock;
 use anti_webui_core::platform::{Presentation, SurfaceId};
 use anti_webui_core::settings::{FrameAdvance, settings};
 use std::collections::VecDeque;
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
+/// Where there are no sync files, there are never fences for when the GPU is done.
+#[cfg(not(unix))]
+type OwnedFd = std::convert::Infallible;
 use std::time::{Duration, Instant};
 
 /// More than this has no use: each frame ahead is one more refresh of latency.

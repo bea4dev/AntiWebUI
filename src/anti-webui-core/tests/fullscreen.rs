@@ -317,7 +317,7 @@ fn a_window_already_on_all_of_the_screen_stays_there() {
     exit_fullscreen();
     ui.update();
     assert!(!target.is_fullscreen());
-    assert_eq!(asked(&mut ui), []);
+    assert_eq!(asked(&mut ui), Vec::<bool>::new());
     assert_eq!(target.rect().unwrap().width, 30);
 }
 
@@ -330,7 +330,7 @@ fn the_system_taking_the_window_back_ends_it() {
     asked(&mut ui);
     window_went(&mut ui, false);
     assert!(!target.is_fullscreen());
-    assert_eq!(asked(&mut ui), []);
+    assert_eq!(asked(&mut ui), Vec::<bool>::new());
     assert_eq!(target.rect().unwrap().width, 30);
 }
 
@@ -395,7 +395,7 @@ fn escape_can_be_kept_from_ending_it() {
     window_went(&mut ui, true);
     asked(&mut ui);
     key(&mut ui, NamedKey::Escape);
-    assert_eq!(asked(&mut ui), []);
+    assert_eq!(asked(&mut ui), Vec::<bool>::new());
     assert!(target.is_fullscreen());
 }
 
