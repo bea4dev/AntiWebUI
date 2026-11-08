@@ -30,6 +30,7 @@ use anti_webui_core::damage::{self, Damage};
 use anti_webui_core::platform::SurfaceId;
 use anti_webui_core::scene::Scene;
 use anti_webui_wgpu::{FrameResult, Gpu, GpuError, WindowRenderer};
+use raw_window_handle::RawWindowHandle;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -39,6 +40,13 @@ use std::rc::Rc;
 pub(crate) struct Presenter {
     // Dropped before `gpu`.
     targets: HashMap<SurfaceId, Target>,
+    /// Surfaces of popup windows that the platform keeps for the next popups, by window. Making
+    /// one takes 50 ms on Windows (see "ポップアップ" in `docs/design/39-platform-windows.md`).
+    #[cfg(windows)]
+    spares: Vec<(RawWindowHandle, WindowRenderer)>,
+    /// One spare was made ahead of time, or tried; after that, popups that close leave theirs.
+    #[cfg(windows)]
+    spare_prepared: bool,
     own: Option<OwnPresenter>,
     gpu: Rc<Gpu>,
     debug: bool,
@@ -49,6 +57,9 @@ pub(crate) struct Presenter {
 /// What is kept per surface.
 struct Target {
     kind: TargetKind,
+    /// The window a GPU surface is on.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    window: Option<RawWindowHandle>,
     /// The last presented scene, to diff the next one against.
     prev: Option<Scene>,
 }
@@ -59,6 +70,11 @@ enum TargetKind {
     Surface(WindowRenderer),
     Own(OwnTarget),
 }
+
+/// How long after the window's first frame a spare popup surface is made, if nothing else is drawn
+/// before.
+#[cfg(windows)]
+const SPARE_AFTER: std::time::Duration = std::time::Duration::from_millis(300);
 
 fn debug_enabled() -> bool {
     std::env::var_os("ANTIWEBUI_DEBUG_DAMAGE").is_some_and(|v| v != "0")
@@ -86,6 +102,10 @@ impl Presenter {
                     }
                     return Ok(Self {
                         targets: HashMap::new(),
+                        #[cfg(windows)]
+                        spares: Vec::new(),
+                        #[cfg(windows)]
+                        spare_prepared: false,
                         own: Some(d),
                         gpu,
                         debug,
@@ -112,9 +132,14 @@ impl Presenter {
                 SurfaceId::Window,
                 Target {
                     kind: TargetKind::Surface(window),
+                    window: None,
                     prev: None,
                 },
             )]),
+            #[cfg(windows)]
+            spares: Vec::new(),
+            #[cfg(windows)]
+            spare_prepared: false,
             own: None,
             gpu: Rc::new(gpu),
             debug,
@@ -207,12 +232,54 @@ impl Presenter {
         let Some(target) = self.targets.remove(&surface) else {
             return;
         };
+        // The platform keeps the window for the next popup.
+        #[cfg(windows)]
+        let target = match target {
+            Target {
+                kind: TargetKind::Surface(w),
+                window: Some(window),
+                ..
+            } if matches!(surface, SurfaceId::Popup(_)) => {
+                self.spares.push((window, w));
+                return;
+            }
+            t => t,
+        };
         if let Some(d) = &mut self.own {
             let target = match target.kind {
                 TargetKind::Own(t) => Some(t),
                 TargetKind::Surface(_) => None,
             };
             d.forget(ctx, renderer_target(surface), target);
+        }
+    }
+
+    /// The surface kept for this popup window, if there is one.
+    fn take_spare(&mut self, window: RawWindowHandle) -> Option<WindowRenderer> {
+        #[cfg(windows)]
+        if let Some(i) = self.spares.iter().position(|(w, _)| *w == window) {
+            return Some(self.spares.swap_remove(i).1);
+        }
+        let _ = window;
+        None
+    }
+
+    /// Makes a surface ahead of time for a window the platform keeps for the next popup, so that
+    /// the first popup doesn't wait for one either.
+    #[cfg(windows)]
+    fn prepare_spare(&mut self, ctx: &mut impl Host) {
+        if std::mem::replace(&mut self.spare_prepared, true) {
+            return;
+        }
+        let Some((display, window)) = ctx.spare_popup_window() else {
+            return;
+        };
+        // Room for most menus without making the swapchain again.
+        const SIDE: u32 = 512;
+        // SAFETY: the platform keeps the window until the presenter is gone.
+        match unsafe { self.gpu.add_window(display, window, SIDE, SIDE) } {
+            Ok(w) => self.spares.push((window, w)),
+            Err(e) => eprintln!("[anti-webui] no GPU surface for a spare popup: {e}"),
         }
     }
 
@@ -223,15 +290,20 @@ impl Presenter {
             return self.failed(ctx, e);
         }
         if !self.targets.contains_key(&surface) {
-            let kind = match &self.own {
-                Some(d) => TargetKind::Own(d.new_target()),
+            let mut window = None;
+            let kind = match self.own.as_ref().map(OwnPresenter::new_target) {
+                Some(t) => TargetKind::Own(t),
                 None => {
                     let size = (scene.width.max(1), scene.height.max(1));
                     let created = match ctx.raw_handles(surface) {
-                        // SAFETY: the surface outlives the target: see `forget`.
-                        Some((display, window)) => unsafe {
-                            self.gpu.add_window(display, window, size.0, size.1)
-                        },
+                        Some((display, w)) => {
+                            window = Some(w);
+                            match self.take_spare(w) {
+                                Some(spare) => Ok(spare),
+                                // SAFETY: the surface outlives the target: see `forget`.
+                                None => unsafe { self.gpu.add_window(display, w, size.0, size.1) },
+                            }
+                        }
                         None => Err(GpuError::NoSurface),
                     };
                     match created {
@@ -243,7 +315,14 @@ impl Presenter {
                     }
                 }
             };
-            self.targets.insert(surface, Target { kind, prev: None });
+            self.targets.insert(
+                surface,
+                Target {
+                    kind,
+                    window,
+                    prev: None,
+                },
+            );
         }
         let target = self.targets.get_mut(&surface).expect("just inserted");
         if ctx.take_exposed(surface) {
@@ -258,6 +337,10 @@ impl Presenter {
         if damage.is_empty() && !unsent {
             if self.debug {
                 eprintln!("[anti-webui] {surface:?}: frame unchanged");
+            }
+            #[cfg(windows)]
+            if surface == SurfaceId::Window {
+                self.prepare_spare(ctx);
             }
             return Presented::Unchanged;
         }
@@ -315,7 +398,20 @@ impl Presenter {
                     t.pixels = scene.width as i64 * scene.height as i64;
                     t.buffers = stats.buffers;
                 }
+                let again = target.prev.is_some();
                 target.prev = Some(scene);
+                // Once the window is on the screen, rather than holding up its first frame: with
+                // its next frame, or a moment after it if nothing changes.
+                #[cfg(windows)]
+                if surface == SurfaceId::Window {
+                    if again {
+                        self.prepare_spare(ctx);
+                    } else {
+                        ctx.request_redraw_after(SPARE_AFTER);
+                    }
+                }
+                #[cfg(not(windows))]
+                let _ = again;
                 Presented::Yes
             }
             Ok(None) => {
@@ -365,6 +461,7 @@ impl Presenter {
                     SurfaceId::Window,
                     Target {
                         kind: TargetKind::Surface(window),
+                        window: None,
                         prev: None,
                     },
                 );

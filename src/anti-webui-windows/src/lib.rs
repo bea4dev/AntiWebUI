@@ -377,6 +377,9 @@ impl Ctx<'_> {
 
     /// To call after something else presented to the surface.
     pub fn committed(&mut self, surface: SurfaceId) {
+        if let SurfaceId::Popup(id) = surface {
+            self.state.popup_presented(id);
+        }
         if surface == SurfaceId::Window {
             self.frames.presented();
             // SAFETY: our window.
@@ -400,16 +403,28 @@ impl Ctx<'_> {
             SurfaceId::Popup(id) => self.state.popups.get(&id)?.hwnd,
             SurfaceId::DragIcon => return None,
         };
-        let mut window = Win32WindowHandle::new(NonZeroIsize::new(hwnd.0 as isize)?);
-        // SAFETY: plain query of this program's module.
-        if let Ok(module) = unsafe { GetModuleHandleW(None) } {
-            window.hinstance = NonZeroIsize::new(module.0 as isize);
-        }
-        Some((
-            RawDisplayHandle::Windows(WindowsDisplayHandle::new()),
-            RawWindowHandle::Win32(window),
-        ))
+        handles_of(hwnd)
     }
+
+    /// A hidden window kept for the next popup, to make a GPU surface on ahead of time. Valid
+    /// until the window closes.
+    pub fn spare_popup_window(&mut self) -> Option<(RawDisplayHandle, RawWindowHandle)> {
+        handles_of(self.state.spare_popup_window()?)
+    }
+}
+
+fn handles_of(
+    hwnd: windows::Win32::Foundation::HWND,
+) -> Option<(RawDisplayHandle, RawWindowHandle)> {
+    let mut window = Win32WindowHandle::new(NonZeroIsize::new(hwnd.0 as isize)?);
+    // SAFETY: plain query of this program's module.
+    if let Ok(module) = unsafe { GetModuleHandleW(None) } {
+        window.hinstance = NonZeroIsize::new(module.0 as isize);
+    }
+    Some((
+        RawDisplayHandle::Windows(WindowsDisplayHandle::new()),
+        RawWindowHandle::Win32(window),
+    ))
 }
 
 /// A window of a [`Session`].

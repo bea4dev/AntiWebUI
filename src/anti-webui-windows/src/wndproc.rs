@@ -7,7 +7,7 @@ use anti_webui_core::event::{
     ImeUpdate, KeyEvent, PointerButton, ScrollPhase, ScrollSource, WindowEvent,
 };
 use anti_webui_core::geometry::{PointF, PointI, Scale, SizeI};
-use anti_webui_core::platform::{CursorIcon, ImeState, PopupId, PopupKind};
+use anti_webui_core::platform::{CursorIcon, ImeState, PopupKind};
 use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -197,8 +197,8 @@ pub(crate) fn scale_of(dpi: u32) -> Scale {
 /// What a window procedure knows of its window: the `Shared` of the window it is or belongs to.
 pub(crate) struct WindowData {
     pub shared: Rc<Shared>,
-    /// For a popup: which, and its origin in window coordinates.
-    pub popup: Option<PopupId>,
+    /// A popup (or a window kept for one), with its origin in window coordinates.
+    pub popup: bool,
     pub origin: Cell<PointI>,
     pub kind: Cell<PopupKind>,
     /// `TrackMouseEvent` was asked for since the pointer came.
@@ -206,14 +206,21 @@ pub(crate) struct WindowData {
 }
 
 impl WindowData {
-    pub fn new(shared: Rc<Shared>, popup: Option<(PopupId, PopupKind)>) -> Box<Self> {
+    pub fn new(shared: Rc<Shared>, popup: Option<PopupKind>) -> Box<Self> {
         Box::new(Self {
             shared,
-            popup: popup.map(|p| p.0),
+            popup: popup.is_some(),
             origin: Cell::new(PointI::default()),
-            kind: Cell::new(popup.map_or(PopupKind::Menu, |p| p.1)),
+            kind: Cell::new(popup.unwrap_or(PopupKind::Menu)),
             tracking: Cell::new(false),
         })
+    }
+
+    /// A popup window was kept, and goes to another popup.
+    pub fn reuse(&self, kind: PopupKind) {
+        self.kind.set(kind);
+        self.origin.set(PointI::default());
+        self.tracking.set(false);
     }
 
     /// The `WindowData` of one of our windows.
@@ -309,7 +316,7 @@ fn handle(
     lparam: LPARAM,
 ) -> Option<LRESULT> {
     let shared = &*data.shared;
-    let main = data.popup.is_none();
+    let main = !data.popup;
     match msg {
         WM_CLOSE => {
             if main {

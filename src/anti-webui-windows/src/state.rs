@@ -29,6 +29,8 @@ use windows::core::HSTRING;
 
 pub(crate) struct Popup {
     pub hwnd: HWND,
+    /// Its first frame came, and so it is on the screen.
+    shown: bool,
     pub params: PopupParams,
     /// Its origin in window coordinates (physical), as the core knows it.
     pub origin: PointI,
@@ -49,6 +51,9 @@ pub(crate) struct State {
     manipulation: Option<Manipulation>,
     /// Since when the window is hidden from the screen while its first frame comes.
     cloaked: Option<Instant>,
+    /// Hidden popup windows kept for the next popups, with the GPU surfaces the presenter keeps
+    /// on them (see "ポップアップ" in `docs/design/39-platform-windows.md`).
+    spare_popups: Vec<HWND>,
 }
 
 /// How long a window stays hidden waiting for its first frame, if that never comes.
@@ -121,6 +126,7 @@ impl State {
             restore: None,
             manipulation,
             cloaked: None,
+            spare_popups: Vec::new(),
         };
         if client {
             // The system's shadow and corners stay with a frame of a pixel in the client area.
@@ -436,8 +442,11 @@ impl State {
         ime::set(self.hwnd, &self.shared, None);
         self.shared.viewport.borrow_mut().take();
         self.manipulation = None;
-        // SAFETY: our window; the window procedure frees what it holds.
+        // SAFETY: our windows; the window procedure frees what each holds.
         unsafe {
+            for hwnd in self.spare_popups.drain(..) {
+                let _ = DestroyWindow(hwnd);
+            }
             let _ = DestroyWindow(self.hwnd);
         }
         self.shared.windows.borrow_mut().clear();
@@ -511,10 +520,40 @@ impl State {
             .parent
             .and_then(|p| self.popups.get(&p))
             .map_or(self.hwnd, |p| p.hwnd);
-        let data = Box::into_raw(WindowData::new(
-            self.shared.clone(),
-            Some((id, params.kind)),
-        ));
+        let hwnd = match self.spare_popups.pop() {
+            Some(hwnd) => {
+                // SAFETY: our window, kept hidden; for a top-level window this is its owner.
+                unsafe {
+                    if let Some(data) = WindowData::of(hwnd) {
+                        data.reuse(params.kind);
+                    }
+                    SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner.0 as isize);
+                }
+                Some(hwnd)
+            }
+            None => self.new_popup_window(owner, params.kind),
+        };
+        let Some(hwnd) = hwnd else {
+            self.shared.push(WindowEvent::PopupDismissed(id));
+            return;
+        };
+        self.shared.windows.borrow_mut().push(hwnd);
+        self.popups.insert(
+            id,
+            Popup {
+                hwnd,
+                shown: false,
+                params,
+                origin: PointI::default(),
+            },
+        );
+        // It shows with its first frame: until then it has nothing, or the last popup's picture.
+        self.place_popup(id);
+    }
+
+    /// A hidden window for popups.
+    fn new_popup_window(&self, owner: HWND, kind: PopupKind) -> Option<HWND> {
+        let data = Box::into_raw(WindowData::new(self.shared.clone(), Some(kind)));
         let ex_style = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP;
         // SAFETY: the class is registered; `data` goes to the window, which frees it.
         let hwnd = unsafe {
@@ -525,33 +564,50 @@ impl State {
                 WS_POPUP | WS_CLIPCHILDREN,
                 0,
                 0,
-                params.buffer.width.max(1),
-                params.buffer.height.max(1),
+                1,
+                1,
                 Some(owner),
                 None,
                 Some(instance()),
                 Some(data.cast()),
             )
         };
-        let Ok(hwnd) = hwnd else {
-            // SAFETY: the window didn't take it.
-            drop(unsafe { Box::from_raw(data) });
-            self.shared.push(WindowEvent::PopupDismissed(id));
+        match hwnd {
+            Ok(hwnd) => Some(hwnd),
+            Err(_) => {
+                // SAFETY: the window didn't take it.
+                drop(unsafe { Box::from_raw(data) });
+                None
+            }
+        }
+    }
+
+    /// A window kept for the next popup, made if there is none.
+    pub fn spare_popup_window(&mut self) -> Option<HWND> {
+        if self.spare_popups.is_empty() {
+            let hwnd = self.new_popup_window(self.hwnd, PopupKind::Menu)?;
+            self.spare_popups.push(hwnd);
+        }
+        self.spare_popups.last().copied()
+    }
+
+    /// The popup's first frame went to it: it can show.
+    pub fn popup_presented(&mut self, id: PopupId) {
+        let Some(p) = self.popups.get_mut(&id).filter(|p| !p.shown) else {
             return;
         };
-        self.shared.windows.borrow_mut().push(hwnd);
-        self.popups.insert(
-            id,
-            Popup {
-                hwnd,
-                params,
-                origin: PointI::default(),
-            },
-        );
-        self.place_popup(id);
-        // SAFETY: our window.
+        p.shown = true;
+        // SAFETY: our window. A kept window may be under others of the same owner.
         unsafe {
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(
+                p.hwnd,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
         }
     }
 
@@ -615,10 +671,12 @@ impl State {
             return;
         };
         self.shared.windows.borrow_mut().retain(|w| *w != p.hwnd);
-        // SAFETY: our window; the window procedure frees what it holds.
+        // Kept for the next popup, with the GPU surface on it: making those takes 50 ms.
+        // SAFETY: our window.
         unsafe {
-            let _ = DestroyWindow(p.hwnd);
+            let _ = ShowWindow(p.hwnd, SW_HIDE);
         }
+        self.spare_popups.push(p.hwnd);
     }
 
     pub fn popups_attached_to(&self, id: PopupId) -> Vec<PopupId> {

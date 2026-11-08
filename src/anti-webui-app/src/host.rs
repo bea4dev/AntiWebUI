@@ -90,6 +90,11 @@ pub(crate) trait Host {
         surface: &anti_webui_wgpu::iosurface::IOSurfaceRef,
     ) -> Option<BufferId>;
 
+    /// A window kept hidden for the next popup, made if there is none, to make a GPU surface on
+    /// ahead of time. Valid until the window closes.
+    #[cfg(windows)]
+    fn spare_popup_window(&mut self) -> Option<(RawDisplayHandle, RawWindowHandle)>;
+
     fn show_popup(&mut self, params: PopupParams);
     fn update_popup(&mut self, params: PopupParams);
     fn close_popup(&mut self, id: PopupId);
@@ -245,6 +250,10 @@ macro_rules! host_for {
                 surface: &anti_webui_wgpu::iosurface::IOSurfaceRef,
             ) -> Option<BufferId> {
                 self.create_iosurface_buffer(surface)
+            }
+            #[cfg(windows)]
+            fn spare_popup_window(&mut self) -> Option<(RawDisplayHandle, RawWindowHandle)> {
+                self.spare_popup_window()
             }
             fn show_popup(&mut self, params: PopupParams) {
                 self.show_popup(params)
