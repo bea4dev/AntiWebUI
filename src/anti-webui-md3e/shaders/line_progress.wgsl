@@ -28,7 +28,7 @@ fn bar(p: vec2<f32>, tail: f32, head: f32, half: f32, w: f32, y: f32, amplitude:
     for (var i = 0; i < 2; i++) {
         let on_line = y + amplitude * sin(x * k - params.phase);
         let slope = amplitude * k * cos(x * k - params.phase);
-        x = clamp(x + slope * (p.y - on_line) / (1.0 + slope * slope), lo, hi);
+        x = clamp(x + (p.x - x + slope * (p.y - on_line)) / (1.0 + slope * slope), lo, hi);
     }
     return distance(p, vec2<f32>(x, y + amplitude * sin(x * k - params.phase))) - half;
 }

@@ -36,7 +36,7 @@ fn paint(f: Frag) -> vec4<f32> {
         for (var i = 0; i < 2; i++) {
             let y = wave(x, size.y, amplitude, k);
             let slope = amplitude * k * cos(x * k - params.phase);
-            x = clamp(x + slope * (f.px.y - y) / (1.0 + slope * slope), half, head);
+            x = clamp(x + (f.px.x - x + slope * (f.px.y - y)) / (1.0 + slope * slope), half, head);
         }
         let d = distance(f.px, vec2<f32>(x, wave(x, size.y, amplitude, k))) - half;
         color = over(params.line * aw_coverage(d, f.pixel), color);

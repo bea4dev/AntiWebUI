@@ -26,10 +26,16 @@ fn arc(p: vec2<f32>, start: f32, sweep: f32, r: f32, a: f32, half: f32) -> f32 {
     let angle = atan2(p.y, p.x);
     let along = fract((angle - start) / TAU) * TAU;
     if (along <= sweep) {
-        let on_it = radius_at(angle, r, a);
-        let slope = -a * params.waves * sin(params.waves * angle - params.phase);
-        let d = abs(length(p) - on_it) / sqrt(1.0 + slope * slope / (on_it * on_it));
-        return d - half;
+        // The closest point on the arc, in a few steps from the one at the same angle.
+        var t = angle;
+        for (var i = 0; i < 3; i++) {
+            let dir = vec2<f32>(cos(t), sin(t));
+            let at = radius_at(t, r, a);
+            let tangent = -a * params.waves * sin(params.waves * t - params.phase) * dir
+                + at * vec2<f32>(-dir.y, dir.x);
+            t += dot(p - at * dir, tangent) / dot(tangent, tangent);
+        }
+        return distance(p, on_curve(t, r, a)) - half;
     }
     let first = distance(p, on_curve(start, r, a));
     let last = distance(p, on_curve(start + sweep, r, a));

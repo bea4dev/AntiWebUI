@@ -40,7 +40,7 @@ fn wavy(p: vec2<f32>, b: f32, mid: f32, s: f32, pixel: f32) -> f32 {
     for (var i = 0; i < 3; i++) {
         let y = mid + amplitude * sin(x * k - params.phase);
         let slope = amplitude * k * cos(x * k - params.phase);
-        x = clamp(x + slope * (p.y - y) / (1.0 + slope * slope), half, head);
+        x = clamp(x + (p.x - x + slope * (p.y - y)) / (1.0 + slope * slope), half, head);
     }
     let d = distance(p, vec2<f32>(x, mid + amplitude * sin(x * k - params.phase))) - half;
     return aw_coverage(d, pixel);
