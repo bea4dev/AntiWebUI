@@ -1217,3 +1217,31 @@ fn a_handler_taking_the_motion_gets_all_of_the_inertia() {
     // 90 pixels by hand and the rest of the curve.
     assert!((panned.get() - 362.0).abs() < 2.0, "{}", panned.get());
 }
+
+#[test]
+fn a_row_that_scrolls_sideways_does_not_scroll_down() {
+    let row = node_ref();
+    let mut ui = mount(move || {
+        div().child(
+            div()
+                .w(300.0)
+                .h(60.0)
+                .overflow_x_scroll()
+                .node_ref(row)
+                .flex()
+                .flex_row()
+                .children((0..20).map(|_| div().w(80.0).h(120.0).flex_none())),
+        )
+    });
+    let p = center(row.rect().unwrap());
+    send(
+        &mut ui,
+        p,
+        (1.0, 1.0),
+        ScrollSource::Wheel,
+        ScrollPhase::Single,
+        0,
+    );
+    assert!(scroll_x(row) > 0);
+    assert_eq!(scroll_y(row), 0);
+}

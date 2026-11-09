@@ -413,6 +413,14 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Scrolls sideways only, like a row of chips or pictures.
+    fn overflow_x_scroll(mut self) -> Self {
+        let style = self.style_mut();
+        style.overflow_x = Some(Overflow::Scroll);
+        style.overflow_y = Some(Overflow::Hidden);
+        self
+    }
+
     fn overflow_clip(mut self) -> Self {
         let style = self.style_mut();
         style.overflow_x = Some(Overflow::Hidden);
