@@ -7,9 +7,9 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Instant;
 
-const STROKE: f32 = 4.0;
-const AMPLITUDE: f32 = 3.0;
-const WAVELENGTH: f32 = 40.0;
+pub(super) const STROKE: f32 = 4.0;
+pub(super) const AMPLITUDE: f32 = 3.0;
+pub(super) const WAVELENGTH: f32 = 40.0;
 const GAP: f32 = 4.0;
 const STOP: f32 = 4.0;
 const HEIGHT: f32 = 10.0;

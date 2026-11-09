@@ -2,6 +2,7 @@
 //! values and handles move with the springs of the motion scheme. See
 //! `docs/design/20-md3e-components.md`.
 
+use super::progress::{AMPLITUDE, STROKE, WAVELENGTH};
 use super::surface::{When, focus_ring, when};
 use crate::color::color_scheme;
 use crate::motion::{fast_effects, fast_spatial};
@@ -18,6 +19,8 @@ const HANDLE: f32 = 4.0;
 const HANDLE_NARROW: f32 = 2.0;
 const INSET: f32 = HANDLE / 2.0;
 const LABEL_BOX: f32 = 96.0;
+/// The handle of [`SliderStyle::wavy`].
+const WAVY_HANDLE: f32 = 24.0;
 
 #[derive(ShaderParams, Clone, Copy)]
 struct Track {
@@ -156,16 +159,19 @@ impl SliderStyle {
         self
     }
 
-    /// What is covered is a wavy line, as in the wavy progress indicator, rather than a bar. It
-    /// swells and flows while the pointer is on the slider or it is held, and lies still otherwise,
-    /// asking for no frames. Only for a slider from the start: a range or a centered slider stays
-    /// straight.
+    /// Looks like the wavy progress bar: what is covered is its wavy line, and the rest of the track
+    /// is as thin as the line, with a smaller handle to go with it. The wave flows while the pointer
+    /// is on the slider or it is held, and lies still otherwise, asking for no frames. Only for a
+    /// slider from the start: a range or a centered slider stays straight. `track` and
+    /// `handle_height` after this change the track and the handle.
     pub fn wavy(self) -> Self {
-        self.wave(3.0, 28.0, 4.0)
+        self.wave(AMPLITUDE, WAVELENGTH, STROKE)
+            .track(STROKE)
+            .handle_height(WAVY_HANDLE)
     }
 
-    /// [`wavy`](Self::wavy) with the height of the wave from its middle, its length and the
-    /// thickness of its line.
+    /// A wavy line with the height of the wave from its middle, its length and the thickness of its
+    /// line, on the track as it is otherwise.
     pub fn wave(mut self, amplitude: f32, wavelength: f32, stroke: f32) -> Self {
         self.wave = Some(Wave {
             amplitude,
@@ -299,10 +305,9 @@ fn look(state: SliderState, style: SliderStyle) -> Div {
         )
     });
 
-    // How much the wave is up, and where it is along its length.
+    // Where the wave is along its length.
     let wavy = wave.is_some();
     let lively = move || wavy && (state.hovered() || state.held().is_some());
-    let swell = follow(move || if lively() { 1.0f32 } else { 0.6 }, fast_spatial());
     let phase = signal(0.0f32);
     let flowing = memo(lively);
     let latest = Rc::new(Cell::new(0u64));
@@ -461,7 +466,7 @@ fn look(state: SliderState, style: SliderStyle) -> Div {
                 stops: if stops { 1.0 } else { 0.0 },
                 vertical: if vertical { 1.0 } else { 0.0 },
                 stroke: wave.map_or(0.0, |w| w.stroke),
-                amplitude: wave.map_or(0.0, |w| w.amplitude * swell.get().max(0.0)),
+                amplitude: wave.map_or(0.0, |w| w.amplitude),
                 wavelength: wave.map_or(1.0, |w| w.wavelength),
                 phase: phase.get(),
             })
