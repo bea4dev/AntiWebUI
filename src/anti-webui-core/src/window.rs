@@ -748,8 +748,19 @@ pub fn roots() -> Vec<WindowId> {
     ROOTS.with(|r| r.borrow().iter().map(|(id, _)| WindowId(*id)).collect())
 }
 
+/// How often a root runs what asked for a frame. A root has no surface to pace it, so this stands in
+/// for a display of 120 Hz.
+const ROOT_FRAME: std::time::Duration = std::time::Duration::from_micros(8_333);
+
+thread_local! {
+    /// When the roots of this thread last ran their frame callbacks.
+    static ROOT_FRAME_AT: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
 /// Does for the roots of this thread what a `Ui` does for its window: takes what came through
-/// channels and runs the timers that are due. Frame callbacks never run in a root.
+/// channels, runs the timers that are due, and runs what asked for a frame. With no surface to
+/// pace them, frames come every [`ROOT_FRAME`] while something asks for them, so that what a
+/// root animates (a theme, a value the windows show) moves too.
 #[doc(hidden)]
 pub fn run_roots(now: std::time::Instant) {
     let roots = roots();
@@ -757,17 +768,39 @@ pub fn run_roots(now: std::time::Instant) {
         return;
     }
     batch(crate::channel::drain);
+    let frame_due = ROOT_FRAME_AT
+        .with(Cell::get)
+        .is_none_or(|at| now.saturating_duration_since(at) >= ROOT_FRAME);
+    let mut ran = false;
     for id in roots {
-        within(id.0, || crate::animation::run_timers(now));
+        within(id.0, || {
+            crate::animation::run_timers(now);
+            if frame_due && crate::animation::frame_requested() {
+                crate::animation::run_frame_callbacks(now);
+                ran = true;
+            }
+        });
+    }
+    if ran {
+        ROOT_FRAME_AT.with(|at| at.set(Some(now)));
     }
 }
 
-/// When the next timer of a root of this thread is due.
+/// When the roots of this thread next have something to do: a timer that is due, or a frame.
 #[doc(hidden)]
 pub fn roots_deadline() -> Option<std::time::Instant> {
+    let frame = roots()
+        .into_iter()
+        .any(|id| within(id.0, crate::animation::frame_requested))
+        .then(|| {
+            ROOT_FRAME_AT
+                .with(Cell::get)
+                .map_or_else(std::time::Instant::now, |at| at + ROOT_FRAME)
+        });
     roots()
         .into_iter()
         .filter_map(|id| within(id.0, crate::animation::next_timer))
+        .chain(frame)
         .min()
 }
 

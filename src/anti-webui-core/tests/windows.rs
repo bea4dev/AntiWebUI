@@ -291,3 +291,45 @@ fn a_window_can_follow_the_size_of_what_is_in_it() {
     ui.update();
     assert_eq!(ui.content_size(), Some(SizeI::new(SIZE.width, 45)));
 }
+
+#[test]
+fn a_thread_without_a_window_animates_on_frames_of_its_own() {
+    use anti_webui_core::window::{roots_deadline, run_roots, stop_root, take_threads};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+    let frames = Arc::new(AtomicU32::new(0));
+    let f = frames.clone();
+    let _thread = spawn_ui_thread(move || {
+        fn again(frames: Arc<AtomicU32>) {
+            request_frame(move |_| {
+                if frames.fetch_add(1, Ordering::Relaxed) < 2 {
+                    again(frames);
+                }
+            });
+        }
+        again(f);
+    });
+    let mut asked = take_threads();
+    let id = asked[0].handle.id();
+    asked.remove(0).start();
+    let start = Instant::now();
+    // A frame is wanted now, and then one a display's frame after the last.
+    assert!(roots_deadline().is_some_and(|at| at <= Instant::now()));
+    run_roots(start);
+    assert_eq!(frames.load(Ordering::Relaxed), 1);
+    run_roots(start + Duration::from_millis(2));
+    assert_eq!(
+        frames.load(Ordering::Relaxed),
+        1,
+        "not before the next frame is due"
+    );
+    let next = roots_deadline().expect("another frame is wanted");
+    assert!(next > start && next <= start + Duration::from_millis(9));
+    run_roots(start + Duration::from_millis(9));
+    run_roots(start + Duration::from_millis(18));
+    assert_eq!(frames.load(Ordering::Relaxed), 3);
+    // Nothing more is asked for: the thread can sleep.
+    assert_eq!(roots_deadline(), None);
+    assert!(stop_root(id));
+}
