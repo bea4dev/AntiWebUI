@@ -127,6 +127,7 @@ dependencies = [
  "icu_properties",
  "image",
  "kurbo",
+ "libc",
  "log",
  "moxcms",
  "parley",

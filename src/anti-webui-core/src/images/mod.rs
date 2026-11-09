@@ -166,6 +166,22 @@ impl Bitmap {
     }
 }
 
+/// Decodes a picture on this thread, at the smallest of its halves that is no smaller than
+/// `at_least` pixels, for a program that wants its pixels rather than to show it: the colors of a
+/// wallpaper, say. They are read with [`Bitmap::with_levels`], or [`Bitmap::frame`] for an
+/// animation. It takes as long as decoding does, so it belongs in a [`task`](crate::task::task).
+pub fn decode_bitmap(
+    source: impl Into<ImageSource>,
+    at_least: (u32, u32),
+) -> Result<Bitmap, String> {
+    let source = source.into();
+    worker::keep_heaps_small();
+    let info = decode::probe(&source)?;
+    let decoded = decode::decode(&source, planned_size(&info, at_least, false));
+    worker::give_back_memory();
+    decoded.map(|d| Bitmap::new(d).0)
+}
+
 /// A picture to show in a frame.
 pub(crate) struct Showing {
     pub bitmap: Arc<Bitmap>,

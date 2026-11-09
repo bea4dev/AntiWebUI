@@ -89,6 +89,8 @@ struct Queue {
     decodes: Vec<Job>,
     threads: usize,
     idle: usize,
+    /// Something has been decoded since memory was last given back.
+    decoded: bool,
 }
 
 #[derive(Default)]
@@ -106,6 +108,7 @@ fn most_threads() -> usize {
 }
 
 pub(crate) fn submit(job: Job) {
+    keep_heaps_small();
     let pool = POOL.get_or_init(Pool::default);
     let mut queue = pool.queue.lock().expect("no panics in here");
     match job.task {
@@ -129,6 +132,12 @@ fn run(pool: &'static Pool) {
     loop {
         let job = queue.probes.pop_front().or_else(|| queue.decodes.pop());
         let Some(job) = job else {
+            if std::mem::take(&mut queue.decoded) {
+                drop(queue);
+                give_back_memory();
+                queue = pool.queue.lock().expect("no panics in here");
+                continue;
+            }
             queue.idle += 1;
             let (back, timeout) = pool
                 .work
@@ -142,11 +151,47 @@ fn run(pool: &'static Pool) {
             }
             continue;
         };
+        let decodes = matches!(job.task, Task::Decode { .. });
         drop(queue);
         work(job);
         queue = pool.queue.lock().expect("no panics in here");
+        queue.decoded |= decodes;
     }
 }
+
+/// The allocator keeps what was freed in the middle of its heaps for later. After decoding, that
+/// is the full size of every picture, for as long as the program runs: it goes back to the system
+/// once there is nothing left to decode.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub(crate) fn give_back_memory() {
+    // SAFETY: it only looks at the allocator's own state, under its locks.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub(crate) fn give_back_memory() {}
+
+/// What is left free at the end of a thread's heap only goes back to the system past a threshold,
+/// which glibc raises as big blocks come and go, up to 64 MiB a thread: for decoders, that is
+/// tens of megabytes each for good. Fixed, it stays at a few. Done once, before the first
+/// decode; a program that sets these itself afterwards has the last word.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub(crate) fn keep_heaps_small() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        const LIMIT: libc::c_int = 4 << 20;
+        // SAFETY: it only sets numbers the allocator reads under its locks.
+        unsafe {
+            libc::mallopt(libc::M_MMAP_THRESHOLD, LIMIT);
+            libc::mallopt(libc::M_TRIM_THRESHOLD, LIMIT);
+        }
+    });
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub(crate) fn keep_heaps_small() {}
 
 fn work(job: Job) {
     if job.cancelled.load(Ordering::Relaxed) {

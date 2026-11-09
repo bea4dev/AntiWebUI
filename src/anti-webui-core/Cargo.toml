@@ -26,3 +26,6 @@ icu_properties.workspace = true
 slotmap.workspace = true
 unicode-segmentation.workspace = true
 read-fonts.workspace = true
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc.workspace = true

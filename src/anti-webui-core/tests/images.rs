@@ -994,3 +994,19 @@ fn an_animation_that_plays_once_stops_on_its_last_frame() {
     assert_eq!(ui.next_deadline(now), None);
     assert_eq!(the_picture(&mut ui).frame, 1);
 }
+
+#[test]
+fn a_program_can_decode_a_picture_for_its_pixels() {
+    let bitmap = anti_webui_core::images::decode_bitmap(png(100, 60), (20, 20)).unwrap();
+    // 100x60 halves to 50x30 and 25x15; the last is smaller than asked for.
+    assert_eq!((bitmap.width(), bitmap.height()), (50, 30));
+    let mut first = Vec::new();
+    assert!(bitmap.with_levels(|i, size, pixels| {
+        if i == 0 {
+            assert_eq!(size, (50, 30));
+            first = pixels[..4].to_vec();
+        }
+    }));
+    // 200 at an alpha of 200, premultiplied.
+    assert_eq!(first, [157, 157, 157, 200]);
+}

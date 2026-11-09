@@ -6,12 +6,24 @@ use anti_webui_style::ImageSource;
 use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageFormat, ImageReader};
 use std::borrow::Cow;
 use std::io::{BufRead, BufReader, Cursor, Seek};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 /// Bigger than this doesn't fit in a texture everywhere, and nobody can see the difference.
 const MAX_SIDE: u32 = 8192;
 /// What all the frames of one animation may take. See "what isn't done" in the design document.
 const MAX_ANIMATION_BYTES: usize = 256 << 20;
+/// A picture that takes this much at its full size is decoded on its own. See "メモリ" in the
+/// design document.
+const HEAVY_BYTES: usize = 32 << 20;
+
+/// Held while a heavy picture is decoded: a folder of big photos coming in at once would otherwise
+/// take a few hundred megabytes at the same time.
+fn heavy((w, h): (u32, u32)) -> Option<MutexGuard<'static, ()>> {
+    static ONE: Mutex<()> = Mutex::new(());
+    (w as usize * h as usize * 4 >= HEAVY_BYTES)
+        .then(|| ONE.lock().unwrap_or_else(|e| e.into_inner()))
+}
 
 /// The size to decode a picture at, to show it at `wanted` physical pixels: the smallest of its
 /// halves that is no smaller than that, or exactly `wanted` for what is drawn from a description.
@@ -171,14 +183,30 @@ fn decode_raster(bytes: &[u8], target: (u32, u32)) -> Result<Decoded, String> {
         _ => {}
     }
     let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
+    let _heavy = heavy(decoder.dimensions());
     let orientation = decoder.orientation().map_err(|e| e.to_string())?;
     let profile = decoder.icc_profile().map_err(|e| e.to_string())?;
     let mut picture = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
     picture.apply_orientation(orientation);
     let opaque = !picture.color().has_alpha();
-    let picture = picture.into_rgba8();
-    let size = picture.dimensions();
-    let mut pixels = picture.into_raw();
+    let (mut pixels, size) = match picture {
+        // Most photos: halved while they are three bytes a pixel, which at their full size is a
+        // quarter less to hold than four.
+        DynamicImage::ImageRgb8(rgb) => {
+            let size = rgb.dimensions();
+            let (rgb, size) = shrink::<3>(rgb.into_raw(), size, target);
+            let rgba = rgb
+                .chunks_exact(3)
+                .flat_map(|p| [p[0], p[1], p[2], 255])
+                .collect();
+            (rgba, size)
+        }
+        picture => {
+            let picture = picture.into_rgba8();
+            let size = picture.dimensions();
+            (picture.into_raw(), size)
+        }
+    };
     if let Some(profile) = profile {
         to_srgb(&mut pixels, &profile);
     }
@@ -208,7 +236,7 @@ fn animation(
         let size = picture.dimensions();
         let mut pixels = picture.into_raw();
         premultiply(&mut pixels);
-        let (pixels, _) = shrink(pixels, size, target);
+        let (pixels, _) = shrink::<4>(pixels, size, target);
         total += pixels.len();
         out.push((pixels, delay));
         if total > MAX_ANIMATION_BYTES {
@@ -287,9 +315,10 @@ fn premultiply(pixels: &mut [u8]) -> bool {
 
 /// One step down: half the size, with each new pixel taking two neighbours on an even side and
 /// three (1, 2, 1) on an odd side so that nothing is left out, like Skia's mipmaps.
-fn halved(src: &[u8], (w, h): (u32, u32)) -> (Vec<u8>, (u32, u32)) {
+fn halved<const N: usize>(src: &[u8], (w, h): (u32, u32)) -> (Vec<u8>, (u32, u32)) {
     let (dw, dh) = ((w / 2).max(1), (h / 2).max(1));
-    let row = |y: u32| &src[(y * w * 4) as usize..((y + 1) * w * 4) as usize];
+    let stride = w as usize * N;
+    let row = |y: u32| &src[y as usize * stride..(y as usize + 1) * stride];
     // Horizontally first, in sums four times as big as the bytes.
     let sums = |y: u32, out: &mut [u32]| {
         let r = row(y);
@@ -298,21 +327,21 @@ fn halved(src: &[u8], (w, h): (u32, u32)) -> (Vec<u8>, (u32, u32)) {
                 *o = *v as u32 * 4;
             }
         } else if w % 2 == 0 {
-            for (o, v) in out.chunks_exact_mut(4).zip(r.chunks_exact(8)) {
-                for c in 0..4 {
-                    o[c] = (v[c] as u32 + v[c + 4] as u32) * 2;
+            for (o, v) in out.chunks_exact_mut(N).zip(r.chunks_exact(2 * N)) {
+                for c in 0..N {
+                    o[c] = (v[c] as u32 + v[c + N] as u32) * 2;
                 }
             }
         } else {
-            for (x, o) in out.chunks_exact_mut(4).enumerate() {
-                let i = x * 8;
-                for c in 0..4 {
-                    o[c] = r[i + c] as u32 + r[i + c + 4] as u32 * 2 + r[i + c + 8] as u32;
+            for (x, o) in out.chunks_exact_mut(N).enumerate() {
+                let i = x * 2 * N;
+                for c in 0..N {
+                    o[c] = r[i + c] as u32 + r[i + c + N] as u32 * 2 + r[i + c + 2 * N] as u32;
                 }
             }
         }
     };
-    let width = (dw * 4) as usize;
+    let width = dw as usize * N;
     let mut out = vec![0u8; width * dh as usize];
     let mut a = vec![0u32; width];
     let mut b = vec![0u32; width];
@@ -342,21 +371,25 @@ fn halved(src: &[u8], (w, h): (u32, u32)) -> (Vec<u8>, (u32, u32)) {
     (out, (dw, dh))
 }
 
-/// Halves until it is at `target`.
-fn shrink(mut pixels: Vec<u8>, mut size: (u32, u32), target: (u32, u32)) -> (Vec<u8>, (u32, u32)) {
+/// Halves until it is at `target`. `N` is the bytes of a pixel.
+fn shrink<const N: usize>(
+    mut pixels: Vec<u8>,
+    mut size: (u32, u32),
+    target: (u32, u32),
+) -> (Vec<u8>, (u32, u32)) {
     while (size.0 > target.0 || size.1 > target.1) && (size.0 > 1 || size.1 > 1) {
-        (pixels, size) = halved(&pixels, size);
+        (pixels, size) = halved::<N>(&pixels, size);
     }
     (pixels, size)
 }
 
 /// A picture at `target` with what is needed to show it smaller.
 fn still(pixels: Vec<u8>, size: (u32, u32), target: (u32, u32), opaque: bool) -> Decoded {
-    let (pixels, size) = shrink(pixels, size, target);
+    let (pixels, size) = shrink::<4>(pixels, size, target);
     let mut levels = vec![pixels];
     let mut at = size;
     while at.0 > 1 || at.1 > 1 {
-        let (next, next_size) = halved(levels.last().expect("there is the first"), at);
+        let (next, next_size) = halved::<4>(levels.last().expect("there is the first"), at);
         levels.push(next);
         at = next_size;
     }
@@ -515,7 +548,7 @@ mod tests {
             (2, 3),
             (3, 2),
         ] {
-            let (out, size) = halved(&solid(w, h, [10, 200, 77, 255]), (w, h));
+            let (out, size) = halved::<4>(&solid(w, h, [10, 200, 77, 255]), (w, h));
             assert_eq!(size, ((w / 2).max(1), (h / 2).max(1)));
             assert_eq!(out, solid(size.0, size.1, [10, 200, 77, 255]), "{w}x{h}");
         }
@@ -524,9 +557,28 @@ mod tests {
     #[test]
     fn halving_averages_neighbours() {
         let src = [0, 0, 0, 255, 100, 100, 100, 255];
-        assert_eq!(halved(&src, (2, 1)).0, [50, 50, 50, 255]);
+        assert_eq!(halved::<4>(&src, (2, 1)).0, [50, 50, 50, 255]);
         let src = [0, 0, 0, 255, 100, 100, 100, 255, 200, 200, 200, 255];
-        assert_eq!(halved(&src, (3, 1)).0, [100, 100, 100, 255]);
+        assert_eq!(halved::<4>(&src, (3, 1)).0, [100, 100, 100, 255]);
+    }
+
+    #[test]
+    fn three_bytes_a_pixel_halve_like_four() {
+        let rgba: Vec<u8> = (0..7 * 5 * 4)
+            .map(|i| if i % 4 == 3 { 255 } else { (i * 37 % 256) as u8 })
+            .collect();
+        let rgb: Vec<u8> = rgba
+            .chunks_exact(4)
+            .flat_map(|p| [p[0], p[1], p[2]])
+            .collect();
+        let (four, size) = shrink::<4>(rgba, (7, 5), (1, 1));
+        let (three, same) = shrink::<3>(rgb, (7, 5), (1, 1));
+        assert_eq!(size, same);
+        let three: Vec<u8> = three
+            .chunks_exact(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect();
+        assert_eq!(three, four);
     }
 
     #[test]
