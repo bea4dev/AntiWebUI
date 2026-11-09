@@ -1335,7 +1335,7 @@ impl Ui {
             Drag::Edit(id) => with_doc(|d| {
                 if let Some(e) = d.get_mut(id).and_then(Node::edit_mut) {
                     e.drag = None;
-                    if e.has_selection() {
+                    if e.has_selection() && !e.is_masked() {
                         let text = e.selected_text().to_owned();
                         d.request(PlatformRequest::SetClipboard {
                             kind: ClipboardKind::Primary,
@@ -2169,7 +2169,8 @@ impl Ui {
     fn edit_clipboard(&mut self, id: NodeId, cut: bool) {
         let outcome = with_doc(|d| {
             let e = d.get_mut(id)?.edit_mut()?;
-            if !e.has_selection() {
+            // A password doesn't leave the field.
+            if !e.has_selection() || e.is_masked() {
                 return None;
             }
             let text = e.selected_text().to_owned();

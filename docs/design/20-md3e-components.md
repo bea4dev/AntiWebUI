@@ -382,6 +382,8 @@ top_app_bar_over(
 
 ### テキストフィールド
 
+`TextFieldStyle::password()` は入力をパスワード用（`ImePurpose::Password`）にし、`•` で伏せる。`on_submit` は Enter で呼ばれる。
+
 | 項目 | filled | outlined |
 |---|---|---|
 | 最小の大きさ | 280 × 56 | 280 × 56 |

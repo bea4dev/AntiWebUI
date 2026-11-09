@@ -321,6 +321,66 @@ fn ime_preedit_and_commit() {
 }
 
 #[test]
+fn a_password_shows_as_dots_edits_by_its_characters_and_isnt_copied() {
+    let field = node_ref();
+    let value = signal(String::new());
+    let mut ui = mount(Scale(120), move || {
+        div().p(10.0).child(
+            text_input()
+                .w(300.0)
+                .node_ref(field)
+                .value(value)
+                .purpose(ImePurpose::Password),
+        )
+    });
+    let r = field.rect().unwrap();
+    press(&mut ui, at(r, 0.5, 0.5), 0);
+    release(&mut ui, at(r, 0.5, 0.5), 5);
+    ui.update();
+    typ(&mut ui, "pässwörd");
+    assert_eq!(value.get(), "pässwörd");
+    let shown = |id: anti_webui_core::tree::NodeId| {
+        with_doc(|d| {
+            let e = d.get(id).unwrap().edit().unwrap();
+            (e.layout.layout.text_len(), e.caret_rect(2).x)
+        })
+    };
+    let id = field.get().unwrap();
+    // Laid out as one dot a character, whatever their length.
+    assert_eq!(shown(id).0, 8 * '•'.len_utf8());
+
+    // The caret goes by characters, the long ones too.
+    named(&mut ui, NamedKey::Home, Modifiers::default());
+    let start = shown(id).1;
+    named(&mut ui, NamedKey::ArrowRight, Modifiers::default());
+    named(&mut ui, NamedKey::ArrowRight, Modifiers::default());
+    assert!(shown(id).1 > start);
+    typ(&mut ui, "X");
+    assert_eq!(value.get(), "päXsswörd");
+    named(&mut ui, NamedKey::Backspace, Modifiers::default());
+    named(&mut ui, NamedKey::Backspace, Modifiers::default());
+    assert_eq!(value.get(), "psswörd");
+
+    // A click at the end puts the caret after the last dot.
+    press(&mut ui, at(r, 0.95, 0.5), 400);
+    release(&mut ui, at(r, 0.95, 0.5), 405);
+    ui.update();
+    typ(&mut ui, "!");
+    assert_eq!(value.get(), "psswörd!");
+
+    ui.take_requests();
+    key(&mut ui, Key::Character("a".into()), None, CTRL);
+    key(&mut ui, Key::Character("c".into()), None, CTRL);
+    key(&mut ui, Key::Character("x".into()), None, CTRL);
+    assert!(
+        !ui.take_requests()
+            .iter()
+            .any(|r| matches!(r, PlatformRequest::SetClipboard { .. }))
+    );
+    assert_eq!(value.get(), "psswörd!");
+}
+
+#[test]
 fn paste_and_tab_focus() {
     let f1 = node_ref();
     let f2 = node_ref();

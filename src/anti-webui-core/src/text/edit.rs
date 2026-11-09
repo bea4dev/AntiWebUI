@@ -220,17 +220,49 @@ impl EditData {
         }
     }
 
-    /// Model offset → display offset.
+    /// A password's characters show as this.
+    pub const MASK: char = '•';
+
+    /// Whether it is laid out as [`MASK`](Self::MASK)s rather than as its text: for a password.
+    pub fn is_masked(&self) -> bool {
+        self.purpose == ImePurpose::Password
+    }
+
+    /// Offset in the display text → offset in what is laid out, which differ when it is masked.
+    fn masked_at(&self, i: usize) -> usize {
+        if !self.is_masked() {
+            return i;
+        }
+        let shown = self.display_text();
+        let i = floor_char_boundary(&shown, i.min(shown.len()));
+        shown[..i].chars().count() * Self::MASK.len_utf8()
+    }
+
+    /// Offset in what is laid out → offset in the display text.
+    fn unmasked_at(&self, i: usize) -> usize {
+        if !self.is_masked() {
+            return i;
+        }
+        let shown = self.display_text();
+        shown
+            .char_indices()
+            .nth(i / Self::MASK.len_utf8())
+            .map_or(shown.len(), |(b, _)| b)
+    }
+
+    /// Model offset → offset in what is laid out.
     pub fn to_display(&self, i: usize) -> usize {
-        if i > self.focus {
+        let i = if i > self.focus {
             i + self.preedit_len()
         } else {
             i
-        }
+        };
+        self.masked_at(i)
     }
 
-    /// Display offset → model offset (offsets inside the pre-edit map to the caret).
+    /// Offset in what is laid out → model offset (offsets inside the pre-edit map to the caret).
     pub fn to_model(&self, i: usize) -> usize {
+        let i = self.unmasked_at(i);
         let pl = self.preedit_len();
         if i <= self.focus {
             i
@@ -248,7 +280,10 @@ impl EditData {
         style: &ShapeStyle,
         width: Option<i32>,
     ) -> SizeI {
-        let display = self.display_text();
+        let mut display = self.display_text();
+        if self.is_masked() {
+            display = display.chars().map(|_| Self::MASK).collect();
+        }
         self.layout.shape(ts, &display, self.display_version, style);
         self.layout.break_lines(width);
         self.metrics_layout.shape(ts, " ", 0, style);
@@ -281,13 +316,10 @@ impl EditData {
 
     /// Caret rectangle relative to the text origin (display coordinates).
     pub fn caret_rect(&self, width: i32) -> RectI {
-        let pre = self.preedit.as_ref();
-        let index = match pre.and_then(|p| p.cursor) {
+        let index = self.masked_at(match self.preedit.as_ref().and_then(|p| p.cursor) {
             Some((_, end)) => self.focus + end,
-            None => {
-                self.to_display(self.focus) + if pre.is_some() { self.preedit_len() } else { 0 }
-            }
-        };
+            None => self.focus + self.preedit_len(),
+        });
         if self.layout.layout.text_len() == 0 {
             let lh = self.line_height();
             let x = match self.layout.layout.lines().next() {
@@ -314,14 +346,15 @@ impl EditData {
         {
             return *sel;
         }
-        let a = Cursor::from_byte_index(&self.layout.layout, self.anchor, Affinity::Downstream);
-        let f = Cursor::from_byte_index(&self.layout.layout, self.focus, self.affinity);
+        let (anchor, focus) = (self.to_display(self.anchor), self.to_display(self.focus));
+        let a = Cursor::from_byte_index(&self.layout.layout, anchor, Affinity::Downstream);
+        let f = Cursor::from_byte_index(&self.layout.layout, focus, self.affinity);
         LayoutSelection::new(a, f)
     }
 
     fn apply_nav(&mut self, sel: LayoutSelection) {
-        let r_anchor = sel.anchor().index().min(self.text.len());
-        let r_focus = sel.focus().index().min(self.text.len());
+        let r_anchor = self.to_model(sel.anchor().index()).min(self.text.len());
+        let r_focus = self.to_model(sel.focus().index()).min(self.text.len());
         self.anchor = r_anchor;
         self.focus = r_focus;
         self.affinity = sel.focus().affinity();
@@ -369,7 +402,7 @@ impl EditData {
                 let i = if motion == Motion::DocStart {
                     0
                 } else {
-                    self.text.len()
+                    self.to_display(self.text.len())
                 };
                 let c = Cursor::from_byte_index(layout_ref, i, Affinity::Downstream);
                 if extend {
@@ -494,14 +527,14 @@ impl EditData {
         let (mut a, mut b) = self.selection_range();
         if a == b {
             if word {
-                let c =
-                    Cursor::from_byte_index(&self.layout.layout, self.focus, Affinity::Downstream);
+                let at = self.to_display(self.focus);
+                let c = Cursor::from_byte_index(&self.layout.layout, at, Affinity::Downstream);
                 let t = if forward {
                     c.next_logical_word(&self.layout.layout)
                 } else {
                     c.previous_logical_word(&self.layout.layout)
                 };
-                let t = t.index().min(self.text.len());
+                let t = self.to_model(t.index()).min(self.text.len());
                 if forward { b = t } else { a = t }
             } else if forward {
                 b = next_grapheme(&self.text, b);
@@ -581,6 +614,21 @@ impl EditData {
         (self.to_model(i).min(self.text.len()), aff)
     }
 
+    /// The word or the line at a point relative to the text origin, as model offsets. A password
+    /// is one word, as its dots would be.
+    fn unit_at(&self, granularity: Granularity, x: f32, y: f32) -> (usize, usize) {
+        if (granularity == Granularity::Word && !self.is_masked()) || self.multiline {
+            let (a, b) = if granularity == Granularity::Word {
+                self.layout.word_at(x, y)
+            } else {
+                self.layout.hard_line_at(x, y)
+            };
+            (self.to_model(a), self.to_model(b))
+        } else {
+            (0, self.text.len())
+        }
+    }
+
     /// Mouse press at a point relative to the text origin.
     pub fn pointer_down(&mut self, x: f32, y: f32, clicks: u32, extend: bool) {
         let (i, aff) = self.hit(x, y);
@@ -591,16 +639,8 @@ impl EditData {
         };
         let (a, b) = match granularity {
             Granularity::Char => (i, i),
-            Granularity::Word => self.layout.word_at(x, y),
-            Granularity::Line => {
-                if self.multiline {
-                    self.layout.hard_line_at(x, y)
-                } else {
-                    (0, self.text.len())
-                }
-            }
+            _ => self.unit_at(granularity, x, y),
         };
-        let (a, b) = (self.to_model(a), self.to_model(b));
         if extend && granularity == Granularity::Char {
             self.focus = i;
         } else {
@@ -621,14 +661,7 @@ impl EditData {
         match granularity {
             Granularity::Char => self.focus = i,
             Granularity::Word | Granularity::Line => {
-                let (a, b) = if granularity == Granularity::Word {
-                    self.layout.word_at(x, y)
-                } else if self.multiline {
-                    self.layout.hard_line_at(x, y)
-                } else {
-                    (0, self.text.len())
-                };
-                let (a, b) = (self.to_model(a), self.to_model(b));
+                let (a, b) = self.unit_at(granularity, x, y);
                 if a < ia {
                     self.anchor = ib;
                     self.focus = a;

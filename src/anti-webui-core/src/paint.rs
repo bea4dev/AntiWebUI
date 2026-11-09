@@ -243,7 +243,8 @@ pub(crate) fn paint_selected_text(
             let e = n.edit()?;
             let inner = child_clip(n, doc.scale, n.clip_shape()).rect;
             let origin = edit_text_origin(doc, id);
-            add(id, &e.layout, origin, e.selection_range(), inner);
+            let (a, b) = e.selection_range();
+            add(id, &e.layout, origin, (e.to_display(a), e.to_display(b)), inner);
         }
         crate::drag::TextOrigin::Editor(host) => {
             for &id in &doc.get(host)?.editor()?.selected_rows {
@@ -1697,6 +1698,7 @@ impl Painter<'_> {
         if edit.has_selection() && edit.preedit.is_none() {
             self.chunk(id, part::SELECTION);
             let (a, b) = edit.selection_range();
+            let (a, b) = (edit.to_display(a), edit.to_display(b));
             let color = if focused && doc.state.window_focused {
                 c.selection_color
             } else {

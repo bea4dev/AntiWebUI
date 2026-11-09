@@ -51,6 +51,8 @@ pub struct TextFieldStyle {
     suffix: Option<String>,
     rows: Option<u32>,
     read_only: bool,
+    password: bool,
+    on_submit: Option<Rc<dyn Fn(&str)>>,
     error: Option<When>,
     disabled: Option<When>,
 }
@@ -110,6 +112,18 @@ impl TextFieldStyle {
 
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
+        self
+    }
+
+    /// For a password: what is typed shows as dots and can't be copied out.
+    pub fn password(mut self) -> Self {
+        self.password = true;
+        self
+    }
+
+    /// Called with the text on Enter (Ctrl+Enter with several rows).
+    pub fn on_submit(mut self, f: impl Fn(&str) + 'static) -> Self {
+        self.on_submit = Some(Rc::new(f));
         self
     }
 
@@ -214,6 +228,8 @@ fn build(
         suffix,
         rows,
         read_only,
+        password,
+        on_submit,
         error,
         disabled,
     } = style;
@@ -318,6 +334,12 @@ fn build(
     let input_off = is_off.clone();
     let input_colors = colors.clone();
     let told = label.clone();
+    if password {
+        input = input.purpose(ImePurpose::Password);
+    }
+    if let Some(f) = on_submit {
+        input = input.on_submit(move |s| f(s));
+    }
     let mut input = input
         .value(value)
         .read_only(read_only)
