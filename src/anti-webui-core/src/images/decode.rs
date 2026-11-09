@@ -565,7 +565,13 @@ mod tests {
     #[test]
     fn three_bytes_a_pixel_halve_like_four() {
         let rgba: Vec<u8> = (0..7 * 5 * 4)
-            .map(|i| if i % 4 == 3 { 255 } else { (i * 37 % 256) as u8 })
+            .map(|i| {
+                if i % 4 == 3 {
+                    255
+                } else {
+                    (i * 37 % 256) as u8
+                }
+            })
             .collect();
         let rgb: Vec<u8> = rgba
             .chunks_exact(4)

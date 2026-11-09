@@ -1,6 +1,7 @@
 // The track, stops, ticks and handles of a slider, cut around the handles like `Slider.kt`. Lengths
 // in the parameters are logical pixels. A kind of 0 is a slider from the start, 1 a range and 2 a
-// slider from the center.
+// slider from the center. With an amplitude, what is covered of a slider from the start is a wavy
+// line `stroke` thick instead.
 
 fn over(top: vec4<f32>, below: vec4<f32>) -> vec4<f32> {
     return top + below * (1.0 - top.a);
@@ -21,6 +22,28 @@ fn piece(p: vec2<f32>, a: f32, b: f32, y: f32, h: f32, r0: f32, r1: f32, pixel: 
 
 fn spot(p: vec2<f32>, x: f32, y: f32, r: f32, pixel: f32) -> f32 {
     return aw_coverage(distance(p, vec2<f32>(x, y)) - r, pixel);
+}
+
+// Coverage of a wavy line from the start to `b`, around `mid`. It flattens when it is shorter than
+// a wavelength, so that it doesn't start with half a wave.
+fn wavy(p: vec2<f32>, b: f32, mid: f32, s: f32, pixel: f32) -> f32 {
+    let half = params.stroke * s * 0.5;
+    let head = b - half;
+    if (head < half) {
+        return 0.0;
+    }
+    let length = params.wavelength * s;
+    let amplitude = params.amplitude * s * clamp((head - half) / length, 0.0, 1.0);
+    let k = 6.2831853 / length;
+    // The closest point on the line, in a few steps from right above or below.
+    var x = clamp(p.x, half, head);
+    for (var i = 0; i < 3; i++) {
+        let y = mid + amplitude * sin(x * k - params.phase);
+        let slope = amplitude * k * cos(x * k - params.phase);
+        x = clamp(x + slope * (p.y - y) / (1.0 + slope * slope), half, head);
+    }
+    let d = distance(p, vec2<f32>(x, mid + amplitude * sin(x * k - params.phase))) - half;
+    return aw_coverage(d, pixel);
 }
 
 // Where a fraction is along a track of length `w`. With ticks the values between the ends keep
@@ -64,7 +87,10 @@ fn paint(f: Frag) -> vec4<f32> {
     var last = 0.0;
     var lower = 0.0;
     var upper = end;
-    if (params.kind < 0.5) {
+    if (params.kind < 0.5 && params.amplitude > 0.0) {
+        covered = wavy(p, end - cut, mid, s, pixel);
+        last = piece(p, end + cut, w, y, h, inside, corner, pixel);
+    } else if (params.kind < 0.5) {
         covered = piece(p, 0.0, end - cut, y, h, corner, inside, pixel);
         last = piece(p, end + cut, w, y, h, inside, corner, pixel);
     } else if (params.kind < 1.5) {

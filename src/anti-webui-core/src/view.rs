@@ -608,8 +608,17 @@ macro_rules! element_methods {
             self
         }
 
+        /// A press and release of the primary button on the node, or its activation from the
+        /// keyboard. The other buttons are [`on_aux_click`](Self::on_aux_click), as in the DOM.
         pub fn on_click(mut self, f: impl Fn(&PointerEvent) + 'static) -> Self {
             self.cfg.listeners.click = also(self.cfg.listeners.click.take(), f);
+            self
+        }
+
+        /// A press and release of a button other than the primary one (`auxclick`): the middle
+        /// button, or the secondary one.
+        pub fn on_aux_click(mut self, f: impl Fn(&PointerEvent) + 'static) -> Self {
+            self.cfg.listeners.aux_click = also(self.cfg.listeners.aux_click.take(), f);
             self
         }
 

@@ -160,6 +160,12 @@ core の `follow(target, spring)` は、目標が変わったときだけばね�
 
 全部を `slider.wgsl` の `fill` で描くので、動いている間もレイアウトを通らず、端数の位置で描ける。トラックの切り方は `Slider.kt` の `drawTrack` と同じ式。
 
+`SliderStyle::wavy()` は、始まりからのスライダーの覆われた側を、波打つ進捗表示と同じ波線にする（振幅 3、波長 28、線 4。`wave(振幅, 波長, 線)` で変えられる）。Compose にはない。Android 16 の再生位置のバーに当たる。
+
+- ポインタが乗っているか押されている間だけ、波が 1 秒に 1 波長流れ、振幅がばねで 0.6 倍から 1 倍に膨らむ。それ以外は止まっていて、フレームを要求しない。
+- 覆われた長さが 1 波長より短いと平らに近づく。端に半端な波を出さないため。
+- 範囲のスライダーと中央からのスライダーは、まっすぐのまま。
+
 **Compose との違い。** `Slider.kt` にはアニメーションが一切ない。
 
 | 項目 | Compose | ここ |
@@ -203,7 +209,7 @@ filter と input は Compose の `shapes` 版の形にする。
 | `indeterminate_linear_progress` | 240 × 4 | 4 | 1750 ms の周期で 2 本 |
 | `indeterminate_wavy_progress` | 240 × 10 | 4 | 同じ周期、波長 20 |
 | `circular_progress` | 40 | 4 | 値は同じばね |
-| `circular_wavy_progress` | 48 | 4 | 値は 500 ms の直線。波は 10〜95% の間だけ |
+| `circular_wavy_progress` | 48 | 4 | 値は 500 ms の直線。波は 10〜95% の間だけ。波がないときはフレームを要求しない |
 | `indeterminate_circular_progress` | 40 | 4 | 6000 ms の周期 |
 | `indeterminate_circular_wavy_progress` | 48 | 4 | 同じ周期 |
 

@@ -322,3 +322,17 @@ fn a_tooltip_shows_for_the_focus_from_the_keyboard() {
     key(&mut ui, anti_webui::core::event::NamedKey::Tab);
     assert_eq!(popups_shown(&mut ui).len(), 1, "at once");
 }
+
+#[test]
+fn a_wavy_circle_moves_only_while_it_has_a_wave() {
+    let value = signal(0.0f32);
+    let mut ui = start_ui(move || div().child(circular_wavy_progress(move || value.get())));
+    assert_at_rest(&mut ui);
+    value.set(0.5);
+    ui.update();
+    settle(&mut ui);
+    assert!(ui.animating(), "a wave goes round");
+    value.set(1.0);
+    ui.update();
+    assert_at_rest(&mut ui);
+}

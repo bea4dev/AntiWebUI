@@ -368,3 +368,14 @@ fn a_slider_goes_by_pages_too() {
     key(&mut ui, NamedKey::PageDown);
     assert!((value.get() - 0.5).abs() < 0.001, "{}", value.get());
 }
+
+#[test]
+fn a_wavy_slider_flows_only_while_the_pointer_is_on_it() {
+    let mut ui = start_ui(|| div().child(styled_slider(signal(0.6), SliderStyle::new().wavy())));
+    assert_at_rest(&mut ui);
+    pointer_at(&mut ui, 100.0, 24.0);
+    settle(&mut ui);
+    assert!(ui.animating(), "the wave goes on while the pointer is on it");
+    pointer_at(&mut ui, 600.0, 400.0);
+    assert_at_rest(&mut ui);
+}

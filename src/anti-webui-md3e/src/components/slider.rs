@@ -10,6 +10,7 @@ use anti_webui::prelude::*;
 use std::cell::Cell;
 use std::ops::RangeInclusive;
 use std::rc::Rc;
+use std::time::Instant;
 
 const TOUCH: f32 = 48.0;
 const LENGTH: f32 = 240.0;
@@ -38,6 +39,10 @@ struct Track {
     steps: f32,
     stops: f32,
     vertical: f32,
+    stroke: f32,
+    amplitude: f32,
+    wavelength: f32,
+    phase: f32,
 }
 
 static TRACK: Shader<Track> = Shader::new("slider", include_str!("../../shaders/slider.wgsl"));
@@ -64,6 +69,15 @@ pub struct SliderStyle {
     vertical: bool,
     label: Option<Rc<dyn Fn(f32) -> String>>,
     disabled: Option<When>,
+    wave: Option<Wave>,
+}
+
+/// The wavy line of [`SliderStyle::wavy`].
+#[derive(Clone, Copy)]
+struct Wave {
+    amplitude: f32,
+    wavelength: f32,
+    stroke: f32,
 }
 
 impl Default for SliderStyle {
@@ -80,6 +94,7 @@ impl Default for SliderStyle {
             vertical: false,
             label: None,
             disabled: None,
+            wave: None,
         }
     }
 }
@@ -141,6 +156,25 @@ impl SliderStyle {
         self
     }
 
+    /// What is covered is a wavy line, as in the wavy progress indicator, rather than a bar. It
+    /// swells and flows while the pointer is on the slider or it is held, and lies still otherwise,
+    /// asking for no frames. Only for a slider from the start: a range or a centered slider stays
+    /// straight.
+    pub fn wavy(self) -> Self {
+        self.wave(3.0, 28.0, 4.0)
+    }
+
+    /// [`wavy`](Self::wavy) with the height of the wave from its middle, its length and the
+    /// thickness of its line.
+    pub fn wave(mut self, amplitude: f32, wavelength: f32, stroke: f32) -> Self {
+        self.wave = Some(Wave {
+            amplitude,
+            wavelength: wavelength.max(1.0),
+            stroke,
+        });
+        self
+    }
+
     /// Doesn't react and looks that way while `f` returns true.
     pub fn disabled_when(mut self, f: impl Fn() -> bool + 'static) -> Self {
         self.disabled = Some(Rc::new(f));
@@ -184,6 +218,25 @@ pub fn range_slider(
     range_slider_with(start, end, min, max, options, move |s| look(s, style))
 }
 
+/// Moves the wave along, a wavelength a second, while `flowing`, from where it was.
+fn flow(
+    phase: Signal<f32>,
+    flowing: Memo<bool>,
+    start: Instant,
+    from: f32,
+    latest: Rc<Cell<u64>>,
+    me: u64,
+) {
+    request_frame(move |now| {
+        if !phase.is_alive() || latest.get() != me || !untrack(|| flowing.get()) {
+            return;
+        }
+        let seconds = now.saturating_duration_since(start).as_secs_f32();
+        phase.set((from + seconds * std::f32::consts::TAU) % std::f32::consts::TAU);
+        flow(phase, flowing, start, from, latest, me);
+    });
+}
+
 fn look(state: SliderState, style: SliderStyle) -> Div {
     crate::ensure_ready();
     let SliderStyle {
@@ -198,6 +251,7 @@ fn look(state: SliderState, style: SliderStyle) -> Div {
         vertical,
         label,
         disabled,
+        wave,
     } = style;
     let two = state.count() == 2;
     let disabled = when(disabled);
@@ -243,6 +297,23 @@ fn look(state: SliderState, style: SliderStyle) -> Div {
             },
             fast_spatial(),
         )
+    });
+
+    // How much the wave is up, and where it is along its length.
+    let wavy = wave.is_some();
+    let lively = move || wavy && (state.hovered() || state.held().is_some());
+    let swell = follow(move || if lively() { 1.0f32 } else { 0.6 }, fast_spatial());
+    let phase = signal(0.0f32);
+    let flowing = memo(lively);
+    let latest = Rc::new(Cell::new(0u64));
+    effect(move || {
+        if flowing.get() {
+            // One that went off and on again before its next frame stops for this one.
+            let me = latest.get() + 1;
+            latest.set(me);
+            let from = untrack(|| phase.get());
+            flow(phase, flowing, Instant::now(), from, latest.clone(), me);
+        }
     });
 
     let paint_off = disabled.clone();
@@ -389,6 +460,10 @@ fn look(state: SliderState, style: SliderStyle) -> Div {
                 steps: steps as f32,
                 stops: if stops { 1.0 } else { 0.0 },
                 vertical: if vertical { 1.0 } else { 0.0 },
+                stroke: wave.map_or(0.0, |w| w.stroke),
+                amplitude: wave.map_or(0.0, |w| w.amplitude * swell.get().max(0.0)),
+                wavelength: wave.map_or(1.0, |w| w.wavelength),
+                phase: phase.get(),
             })
         });
     let root = if two { root.child(thumb(0)) } else { root };

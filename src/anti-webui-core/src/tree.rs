@@ -28,6 +28,7 @@ pub type Handler<E> = Rc<dyn Fn(&E)>;
 #[derive(Default, Clone)]
 pub struct Listeners {
     pub click: Option<Handler<PointerEvent>>,
+    pub aux_click: Option<Handler<PointerEvent>>,
     pub pointer_down: Option<Handler<PointerEvent>>,
     pub pointer_up: Option<Handler<PointerEvent>>,
     pub pointer_move: Option<Handler<PointerEvent>>,

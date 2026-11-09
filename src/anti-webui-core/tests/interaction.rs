@@ -445,3 +445,44 @@ fn release_outside_still_reaches_the_pressed_node() {
     ui.handle_event(WindowEvent::Focused(false));
     assert!(!dragging.get());
 }
+
+#[test]
+fn only_the_primary_button_clicks_the_others_aux_click() {
+    let clicks = signal(0);
+    let aux = signal(Vec::new());
+    let b = node_ref();
+    let mut ui = mount(Scale(120), move || {
+        div().p(10.0).child(
+            div()
+                .node_ref(b)
+                .w(80.0)
+                .h(30.0)
+                .on_click(move |_| clicks.update(|c| *c += 1))
+                .on_aux_click(move |e| aux.update(|a| a.push(e.button))),
+        )
+    });
+    let p = at(b.rect().unwrap(), 0.5, 0.5);
+    for (i, button) in [
+        PointerButton::Secondary,
+        PointerButton::Middle,
+        PointerButton::Primary,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for pressed in [true, false] {
+            ui.handle_event(WindowEvent::PointerButton {
+                position: p,
+                button,
+                pressed,
+                modifiers: Modifiers::default(),
+                time: i as u32 * 1000 + if pressed { 0 } else { 5 },
+            });
+        }
+    }
+    assert_eq!(clicks.get(), 1);
+    assert_eq!(
+        aux.get(),
+        [Some(PointerButton::Secondary), Some(PointerButton::Middle)]
+    );
+}

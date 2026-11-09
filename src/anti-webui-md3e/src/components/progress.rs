@@ -66,6 +66,21 @@ fn keep_moving(phase: Signal<f32>, wave: Animated<f32>, ticking: Signal<bool>, s
     });
 }
 
+/// Keeps the seconds of a circle's wave going while it has one.
+fn keep_turning(time: Signal<f32>, wave: Animated<f32>, ticking: Signal<bool>, start: Instant) {
+    request_frame(move |now| {
+        if !time.is_alive() {
+            return;
+        }
+        if wave.get_untracked() <= 0.0 {
+            ticking.set(false);
+            return;
+        }
+        time.set(now.saturating_duration_since(start).as_secs_f32());
+        keep_turning(time, wave, ticking, start);
+    });
+}
+
 /// A progress bar with a wavy line, for a value from 0 to 1. It takes the whole width it is given
 /// when styled with `.w_full()`.
 pub fn wavy_progress(progress: impl Fn() -> f32 + 'static) -> Div {
@@ -328,7 +343,18 @@ fn determinate_circle(progress: impl Fn() -> f32 + 'static, size: f32, wavy: boo
         },
         default_effects(),
     );
-    let time = if wavy { clock() } else { signal(0.0f32) };
+    // Moves only while there is a wave to move, like the wavy bar.
+    let time = signal(0.0f32);
+    if wavy {
+        let ticking = signal(false);
+        let start = Instant::now();
+        effect(move || {
+            if wave.get() > 0.0 && !ticking.get_untracked() {
+                ticking.set(true);
+                keep_turning(time, wave, ticking, start);
+            }
+        });
+    }
     let waves = (std::f32::consts::TAU * (size / 2.0 - 2.0) / CIRCLE_WAVELENGTH)
         .round()
         .max(5.0);

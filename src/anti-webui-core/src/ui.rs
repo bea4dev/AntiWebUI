@@ -135,6 +135,7 @@ enum PointerKind {
     Up,
     Move,
     Click,
+    AuxClick,
 }
 
 impl Ui {
@@ -1035,6 +1036,7 @@ impl Ui {
                     PointerKind::Up => l.pointer_up.clone(),
                     PointerKind::Move => l.pointer_move.clone(),
                     PointerKind::Click => l.click.clone(),
+                    PointerKind::AuxClick => l.aux_click.clone(),
                 }?;
                 Some((h, d.window_rect(id).unwrap_or_default()))
             });
@@ -1295,7 +1297,13 @@ impl Ui {
             });
             if let Some(c) = common {
                 let clicks = self.last_click.map(|(_, _, _, n)| n).unwrap_or(1);
-                self.dispatch_pointer(PointerKind::Click, c, p, Some(button), clicks);
+                // As in the DOM: `click` is the primary button's, the others are `auxclick`.
+                let kind = if button == PointerButton::Primary {
+                    PointerKind::Click
+                } else {
+                    PointerKind::AuxClick
+                };
+                self.dispatch_pointer(kind, c, p, Some(button), clicks);
             }
         }
         match press.drag {
