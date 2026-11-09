@@ -2,7 +2,7 @@
 //! `docs/design/20-md3e-components.md`.
 
 use super::icon::sized_icon;
-use super::surface::{Ink, When, elevation_shadows, focus_ring, progress_of, when};
+use super::surface::{Ink, When, elevation_shadows, focus_ring, progress_of};
 use crate::color::color_scheme;
 use crate::icons::{self, Symbol};
 use crate::motion::{fast_effects, fast_spatial, slow_effects};
@@ -89,7 +89,7 @@ fn menu_row(item: FabMenuItem, shown: When) -> Div {
     let width = progress_of(shown.clone(), fast_spatial());
     let fade = progress_of(shown.clone(), fast_effects());
     let natural = signal(0.0f32);
-    let ink = Ink::new(|c| c.on_primary_container, when(None));
+    let ink = Ink::new(|c| c.on_primary_container, || false);
     let focused = ink.focused;
     let gone = shown.clone();
     ink.paint(
@@ -147,7 +147,7 @@ fn toggle(symbol: &'static Symbol, checked: When) -> Div {
                 c.on_primary_container
             }
         },
-        when(None),
+        || false,
     );
     let focused = ink.focused;
     let plain = sized_icon(symbol, 24.0).absolute();

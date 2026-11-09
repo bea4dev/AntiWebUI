@@ -182,7 +182,7 @@ pub fn styled_list_item(headline: impl IntoTextSource, style: ListItemStyle) -> 
     }
 
     let ink_selected = is_selected.clone();
-    let ink = Ink::new(
+    let ink = Ink::new_when(
         move |c| {
             if ink_selected() {
                 c.on_secondary_container

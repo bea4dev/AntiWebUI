@@ -2,7 +2,7 @@
 //! `docs/design/20-md3e-components.md`.
 
 use super::icon::sized_icon;
-use super::surface::{Ink, elevation_shadows, when};
+use super::surface::{Ink, elevation_shadows};
 use crate::color::color_scheme;
 use crate::icons;
 use crate::typography::TextStyle;
@@ -132,7 +132,7 @@ impl Snackbars {
             lasts,
         } = item;
         let action = action.map(|(label, f)| {
-            let ink = Ink::new(|c| c.inverse_primary, when(None));
+            let ink = Ink::new(|c| c.inverse_primary, || false);
             ink.paint(
                 ink.listen(
                     TextStyle::LABEL_LARGE.apply(
@@ -156,7 +156,7 @@ impl Snackbars {
             )
         });
         let close = closable.then(|| {
-            let ink = Ink::new(|c| c.inverse_on_surface, when(None));
+            let ink = Ink::new(|c| c.inverse_on_surface, || false);
             ink.paint(
                 ink.listen(
                     div()

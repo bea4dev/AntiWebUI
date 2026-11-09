@@ -169,7 +169,7 @@ fn checkbox_look(box_state: CheckboxState, style: CheckboxStyle) -> Div {
 
     let layer_state = state.clone();
     let layer_error = error;
-    let ink = Ink::new(
+    let ink = Ink::new_when(
         move |c| {
             if layer_error() {
                 c.error
@@ -290,7 +290,7 @@ fn radio_look(radio: RadioState, style: RadioStyle) -> Div {
         default_effects(),
     );
     let layer_selected = selected;
-    let ink = Ink::new(
+    let ink = Ink::new_when(
         move |c| {
             if layer_selected() {
                 c.primary

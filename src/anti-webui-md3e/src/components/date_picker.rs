@@ -4,7 +4,7 @@
 use super::card::divider;
 use super::icon::sized_icon;
 use super::modal::dialog;
-use super::surface::{Ink, When, focus_ring, when};
+use super::surface::{Ink, When, focus_ring};
 use crate::color::color_scheme;
 use crate::icons;
 use crate::motion::{default_effects, default_spatial};
@@ -186,7 +186,7 @@ fn day_cell(
         },
         default_effects(),
     );
-    let ink = Ink::new(
+    let ink = Ink::new_when(
         move |c| {
             if layer_on() {
                 c.on_primary
@@ -283,7 +283,7 @@ fn month_grid(
 }
 
 fn plain_icon_button(symbol: &'static crate::icons::Symbol, f: impl Fn() + 'static) -> Div {
-    let ink = Ink::new(|c| c.on_surface_variant, when(None));
+    let ink = Ink::new(|c| c.on_surface_variant, || false);
     let focused = ink.focused;
     ink.paint(
         ink.listen(
@@ -618,7 +618,7 @@ fn year_cell(year: i32, on: When, is_current: bool, node: NodeRef, f: impl Fn() 
                 c.on_surface_variant
             }
         },
-        when(None),
+        || false,
     );
     ink.paint(
         ink.listen(
