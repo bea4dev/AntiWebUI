@@ -85,7 +85,7 @@ fn look(state: SwitchState, style: SwitchStyle) -> Div {
     } = style;
     let disabled = when(disabled);
     let layer_checked = checked.clone();
-    let ink = Ink::new(
+    let ink = Ink::new_when(
         move |c| {
             if layer_checked() {
                 c.primary

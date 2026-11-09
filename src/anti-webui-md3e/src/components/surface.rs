@@ -194,12 +194,42 @@ pub(super) type When = Rc<dyn Fn() -> bool>;
 /// The colors of a button, given whether it is checked.
 pub(super) type ColorsOf = Rc<dyn Fn(&ColorScheme, bool) -> Colors>;
 
-/// How a component reacts to the pointer and the keyboard: a state layer and ripples, drawn on one
-/// box and caused by another, which may be the same.
+/// The state layer and the ripples of Material 3: how a component shows that it is under the
+/// pointer, has the focus from the keyboard or is pressed. They are caused by one box and drawn on
+/// another, which may be the same, in that box's shape (its rounded corners).
+///
+/// The state layer is 8% of `color` under the pointer and 10% with the focus from the keyboard,
+/// and a press makes a ripple of 10% that grows from where it was pressed. Enter and Space make one
+/// that grows from the middle. Nothing is drawn, and no frames are asked for, while nothing goes
+/// on.
+///
+/// ```no_run
+/// use anti_webui::prelude::*;
+/// use anti_webui_md3e::color_scheme;
+/// use anti_webui_md3e::components::Ink;
+///
+/// // A box of its own that reacts like the components do.
+/// let ink = Ink::new(|c| c.on_secondary_container, || false);
+/// let tile = div()
+///     .w(120.0)
+///     .h(56.0)
+///     .rounded(16.0)
+///     .focusable()
+///     .dyn_style(|s| s.bg(color_scheme().secondary_container))
+///     .on_click(|_| println!("clicked"));
+/// let tile = ink.paint(ink.listen(tile));
+/// ```
+///
+/// [`paint`](Self::paint) uses the `overlay` of the box it is given, which goes over the background
+/// and under the children; that box can't have another overlay.
 #[derive(Clone)]
-pub(super) struct Ink {
+pub struct Ink {
+    /// Whether the pointer is over the box that `listen` was given.
     pub hovered: Signal<bool>,
+    /// Whether it has the focus from the keyboard (`:focus-visible`), which may also be set from
+    /// outside, for a list whose items the keys move between.
     pub focused: Signal<bool>,
+    /// Whether it is pressed by the pointer.
     pub pressed: Signal<bool>,
     state: Animated<f32>,
     ripples: Ripples,
@@ -208,8 +238,18 @@ pub(super) struct Ink {
 }
 
 impl Ink {
-    /// `color` is usually that of the content.
-    pub fn new(color: impl Fn(&ColorScheme) -> Color + 'static, disabled: When) -> Self {
+    /// `color` is usually that of the content. Nothing is drawn while `disabled` returns true.
+    pub fn new(
+        color: impl Fn(&ColorScheme) -> Color + 'static,
+        disabled: impl Fn() -> bool + 'static,
+    ) -> Self {
+        Self::new_when(color, Rc::new(disabled))
+    }
+
+    pub(super) fn new_when(
+        color: impl Fn(&ColorScheme) -> Color + 'static,
+        disabled: When,
+    ) -> Self {
         crate::ensure_ready();
         let state = animated(0.0f32);
         let hovered = signal(false);
@@ -243,8 +283,9 @@ impl Ink {
         }
     }
 
-    /// Makes what happens to `node` cause ripples that start where it is pressed. For a state layer
-    /// on another box, use `listen_centered`.
+    /// Makes the pointer and the keyboard on `node` show: hovering, the focus, and ripples that
+    /// start where it is pressed. `node` should be `focusable` for the keyboard to reach it. For a
+    /// state layer on another box, use `listen_centered`.
     pub fn listen(&self, node: Div) -> Div {
         let this = self.clone();
         self.listeners(node).on_pointer_down(move |e| {
@@ -255,7 +296,8 @@ impl Ink {
         })
     }
 
-    /// Like `listen`, with ripples that are in the center of what they are drawn on.
+    /// Like `listen`, with ripples that grow from the middle of what they are drawn on, for when
+    /// that is another box, like the circle around the handle of a switch.
     pub fn listen_centered(&self, node: Div) -> Div {
         let this = self.clone();
         self.listeners(node).on_pointer_down(move |_| {
@@ -306,7 +348,8 @@ impl Ink {
             })
     }
 
-    /// Draws the state layer and the ripples on `node`, in its shape.
+    /// Draws the state layer and the ripples on `node`, in its shape, over its background and
+    /// under its children.
     pub fn paint(&self, node: Div) -> Div {
         let shown = self.ripples.shown;
         let state = self.state;
@@ -408,7 +451,7 @@ pub(super) fn surface(surface: Surface) -> Div {
 
     let layer_colors = colors.clone();
     let layer_checked = is_checked.clone();
-    let ink = Ink::new(
+    let ink = Ink::new_when(
         move |c| layer_colors(c, layer_checked()).1,
         is_disabled.clone(),
     );

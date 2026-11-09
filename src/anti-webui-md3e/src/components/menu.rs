@@ -304,7 +304,7 @@ fn item_view(m: MenuState, item: MenuItem, corners: Corners, vibrant: bool, at: 
             });
         }
     });
-    let ink = Ink::new(move |_| layer().0, is_off.clone());
+    let ink = Ink::new_when(move |_| layer().0, is_off.clone());
     // The menu has the focus; the item the keys are on shows it.
     let focused = ink.focused;
     effect(move || focused.set(m.is_lit(at) && m.keyed()));

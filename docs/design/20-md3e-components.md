@@ -16,6 +16,8 @@ cargo run --release -p anti-webui-md3e --example showcase [actions|selection|com
 | 画像 | `image`、`avatar`、`initials_avatar`（[22](22-images.md)） |
 | 並べ替え | `sortable_list`、`sortable_row`（[23](23-drag-and-drop.md)） |
 | 移動 | `navigation_bar`、`short_navigation_bar`、`navigation_rail`、`wide_navigation_rail`、`drawer_item`、`tabs`、`styled_tabs`、`top_app_bar`、`top_app_bar_over`、`bottom_app_bar`、`flexible_bottom_app_bar`、`floating_toolbar`、`floating_toolbar_with_fab` |
+| 形 | `shape`、`styled_shape`、`MaterialShape`（[15](15-md3e.md) の「形」） |
+| 部品を作るための部品 | `Ink` |
 | 入力 | `text_field`、`outlined_text_field`、`dropdown_field`、`search_bar`、`menu`、`fab_menu`、`split_button`、`date_picker`、`date_picker_dialog`、`time_picker`、`time_picker_dialog` |
 
 スイッチ、チェックボックス、ラジオボタン、スライダー、タブ、ツールチップ、ダイアログとシートは、標準の部品の動き（`switch_with` など）の上に MD3E の見た目を載せている（[33](33-customization.md)）。値は `Binding`（`Signal` をそのまま渡せる）で受け、変更も部品がする。そのほかの部品は、状態を値を読むクロージャで受け、変更はアプリが行う（[19](19-buttons.md) のトグルと同じ）。
@@ -77,6 +79,27 @@ alert_dialog(move || open.get(), move || open.set(false), AlertDialog::new().tit
 ## 共通の部分
 
 `surface.rs` から状態レイヤーとリップルを `Ink` として切り出した。**動きを受ける箱と描く箱を分けられる**ので、スイッチのように「ルートでホバーを受け、つまみの周りの 40 の円に描く」部品が書ける。
+
+`Ink` は公開している。アプリが自分で作った `div()`（デスクトップのバーやドックのタイルなど）にも、部品と同じホバー、フォーカス、押下の表示を付けられる。
+
+```rust
+use anti_webui_md3e::components::Ink;
+
+let ink = Ink::new(|c| c.on_secondary_container, move || off.get());
+let tile = div().w(120.0).h(56.0).rounded(16.0).focusable()
+    .dyn_style(|s| s.bg(color_scheme().secondary_container));
+let tile = ink.paint(ink.listen(tile));   // 受ける箱と描く箱が同じ
+```
+
+| API | 内容 |
+|---|---|
+| `Ink::new(color, disabled)` | `color` は `Fn(&ColorScheme) -> Color`（ふつうは内容の色）、`disabled` は `Fn() -> bool`。無効の間は何も描かない |
+| `listen(div)` | ホバー、`:focus-visible`、押下、Enter と Space を受ける。リップルは押した位置から広がる |
+| `listen_centered(div)` | 同じだが、リップルは描く箱の中心から広がる。受ける箱と描く箱が違うとき用 |
+| `paint(div)` | その箱の `overlay` に、箱の角丸の形で描く。`bg` の上、子の下 |
+| `hovered`、`focused`、`pressed` | 状態のシグナル。`focused` は外から立ててもよい（キーで項目を移るリスト） |
+
+濃さと時間は [15](15-md3e.md) の「状態レイヤーとリップル」と同じ。何も起きていない間は `overlay` が `None` を返し、フレームも要求しない。`paint` は `overlay` を使うので、その箱に別の `overlay` は付けられない。以前の `disabled` は内部の `Rc<dyn Fn() -> bool>` だったが、公開にあたって `impl Fn() -> bool` にした（部品の中では `new_when` で `Rc` のまま渡す）。
 
 core の `follow(target, spring)` は、目標が変わったときだけばねを始める値（以前はこのクレートの `following`）。止まっているときにフレームを要求しないという、[15](15-md3e.md) の約束をここで守る。
 
@@ -452,16 +475,18 @@ fab_menu(icons::ADD, move || open.get(), move || open.update(|o| *o = !*o), item
 |---|---|
 | `actions` | ボタン、アイコンボタン、FAB、グループ、スプリットボタン |
 | `selection` | スイッチ、チェックボックス、ラジオ、スライダー、チップ |
-| `communication` | 進捗、バッジ、ツールチップ、スナックバー |
+| `communication` | 進捗、形、バッジ、ツールチップ、スナックバー |
 | `containment` | カード、リスト、ダイアログ、シート、カルーセル |
 | `navigation` | バー、レール、タブ、アプリバー、ツールバー、ドロワー |
 | `inputs` | テキストフィールド、検索、メニュー、ピッカー |
+
+`communication` の形の節は、カタログの全部の形を並べ、ポインタを乗せると次の形に変わる。その下は `Ink` を付けた自作の箱で、押すたびに中の形が次の形へ 90 度ずつ回りながら変わる。
 
 `--shot <page> <file.png> [--dark]` はウィンドウなしで絵を書き出し、`SHOWCASE_OPEN=<名前>` でダイアログなどを開いた状態から始める。`--bench` は下の表を出す。
 
 ## 確認
 
-`anti-webui-md3e/tests` の `selection`、`feedback`、`containers`、`navigation`、`inputs` で、大きさ、色、形、順番、キーボード、止まっている間はフレームを要求しないことを確かめる。`anti-webui-core/tests/portals.rs` はポータル、タイマー、通知を確かめる。
+`anti-webui-md3e/tests` の `selection`、`feedback`、`containers`、`navigation`、`inputs`、`shapes` で、大きさ、色、形、順番、キーボード、止まっている間はフレームを要求しないことを確かめる。`anti-webui-core/tests/portals.rs` はポータル、タイマー、通知を確かめる。
 
 ショーケースの全ページとダイアログ類を、オフスクリーンの絵で目で確かめた。実ウィンドウでは `containment` でアラートダイアログを開いた状態を画面で確かめた。
 
@@ -479,6 +504,8 @@ fab_menu(icons::ADD, move || open.get(), move || open.update(|o| *o = !*o), item
 | `containment` | 0.20 | 1.31 | 0.00 | 0.13 |
 | `navigation` | 0.73 | 2.66 | 0.00 | 0.32 |
 | `inputs` | 0.27 | 1.53 | 0.00 | 0.44 |
+
+この表は形の節を足す前の値で、`communication` は測り直していない。
 
 1 周目はフォントの登録と形の計算があるので、`navigation` の最初のフレームが 6.14 ms で最も重い。
 

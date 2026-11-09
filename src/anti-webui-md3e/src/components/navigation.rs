@@ -102,7 +102,7 @@ fn item_state(
     ItemState {
         grown: progress_of(selected.clone(), grow),
         fade: progress_of(selected.clone(), default_effects()),
-        ink: Ink::new(|c| c.on_surface, disabled.clone()),
+        ink: Ink::new_when(|c| c.on_surface, disabled.clone()),
         selected,
         disabled,
         icon_color,
@@ -577,7 +577,7 @@ pub fn drawer_item(
                 c.on_surface
             }
         },
-        Rc::new(|| false),
+        || false,
     );
     let focused = ink.focused;
     ink.paint(

@@ -1,13 +1,15 @@
-//! Progress, badges, tooltips and snackbars.
+//! Progress, shapes, badges, tooltips and snackbars.
 
 use super::{demo_is, row, section};
 use anti_webui::prelude::*;
+use anti_webui_md3e::color_scheme;
 use anti_webui_md3e::components::{
-    ButtonStyle, RichTooltip, Snackbar, badge, badged, button, circular_progress,
-    circular_wavy_progress, filled_icon_button, icon, icon_button, indeterminate_circular_progress,
-    indeterminate_circular_wavy_progress, indeterminate_linear_progress,
-    indeterminate_wavy_progress, linear_progress, loading_indicator, outlined_button, rich_tooltip,
-    slider, snackbars, styled_button, text_badge, tonal_button, tooltip, wavy_progress,
+    ButtonStyle, Ink, MaterialShape, RichTooltip, ShapeStyle, Snackbar, badge, badged, button,
+    circular_progress, circular_wavy_progress, filled_icon_button, icon, icon_button,
+    indeterminate_circular_progress, indeterminate_circular_wavy_progress,
+    indeterminate_linear_progress, indeterminate_wavy_progress, linear_progress, loading_indicator,
+    outlined_button, rich_tooltip, slider, snackbars, styled_button, styled_shape, text_badge,
+    tonal_button, tooltip, wavy_progress,
 };
 use anti_webui_md3e::icons;
 
@@ -17,6 +19,7 @@ pub fn page() -> Div {
         .flex_col()
         .gap(24.0)
         .child(progress())
+        .child(shapes())
         .child(badges())
         .child(tooltips())
         .child(snacks())
@@ -45,6 +48,62 @@ fn progress() -> Div {
                 .child(indeterminate_linear_progress().w(320.0))
                 .child(indeterminate_wavy_progress().w(320.0)),
         )
+}
+
+/// The catalog, each shape turning into the next under the pointer, and a box of its own with
+/// `Ink` that goes through them as it is clicked.
+fn shapes() -> Div {
+    let all = MaterialShape::ALL;
+    let tile = move |i: usize| {
+        let hovered = signal(false);
+        let (shape, next) = (all[i], all[(i + 1) % all.len()]);
+        tooltip(
+            styled_shape(
+                move || if hovered.get() { next } else { shape },
+                ShapeStyle::new().color(|c| c.secondary),
+            )
+            .w(48.0)
+            .h(48.0)
+            .on_hover(move |on| hovered.set(on)),
+            format!("{shape:?}"),
+        )
+    };
+    let grid =
+        div()
+            .flex()
+            .flex_col()
+            .gap(12.0)
+            .children(all.chunks(12).enumerate().map(move |(r, chunk)| {
+                row().children((0..chunk.len()).map(move |c| tile(r * 12 + c)))
+            }));
+
+    let at = signal(0usize);
+    let ink = Ink::new(|c| c.on_primary_container, || false);
+    let button = div()
+        .w(96.0)
+        .h(96.0)
+        .rounded(28.0)
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor(CursorIcon::Pointer)
+        .focusable()
+        .access(|a| a.role(Role::Button).label("Next shape"))
+        .dyn_style(|s| s.bg(color_scheme().primary_container))
+        .on_click(move |_| at.update(|i| *i += 1))
+        .child(
+            styled_shape(
+                move || all[at.get() % all.len()],
+                ShapeStyle::new()
+                    .color(|c| c.on_primary_container)
+                    .rotation(move || at.get() as f32 * 90.0),
+            )
+            .w(56.0)
+            .h(56.0),
+        );
+    section("Shapes")
+        .child(grid)
+        .child(row().gap(24.0).child(ink.paint(ink.listen(button))))
 }
 
 fn badges() -> Div {

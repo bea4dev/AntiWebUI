@@ -21,6 +21,7 @@ mod modal;
 mod navigation;
 mod progress;
 mod search;
+mod shape;
 mod slider;
 mod snackbar;
 mod sortable;
@@ -79,10 +80,12 @@ pub use progress::{
     indeterminate_wavy_progress, linear_progress, wavy_progress,
 };
 pub use search::{SearchStyle, search_bar};
+pub use shape::{MaterialShape, ShapeStyle, shape, styled_shape};
 pub use slider::{SliderStyle, range_slider, slider, styled_slider};
 pub use snackbar::{Snackbar, Snackbars, snackbars};
 pub use sortable::{sortable_list, sortable_row};
 pub use split_button::{SplitButtonStyle, split_button};
+pub use surface::Ink;
 pub use switch::{SwitchStyle, styled_switch, switch};
 pub use tabs::{Tab, TabsStyle, icon_tab, styled_tabs, tab, tabs};
 pub use text_field::{TextFieldStyle, dropdown_field, outlined_text_field, text_field};
@@ -93,7 +96,7 @@ pub use tooltip::{RichTooltip, rich_tooltip, tooltip};
 /// Compiles the shaders of the components, so that the first press doesn't have to wait for that.
 pub(crate) fn preload_shaders() {
     surface::preload_shaders();
-    loading::preload_shaders();
+    shape::preload_shaders();
     progress::preload_shaders();
     checkbox::preload_shaders();
     slider::preload_shaders();
@@ -105,7 +108,7 @@ pub(crate) fn preload_shaders() {
 #[doc(hidden)]
 pub fn check_shaders() -> Result<(), String> {
     surface::check_shader()?;
-    loading::check_shader()?;
+    shape::check_shader()?;
     progress::check_shader()?;
     checkbox::check_shader()?;
     slider::check_shader()?;

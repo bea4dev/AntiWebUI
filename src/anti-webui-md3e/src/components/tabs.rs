@@ -254,7 +254,7 @@ fn one_tab(
                 c.on_surface
             }
         },
-        Rc::new(|| false),
+        || false,
     );
     // The row has the focus; the chosen tab shows it.
     let focused = ink.focused;
