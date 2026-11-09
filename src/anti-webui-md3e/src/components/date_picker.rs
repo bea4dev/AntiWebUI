@@ -7,11 +7,12 @@ use super::modal::dialog;
 use super::surface::{Ink, When, focus_ring};
 use crate::color::color_scheme;
 use crate::icons;
-use crate::motion::{default_effects, default_spatial};
+use crate::motion::{default_effects, default_spatial, fast_spatial};
 use crate::typography::TextStyle;
 use anti_webui::prelude::*;
+use std::cell::Cell;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CELL: f32 = 48.0;
 const DAY: f32 = 40.0;
@@ -113,6 +114,7 @@ pub struct DatePickerStyle {
     header: bool,
     years: std::ops::RangeInclusive<i32>,
     allowed: Option<Rc<dyn Fn(Date) -> bool>>,
+    cascade: Option<Duration>,
 }
 
 impl Default for DatePickerStyle {
@@ -122,6 +124,7 @@ impl Default for DatePickerStyle {
             header: true,
             years: 1900..=2100,
             allowed: None,
+            cascade: None,
         }
     }
 }
@@ -153,6 +156,35 @@ impl DatePickerStyle {
         self.allowed = Some(Rc::new(f));
         self
     }
+
+    /// The days of the week and of the month come in one after another when it first shows,
+    /// `step` apart, along the diagonals from the top left: for a calendar that comes in with what
+    /// it is in. The months it goes to after that don't.
+    pub fn cascade(mut self, step: Duration) -> Self {
+        self.cascade = Some(step);
+        self
+    }
+}
+
+/// `node` coming in, growing as it fades in, `order` steps after it is first laid out. Not
+/// before: a timer set when it is made could be over before a new window is on the screen.
+fn cascading(node: Div, order: u32, step: Duration) -> Div {
+    let go = signal(false);
+    let shown = follow(move || if go.get() { 1.0f32 } else { 0.0 }, fast_spatial());
+    let started = Cell::new(false);
+    node.on_resized(move |_, _| {
+        if !started.replace(true) {
+            set_timeout(step * order, move || {
+                if go.is_alive() {
+                    go.set(true);
+                }
+            });
+        }
+    })
+    .dyn_style(move |s| {
+        let t = shown.get();
+        s.opacity(t.clamp(0.0, 1.0)).scale(0.6 + 0.4 * t)
+    })
 }
 
 fn day_cell(
@@ -257,6 +289,7 @@ fn month_grid(
     on_select: Rc<dyn Fn(Date)>,
     today: Date,
     allowed: Option<Rc<dyn Fn(Date) -> bool>>,
+    cascade: Option<Duration>,
 ) -> Div {
     let (year, month) = from_index(month_index);
     let first = Date::new(year, month, 1).weekday() as usize;
@@ -271,7 +304,12 @@ fn month_grid(
                 }
                 let date = Date::new(year, month, (n - first + 1) as u32);
                 let ok = allowed.as_ref().is_none_or(|f| f(date));
-                day_cell(date, selected.clone(), on_select.clone(), today, ok)
+                let cell = day_cell(date, selected.clone(), on_select.clone(), today, ok);
+                match cascade {
+                    // After the days of the week.
+                    Some(step) => cascading(cell, (row + 1 + column) as u32, step),
+                    None => cell,
+                }
             })
             .collect();
         rows.push(
@@ -328,6 +366,7 @@ pub fn date_picker(
         header: with_header,
         years,
         allowed,
+        cascade,
     } = style;
     let today = Date::today();
     let start = untrack(|| selected()).unwrap_or(today);
@@ -450,8 +489,9 @@ pub fn date_picker(
         .children(
             WEEKDAYS
                 .iter()
-                .map(|day| {
-                    TextStyle::BODY_LARGE.apply(
+                .enumerate()
+                .map(|(column, day)| {
+                    let cell = TextStyle::BODY_LARGE.apply(
                         div()
                             .flex()
                             .items_center()
@@ -461,7 +501,11 @@ pub fn date_picker(
                             .flex_none()
                             .dyn_style(|s| s.text_color(color_scheme().on_surface))
                             .child(text(day.to_string())),
-                    )
+                    );
+                    match cascade {
+                        Some(step) => cascading(cell, column as u32, step),
+                        None => cell,
+                    }
                 })
                 .collect::<Vec<_>>(),
         );
@@ -481,6 +525,8 @@ pub fn date_picker(
     };
     let (cell_selected, cell_select, cell_allowed) =
         (selected.clone(), on_select.clone(), allowed.clone());
+    // Only the month it shows first comes in one day after another.
+    let first_cascade = Cell::new(cascade);
     let strip = for_each(
         visible,
         |m| *m,
@@ -491,6 +537,7 @@ pub fn date_picker(
                 cell_select.clone(),
                 today,
                 cell_allowed.clone(),
+                first_cascade.take(),
             )
             .absolute()
             .top(0.0)
