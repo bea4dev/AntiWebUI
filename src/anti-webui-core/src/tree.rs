@@ -613,6 +613,8 @@ pub struct Document {
     pub images: RefCell<crate::images::ImageStore>,
     pub videos: RefCell<crate::video::VideoStore>,
     pub fullscreen: Fullscreen,
+    /// What shows where nothing is drawn; `None` is white.
+    pub background: Option<anti_webui_style::Color>,
     /// Errors to tell of when the document isn't borrowed any more.
     pub(crate) videos_failed: Vec<(crate::video::VideoErrorListener, crate::video::VideoError)>,
     /// What decides which contents to skip. See `docs/design/29-content-visibility.md`.
@@ -681,6 +683,7 @@ impl Default for Document {
             images: RefCell::default(),
             videos: RefCell::default(),
             fullscreen: Fullscreen::default(),
+            background: None,
             videos_failed: Vec::new(),
             visibility: Default::default(),
         }

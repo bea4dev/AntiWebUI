@@ -96,6 +96,9 @@ pub struct WindowOptions {
     pub fullscreen: bool,
     /// What kind of surface it is.
     pub role: Role,
+    /// What shows where nothing is drawn. `None` is white, but for a [`Role::Layer`], which is
+    /// transparent: a bar or a dock is usually less than the rectangle it is given.
+    pub background: Option<anti_webui_style::Color>,
 }
 
 /// What kind of surface a window is.
@@ -131,6 +134,7 @@ impl WindowOptions {
             top_level: false,
             fullscreen: false,
             role: Role::Toplevel,
+            background: None,
         }
     }
 
@@ -180,6 +184,13 @@ impl WindowOptions {
 
     pub fn role(mut self, role: Role) -> Self {
         self.role = role;
+        self
+    }
+
+    /// What shows where nothing is drawn. A color that isn't opaque shows what is behind the
+    /// window, where the system composites windows with their alpha.
+    pub fn background(mut self, color: anti_webui_style::Color) -> Self {
+        self.background = Some(color);
         self
     }
 }

@@ -153,7 +153,14 @@ impl Ui {
             request.parent.clone(),
             request.options.modal,
         );
-        Self::mount(window, request.root)
+        let background = request.options.background.or(match request.options.role {
+            crate::window::Role::Layer(_) => Some(anti_webui_style::Color::TRANSPARENT),
+            _ => None,
+        });
+        let ui = Self::mount(window, request.root);
+        crate::window::activate(window);
+        with_doc(|d| d.background = background);
+        ui
     }
 
     /// Lets the window go: what its root owns is disposed, and its cleanups run.

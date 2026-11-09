@@ -414,7 +414,7 @@ fn window_clear(doc: &Document) -> Color {
     if doc.fullscreen.element.is_some() {
         Color::BLACK
     } else {
-        Color::WHITE
+        doc.background.unwrap_or(Color::WHITE)
     }
 }
 
