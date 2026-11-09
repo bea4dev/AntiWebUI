@@ -476,6 +476,29 @@ fn a_date_picker_chooses_a_day_and_moves_between_months() {
 }
 
 #[test]
+fn a_date_picker_without_a_header_starts_with_the_month() {
+    let date = Some(Date::new(2024, 2, 10));
+    let with = settle(&mut start_ui(move || {
+        div().child(date_picker(move || date, |_| {}, DatePickerStyle::new()))
+    }));
+    let without = settle(&mut start_ui(move || {
+        div().child(date_picker(
+            move || date,
+            |_| {},
+            DatePickerStyle::new().no_header(),
+        ))
+    }));
+    let day = |scene| {
+        colored(scene, C.primary)
+            .pop()
+            .expect("the selected day")
+            .rect
+    };
+    // The title, the date and the line under them are 121 high.
+    assert_eq!(day(&with).y - day(&without).y, 121);
+}
+
+#[test]
 fn a_time_picker_turns_its_hand_and_goes_on_to_the_minutes() {
     let time = signal((9u32, 41u32));
     let mut ui = start_ui(move || {

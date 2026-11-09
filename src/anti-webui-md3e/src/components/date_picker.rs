@@ -110,6 +110,7 @@ fn from_index(i: i32) -> (i32, u32) {
 #[derive(Clone)]
 pub struct DatePickerStyle {
     title: String,
+    header: bool,
     years: std::ops::RangeInclusive<i32>,
     allowed: Option<Rc<dyn Fn(Date) -> bool>>,
 }
@@ -118,6 +119,7 @@ impl Default for DatePickerStyle {
     fn default() -> Self {
         Self {
             title: "Select date".to_string(),
+            header: true,
             years: 1900..=2100,
             allowed: None,
         }
@@ -131,6 +133,13 @@ impl DatePickerStyle {
 
     pub fn title(mut self, title: impl Into<String>) -> Self {
         self.title = title.into();
+        self
+    }
+
+    /// Without the title and the chosen date above the month, like Compose's `title = null` and
+    /// `headline = null`: a calendar that shows the month, for one that is always open.
+    pub fn no_header(mut self) -> Self {
+        self.header = false;
         self
     }
 
@@ -316,6 +325,7 @@ pub fn date_picker(
     let on_select: Rc<dyn Fn(Date)> = Rc::new(on_select);
     let DatePickerStyle {
         title,
+        header: with_header,
         years,
         allowed,
     } = style;
@@ -357,7 +367,7 @@ pub fn date_picker(
             None => "Selected date".to_string(),
         }
     };
-    let header = div()
+    let mut header = div()
         .flex()
         .flex_col()
         .flex_none()
@@ -376,6 +386,11 @@ pub fn date_picker(
                 .pb(12.0)
                 .child(TextStyle::HEADLINE_LARGE.apply(div().child(text(shown)))),
         );
+    let mut rule = divider();
+    if !with_header {
+        header = div();
+        rule = div();
+    }
     let nav = div()
         .flex()
         .flex_row()
@@ -562,7 +577,7 @@ pub fn date_picker(
         .select_none()
         .dyn_style(|s| s.bg(color_scheme().surface_container_high))
         .child(header)
-        .child(divider())
+        .child(rule)
         .child(nav)
         .child(
             div()
