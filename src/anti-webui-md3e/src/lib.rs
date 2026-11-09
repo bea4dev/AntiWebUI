@@ -14,12 +14,16 @@
 
 pub mod color;
 pub mod components;
+pub mod dynamic;
 pub mod motion;
 mod shapes;
 pub mod typography;
 
 pub use anti_webui_symbols_outlined as icons;
-pub use color::{ColorScheme, color_scheme, set_color_scheme};
+pub use color::{
+    ColorScheme, SchemeOptions, SchemeVariant, color_scheme, set_color_scheme,
+    set_color_scheme_animated,
+};
 
 use std::cell::Cell;
 
