@@ -37,8 +37,7 @@ static SHARED: OnceLock<Shared> = OnceLock::new();
 
 /// The power profiles. It starts following them the first time.
 pub fn power_profiles() -> PowerProfiles {
-    PowerProfiles(SHARED.get_or_init(|| {
-        dbus::spawn(follow());
+    PowerProfiles(dbus::init_then_follow(&SHARED, follow, || {
         Shared {
             available: shared_signal(false),
             active: shared_signal(String::new()),

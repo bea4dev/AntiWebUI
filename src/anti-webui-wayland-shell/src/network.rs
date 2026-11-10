@@ -161,8 +161,7 @@ static SHARED: OnceLock<Shared> = OnceLock::new();
 
 /// The networks. It starts following them the first time.
 pub fn network() -> Network {
-    Network(SHARED.get_or_init(|| {
-        dbus::spawn(follow());
+    Network(dbus::init_then_follow(&SHARED, follow, || {
         Shared {
             available: shared_signal(false),
             connectivity: shared_signal(Connectivity::Unknown),

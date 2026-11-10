@@ -61,7 +61,7 @@ static SHARED: OnceLock<Shared> = OnceLock::new();
 
 /// The session. It starts following it the first time.
 pub fn session() -> Session {
-    Session(SHARED.get_or_init(|| {
+    Session(dbus::init_then_follow(&SHARED, follow, || {
         let shared = Shared {
             available: shared_signal(false),
             can: shared_signal([false; 4]),
@@ -71,7 +71,6 @@ pub fn session() -> Session {
             unlock: Listeners::new(),
             sleep: Listeners::new(),
         };
-        dbus::spawn(follow());
         follow_backlight(shared.brightness.clone());
         shared
     }))

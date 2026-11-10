@@ -122,24 +122,20 @@ static SHARED: OnceLock<Shared> = OnceLock::new();
 
 /// The batteries. It starts following them the first time.
 pub fn battery() -> Battery {
-    Battery(SHARED.get_or_init(|| {
-        let shared = Shared {
-            present: shared_signal(false),
-            percentage: shared_signal(0.0),
-            state: shared_signal(BatteryState::Unknown),
-            on_battery: shared_signal(false),
-            time_to_empty: shared_signal(None),
-            time_to_full: shared_signal(None),
-            energy_rate: shared_signal(0.0),
-            energy: shared_signal(0.0),
-            energy_full: shared_signal(0.0),
-            health: shared_signal(None),
-            cycles: shared_signal(None),
-            icon_name: shared_signal(String::new()),
-            devices: shared_signal(Vec::new()),
-        };
-        dbus::spawn(follow());
-        shared
+    Battery(dbus::init_then_follow(&SHARED, follow, || Shared {
+        present: shared_signal(false),
+        percentage: shared_signal(0.0),
+        state: shared_signal(BatteryState::Unknown),
+        on_battery: shared_signal(false),
+        time_to_empty: shared_signal(None),
+        time_to_full: shared_signal(None),
+        energy_rate: shared_signal(0.0),
+        energy: shared_signal(0.0),
+        energy_full: shared_signal(0.0),
+        health: shared_signal(None),
+        cycles: shared_signal(None),
+        icon_name: shared_signal(String::new()),
+        devices: shared_signal(Vec::new()),
     }))
 }
 

@@ -60,8 +60,7 @@ static SHARED: OnceLock<Shared> = OnceLock::new();
 
 /// Bluetooth. It starts following it the first time.
 pub fn bluetooth() -> Bluetooth {
-    Bluetooth(SHARED.get_or_init(|| {
-        dbus::spawn(follow());
+    Bluetooth(dbus::init_then_follow(&SHARED, follow, || {
         Shared {
             adapters: shared_signal(Vec::new()),
             devices: shared_signal(Vec::new()),

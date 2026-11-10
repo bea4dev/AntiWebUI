@@ -35,6 +35,24 @@ pub(crate) fn spawn(f: impl Future<Output = ()> + Send + 'static) {
     executor().spawn(f).detach();
 }
 
+/// A service's shared state, made the first time it is asked for, and `follow` started on the
+/// D-Bus thread once the state is in `cell` — not before, or it could find `cell` empty.
+pub(crate) fn init_then_follow<T: Send + Sync, F: Future<Output = ()> + Send + 'static>(
+    cell: &'static std::sync::OnceLock<T>,
+    follow: impl FnOnce() -> F,
+    make: impl FnOnce() -> T,
+) -> &'static T {
+    let mut made = false;
+    let shared = cell.get_or_init(|| {
+        made = true;
+        make()
+    });
+    if made {
+        spawn(follow());
+    }
+    shared
+}
+
 /// Runs `f` on the D-Bus thread, its result coming back to this one.
 pub(crate) fn run<T: Send + 'static>(
     f: impl Future<Output = Result<T, ServiceError>> + Send + 'static,

@@ -159,8 +159,7 @@ static SHARED: OnceLock<Shared> = OnceLock::new();
 
 /// The players. It starts following them the first time.
 pub fn media() -> Media {
-    Media(SHARED.get_or_init(|| {
-        dbus::spawn(follow());
+    Media(dbus::init_then_follow(&SHARED, follow, || {
         Shared {
             players: shared_signal(Vec::new()),
         }

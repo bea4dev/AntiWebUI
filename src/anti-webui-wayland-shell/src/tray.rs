@@ -170,8 +170,7 @@ static SHARED: OnceLock<Shared> = OnceLock::new();
 
 /// The tray. It starts following it the first time.
 pub fn tray() -> Tray {
-    Tray(SHARED.get_or_init(|| {
-        dbus::spawn(follow());
+    Tray(dbus::init_then_follow(&SHARED, follow, || {
         Shared {
             available: shared_signal(false),
             items: shared_signal(Vec::new()),
