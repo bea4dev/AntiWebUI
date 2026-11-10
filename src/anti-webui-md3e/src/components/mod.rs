@@ -77,7 +77,7 @@ pub use navigation::{
 pub use progress::{
     circular_progress, circular_wavy_progress, indeterminate_circular_progress,
     indeterminate_circular_wavy_progress, indeterminate_linear_progress,
-    indeterminate_wavy_progress, linear_progress, wavy_progress,
+    indeterminate_wavy_progress, linear_progress, wavy_progress, wavy_progress_eased,
 };
 pub use search::{SearchStyle, search_bar};
 pub use shape::{MaterialShape, ShapeStyle, shape, styled_shape};

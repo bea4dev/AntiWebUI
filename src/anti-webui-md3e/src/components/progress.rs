@@ -84,6 +84,12 @@ fn keep_turning(time: Signal<f32>, wave: Animated<f32>, ticking: Signal<bool>, s
 /// A progress bar with a wavy line, for a value from 0 to 1. It takes the whole width it is given
 /// when styled with `.w_full()`.
 pub fn wavy_progress(progress: impl Fn() -> f32 + 'static) -> Div {
+    wavy_progress_eased(progress, Transition::ms(500).linear())
+}
+
+/// [`wavy_progress`] whose line goes to a new value with `timing` instead of in half a second at an
+/// even pace: a short one for a value that changes often or is dragged, like a seek bar's.
+pub fn wavy_progress_eased(progress: impl Fn() -> f32 + 'static, timing: Transition) -> Div {
     crate::ensure_ready();
     let first = progress().clamp(0.0, 1.0);
     let value = animated(first);
@@ -99,7 +105,7 @@ pub fn wavy_progress(progress: impl Fn() -> f32 + 'static) -> Div {
             return;
         }
         untrack(|| {
-            value.to(target, Transition::ms(500).linear());
+            value.to(target, timing.clone());
             if waves_at(target) != waves_at(before) {
                 wave.to(
                     if waves_at(target) { 1.0 } else { 0.0 },
