@@ -22,6 +22,7 @@ pub struct MenuItem {
     selected: Option<When>,
     disabled: Option<When>,
     on_click: Option<Rc<dyn Fn()>>,
+    submenu: Option<Rc<Vec<Vec<MenuItem>>>>,
 }
 
 /// An item of a menu.
@@ -73,6 +74,14 @@ impl MenuItem {
     /// What it does.
     pub fn on_click(mut self, f: impl Fn() + 'static) -> Self {
         self.on_click = Some(Rc::new(f));
+        self
+    }
+
+    /// Opens a menu of `groups` beside it instead of doing something: when it is clicked, when the
+    /// pointer rests on it, and with Right; Left goes back. It is in the selected colors and shape
+    /// while that menu is open, and has an arrow after the label unless it has another icon there.
+    pub fn submenu(mut self, groups: Vec<Vec<MenuItem>>) -> Self {
+        self.submenu = Some(Rc::new(groups));
         self
     }
 }
@@ -154,28 +163,38 @@ pub fn styled_menu(
     }
     let vibrant = style.vibrant;
     menu_with(open, on_dismiss, options, move |m| {
-        let fade = follow(move || if m.open() { 1.0f32 } else { 0.0 }, fast_effects());
-        let size = follow(move || if m.open() { 1.0f32 } else { 0.8 }, fast_spatial());
-        m.hold_while(move || fade.get() > 0.0);
-        move || {
-            let groups = groups.clone();
-            let count = groups.len();
-            let next = Rc::new(Cell::new(0usize));
-            div()
-                .flex()
-                .flex_col()
-                .gap(2.0)
-                .transform_origin(origin.0, origin.1)
-                .dyn_style(move |s| s.opacity(fade.get().clamp(0.0, 1.0)).scale(size.get()))
-                .children(
-                    groups
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, items)| group(m, i, count, items, vibrant, next.clone()))
-                        .collect::<Vec<_>>(),
-                )
-        }
+        body(m, groups, vibrant, origin)
     })
+}
+
+/// What builds the groups of a menu or a submenu each time it opens, growing from `origin`.
+fn body(
+    m: MenuState,
+    groups: Vec<Vec<MenuItem>>,
+    vibrant: bool,
+    origin: (f32, f32),
+) -> impl Fn() -> Div + 'static {
+    let fade = follow(move || if m.open() { 1.0f32 } else { 0.0 }, fast_effects());
+    let size = follow(move || if m.open() { 1.0f32 } else { 0.8 }, fast_spatial());
+    m.hold_while(move || fade.get() > 0.0);
+    move || {
+        let groups = groups.clone();
+        let count = groups.len();
+        let next = Rc::new(Cell::new(0usize));
+        div()
+            .flex()
+            .flex_col()
+            .gap(2.0)
+            .transform_origin(origin.0, origin.1)
+            .dyn_style(move |s| s.opacity(fade.get().clamp(0.0, 1.0)).scale(size.get()))
+            .children(
+                groups
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, items)| group(m, i, count, items, vibrant, next.clone()))
+                    .collect::<Vec<_>>(),
+            )
+    }
 }
 
 /// The corners of a group by its place among the groups, or of an item by its place in the group.
@@ -249,8 +268,17 @@ fn item_view(m: MenuState, item: MenuItem, corners: Corners, vibrant: bool, at: 
         selected,
         disabled,
         on_click,
+        submenu,
     } = item;
     let selects = selected.is_some();
+    // A row that opens a submenu is selected while it is open, and never has a check.
+    let opens = submenu.is_some() && disabled.is_none();
+    let selected: Option<When> = if submenu.is_some() {
+        Some(Rc::new(move || m.is_open(at)))
+    } else {
+        selected
+    };
+    let trailing_icon = trailing_icon.or(submenu.as_ref().map(|_| icons::ARROW_RIGHT));
     let can_be_off = disabled.is_some();
     let is_on = when(selected);
     let is_off = when(disabled);
@@ -394,5 +422,10 @@ fn item_view(m: MenuState, item: MenuItem, corners: Corners, vibrant: bool, at: 
                 .children(trailing_icon.map(|symbol| sized_icon(symbol, 20.0).ml(8.0))),
         ),
     );
-    m.item(at, node, choice)
+    match submenu {
+        Some(groups) if opens => m.submenu(at, node, move |child| {
+            body(child, (*groups).clone(), vibrant, (0.0, 0.0))
+        }),
+        _ => m.item(at, node, choice),
+    }
 }
