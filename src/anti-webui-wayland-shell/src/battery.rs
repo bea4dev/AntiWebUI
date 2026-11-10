@@ -110,6 +110,10 @@ struct Shared {
     time_to_empty: SharedSignal<Option<Duration>>,
     time_to_full: SharedSignal<Option<Duration>>,
     energy_rate: SharedSignal<f64>,
+    energy: SharedSignal<f64>,
+    energy_full: SharedSignal<f64>,
+    health: SharedSignal<Option<f64>>,
+    cycles: SharedSignal<Option<u32>>,
     icon_name: SharedSignal<String>,
     devices: SharedSignal<Vec<BatteryDevice>>,
 }
@@ -127,6 +131,10 @@ pub fn battery() -> Battery {
             time_to_empty: shared_signal(None),
             time_to_full: shared_signal(None),
             energy_rate: shared_signal(0.0),
+            energy: shared_signal(0.0),
+            energy_full: shared_signal(0.0),
+            health: shared_signal(None),
+            cycles: shared_signal(None),
             icon_name: shared_signal(String::new()),
             devices: shared_signal(Vec::new()),
         };
@@ -176,6 +184,27 @@ impl Battery {
     /// How fast it fills up or runs down, in watts.
     pub fn energy_rate(&self) -> f64 {
         self.0.energy_rate.get()
+    }
+
+    /// How much energy is in it now, in watt-hours.
+    pub fn energy(&self) -> f64 {
+        self.0.energy.get()
+    }
+
+    /// How much energy it holds when full, in watt-hours.
+    pub fn energy_full(&self) -> f64 {
+        self.0.energy_full.get()
+    }
+
+    /// How much it holds when full against what it held when new, from 0 to 100, when the
+    /// batteries say.
+    pub fn health(&self) -> Option<f64> {
+        self.0.health.get()
+    }
+
+    /// How many times it has been charged through, when the batteries say: the most of them.
+    pub fn charge_cycles(&self) -> Option<u32> {
+        self.0.cycles.get()
     }
 
     /// The name of an icon in the icon theme for how it is, like `battery-good-charging-symbolic`.
@@ -232,6 +261,34 @@ fn publish(root: &Props, display: &Props, devices: &Devices) {
     put(&s.time_to_empty, seconds(display, "TimeToEmpty"));
     put(&s.time_to_full, seconds(display, "TimeToFull"));
     put(&s.energy_rate, get(display, "EnergyRate").unwrap_or(0.0));
+    put(&s.energy, get(display, "Energy").unwrap_or(0.0));
+    put(&s.energy_full, get(display, "EnergyFull").unwrap_or(0.0));
+    // The computer's own batteries (not a mouse's), which the display device leaves these out of.
+    let own: Vec<&Props> = devices
+        .values()
+        .filter(|p| {
+            get::<u32>(p, "Type") == Some(2)
+                && get::<bool>(p, "PowerSupply").unwrap_or(false)
+                && get::<bool>(p, "IsPresent").unwrap_or(true)
+        })
+        .collect();
+    let healths: Vec<f64> = own
+        .iter()
+        .filter_map(|p| get::<f64>(p, "Capacity"))
+        .filter(|c| *c > 0.0)
+        .collect();
+    put(
+        &s.health,
+        (!healths.is_empty()).then(|| healths.iter().sum::<f64>() / healths.len() as f64),
+    );
+    put(
+        &s.cycles,
+        own.iter()
+            .filter_map(|p| get::<i32>(p, "ChargeCycles"))
+            .filter(|c| *c >= 0)
+            .max()
+            .map(|c| c as u32),
+    );
     put(&s.icon_name, string(display, "IconName"));
     put(
         &s.devices,

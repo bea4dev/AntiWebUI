@@ -692,7 +692,7 @@ src/anti-webui-wayland-shell/
   - 共通：`dbus.rs`（zbus。2 本のバスを隠れたスレッド 1 本で回す、`while_owned` で相手が後から起きても埋まる）と、UI スレッドへイベントを渡す `listeners.rs`。
   - 機能（どれも feature。facade では `shell-<名前>`、全部は `shell-all`）：
     - `network()`：接続状態、Wi-Fi のオンオフ、AP の一覧（SSID ごとに一番強いもの、強い順）、スキャン、接続、切断、有線。保存済みでない鍵つきの AP をパスワードなしでつなぐと `NetError::NeedsSecret`。保存済みでない Enterprise は `Unsupported`。
-    - `battery()`：表示用のまとめた電池、`devices()` でマウスなどの電池も。
+    - `battery()`：表示用のまとめた電池、`devices()` でマウスなどの電池も。残り時間、電力、エネルギー、劣化具合（`health()`）、充電回数（`charge_cycles()`）も読める。後の 2 つは、表示用の電池にはないので、パソコン自身の電池から取る。
     - `power_profiles()`：新旧どちらの名前の power-profiles-daemon にも対応。
     - `bluetooth()`：アダプタと機器、電源、探索、接続、ペアリング、信頼、削除、機器の電池。
     - `media()`：MPRIS のプレーヤーの一覧と今のプレーヤー、曲の情報、操作。`position()` は追跡されない計算で、UI は自分のタイマーで読む。
