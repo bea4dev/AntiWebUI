@@ -44,9 +44,12 @@ impl SessionLock {
 }
 
 fn options(output: &Output) -> WindowOptions {
+    // Never a child of the window that locked, as when a button in a panel did: the panel closing
+    // would close the lock screens with it, and closing them unlocks.
     WindowOptions::new()
         .title("Lock")
         .role(Role::Lock(output.name.clone()))
+        .top_level()
 }
 
 fn opened_here(output: &Output, screen: impl FnOnce() -> anti_webui_core::view::View + 'static) {
