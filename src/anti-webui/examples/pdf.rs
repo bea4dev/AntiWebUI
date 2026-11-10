@@ -48,10 +48,10 @@ fn main() {
             }
             let bar = rgb(0x2b2d31);
             let shown = move || match viewer.state() {
-                PdfState::Loading => "読み込み中".to_owned(),
+                PdfState::Loading => "Loading".to_owned(),
                 PdfState::Failed(e) => e.to_string(),
                 PdfState::Ready => format!(
-                    "{} / {} ページ  {:.0}%",
+                    "Page {} / {}  {:.0}%",
                     viewer.page() + 1,
                     viewer.page_count(),
                     viewer.percent() * 100.0
@@ -135,25 +135,25 @@ fn main() {
                         .bg(bar)
                         .text_color(Color::WHITE)
                         .select_none()
-                        .child(button("目次").on_click(move |_| contents.update(|c| *c = !*c)))
+                        .child(button("Contents").on_click(move |_| contents.update(|c| *c = !*c)))
                         .child(
-                            button("サムネイル").on_click(move |_| thumbnails.update(|t| *t = !*t)),
+                            button("Thumbnails").on_click(move |_| thumbnails.update(|t| *t = !*t)),
                         )
                         .child(button("−").on_click(move |_| viewer.zoom_by(0.8)))
                         .child(button("+").on_click(move |_| viewer.zoom_by(1.25)))
                         .child(
-                            button("幅に合わせる")
+                            button("Fit width")
                                 .on_click(move |_| viewer.set_zoom(PdfZoom::FitWidth)),
                         )
-                        .child(button("全体").on_click(move |_| viewer.set_zoom(PdfZoom::FitPage)))
-                        .child(button("回転").on_click(move |_| viewer.rotate_clockwise()))
-                        .child(button("プレゼン").on_click(move |_| viewer.present()))
+                        .child(button("Fit page").on_click(move |_| viewer.set_zoom(PdfZoom::FitPage)))
+                        .child(button("Rotate").on_click(move |_| viewer.rotate_clockwise()))
+                        .child(button("Present").on_click(move |_| viewer.present()))
                         .child(
                             button(move || {
                                 if window_fullscreen() {
-                                    "全画面を解除"
+                                    "Exit fullscreen"
                                 } else {
-                                    "全画面"
+                                    "Fullscreen"
                                 }
                             })
                             .on_click(move |_| set_window_fullscreen(!window_fullscreen())),
@@ -163,7 +163,7 @@ fn main() {
                         .child(
                             text_input()
                                 .w(200.0)
-                                .placeholder("検索")
+                                .placeholder("Search")
                                 .value(query)
                                 .node_ref(search_box)
                                 .on_input(move |q| viewer.search(q))
@@ -184,32 +184,32 @@ fn main() {
                         .bg(bar)
                         .text_color(Color::WHITE)
                         .select_none()
-                        .child(tool_button("蛍光ペン", PdfTool::Highlight))
-                        .child(tool_button("下線", PdfTool::Underline))
-                        .child(tool_button("取り消し線", PdfTool::StrikeOut))
-                        .child(tool_button("インク", PdfTool::Ink))
-                        .child(tool_button("テキスト", PdfTool::FreeText))
-                        .child(tool_button("付箋", PdfTool::Note))
-                        .child(button("消す").on_click(move |_| viewer.delete_annotation()))
-                        .child(button("元に戻す").on_click(move |_| viewer.undo()))
-                        .child(button("やり直す").on_click(move |_| viewer.redo()))
-                        .child(button("保存").on_click({
+                        .child(tool_button("Highlight", PdfTool::Highlight))
+                        .child(tool_button("Underline", PdfTool::Underline))
+                        .child(tool_button("Strikeout", PdfTool::StrikeOut))
+                        .child(tool_button("Ink", PdfTool::Ink))
+                        .child(tool_button("Text", PdfTool::FreeText))
+                        .child(tool_button("Note", PdfTool::Note))
+                        .child(button("Delete").on_click(move |_| viewer.delete_annotation()))
+                        .child(button("Undo").on_click(move |_| viewer.undo()))
+                        .child(button("Redo").on_click(move |_| viewer.redo()))
+                        .child(button("Save").on_click({
                             let save = save.clone();
                             move |_| save()
                         }))
                         .child(text(move || {
                             let state = match viewer.editing() {
                                 PdfEditing::Yes | PdfEditing::NotYet => "",
-                                PdfEditing::Encrypted => "暗号化されているので編集できません",
-                                PdfEditing::Broken => "壊れているので編集できません",
+                                PdfEditing::Encrypted => "Encrypted; editing is unavailable",
+                                PdfEditing::Broken => "Damaged; editing is unavailable",
                             };
                             let saving = match viewer.save_result() {
-                                Some(Ok(path)) => format!("{} に保存しました", path.display()),
-                                Some(Err(e)) => format!("保存できません: {e}"),
+                                Some(Ok(path)) => format!("Saved to {}", path.display()),
+                                Some(Err(e)) => format!("Could not save: {e}"),
                                 None => String::new(),
                             };
                             let modified = if viewer.is_modified() {
-                                "変更あり"
+                                "Modified"
                             } else {
                                 ""
                             };

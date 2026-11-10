@@ -22,8 +22,8 @@ fn selection_demo() -> Div {
         .flex_col()
         .gap(8.0)
         .child(text(
-            "ここに並んだ文章は、別々の要素に分かれていてもドラッグで一度に選択できます。\
-             ダブルクリックで単語、トリプルクリックで段落を選択し、Ctrl+C でコピーできます。",
+            "These paragraphs are separate elements, yet one drag selects across all of them. \
+             Double-click selects a word, triple-click a paragraph, and Ctrl+C copies.",
         ))
         .child(
             div()
@@ -44,7 +44,7 @@ fn selection_demo() -> Div {
                         .p(10.0)
                         .rounded(6.0)
                         .dyn_style(|s| s.bg(theme().surface_muted))
-                        .child(text("右の列: いろはにほへと ちりぬるを わかよたれそ つねならむ 🎌")),
+                        .child(text("Right column: いろはにほへと ちりぬるを わかよたれそ つねならむ 🎌")),
                 ),
         )
         .child(
@@ -73,7 +73,7 @@ fn counter_demo() -> Div {
 fn input_demo() -> Div {
     let name = signal(String::new());
     let note = signal(String::from(
-        "複数行の入力欄です。\nIME（日本語入力）も使えます。",
+        "A multi-line input.\nIME works too: 日本語も入力できます。",
     ));
     let submitted = signal(String::new());
     div()
@@ -83,21 +83,21 @@ fn input_demo() -> Div {
         .child(label("Name"))
         .child(
             text_field(name)
-                .placeholder("お名前を入力（Enter で送信）")
+                .placeholder("Enter your name (Enter to submit)")
                 .on_submit(move |v| submitted.set(v.to_owned())),
         )
         .child(text(move || {
             let n = name.get();
             if n.is_empty() {
-                "まだ入力されていません".to_owned()
+                "Nothing entered yet".to_owned()
             } else {
-                format!("こんにちは、{n} さん！ ({} 文字)", n.chars().count())
+                format!("Hello, {n}! ({} characters)", n.chars().count())
             }
         }))
         .child(show(
             move || !submitted.get().is_empty(),
             move || {
-                text(move || format!("送信された値: {}", submitted.get()))
+                text(move || format!("Submitted: {}", submitted.get()))
                     .dyn_style(|s| s.text_color(theme().success))
             },
         ))
@@ -120,7 +120,7 @@ fn controls_demo() -> Div {
         .flex()
         .flex_col()
         .gap(12.0)
-        .child(checkbox(agree, "利用規約に同意する"))
+        .child(checkbox(agree, "I agree to the terms of service"))
         .child(
             div()
                 .flex()
@@ -158,12 +158,12 @@ fn todo_demo() -> Div {
     let todos = signal(vec![
         Todo {
             id: 1,
-            title: "Wayland で fractional scaling を試す".into(),
+            title: "Try fractional scaling on Wayland".into(),
             done: signal(true),
         },
         Todo {
             id: 2,
-            title: "テキスト選択をドラッグで試す".into(),
+            title: "Try selecting text by dragging".into(),
             done: signal(false),
         },
     ]);
@@ -196,7 +196,7 @@ fn todo_demo() -> Div {
                 .child(
                     text_field(draft)
                         .flex_1()
-                        .placeholder("新しいタスク")
+                        .placeholder("New task")
                         .on_submit(move |_| add()),
                 )
                 .child(primary_button("Add").on_click(move |_| add())),
@@ -229,7 +229,7 @@ fn todo_demo() -> Div {
         .child(label(move || {
             let list = todos.get();
             let done = list.iter().filter(|t| t.done.get()).count();
-            format!("{done} / {} 完了", list.len())
+            format!("{done} / {} done", list.len())
         }))
 }
 
@@ -251,7 +251,7 @@ fn scroll_demo() -> Div {
                     }
                 })
                 .child(text(format!(
-                    "Row {i} — スクロールしても選択を続けられます"
+                    "Row {i} — selection keeps going while you scroll"
                 )))
         })))
 }
@@ -292,20 +292,20 @@ fn overlay_demo() -> Div {
     let bubble = signal(false);
     let context = signal(None::<RectI>);
     let fruits = [
-        "りんご",
-        "みかん",
-        "ぶどう",
-        "もも",
-        "なし",
-        "かき",
-        "いちご",
-        "すいか",
-        "メロン",
-        "バナナ",
-        "キウイ",
-        "パイナップル",
-        "さくらんぼ",
-        "マンゴー",
+        "Apple",
+        "Orange",
+        "Grape",
+        "Peach",
+        "Pear",
+        "Persimmon",
+        "Strawberry",
+        "Watermelon",
+        "Melon",
+        "Banana",
+        "Kiwi",
+        "Pineapple",
+        "Cherry",
+        "Mango",
     ];
     div()
         .flex()
@@ -329,7 +329,7 @@ fn overlay_demo() -> Div {
                     .w(180.0),
                 )
                 .child(text(move || {
-                    format!("選択: {}", fruits[fruit.get() as usize])
+                    format!("Selected: {}", fruits[fruit.get() as usize])
                 })),
         )
         .child(
@@ -342,7 +342,7 @@ fn overlay_demo() -> Div {
                     div()
                         .relative()
                         .child(
-                            button("ウィンドウ内 (z_index)")
+                            button("In window (z_index)")
                                 .on_click(move |_| in_page.update(|v| *v = !*v)),
                         )
                         .child(show(
@@ -361,13 +361,13 @@ fn overlay_demo() -> Div {
                                     .border(1.0)
                                     .dyn_style(|s| s.border_color(theme().border))
                                     .shadow_lg()
-                                    .child(text("後ろの要素より上に描かれます"))
+                                    .child(text("Drawn above the elements behind it"))
                             },
                         )),
                 )
                 .child(
                     div()
-                        .child(button("ツールチップ").on_hover(move |inside| tip.set(inside)))
+                        .child(button("Tooltip").on_hover(move |inside| tip.set(inside)))
                         .child(show(
                             move || tip.get(),
                             || {
@@ -384,7 +384,7 @@ fn overlay_demo() -> Div {
                                             .text_color(Color::WHITE)
                                             .text_size(12.0)
                                             .shadow_md()
-                                            .child(text("入力はこの下に素通りします")),
+                                            .child(text("Input passes through to what is below")),
                                     )
                             },
                         )),
@@ -392,7 +392,7 @@ fn overlay_demo() -> Div {
                 .child(
                     div()
                         .child(
-                            button("バブル (subsurface)")
+                            button("Bubble (subsurface)")
                                 .on_click(move |_| bubble.update(|v| *v = !*v)),
                         )
                         .child(show(
@@ -406,9 +406,9 @@ fn overlay_demo() -> Div {
                                         card()
                                             .shadow_lg()
                                             .w(220.0)
-                                            .child(text("閉じるまで残ります"))
+                                            .child(text("Stays until you close it"))
                                             .child(
-                                                button("閉じる")
+                                                button("Close")
                                                     .on_click(move |_| bubble.set(false)),
                                             ),
                                     )
@@ -421,7 +421,7 @@ fn overlay_demo() -> Div {
                 .p(16.0)
                 .rounded(6.0)
                 .dyn_style(|s| s.bg(theme().surface_muted))
-                .child(text("ここを右クリックするとメニューが開きます"))
+                .child(text("Right-click here to open a menu"))
                 .on_pointer_down(move |e| {
                     if e.button == Some(PointerButton::Secondary) {
                         let (x, y) = (e.position.x as i32, e.position.y as i32);
@@ -444,7 +444,7 @@ fn overlay_demo() -> Div {
                                     .dyn_style(|s| s.border_color(theme().border))
                                     .dyn_style(|s| s.bg(theme().surface))
                                     .shadow_lg()
-                                    .children(["コピー", "貼り付け", "削除"].map(|name| {
+                                    .children(["Copy", "Paste", "Delete"].map(|name| {
                                         div()
                                             .px(8.0)
                                             .py(5.0)
@@ -505,7 +505,7 @@ pub fn root() -> Div {
                                 .font_weight(FontWeight::BOLD),
                         )
                         .child(
-                            text("wgpu で描画する軽量ネイティブ UI フレームワーク")
+                            text("A lightweight native UI framework drawn with wgpu")
                                 .dyn_style(|s| s.text_color(theme().text_muted)),
                         ),
                 )

@@ -50,9 +50,9 @@ fn sample(label: &'static str, view: impl IntoView) -> (&'static str, View) {
 }
 
 fn level(l: Level) -> Div {
-    let tag_color = if l.tag.contains("新") {
+    let tag_color = if l.tag.contains("new") {
         rgb(0x7c3aed)
-    } else if l.tag.contains("参考") {
+    } else if l.tag.contains("Reference") {
         rgb(0x57534e)
     } else {
         rgb(0x15803d)
@@ -414,41 +414,41 @@ fn page() -> Div {
 
     let levels = [
         Level {
-            tag: "Lv0 今",
-            title: "そのまま",
-            note: "標準の見た目。",
-            code: "primary_button(\"保存\")\nswitch(on)\nslider(volume, 0.0, 100.0)",
+            tag: "Lv0 · existing",
+            title: "As is",
+            note: "The standard look.",
+            code: "primary_button(\"Save\")\nswitch(on)\nslider(volume, 0.0, 100.0)",
             samples: vec![
-                sample("ボタン", primary_button("保存")),
-                sample("スイッチ", switch(on)),
-                sample("スライダー", with_value(volume, slider(volume, 0.0, 100.0))),
+                sample("Button", primary_button("Save")),
+                sample("Switch", switch(on)),
+                sample("Slider", with_value(volume, slider(volume, 0.0, 100.0))),
             ],
         },
         Level {
-            tag: "Lv1 今",
-            title: "テーマ（色だけ、アプリ全体）",
-            note: "色 39 個を差し替える。窓の中の標準部品すべてに効き、一部だけには効かない。寸法や形は変わらない。右のスイッチで Lv0 の行も一緒に変わる。",
+            tag: "Lv1 · existing",
+            title: "Theme (colors only, app-wide)",
+            note: "Replaces the 39 colors. Applies to every standard widget in the window, never to just some of them. Sizes and shapes stay the same. The switch on the right changes the Lv0 row too.",
             code: "set_theme(Theme {\n    accent: rgb(0xdb2777),\n    success: rgb(0xdb2777),\n    ..Theme::light()\n})",
             samples: vec![sample(
-                "テーマ",
+                "Theme",
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(10.0)
                     .child(switch(pink))
-                    .child(div().text_size(13.0).child("ピンクのテーマ")),
+                    .child(div().text_size(13.0).child("Pink theme")),
             )],
         },
         Level {
-            tag: "Lv2 今",
-            title: "外側の箱にスタイル（CSS で要素に書くのと同じ）",
-            note: "返ってくる Div に続けて書く。テーマより強く、ホバー中も押下中も勝つ。ボタンは中身を自分で渡すのでほぼ何でもできるが、スイッチのつまみやスライダーの溝のような中の部品には届かない。",
-            code: "primary_button(\"保存\")\n    .h(40.0).px(24.0).rounded(20.0).bg(ORANGE).border_color(ORANGE)\n    .hover(|s| s.bg(ORANGE_DARK))\n\nswitch(on).w(56.0).h(30.0).rounded(8.0)\n    .dyn_style(move |s| s.bg(if on.get() { ORANGE } else { GRAY }))\n    // つまみは白い 16px の丸のまま\n\nslider(volume, 0.0, 100.0)\n    .h(32.0).px(10.0).bg(rgb(0xfff7ed)).rounded(16.0)\n    // 溝とつまみは標準のまま",
+            tag: "Lv2 · existing",
+            title: "Style the outer box (like styling an element in CSS)",
+            note: "Chain onto the returned Div. Beats the theme, even while hovered or pressed. A button takes its content from you, so almost anything goes, but inner parts such as a switch's thumb or a slider's track are out of reach.",
+            code: "primary_button(\"Save\")\n    .h(40.0).px(24.0).rounded(20.0).bg(ORANGE).border_color(ORANGE)\n    .hover(|s| s.bg(ORANGE_DARK))\n\nswitch(on).w(56.0).h(30.0).rounded(8.0)\n    .dyn_style(move |s| s.bg(if on.get() { ORANGE } else { GRAY }))\n    // the thumb stays a white 16px circle\n\nslider(volume, 0.0, 100.0)\n    .h(32.0).px(10.0).bg(rgb(0xfff7ed)).rounded(16.0)\n    // the track and thumb stay standard",
             samples: vec![
                 sample(
-                    "ボタン",
-                    primary_button("保存")
+                    "Button",
+                    primary_button("Save")
                         .h(40.0)
                         .px(24.0)
                         .rounded(20.0)
@@ -457,7 +457,7 @@ fn page() -> Div {
                         .hover(|s| s.bg(ORANGE_DARK)),
                 ),
                 sample(
-                    "スイッチ",
+                    "Switch",
                     switch(on)
                         .w(56.0)
                         .h(30.0)
@@ -465,7 +465,7 @@ fn page() -> Div {
                         .dyn_style(move |s| s.bg(if on.get() { ORANGE } else { GRAY })),
                 ),
                 sample(
-                    "スライダー",
+                    "Slider",
                     with_value(
                         volume,
                         slider(volume, 0.0, 100.0)
@@ -478,13 +478,13 @@ fn page() -> Div {
             ],
         },
         Level {
-            tag: "Lv3 新",
-            title: "部品ごとにスタイル（CSS の ::part や ::-webkit-slider-thumb に当たる）",
-            note: "標準の見た目のまま、名前の付いた部品を受け取って書き足す。部品は Div そのものなので .hover() や .child() も使え、状態（押下中、ドラッグ中）も読める。部品の数と並びは変えられない。",
+            tag: "Lv3 · new",
+            title: "Style each part (like CSS ::part or ::-webkit-slider-thumb)",
+            note: "Keeps the standard look and hands you the named parts to add to. Each part is a plain Div, so .hover() and .child() work, and the state (pressed, dragging) can be read. The number and order of the parts are fixed.",
             code: "styled_switch(on, SwitchParts::new()\n    .track(|t, s| t.w(56.0).h(30.0).p(3.0).rounded(8.0)\n        .dyn_style(move |st| st.bg(if s.on() { ORANGE } else { GRAY })))\n    .thumb(|t, s| t.w(24.0).h(24.0).rounded(5.0)\n        .dyn_style(move |st| st.scale(if s.pressed() { 0.8 } else { 1.0 }))))\n\nstyled_slider(volume, 0.0, 100.0, SliderParts::new()\n    .track(|t, _| t.h(8.0).rounded(4.0))\n    .fill(|f, _| f.rounded(4.0).bg(ORANGE))\n    .thumb(|t, s| t.w(22.0).h(22.0).rounded(6.0).border(0.0).bg(ORANGE)\n        .dyn_style(move |st| st.scale(if s.dragging() { 1.25 } else { 1.0 }))))",
             samples: vec![
                 sample(
-                    "スイッチ",
+                    "Switch",
                     styled_switch(
                         on,
                         SwitchParts::new()
@@ -507,7 +507,7 @@ fn page() -> Div {
                     ),
                 ),
                 sample(
-                    "スライダー",
+                    "Slider",
                     with_value(
                         volume,
                         styled_slider(
@@ -537,21 +537,21 @@ fn page() -> Div {
             ],
         },
         Level {
-            tag: "Lv4 新",
-            title: "見た目を丸ごと（動きだけ借りる）",
-            note: "部品は状態（値、押下、ドラッグ、ホバー、キーボードのフォーカス）を渡すだけで、見た目の木は全部自分で組む。ばね、アイコン、吹き出しも自由。ポインタ、キー（矢印、PageUp/Down、Home/End）、フォーカスは標準と同じ。md3e もこの形で載せてある。",
-            code: "switch_with(on, |s: SwitchState| {\n    // s.on() / s.pressed() / s.hovered() / s.focus_visible() を読んで\n    // 木を自由に組む（ばねで動くつまみ、中のアイコンなど）\n    div()...\n})\n\nslider_with(volume, 0.0, 100.0, SliderOptions::new(), |s: SliderState| {\n    // s.fraction() / s.dragging() / s.focus_visible() を読む\n    div()...\n})\n// 全部のコードはこのファイルの md3e_like_switch などにある",
+            tag: "Lv4 · new",
+            title: "Replace the whole look (borrow only the behavior)",
+            note: "The widget only hands over its state (value, pressed, dragging, hovered, keyboard focus); you build the whole visual tree. Springs, icons and bubbles are all up to you. Pointer, keys (arrows, PageUp/Down, Home/End) and focus behave as standard. md3e is built this way too.",
+            code: "switch_with(on, |s: SwitchState| {\n    // read s.on() / s.pressed() / s.hovered() / s.focus_visible()\n    // and build any tree (a spring-driven thumb, an icon inside, ...)\n    div()...\n})\n\nslider_with(volume, 0.0, 100.0, SliderOptions::new(), |s: SliderState| {\n    // read s.fraction() / s.dragging() / s.focus_visible()\n    div()...\n})\n// the full code is in md3e_like_switch and friends in this file",
             samples: vec![
-                sample("md3e 風", md3e_like_switch(on)),
-                sample("md3e 風", with_value(volume, md3e_like_slider(volume))),
-                sample("自由", day_night_switch(on)),
-                sample("自由", with_value(volume, meter_slider(volume))),
+                sample("md3e-like", md3e_like_switch(on)),
+                sample("md3e-like", with_value(volume, md3e_like_slider(volume))),
+                sample("Free-form", day_night_switch(on)),
+                sample("Free-form", with_value(volume, meter_slider(volume))),
             ],
         },
         Level {
-            tag: "参考 今",
-            title: "本物の md3e（標準の動きの上に載せてある）",
-            note: "Lv4 の md3e 風と比べるためのもの。中身は switch_with と slider_with に MD3E の見た目（シェーダー、ばね、リップル）を渡したもの。同じシグナルにつないである。",
+            tag: "Reference · existing",
+            title: "The real md3e (built on the standard behavior)",
+            note: "For comparison with the md3e-like ones in Lv4. Under the hood it is switch_with and slider_with given the MD3E look (shaders, springs, ripples). Bound to the same signals.",
             code: "md3e::styled_switch(on, SwitchStyle::new().on_icon(icons::CHECK))\n\nmd3e::styled_slider(volume, SliderStyle::new().range(0.0..=100.0))",
             samples: vec![
                 sample(
@@ -580,12 +580,12 @@ fn page() -> Div {
                 .flex_col()
                 .gap(12.0)
                 .p(20.0)
-                .child(div().text_size(20.0).bold().child("見た目をどこまで変えられるか"))
+                .child(div().text_size(20.0).bold().child("How far the look can be changed"))
                 .child(
                     div()
                         .text_size(13.0)
                         .text_color(rgb(0x57534e))
-                        .child("どの行も同じ on と volume につないである。動きは全部同じで、見た目だけが違う。"),
+                        .child("Every row is bound to the same on and volume. They all behave the same; only the look differs."),
                 )
                 .children(levels.into_iter().map(level)),
         )

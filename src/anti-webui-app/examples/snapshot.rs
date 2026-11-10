@@ -20,7 +20,7 @@ fn main() {
             .p(16.0)
             .h(pct(100.0))
             .bg(rgb(0xf6f8fa))
-            .child(text("AntiWebUI — 物理整数ピクセル描画").text_size(20.0).bold())
+            .child(text("AntiWebUI — integer physical pixel rendering").text_size(20.0).bold())
             .child(text("The quick brown fox jumps over the lazy dog. 日本語の文章も正しく折り返されるかを確認します。絵文字 🎉👍🏽"))
             .child(
                 div()

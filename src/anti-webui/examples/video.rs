@@ -101,9 +101,9 @@ fn main() {
                         .child(
                             button(move || {
                                 if player.paused() {
-                                    "再生"
+                                    "Play"
                                 } else {
-                                    "一時停止"
+                                    "Pause"
                                 }
                             })
                             .on_click(move |_| {
@@ -131,10 +131,10 @@ fn main() {
                         .flex()
                         .items_center()
                         .gap(16.0)
-                        .child(checkbox(muted, "消音"))
+                        .child(checkbox(muted, "Mute"))
                         .child(slider(volume, 0.0, 100.0).w(120.0))
                         .child(checkbox(cover, "cover"))
-                        .child(button("全画面").on_click(move |_| screen.request_fullscreen()))
+                        .child(button("Fullscreen").on_click(move |_| screen.request_fullscreen()))
                         .child(text(status))
                         .child(text(move || error.get().unwrap_or_default())),
                 )
