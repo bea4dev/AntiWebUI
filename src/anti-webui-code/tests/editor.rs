@@ -51,9 +51,8 @@ fn named(ui: &mut Ui, k: NamedKey) {
 
 fn ctrl(shift: bool) -> Modifiers {
     Modifiers {
-        ctrl: true,
         shift,
-        ..Modifiers::default()
+        ..Modifiers::PRIMARY
     }
 }
 

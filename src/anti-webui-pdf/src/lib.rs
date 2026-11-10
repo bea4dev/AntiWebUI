@@ -1713,7 +1713,7 @@ impl IntoView for PdfView {
                     slides.scroll(e);
                     return;
                 }
-                if e.modifiers.ctrl {
+                if e.modifiers.primary() {
                     // A notch of a wheel is about a tenth, and a touchpad gets there in small steps.
                     viewer.zoom_by((-e.delta_y / 1000.0).exp());
                     e.stop_propagation();
@@ -1732,7 +1732,7 @@ impl IntoView for PdfView {
                 let at = scroller.scroll_offset();
                 let height = viewport.get_untracked().1;
                 let total = scale.to_logical(table.with(|t| t.height) as f32);
-                if e.modifiers.ctrl {
+                if e.modifiers.primary() {
                     match &e.key {
                         Key::Character(c) if c == "=" || c == "+" => viewer.zoom_by(1.25),
                         Key::Character(c) if c == "-" => viewer.zoom_by(0.8),

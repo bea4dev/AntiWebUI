@@ -1,5 +1,7 @@
 //! The X11 backend (see `docs/design/35-platform-x11.md`).
 
+#![cfg(target_os = "linux")]
+
 mod atoms;
 mod cursor;
 mod decor;
@@ -439,18 +441,18 @@ impl Ctx<'_> {
     }
 
     /// Raw handles for creating a GPU surface. Valid until the surface closes.
-    pub fn raw_handles(&self, surface: SurfaceId) -> (RawDisplayHandle, RawWindowHandle) {
+    pub fn raw_handles(&self, surface: SurfaceId) -> Option<(RawDisplayHandle, RawWindowHandle)> {
         let conn = NonNull::new(self.state.conn.get_raw_xcb_connection()).expect("xcb");
         let window = self
             .state
             .window_of(surface)
             .map_or(self.state.window, |(w, _)| w);
-        (
+        Some((
             RawDisplayHandle::Xcb(XcbDisplayHandle::new(Some(conn), self.state.screen as i32)),
             RawWindowHandle::Xcb(XcbWindowHandle::new(
                 NonZeroU32::new(window).expect("a window"),
             )),
-        )
+        ))
     }
 }
 
@@ -488,6 +490,9 @@ pub struct Session {
 }
 
 impl Session {
+    /// Windows from `spawn_window` get threads of their own.
+    pub const OWN_THREADS: bool = true;
+
     pub fn connect() -> Result<Self, Error> {
         let (wake_read, wake_write) = rustix::pipe::pipe_with(
             rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,

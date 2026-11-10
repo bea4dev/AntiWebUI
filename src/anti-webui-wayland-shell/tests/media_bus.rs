@@ -1,4 +1,6 @@
 //! MPRIS players, against fakes on a bus of the test's own. Run with `--features media`.
+
+#![cfg(target_os = "linux")]
 #![cfg(feature = "media")]
 
 mod common;

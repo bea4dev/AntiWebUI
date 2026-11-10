@@ -61,10 +61,7 @@ fn named(ui: &mut Ui, k: NamedKey) {
 }
 
 fn ctrl() -> Modifiers {
-    Modifiers {
-        ctrl: true,
-        ..Modifiers::default()
-    }
+    Modifiers::PRIMARY
 }
 
 fn host() -> NodeId {
@@ -372,11 +369,7 @@ fn on_row(i: usize, x: f32) -> PointF {
 
 fn select_first_word(ui: &mut Ui) {
     click(ui, on_row(0, 1.0), 0);
-    let both = Modifiers {
-        ctrl: true,
-        shift: true,
-        ..Modifiers::default()
-    };
+    let both = Modifiers::WORD.with_shift();
     key(ui, Key::Named(NamedKey::ArrowRight), None, both);
 }
 

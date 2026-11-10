@@ -20,3 +20,19 @@ pollster.workspace = true
 ash.workspace = true
 libc.workspace = true
 libloading.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-metal = { workspace = true, features = [
+    "std",
+    "objc2-io-surface",
+    "MTLAllocation",
+    "MTLCommandBuffer",
+    "MTLCommandQueue",
+    "MTLDevice",
+    "MTLPixelFormat",
+    "MTLResource",
+    "MTLTexture",
+] }
+objc2-io-surface = { workspace = true, features = ["std", "objc2", "objc2-core-foundation", "IOSurfaceRef", "IOSurfaceTypes"] }
+objc2-core-foundation = { workspace = true, features = ["std", "CFDictionary", "CFNumber", "CFString"] }

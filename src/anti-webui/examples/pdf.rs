@@ -106,11 +106,13 @@ fn main() {
                 .on_key_down({
                     let save = save.clone();
                     move |e| {
-                        if e.modifiers.ctrl && matches!(&e.key, Key::Character(c) if c == "f") {
+                        if e.modifiers.primary() && matches!(&e.key, Key::Character(c) if c == "f")
+                        {
                             search_box.focus();
                             e.stop_propagation();
                         }
-                        if e.modifiers.ctrl && matches!(&e.key, Key::Character(c) if c == "s") {
+                        if e.modifiers.primary() && matches!(&e.key, Key::Character(c) if c == "s")
+                        {
                             save();
                             e.stop_propagation();
                         }

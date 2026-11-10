@@ -128,13 +128,7 @@ impl Hand {
     }
 
     fn ctrl(&mut self, c: &str) {
-        self.key(
-            c,
-            Modifiers {
-                ctrl: true,
-                ..Default::default()
-            },
-        );
+        self.key(c, Modifiers::PRIMARY);
     }
 
     fn escape(&mut self) {
@@ -700,10 +694,7 @@ fn control_copies_inside_of_an_input() {
     h.button(5.0, 15.0, true, Modifiers::default());
     h.button(5.0, 15.0, false, Modifiers::default());
     h.press(5.0, 15.0);
-    let ctrl = Modifiers {
-        ctrl: true,
-        ..Default::default()
-    };
+    let ctrl = Modifiers::COPY_DRAG;
     h.ui.handle_event(WindowEvent::PointerMoved {
         position: at(490.0, 15.0),
         modifiers: ctrl,

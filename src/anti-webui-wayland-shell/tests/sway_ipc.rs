@@ -1,4 +1,6 @@
 //! Sway's IPC against a small server in its place. Run with `--features sway`.
+
+#![cfg(target_os = "linux")]
 #![cfg(feature = "sway")]
 
 use anti_webui_wayland_shell::sway;

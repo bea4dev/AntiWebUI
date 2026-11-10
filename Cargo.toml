@@ -47,6 +47,8 @@ anti-webui-markdown = { path = "src/anti-webui-markdown", version = "0.1.0" }
 anti-webui-code = { path = "src/anti-webui-code", version = "0.1.0" }
 anti-webui-wayland = { path = "src/anti-webui-wayland", version = "0.1.0" }
 anti-webui-x11 = { path = "src/anti-webui-x11", version = "0.1.0" }
+anti-webui-macos = { path = "src/anti-webui-macos", version = "0.1.0" }
+anti-webui-windows = { path = "src/anti-webui-windows", version = "0.1.0" }
 anti-webui-wayland-shell = { path = "src/anti-webui-wayland-shell", version = "0.1.0" }
 anti-webui-symbols-outlined = { path = "src/anti-webui-symbols-outlined", version = "0.1.0" }
 
@@ -84,3 +86,13 @@ fontique = "0.12"
 subsetter = { version = "0.2.6", default-features = false }
 rquickjs = "0.11"
 pulldown-cmark = { version = "0.13", default-features = false }
+objc2 = "0.6.3"
+objc2-foundation = { version = "0.3.2", default-features = false }
+objc2-app-kit = { version = "0.3.2", default-features = false }
+objc2-quartz-core = { version = "0.3.2", default-features = false }
+objc2-core-foundation = { version = "0.3.2", default-features = false }
+objc2-metal = { version = "0.3.2", default-features = false }
+objc2-io-surface = { version = "0.3.2", default-features = false }
+dispatch2 = { version = "0.3", default-features = false }
+windows = "0.62"
+windows-core = "0.62"

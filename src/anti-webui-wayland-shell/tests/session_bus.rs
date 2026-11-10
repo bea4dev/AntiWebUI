@@ -1,5 +1,7 @@
 //! The session against a small logind on a bus of the test's own, with backlights in a directory of
 //! its own. Run with `--features session`.
+
+#![cfg(target_os = "linux")]
 #![cfg(feature = "session")]
 
 mod common;

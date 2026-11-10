@@ -1,5 +1,7 @@
 //! Reads the PipeWire of the machine this runs on, changing nothing. Not run by default:
 //! `cargo test -p anti-webui-wayland-shell --features audio --test audio_live -- --ignored --nocapture`.
+
+#![cfg(target_os = "linux")]
 #![cfg(feature = "audio")]
 
 use anti_webui_wayland_shell::audio;

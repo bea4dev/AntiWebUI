@@ -233,10 +233,7 @@ fn select_all(ui: &mut Ui) {
     ui.handle_event(WindowEvent::Key(anti_webui_core::event::KeyEvent {
         key: anti_webui_core::event::Key::Character("a".into()),
         text: None,
-        modifiers: Modifiers {
-            ctrl: true,
-            ..Default::default()
-        },
+        modifiers: Modifiers::PRIMARY,
         pressed: true,
         repeat: false,
     }));

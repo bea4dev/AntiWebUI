@@ -1,5 +1,7 @@
 //! The Wayland backend (see `docs/design/06-platform-wayland.md`).
 
+#![cfg(target_os = "linux")]
+
 mod decor;
 mod drag;
 mod keyboard;
@@ -438,15 +440,15 @@ impl Ctx<'_> {
     }
 
     /// Raw handles for creating a GPU surface. Valid until the surface closes.
-    pub fn raw_handles(&self, surface: SurfaceId) -> (RawDisplayHandle, RawWindowHandle) {
+    pub fn raw_handles(&self, surface: SurfaceId) -> Option<(RawDisplayHandle, RawWindowHandle)> {
         let display =
             NonNull::new(self.conn.backend().display_ptr() as *mut _).expect("wl_display");
         let surface = self.state.wl_surface(surface).expect("an open surface");
         let surface = NonNull::new(surface.id().as_ptr() as *mut _).expect("wl_surface");
-        (
+        Some((
             RawDisplayHandle::Wayland(WaylandDisplayHandle::new(display)),
             RawWindowHandle::Wayland(WaylandWindowHandle::new(surface)),
-        )
+        ))
     }
 }
 
@@ -514,6 +516,9 @@ pub struct Session {
 }
 
 impl Session {
+    /// Windows from `spawn_window` get threads of their own.
+    pub const OWN_THREADS: bool = true;
+
     /// Connects to the compositor.
     pub fn connect() -> Result<Self, Error> {
         Self::on(Connection::connect_to_env().map_err(err)?)

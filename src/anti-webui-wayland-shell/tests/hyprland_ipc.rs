@@ -1,5 +1,7 @@
 //! Hyprland's IPC against a small server in its place: what is read, what follows events, and what
 //! is sent. Run with `--features hyprland`.
+
+#![cfg(target_os = "linux")]
 #![cfg(feature = "hyprland")]
 
 use anti_webui_wayland_shell::hyprland::{self, Event};

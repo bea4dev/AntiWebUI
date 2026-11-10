@@ -1,4 +1,6 @@
 //! Running commands: their output, their end, input, killing them. Run with `--features process`.
+
+#![cfg(target_os = "linux")]
 #![cfg(feature = "process")]
 
 use anti_webui_core::reactive::create_root;

@@ -58,10 +58,7 @@ fn named(ui: &mut Ui, k: NamedKey) {
 }
 
 fn ctrl() -> Modifiers {
-    Modifiers {
-        ctrl: true,
-        ..Modifiers::default()
-    }
+    Modifiers::PRIMARY
 }
 
 fn host() -> NodeId {

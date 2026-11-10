@@ -19,6 +19,9 @@ use std::sync::Arc;
 
 #[cfg(feature = "svg")]
 pub use crate::svg_file::parse;
+#[cfg(feature = "svg")]
+#[doc(hidden)]
+pub use crate::svg_file::prepare_fonts_for;
 
 pub use crate::geometry::Affine as Transform;
 #[doc(hidden)]

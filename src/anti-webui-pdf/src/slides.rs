@@ -93,7 +93,8 @@ impl Slides {
         if !self.presenting() {
             return false;
         }
-        if e.modifiers.ctrl || e.modifiers.alt || matches!(e.key, Key::Named(NamedKey::Escape)) {
+        let m = e.modifiers;
+        if m.ctrl || m.alt || m.logo || matches!(e.key, Key::Named(NamedKey::Escape)) {
             return true;
         }
         let typed = self.typed.take();

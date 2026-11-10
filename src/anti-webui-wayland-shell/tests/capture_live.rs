@@ -2,6 +2,8 @@
 //! by default: `cargo test -p anti-webui-wayland-shell --test capture_live -- --ignored`.
 //! `ANTIWEBUI_CAPTURE_DUMP=dir` writes them there as PPM.
 
+#![cfg(target_os = "linux")]
+
 use anti_webui_wayland_shell::{CaptureOptions, CaptureSource, capture, toplevels};
 use std::time::{Duration, Instant};
 

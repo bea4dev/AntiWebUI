@@ -5,4 +5,64 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
-[dependencies]
+# macOS only: elsewhere the crate is empty, so that the workspace builds on every OS.
+[target.'cfg(target_os = "macos")'.dependencies]
+anti-webui-core.workspace = true
+raw-window-handle.workspace = true
+objc2.workspace = true
+objc2-foundation = { workspace = true, features = [
+    "std",
+    "NSArray",
+    "NSAttributedString",
+    "NSDate",
+    "NSGeometry",
+    "NSNotification",
+    "NSObjCRuntime",
+    "NSProcessInfo",
+    "NSRange",
+    "NSRunLoop",
+    "NSString",
+    "NSThread",
+    "NSValue",
+    "NSDictionary",
+    "NSData",
+    "NSURL",
+] }
+objc2-app-kit = { workspace = true, features = [
+    "std",
+    "objc2-quartz-core",
+    "objc2-core-foundation",
+    "NSApplication",
+    "NSApplicationScripting",
+    "NSColor",
+    "NSCursor",
+    "NSEvent",
+    "NSGraphics",
+    "NSGraphicsContext",
+    "NSMenu",
+    "NSMenuItem",
+    "NSPasteboard",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSScreen",
+    "NSText",
+    "NSTextInputClient",
+    "NSTextInputContext",
+    "NSTrackingArea",
+    "NSView",
+    "NSWindow",
+    "NSButton",
+    "NSControl",
+    "NSBitmapImageRep",
+    "NSDragging",
+    "NSDraggingItem",
+    "NSDraggingSession",
+    "NSImage",
+    "NSImageRep",
+    "NSPasteboardItem",
+] }
+objc2-quartz-core = { workspace = true, features = ["std", "CALayer", "CAMetalLayer", "CADisplayLink", "CATransaction", "objc2-core-foundation"] }
+objc2-core-foundation = { workspace = true, features = ["std", "CFCGTypes", "CFDate", "CFRunLoop"] }
+objc2-io-surface = { workspace = true, features = ["std", "libc", "objc2", "objc2-core-foundation", "IOSurfaceRef", "IOSurfaceTypes"] }
+dispatch2 = { workspace = true, features = ["std"] }
+libc.workspace = true

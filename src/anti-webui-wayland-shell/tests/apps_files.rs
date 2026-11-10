@@ -1,5 +1,7 @@
 //! Applications from `.desktop` files in directories of the test's own: what shows, shadowing,
 //! languages, searching, icons, following changes and launching. Run with `--features apps`.
+
+#![cfg(target_os = "linux")]
 #![cfg(feature = "apps")]
 
 use anti_webui_wayland_shell::{apps, icon_path};

@@ -5,9 +5,11 @@
 use crate::audio::Output;
 use crate::cadence::Cadence;
 use crate::ffi::*;
+#[cfg(unix)]
+use anti_webui_core::video::DmabufPlane;
 use anti_webui_core::video::{
-    DmabufPlane, MemoryPlane, PlaneFormat, VideoColor, VideoError, VideoEvent, VideoFrame,
-    VideoPixels, VideoRequest, VideoStream, VideoTiming, VideoTransfer, YuvMatrix,
+    MemoryPlane, PlaneFormat, VideoColor, VideoError, VideoEvent, VideoFrame, VideoPixels,
+    VideoRequest, VideoStream, VideoTiming, VideoTransfer, YuvMatrix,
 };
 use std::collections::VecDeque;
 use std::ffi::{c_int, c_void};
@@ -1165,7 +1167,14 @@ fn memory_frame(
     }
 }
 
+/// Where there are no dmabufs, pictures on the GPU are read back to memory.
+#[cfg(not(unix))]
+fn dmabuf_frame(_ffmpeg: &Arc<Ffmpeg>, _frame: *mut Opaque) -> Option<(VideoPixels, Keep)> {
+    None
+}
+
 /// The dmabufs of a picture on the GPU.
+#[cfg(unix)]
 fn dmabuf_frame(ffmpeg: &Arc<Ffmpeg>, frame: *mut Opaque) -> Option<(VideoPixels, Keep)> {
     let (f, l) = (&ffmpeg.f, ffmpeg.layout);
     // SAFETY: `frame` is a picture on the GPU, and the layout says where the fields are.

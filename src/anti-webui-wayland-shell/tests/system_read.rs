@@ -1,4 +1,6 @@
 //! Readings of this machine, which only reads. Run with `--features system`.
+
+#![cfg(target_os = "linux")]
 #![cfg(feature = "system")]
 
 use anti_webui_wayland_shell::{system, system_every};

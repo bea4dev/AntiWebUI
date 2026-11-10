@@ -60,8 +60,9 @@
 ## M3: 多言語・多プラットフォーム
 
 - `anti-webui-ffi`（C ABI）、C++ / C# バインディング
-- Windows / macOS バックエンド（それぞれの presenter でダメージトラッキング。[05](05-rendering.md) 参照）
+- Windows バックエンド：2026-11-08 に作った（Win32、DPI はモニターごと、DirectComposition の上の DX12、垂直同期のスレッド、IMM32 の IME、ポップアップ、複数ウィンドウ。[39](39-platform-windows.md)）。自前のスワップチェーンと `Present1` の dirty rects によるダメージトラッキング、OLE の DnD、TSF は今後
 - X11 バックエンド：2026-11-07 に作った（DRI3 と Present でダメージトラッキング。[35](35-platform-x11.md)）
+- macOS バックエンド：2026-11-07 に作った（AppKit、`IOSurface` での部分描画と `CADisplayLink`、IME、ポップアップ、OS との DnD、`spawn_window` の別スレッド。[38](38-platform-macos.md)）
 
 ## M4: おまけ機能
 

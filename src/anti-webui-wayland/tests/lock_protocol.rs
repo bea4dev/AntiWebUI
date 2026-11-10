@@ -2,6 +2,8 @@
 //! asked: the lock, the surface on the output named, `configure`, `locked`, and unlocking when the
 //! surface closes. See "画面ロック" in `docs/design/37-wayland-shell.md`.
 
+#![cfg(target_os = "linux")]
+
 use anti_webui_core::event::WindowEvent;
 use anti_webui_core::geometry::{Scale, SizeI};
 use anti_webui_wayland::{Ctx, LockState, WaylandHandler, WindowOptions, lock_state, run};

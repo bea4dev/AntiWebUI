@@ -1,4 +1,6 @@
 //! Another notification daemon already has the name. Run with `--features notifications`.
+
+#![cfg(target_os = "linux")]
 #![cfg(feature = "notifications")]
 
 mod common;

@@ -1,4 +1,6 @@
 //! niri's IPC against a small server in its place. Run with `--features niri`.
+
+#![cfg(target_os = "linux")]
 #![cfg(feature = "niri")]
 
 use anti_webui_wayland_shell::serde_json::{Value, json};

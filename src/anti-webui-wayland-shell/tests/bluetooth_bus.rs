@@ -1,4 +1,6 @@
 //! Bluetooth against a small BlueZ on a bus of the test's own. Run with `--features bluetooth`.
+
+#![cfg(target_os = "linux")]
 #![cfg(feature = "bluetooth")]
 
 mod common;

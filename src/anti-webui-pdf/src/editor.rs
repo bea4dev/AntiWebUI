@@ -894,7 +894,7 @@ impl Editor {
             // Otherwise the keys for typing would also scroll and select the whole document.
             return true;
         }
-        if e.modifiers.ctrl {
+        if e.modifiers.primary() {
             match &e.key {
                 Key::Character(c) if c.eq_ignore_ascii_case("z") && e.modifiers.shift => {
                     self.viewer.redo();
@@ -1399,7 +1399,7 @@ impl Editor {
                     })
                     .on_click(move |e| {
                         let mut now = picked(&this);
-                        if multiple && e.modifiers.ctrl {
+                        if multiple && e.modifiers.primary() {
                             match now.iter().position(|p| *p == value) {
                                 Some(at) => {
                                     now.remove(at);

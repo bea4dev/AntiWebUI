@@ -3,8 +3,29 @@
 use crate::event::{ClipboardKind, DragAction, DragActions};
 use crate::geometry::{PointI, RectI, SizeI};
 pub use anti_webui_style::CursorIcon;
-use std::os::fd::BorrowedFd;
 use std::sync::Arc;
+
+/// A file descriptor, for what is about dmabufs and their synchronization.
+#[doc(hidden)]
+#[cfg(unix)]
+pub use std::os::fd::BorrowedFd;
+
+/// Where there are no file descriptors, like Windows: nothing can make one, so that what is about
+/// dmabufs reads the same on every OS and is never called.
+#[doc(hidden)]
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug)]
+pub struct BorrowedFd<'a> {
+    never: std::convert::Infallible,
+    _fd: std::marker::PhantomData<&'a ()>,
+}
+
+#[cfg(not(unix))]
+impl BorrowedFd<'_> {
+    pub fn never(self) -> ! {
+        match self.never {}
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ImePurpose {
@@ -148,6 +169,88 @@ pub enum PlatformRequest {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Placing popups.
+
+/// The box of a popup in window coordinates, given the anchor, the size it would like and the
+/// area it has to stay in, all physical, for platforms that place popups themselves. Like `xdg_positioner`: the other side if it doesn't fit,
+/// then along the edge, and smaller as a last resort.
+#[doc(hidden)]
+pub fn place_popup(
+    placement: Placement,
+    anchor: RectI,
+    gap: i32,
+    size: SizeI,
+    area: RectI,
+) -> RectI {
+    let (w, h) = (size.width.max(1), size.height.max(1));
+    let center_x = anchor.x + (anchor.width - w) / 2;
+    let below = anchor.bottom() + gap;
+    let above = anchor.y - gap - h;
+    let (x, y) = match placement {
+        Placement::BelowStart => (anchor.x, below),
+        Placement::BelowEnd => (anchor.right() - w, below),
+        Placement::BelowCenter => (center_x, below),
+        Placement::AboveStart => (anchor.x, above),
+        Placement::AboveEnd => (anchor.right() - w, above),
+        Placement::AboveCenter => (center_x, above),
+        Placement::RightStart => (anchor.right() + gap, anchor.y),
+        Placement::LeftStart => (anchor.x - gap - w, anchor.y),
+    };
+    let mut r = RectI::new(x, y, w, h);
+    let sideways = matches!(placement, Placement::RightStart | Placement::LeftStart);
+    if sideways {
+        let flipped = match placement {
+            Placement::RightStart => anchor.x - gap - w,
+            _ => anchor.right() + gap,
+        };
+        if (r.x < area.x || r.right() > area.right())
+            && flipped >= area.x
+            && flipped + w <= area.right()
+        {
+            r.x = flipped;
+        }
+        r.y = slide(r.y, h, area.y, area.bottom());
+        if r.bottom() > area.bottom() {
+            r.height = (area.bottom() - r.y).max(1);
+        }
+    } else {
+        let below_room = area.bottom() - below;
+        let above_room = anchor.y - gap - area.y;
+        let goes_below = matches!(
+            placement,
+            Placement::BelowStart | Placement::BelowEnd | Placement::BelowCenter
+        );
+        let (room, other_room) = if goes_below {
+            (below_room, above_room)
+        } else {
+            (above_room, below_room)
+        };
+        let flip = room < h && other_room > room;
+        let on_below = goes_below != flip;
+        let fit = if on_below { below_room } else { above_room };
+        r.height = h.min(fit.max(1));
+        r.y = if on_below {
+            below
+        } else {
+            anchor.y - gap - r.height
+        };
+        r.x = slide(r.x, w, area.x, area.right());
+    }
+    r
+}
+
+/// Moves `[at, at + len)` into `[lo, hi)` if it can.
+fn slide(at: i32, len: i32, lo: i32, hi: i32) -> i32 {
+    if at + len > hi {
+        (hi - len).max(lo)
+    } else if at < lo {
+        lo
+    } else {
+        at
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // What the app's presenter and the backends hand each other (see `docs/design/35-platform-x11.md`).
 
 /// One of the surfaces that show something.
@@ -269,4 +372,58 @@ pub struct Shown {
     pub refresh_ns: u32,
     /// `wp_presentation_feedback.kind`.
     pub flags: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AREA: RectI = RectI {
+        x: 0,
+        y: 0,
+        width: 1000,
+        height: 800,
+    };
+
+    #[test]
+    fn below_the_anchor_with_the_gap() {
+        let anchor = RectI::new(100, 100, 80, 30);
+        let r = place_popup(Placement::BelowStart, anchor, 4, SizeI::new(200, 300), AREA);
+        assert_eq!(r, RectI::new(100, 134, 200, 300));
+        let r = place_popup(Placement::BelowEnd, anchor, 4, SizeI::new(200, 300), AREA);
+        assert_eq!(r.x, 0, "would start left of the area");
+        let r = place_popup(Placement::AboveCenter, anchor, 4, SizeI::new(40, 20), AREA);
+        assert_eq!(r, RectI::new(120, 76, 40, 20));
+    }
+
+    #[test]
+    fn flips_when_there_is_more_room_on_the_other_side() {
+        let anchor = RectI::new(100, 700, 80, 30);
+        let r = place_popup(Placement::BelowStart, anchor, 4, SizeI::new(200, 300), AREA);
+        assert_eq!(r, RectI::new(100, 700 - 4 - 300, 200, 300));
+    }
+
+    #[test]
+    fn slides_along_the_edge_and_shrinks_as_a_last_resort() {
+        let anchor = RectI::new(950, 100, 40, 30);
+        let r = place_popup(
+            Placement::BelowStart,
+            anchor,
+            0,
+            SizeI::new(200, 2000),
+            AREA,
+        );
+        assert_eq!(r.x, 800, "slid in from the right");
+        assert_eq!((r.y, r.height), (130, 670), "the longer side, made to fit");
+    }
+
+    #[test]
+    fn submenus_go_to_the_other_side_at_the_edge() {
+        let anchor = RectI::new(850, 200, 100, 30);
+        let r = place_popup(Placement::RightStart, anchor, 2, SizeI::new(120, 100), AREA);
+        assert_eq!(r, RectI::new(850 - 2 - 120, 200, 120, 100));
+        let anchor = RectI::new(300, 750, 100, 30);
+        let r = place_popup(Placement::RightStart, anchor, 2, SizeI::new(120, 100), AREA);
+        assert_eq!(r.y, 700, "slid up");
+    }
 }

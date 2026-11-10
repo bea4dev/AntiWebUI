@@ -2,6 +2,8 @@
 //! asked. It shows the requests and what comes of a `configure`, not how a real compositor places
 //! them. See `docs/design/37-wayland-shell.md`.
 
+#![cfg(target_os = "linux")]
+
 use anti_webui_core::event::WindowEvent;
 use anti_webui_core::geometry::{Scale, SizeI};
 use anti_webui_core::layer::{

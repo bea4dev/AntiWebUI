@@ -1,6 +1,8 @@
 //! Reads the D-Bus services of the machine this runs on. Not run by default:
 //! `cargo test -p anti-webui-wayland-shell --all-features --test dbus_live -- --ignored --nocapture`.
 
+#![cfg(target_os = "linux")]
+
 #![cfg(feature = "dbus")]
 
 use std::time::Duration;

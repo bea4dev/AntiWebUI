@@ -153,15 +153,7 @@ fn the_line_with_the_caret_has_its_row_however_far() {
     let r = editor_ref();
     let mut ui = mount(move || editor(lines(5000), scroller).editor_ref(r));
     click(&mut ui, PointF::new(5.0, 5.0));
-    key_with(
-        &mut ui,
-        Key::Named(NamedKey::End),
-        None,
-        Modifiers {
-            ctrl: true,
-            ..Modifiers::default()
-        },
-    );
+    key_with(&mut ui, Key::Named(NamedKey::End), None, Modifiers::WORD);
     typ(&mut ui, "x");
     assert!(r.text().ends_with("line 4999\nx"));
     // It scrolled to the end, where the rows are.

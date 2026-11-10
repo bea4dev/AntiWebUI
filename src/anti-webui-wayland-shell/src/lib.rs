@@ -1,8 +1,8 @@
 //! Desktop shells on Wayland: bars, wallpapers, launchers and the like as layer surfaces, on as
 //! many threads as there are outputs if wanted, with what a shell shows. See
-//! `docs/design/37-wayland-shell.md`.
+//! `docs/design/37-wayland-shell.md`. Linux only: elsewhere the crate is empty.
 //!
-//! ```no_run
+//! ```no_run,ignore-apple,ignore-windows
 //! use anti_webui_core::prelude::*;
 //! use anti_webui_wayland_shell::prelude::*;
 //!
@@ -17,6 +17,8 @@
 //!     })
 //!     .unwrap();
 //! ```
+
+#![cfg(target_os = "linux")]
 
 #[cfg(feature = "apps")]
 mod apps;

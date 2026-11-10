@@ -1,6 +1,8 @@
 //! The tray against a fake item on a bus of its own, with no watcher there but this one. Run with
 //! `--features tray`. `what_the_real_tray_has` reads the session bus of the machine instead:
 //! `--features tray --test tray_bus -- --ignored what_the_real_tray_has --nocapture`, alone.
+
+#![cfg(target_os = "linux")]
 #![cfg(feature = "tray")]
 
 mod common;

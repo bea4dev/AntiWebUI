@@ -1,5 +1,7 @@
 //! The network service against a small NetworkManager on a bus of the test's own. Run with
 //! `--features network`.
+
+#![cfg(target_os = "linux")]
 #![cfg(feature = "network")]
 
 mod common;

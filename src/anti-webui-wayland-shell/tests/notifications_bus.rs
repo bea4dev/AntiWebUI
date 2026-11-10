@@ -1,5 +1,7 @@
 //! Being the notification daemon, on a bus of the test's own with a program sending notifications.
 //! Run with `--features notifications`.
+
+#![cfg(target_os = "linux")]
 #![cfg(feature = "notifications")]
 
 mod common;

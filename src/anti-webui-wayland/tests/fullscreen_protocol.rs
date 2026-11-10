@@ -2,6 +2,8 @@
 //! what it is asked. It shows the requests and what comes of a `configure`, not how a real compositor
 //! behaves. See `docs/design/27-fullscreen.md`.
 
+#![cfg(target_os = "linux")]
+
 use anti_webui_core::event::WindowEvent;
 use anti_webui_core::geometry::{Scale, SizeI};
 use anti_webui_wayland::{Ctx, WaylandHandler, WindowOptions, run};

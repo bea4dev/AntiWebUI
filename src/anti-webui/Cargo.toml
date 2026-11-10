@@ -7,11 +7,15 @@ license.workspace = true
 description = "A lightweight native UI framework rendered with wgpu"
 
 [features]
-default = ["svg", "svg-text", "wayland", "x11"]
+default = ["svg", "svg-text", "wayland", "x11", "macos", "windows"]
 ## Runs on Wayland compositors.
 wayland = ["anti-webui-internal/wayland"]
 ## Runs on X servers. See `docs/design/35-platform-x11.md`.
 x11 = ["anti-webui-internal/x11"]
+## Runs on macOS. See `docs/design/38-platform-macos.md`.
+macos = ["anti-webui-internal/macos"]
+## Runs on Windows. See `docs/design/39-platform-windows.md`.
+windows = ["anti-webui-internal/windows"]
 ## Pictures in SVG.
 svg = ["anti-webui-internal/svg"]
 ## Text in pictures in SVG, which adds 1.6 MiB.

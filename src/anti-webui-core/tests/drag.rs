@@ -563,10 +563,7 @@ fn control_copies_unless_it_may_not() {
                 },
             ))
     });
-    let ctrl = Modifiers {
-        ctrl: true,
-        ..Default::default()
-    };
+    let ctrl = Modifiers::COPY_DRAG;
     key(&mut ui, Key::Named(NamedKey::Control), ctrl);
     press(&mut ui, 10.0, 10.0);
     ui.handle_event(WindowEvent::PointerMoved {

@@ -298,10 +298,7 @@ fn control(ui: &mut Ui, c: &str) {
     ui.handle_event(WindowEvent::Key(KeyEvent {
         key: Key::Character(c.into()),
         text: None,
-        modifiers: Modifiers {
-            ctrl: true,
-            ..Default::default()
-        },
+        modifiers: Modifiers::PRIMARY,
         pressed: true,
         repeat: false,
     }));

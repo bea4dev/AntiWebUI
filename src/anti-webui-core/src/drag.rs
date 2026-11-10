@@ -321,8 +321,16 @@ fn uri_list<P: AsRef<Path>>(files: impl IntoIterator<Item = P>) -> String {
     for path in files {
         let path = std::path::absolute(path.as_ref()).unwrap_or_else(|_| path.as_ref().into());
         out.push_str("file://");
-        for &b in path.as_os_str().as_encoded_bytes() {
-            if b.is_ascii_alphanumeric() || b"-_.~/".contains(&b) {
+        // `C:\a\b` is `file:///C:/a/b`.
+        #[cfg(windows)]
+        let path = format!("/{}", path.to_string_lossy().replace('\\', "/"));
+        #[cfg(windows)]
+        let bytes = path.as_bytes();
+        #[cfg(not(windows))]
+        let bytes = path.as_os_str().as_encoded_bytes();
+        for &b in bytes {
+            // The colon of a drive stays as it is: `file:///C:/a`.
+            if b.is_ascii_alphanumeric() || b"-_.~/".contains(&b) || (cfg!(windows) && b == b':') {
                 out.push(b as char);
             } else {
                 let _ = write!(out, "%{b:02X}");
@@ -335,7 +343,6 @@ fn uri_list<P: AsRef<Path>>(files: impl IntoIterator<Item = P>) -> String {
 
 /// The local files of a `text/uri-list`. What isn't one isn't there.
 fn files_of_uri_list(bytes: &[u8]) -> Vec<PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
     String::from_utf8_lossy(bytes)
         .lines()
         .filter(|l| !l.starts_with('#'))
@@ -361,9 +368,24 @@ fn files_of_uri_list(bytes: &[u8]) -> Vec<PathBuf> {
                     }
                 }
             }
-            Some(PathBuf::from(std::ffi::OsString::from_vec(out)))
+            Some(path_of_bytes(out))
         })
         .collect()
+}
+
+#[cfg(unix)]
+fn path_of_bytes(bytes: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(std::ffi::OsString::from_vec(bytes))
+}
+
+/// `/C:/a/b` is `C:\a\b`, and `//server/share/a` stays a UNC path.
+#[cfg(not(unix))]
+fn path_of_bytes(bytes: Vec<u8>) -> PathBuf {
+    let path = String::from_utf8_lossy(&bytes);
+    let drive = path.as_bytes().get(2) == Some(&b':');
+    let path = if drive { &path[1..] } else { &path[..] };
+    PathBuf::from(path.replace('/', "\\"))
 }
 
 type GrabHandler = Rc<dyn Fn(&GrabEvent)>;
@@ -557,7 +579,7 @@ fn action_for(allowed: DragActions, modifiers: Modifiers) -> DragAction {
     match allowed {
         DragActions::Move => DragAction::Move,
         DragActions::Copy => DragAction::Copy,
-        DragActions::Both if modifiers.ctrl => DragAction::Copy,
+        DragActions::Both if modifiers.copies_drag() => DragAction::Copy,
         DragActions::Both => DragAction::Move,
     }
 }
@@ -1705,9 +1727,18 @@ mod tests {
 
     #[test]
     fn uri_lists_survive_the_round_trip() {
-        let files = ["/tmp/a b.png", "/tmp/日本語/%.txt", "/x/#y?z"];
+        #[cfg(not(windows))]
+        let (files, first) = (
+            ["/tmp/a b.png", "/tmp/日本語/%.txt", "/x/#y?z"],
+            "file:///tmp/a%20b.png\r\n",
+        );
+        #[cfg(windows)]
+        let (files, first) = (
+            [r"C:\tmp\a b.png", r"C:\tmp\日本語\%.txt", r"D:\x\#y"],
+            "file:///C:/tmp/a%20b.png\r\n",
+        );
         let list = uri_list(files);
-        assert!(list.contains("file:///tmp/a%20b.png\r\n"));
+        assert!(list.contains(first), "{list}");
         let back = files_of_uri_list(list.as_bytes());
         let want: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
         assert_eq!(back, want);

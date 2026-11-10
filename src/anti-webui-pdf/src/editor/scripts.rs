@@ -268,7 +268,7 @@ impl Editor {
             widget: index,
             what,
             shift: e.is_some_and(|e| e.modifiers.shift),
-            modifier: e.is_some_and(|e| e.modifiers.ctrl),
+            modifier: e.is_some_and(|e| e.modifiers.primary()),
         };
         if matches!(what, Mouse::Down | Mouse::Up) {
             self.ask(ask, true);

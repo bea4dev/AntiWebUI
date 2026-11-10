@@ -2,6 +2,8 @@
 //! asked. It shows the requests are what `wl_data_device` wants, not how a real compositor behaves.
 //! See `docs/design/23-drag-and-drop.md`. Pinching goes through the same small compositor.
 
+#![cfg(target_os = "linux")]
+
 use anti_webui_core::event::{
     DragAction, DragActions, DragResult, PinchPhase, PointerButton, WindowEvent,
 };

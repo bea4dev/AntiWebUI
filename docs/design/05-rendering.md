@@ -70,7 +70,7 @@ wgpu の Surface は buffer age も変更範囲の通知も公開していない
 |---|---|---|---|
 | Wayland | dmabuf を自前で確保（Vulkan） | `wl_surface.damage_buffer` | 実装（[06](06-platform-wayland.md)） |
 | Windows | DXGI flip model のバッファ / DirectComposition | `Present1` の dirty rects、`IDCompositionSurface::BeginDraw` | M3 |
-| macOS | IOSurface を自前で回し `CALayer.contents` に設定 | 矩形単位の API は無い。レイヤー分割で代替 | M3 |
+| macOS | IOSurface を自前で回し `CALayer.contents` に設定 | 矩形単位の API は無い。減るのは GPU の仕事だけで、合成は層の単位（レイヤー分割は今後） | 実装（[38](38-platform-macos.md)） |
 | その他 / フォールバック | wgpu Surface | 無し（毎回全面） | 実装 |
 
 ポップアップも同じ構成で、バッファと履歴をサーフェスごとに持ち、GPU デバイスとレンダラは共有する（[09](09-shadows-stacking-popups.md)）。

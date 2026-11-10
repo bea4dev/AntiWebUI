@@ -1,5 +1,7 @@
 //! Batteries and power profiles against a UPower and a power-profiles-daemon in their place, on a
 //! bus of the test's own. Run with `--features battery,power-profiles`.
+
+#![cfg(target_os = "linux")]
 #![cfg(all(feature = "battery", feature = "power-profiles"))]
 
 mod common;
