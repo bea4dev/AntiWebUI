@@ -479,6 +479,36 @@ mod on_the_gpu {
     }
 
     #[test]
+    fn pixels_the_program_made_can_be_drawn_by_another_renderer_afterwards() {
+        // A notification's picture shows in its popup and in the list, which are windows of their
+        // own: the second renderer to draw it still has pixels to put on its GPU.
+        use anti_webui_core::images::Bitmap;
+        use std::sync::Arc;
+        let gpu = Gpu::headless().unwrap();
+        let bitmap = Arc::new(Bitmap::from_premultiplied(
+            2,
+            2,
+            [0, 0, 255, 255].repeat(4),
+            true,
+        ));
+        let draw = |renderer: &mut Renderer| {
+            let bitmap = bitmap.clone();
+            let mut ui = mount(move || {
+                div().child(bitmap_view(move || Some(bitmap.clone())).w(16.0).h(16.0))
+            });
+            let scene = ui.paint(Instant::now());
+            gpu.render_to_rgba(renderer, &scene)
+        };
+        let mut first = Renderer::new(&gpu.device, TextureFormat::Rgba8Unorm);
+        first.set_release_picture_pixels(true);
+        let mut second = Renderer::new(&gpu.device, TextureFormat::Rgba8Unorm);
+        second.set_release_picture_pixels(true);
+        assert_eq!(&draw(&mut first)[0..4], &[0, 0, 255, 255]);
+        assert_eq!(&draw(&mut second)[0..4], &[0, 0, 255, 255]);
+        assert!(bitmap.with_levels(|_, _, _| {}));
+    }
+
+    #[test]
     fn the_frames_of_an_animation_reach_the_screen() {
         use image::codecs::gif::{GifEncoder, Repeat};
         use image::{Delay, Frame, Rgba, RgbaImage};

@@ -230,13 +230,13 @@ impl HayroSession<'_> {
 impl Session for HayroSession<'_> {
     fn draw(&mut self, job: Job) -> Bitmap {
         let (width, height) = job.size();
-        Bitmap::from_premultiplied(width, height, self.pixels(job), true)
+        Bitmap::from_premultiplied(width, height, self.pixels(job), true).releasable()
     }
 
     fn cut_out(&mut self, job: Job, boxes: &[RectI]) -> Bitmap {
         let (width, height) = job.size();
         let pixels = plan::cut_out(&self.pixels(job), width, boxes);
-        Bitmap::from_premultiplied(width, height, pixels, false)
+        Bitmap::from_premultiplied(width, height, pixels, false).releasable()
     }
 
     fn text(&mut self, page: usize) -> PageText {

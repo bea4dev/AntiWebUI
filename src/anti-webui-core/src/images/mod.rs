@@ -53,7 +53,9 @@ pub struct Bitmap {
     opaque: bool,
     bytes: usize,
     level_count: u32,
-    /// Let go of once the GPU has them.
+    /// The renderer may let go of the levels once the GPU has them.
+    releasable: bool,
+    /// Let go of once the GPU has them, if `releasable`.
     levels: Mutex<Option<Vec<Vec<u8>>>>,
     frames: Vec<Vec<u8>>,
 }
@@ -83,6 +85,7 @@ impl Bitmap {
             opaque: d.opaque,
             bytes,
             level_count,
+            releasable: true,
             levels: Mutex::new(Some(d.levels)),
             frames,
         };
@@ -92,6 +95,11 @@ impl Bitmap {
     /// Pixels made by the program, for [`bitmap_view`](crate::view::bitmap_view): four bytes each,
     /// row by row, with premultiplied alpha. It has no smaller levels, so it looks coarse when drawn
     /// much smaller.
+    ///
+    /// The pixels stay here after the GPU has them, because nothing could make them again: the same
+    /// bitmap can be shown in more than one window, or again after what showed it is gone. Pixels
+    /// that are shown in one place and made again when they are needed can be let go of with
+    /// [`releasable`](Self::releasable).
     ///
     /// # Panics
     ///
@@ -106,9 +114,17 @@ impl Bitmap {
             opaque,
             bytes,
             level_count: 1,
+            releasable: false,
             levels: Mutex::new(Some(vec![pixels])),
             frames: Vec::new(),
         }
+    }
+
+    /// Lets the renderer let go of the pixels once the GPU has them. Only for pixels that one
+    /// renderer draws, and that are made again if they are needed after the texture is gone.
+    pub fn releasable(mut self) -> Self {
+        self.releasable = true;
+        self
     }
 
     /// Identifies the pixels.
@@ -160,9 +176,12 @@ impl Bitmap {
         true
     }
 
-    /// Lets go of the levels of a still: nothing else in this process is going to need them.
+    /// Lets go of the levels of a still, if it is [`releasable`](Self::releasable): nothing else
+    /// in this process is going to need them.
     pub fn release_levels(&self) {
-        *self.levels.lock().expect("no panics in here") = None;
+        if self.releasable {
+            *self.levels.lock().expect("no panics in here") = None;
+        }
     }
 }
 
@@ -179,7 +198,11 @@ pub fn decode_bitmap(
     let info = decode::probe(&source)?;
     let decoded = decode::decode(&source, planned_size(&info, at_least, false));
     worker::give_back_memory();
-    decoded.map(|d| Bitmap::new(d).0)
+    // The program has these to read, and perhaps to show in more than one place.
+    decoded.map(|d| Bitmap {
+        releasable: false,
+        ..Bitmap::new(d).0
+    })
 }
 
 /// A picture to show in a frame.
