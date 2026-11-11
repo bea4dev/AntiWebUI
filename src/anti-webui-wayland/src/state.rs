@@ -180,6 +180,10 @@ pub struct State {
 
     pub(crate) window_frame: SurfaceFrame,
     pub(crate) popups: HashMap<PopupId, Popup>,
+    /// The xdg popups of every window on the connection, for the one grab they share.
+    pub(crate) connection_popups: crate::grab::ConnectionPopups,
+    /// Where other windows say which popups of this one they ended.
+    pub(crate) mailbox: std::sync::Arc<crate::grab::Mailbox>,
     /// Popups whose parent has no buffer yet.
     pub(crate) waiting_popups: Vec<PopupParams>,
     pub redraw_requested: bool,
@@ -199,6 +203,8 @@ impl State {
         logical_size: (i32, i32),
         paste_tx: mpsc::Sender<(ClipboardKind, String)>,
         wake: OwnedFd,
+        connection_popups: crate::grab::ConnectionPopups,
+        mailbox: std::sync::Arc<crate::grab::Mailbox>,
     ) -> Self {
         Self {
             qh,
@@ -268,6 +274,8 @@ impl State {
             wake,
             window_frame: SurfaceFrame::default(),
             popups: HashMap::new(),
+            connection_popups,
+            mailbox,
             waiting_popups: Vec::new(),
             redraw_requested: true,
             redraw_at: None,

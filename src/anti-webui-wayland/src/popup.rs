@@ -179,6 +179,25 @@ impl State {
                     },
                     None => self.xdg_surface(),
                 };
+                let ancestors = self.ancestors(params.parent);
+                let grabbing = params.kind == PopupKind::Menu && self.seat.is_some();
+                let shared = self.connection_popups.clone();
+                let mut shared = shared.lock();
+                // Another window may have ended the popup it goes on.
+                if let Some(p) = params.parent
+                    && parent.is_some()
+                    && !shared.has(&self.mailbox, p)
+                {
+                    if let Some(vp) = viewport {
+                        vp.destroy();
+                    }
+                    surface.destroy();
+                    self.events.push(WindowEvent::PopupDismissed(id));
+                    return;
+                }
+                if grabbing {
+                    shared.end_other_grabs(&self.mailbox, &ancestors);
+                }
                 let xdg_surface = self.wm_base.get_xdg_surface(&surface, &self.qh, tag);
                 let positioner = self.positioner(&params);
                 let popup = xdg_surface.get_popup(parent, &positioner, &self.qh, id);
@@ -189,11 +208,10 @@ impl State {
                 {
                     l.object.get_popup(&popup);
                 }
-                if params.kind == PopupKind::Menu
-                    && let Some(seat) = &self.seat
-                {
+                if grabbing && let Some(seat) = &self.seat {
                     popup.grab(seat, self.press_serial);
                 }
+                shared.add(&self.mailbox, id, ancestors, popup.clone(), grabbing);
                 Role::Xdg { xdg_surface, popup }
             }
         };
@@ -319,8 +337,8 @@ impl State {
             self.pointer_surface = SurfaceId::Window;
         }
         match p.role {
-            Role::Xdg { xdg_surface, popup } => {
-                popup.destroy();
+            Role::Xdg { xdg_surface, .. } => {
+                self.connection_popups.lock().destroy(&self.mailbox, id);
                 xdg_surface.destroy();
             }
             Role::Sub(sub) => sub.destroy(),
@@ -332,6 +350,26 @@ impl State {
             s.destroy();
         }
         p.surface.destroy();
+    }
+
+    /// The popups that one attached to `parent` is attached to, `parent` first.
+    fn ancestors(&self, mut parent: Option<PopupId>) -> Vec<PopupId> {
+        let mut ancestors = Vec::new();
+        while let Some(p) = parent {
+            ancestors.push(p);
+            parent = self.popups.get(&p).and_then(|p| p.params.parent);
+        }
+        ancestors
+    }
+
+    /// Popups whose grab another window ended: they are dismissed, as when the compositor ends a
+    /// grab. Their surfaces stay until the core closes them.
+    pub(crate) fn take_ended_popups(&mut self) {
+        for id in self.mailbox.take() {
+            if self.popups.contains_key(&id) {
+                self.events.push(WindowEvent::PopupDismissed(id));
+            }
+        }
     }
 
     pub(crate) fn popups_attached_to(&self, id: PopupId) -> Vec<PopupId> {
