@@ -30,6 +30,8 @@ use windows::core::{IUnknown, Interface};
 
 /// One shown, one DWM may still read, and one to draw: as many as wgpu's surface had.
 const BUFFERS: u32 = 3;
+/// How long showing a new swapchain waits for its first frame; past that it is shown anyway.
+const SHOW_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 thread_local! {
     /// The DirectComposition device of this thread's windows: one is enough for any number of
@@ -65,8 +67,11 @@ struct Chain {
 /// A swapchain on a DirectComposition visual of a window.
 pub(crate) struct Swapchain {
     chain: Chain,
+    /// Whether the visual shows `chain`. A new swapchain is shown only once its first frame is in
+    /// it: until then DWM would show it empty, and the window transparent.
+    shown: bool,
     /// Swapchains of earlier sizes, kept until the GPU is done with what was submitted before
-    /// they were replaced.
+    /// they were replaced. The visual holds the last one until the new one is shown.
     retired: Vec<(Chain, Arc<AtomicBool>)>,
     factory: IDXGIFactory2,
     queue: ID3D12CommandQueue,
@@ -122,21 +127,19 @@ impl Swapchain {
         };
         let chain = make_chain(gpu, &factory, &queue, format, alpha, size)?;
         let dcomp = dcomp_device().map_err(fail("DCompositionCreateDevice2"))?;
-        // SAFETY: the caller keeps the window; the objects are kept with the swapchain.
+        // SAFETY: the caller keeps the window; the objects are kept with the swapchain. The
+        // visual gets the swapchain with its first frame (`show`).
         let (target, visual) = unsafe {
             let target = dcomp
                 .CreateTargetForHwnd(hwnd, false)
                 .map_err(fail("CreateTargetForHwnd"))?;
             let visual = dcomp.CreateVisual().map_err(fail("CreateVisual"))?;
-            visual
-                .SetContent(&chain.swapchain)
-                .map_err(fail("SetContent"))?;
             target.SetRoot(&visual).map_err(fail("SetRoot"))?;
-            dcomp.Commit().map_err(fail("Commit"))?;
             (target, visual)
         };
         Ok(Self {
             chain,
+            shown: false,
             retired: Vec::new(),
             factory,
             queue,
@@ -161,8 +164,9 @@ impl Swapchain {
         self.last_age
     }
 
-    /// Shows a new swapchain of `size` in place of this one. `ResizeBuffers` needs every reference
-    /// to the buffers gone first, so it would wait for the GPU to finish what uses them.
+    /// Makes a new swapchain of `size` to present to in place of this one, which the window shows
+    /// until the next frame is in the new one. `ResizeBuffers` needs every reference to the
+    /// buffers gone first, so it would wait for the GPU to finish what uses them.
     pub(crate) fn resize(&mut self, gpu: &Gpu, size: (u32, u32)) -> Result<(), String> {
         let chain = make_chain(
             gpu,
@@ -172,13 +176,7 @@ impl Swapchain {
             self.alpha,
             size,
         )?;
-        // SAFETY: the visual and the swapchain are ours.
-        unsafe {
-            self.visual
-                .SetContent(&chain.swapchain)
-                .map_err(fail("SetContent"))?;
-            self.dcomp.Commit().map_err(fail("Commit"))?;
-        }
+        self.shown = false;
         let old = std::mem::replace(&mut self.chain, chain);
         let done = Arc::new(AtomicBool::new(false));
         let flag = done.clone();
@@ -299,7 +297,36 @@ impl Swapchain {
         // we pace ourselves with the vertical blank.
         unsafe { self.chain.swapchain.Present1(0, DXGI_PRESENT(0), &params) }
             .ok()
-            .map_err(fail("Present1"))
+            .map_err(fail("Present1"))?;
+        if !self.shown {
+            self.show(gpu)?;
+        }
+        Ok(())
+    }
+
+    /// Shows `chain` in the window, once the frame just presented to it is done. A swapchain
+    /// shown before DWM has a frame of it is shown empty: the window was transparent for a frame
+    /// now and then while it was resized quickly, whenever the swapchain was made again.
+    fn show(&mut self, gpu: &Gpu) -> Result<(), String> {
+        // The present went to the queue after the frame's commands; an empty submission signals
+        // the queue's fence after both.
+        let index = gpu.queue.submit([]);
+        let wait = gpu.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(index),
+            timeout: Some(SHOW_WAIT),
+        });
+        if let Err(e) = wait {
+            eprintln!("[anti-webui] waiting for the first frame of a swapchain: {e}");
+        }
+        // SAFETY: the visual and the swapchain are ours.
+        unsafe {
+            self.visual
+                .SetContent(&self.chain.swapchain)
+                .map_err(fail("SetContent"))?;
+            self.dcomp.Commit().map_err(fail("Commit"))?;
+        }
+        self.shown = true;
+        Ok(())
     }
 }
 

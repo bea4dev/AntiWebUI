@@ -177,11 +177,15 @@ wgpu は、間接描画の引数を検証するためのコンピュートパイ
 ## 提示
 
 - **自前のスワップチェーン（いまの既定）：** wgpu が DX12 で描くときは、`WindowRenderer` が DXGI のスワップチェーンを自分で持つ（`anti-webui-wgpu` の `dxgi.rs`）。wgpu の Surface は `Present(0, 0)` でフレームを丸ごと渡すだけで、変わった矩形を渡す口が無い。そのため DWM は、波のプログレス 1 本が動くだけでも、毎フレームウィンドウ全体を合成し直していた。
-  - wgpu が submit するのと同じ `ID3D12CommandQueue` で `CreateSwapChainForComposition` を呼び、`FLIP_SEQUENTIAL`、3 枚、`PREMULTIPLIED` のアルファのスワップチェーンを作って、DirectComposition のビジュアルに付ける。DirectComposition のデバイスはスレッドに 1 つで、ウィンドウとポップアップで共有する。
+  - wgpu が submit するのと同じ `ID3D12CommandQueue` で `CreateSwapChainForComposition` を呼び、`FLIP_SEQUENTIAL`、3 枚、`PREMULTIPLIED` のアルファのスワップチェーンを作って、DirectComposition のビジュアルに付ける（最初のフレームが入ってから。下記）。DirectComposition のデバイスはスレッドに 1 つで、ウィンドウとポップアップで共有する。
   - バッファは `texture_from_raw` と `create_texture_from_hal` で wgpu のテクスチャとして包む（`COPY_DST`、最初の状態は `PRESENT`）。写したあと `transition_resources` で `PRESENT` に戻してから submit する。
   - フレームは残すテクスチャ（下記）に描き、変わったところだけをバックバッファに写す。`FLIP_SEQUENTIAL` のバッファは前に提示した中身を保つので、`GetCurrentBackBufferIndex` のバッファに最後に写したフレームから buffer age を求め、その間の変更矩形の和を写す（`DamageHistory`、Wayland と同じ）。DXGI は、変わっていない部分を前のフレームから写してはくれない（スクロール矩形を除く）。
   - `Present1(0, 0, …)` の dirty rects に、そのフレームの変更矩形を渡す。最初のフレームと、大きさが変わったフレームは全面。描く間隔はこちらの垂直同期の合図で決めるので、描きすぎない。
   - 大きさが変わってスワップチェーンを作り直すときは、`ResizeBuffers` ではなく新しいスワップチェーンを作り、ビジュアルの中身を差し替える。`ResizeBuffers` はバッファへの参照を全部放してからでないと呼べないので、GPU の仕事が終わるのを待つことになる（参照を放して GPU を待ってから呼ぶ形では、全画面にするときに落ちた）。古いスワップチェーンは、それまでに submit した仕事が終わるまで（`on_submitted_work_done`）持っておく。
+  - 新しいスワップチェーンは、最初のフレームが入ってからビジュアルに付ける（`Swapchain::show`）。`Present1` のあとに空の submit をして、キューのフェンスが `Present1` より後まで進むのを待ち（最大 500 ms）、それから `SetContent` と `Commit` をする。それまでは古いスワップチェーンが見えている。最初のウィンドウとポップアップも同じで、ビジュアルは中身なしで作る。
+    - 前は、作ったその場で `SetContent` と `Commit` をしてから描いていた。GPU がフレームを描き終える前に DWM が合成すると、中身の無いスワップチェーンが映り、ウィンドウが 1 フレーム丸ごと透けた。速くリサイズすると、スワップチェーンを作り直す段（256 px の境）でときどき起きていた。
+    - 確かめ方：マゼンタの窓を後ろに置き、`gallery` を `SetWindowPos` で 60 px ずつ 700〜1800 px の間で伸び縮みさせ、変える前からウィンドウの中だった部分を画面から読んだ。前は 4 回中 2 回で、中央の 6 割ほどがマゼンタになった（縮めて 1024×768 に作り直す段）。直してからは 7 回とも 0 回。起動の時間は変わらない（`gallery` で 0.39〜0.40 秒）。
+    - 広げたときに、新しく出た端がフレームの届くまで透けるのは別のことで、これでは変わらない。
   - DX12 でないとき、作れなかったとき、`ANTIWEBUI_PRESENT=surface` のときは wgpu の Surface を使う。`ANTIWEBUI_DEBUG_DAMAGE=1` で、どちらを使っているか（`DXGI swapchain` / `wgpu surface`）と、フレームごとの buffer age が出る。
   - 計測（md3e の `gallery`、リリースビルド、175%、Radeon 880M、120 Hz）。波のプログレスが動き続け、1 フレームの変更はウィンドウの 0.6%。GPU の使用率は WMI の `Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine` を 0.5 秒ごとに 10 回読んだ平均。スワップチェーンを作り直す時間は、ウィンドウの大きさを 40 px ずつ変えて計った：
 
