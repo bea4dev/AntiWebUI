@@ -101,6 +101,79 @@ loop {
   - ポンプは使っている間は外しておく。入れ子にはならない。
 - **キーボードのメッセージ：** ループで `TranslateMessage` を呼び、`WM_CHAR` を作らせる。`WM_KEYDOWN` を受けたら、キューの次にある `WM_CHAR` を取り出して、そのキーの `text` にする（後述）。
 
+## 起動
+
+md3e の `gallery` は、プロセスを起こしてから最初のフレームが出るまで約 2.5 秒かかっていた（リリースビルド、Radeon 880M と RTX 5070 Laptop のハイブリッド構成）。大半は、使わない dGPU を起こす時間と、FXC でシェーダーをコンパイルする時間だった。いまは約 0.4 秒（キャッシュが無い初めての起動は約 1.5 秒）。
+
+### 使う GPU
+
+wgpu の DX12 は、アダプタを列挙するときに、DXGI が返すアダプタ全部に `D3D12CreateDevice` を呼んで機能を調べる（`wgpu-hal` の `dx12::Adapter::expose`）。D3 で眠っている dGPU もここで起こされる。`LowPower` で内蔵 GPU を選ぶのは、全部を調べたあとである。Wayland で NVIDIA の Vulkan ドライバを読ませないようにしたのと同じ問題（[06](06-platform-wayland.md) の「読み込む Vulkan ドライバ」）。
+
+| `D3D12CreateDevice`（各 3 回） | 時間 |
+|---|---|
+| RTX 5070 Laptop（D3 から） | 0.72〜2.49 秒 |
+| Radeon 880M | 0.10〜0.14 秒 |
+| Microsoft Basic Render Driver | 7〜10 ms |
+
+- wgpu には列挙するアダプタを絞る口が無いので、フォーク（`bea4dev/wgpu` の `adapter-filter` ブランチ、v30.0.1 から）に `Dx12BackendOptions::adapter_filter`（`Dx12AdapterFilter::All` / `Luids`）を足した。`Luids` のとき、LUID が入っていないアダプタにはデバイスを作らない。ワークスペースの `[patch.crates-io]` で、このブランチ（`https://github.com/bea4dev/wgpu`）を git で使う。コミットは Cargo.lock が決める。
+- `Gpu::with_window` は、DXGI の `EnumAdapterByGpuPreference(MINIMUM_POWER)` の先頭（内蔵 GPU）の LUID だけを渡す（`anti-webui-wgpu` の `adapters.rs`）。アダプタを列挙するだけなら GPU は起きない（D3 のままなのを `DEVPKEY_Device_PowerData` で確かめた）。
+  - Windows の「グラフィックの設定」でその exe を高パフォーマンスにしているとき（`HKCU\Software\Microsoft\DirectX\UserGpuPreferences` の、exe のパスの名前の値が `GpuPreference=2;`）は、`HIGH_PERFORMANCE` の先頭を使う。この経路はまだ実機で確かめていない。
+  - 初めは、ウィンドウのあるモニターを出力に持つアダプタを選んでいた。ところが NVIDIA のドライバは、exe の名前がドライバのプロファイルにあるアプリ（`showcase.exe` がそうだった）を dGPU に回し、そのプロセスの DXGI にはモニターの出力が RTX 5070 側にあるように見せる。md3e の `showcase` は、そのせいで dGPU を起こして約 1.1 秒かかっていた（中身を `md3e_demo.exe` という名前で動かすと 0.44 秒、`gallery` を `showcase.exe` という名前にすると dGPU が起きた）。利用者のアプリも名前しだいで同じことになるので、モニターではなく省電力の順で選ぶ。
+  - 外部モニターが dGPU につながっていても内蔵 GPU で描き、DWM がアダプタをまたいで写す。ハイブリッド構成のノートで、設定の無いアプリがふつうそうなるのと同じ。
+  - DX12 で見つからなければ、次の `PRIMARY` と GL は絞らずに試す。
+  - `IDXGIFactory6` が無いとき（Windows 10 1803 より前）は絞らない。
+  - `ANTIWEBUI_ADAPTERS=all` か `WGPU_ADAPTER_NAME` があれば絞らない。
+
+### シェーダーのコンパイル
+
+DX12 の wgpu は WGSL を HLSL にし、FXC（`d3dcompiler_47.dll`）でコンパイルする。FXC は関数を全部インライン展開するので遅く、md3e のシェーダーは 1 本 80〜430 ms かかった（`slider.wgsl` が最も遅い）。md3e は 9 本を preload していて、最初のフレームの前に順にコンパイルしていたので、その間 1.25 秒止まっていた。
+
+- preload されたシェーダーは、コアの数までのスレッドで並列にコンパイルする（[14](14-shaders.md) の「実行時の扱い」）。最初のフレームの描画は 1.25 秒から 0.44 秒になり、残りはほぼ `slider.wgsl` 1 本の時間である。
+- `wgpu-hal` の DX12 はデバイスごとにコンパイル済みのシェーダーを持つので、ポップアップの `Renderer` ではコンパイルし直さない（2 つ目の `Renderer::new` は約 5 ms）。
+- 時間のほとんどは FXC で、WGSL から HLSL を作るのは 1 本 1 ms 未満。`D3DCOMPILE_SKIP_OPTIMIZATION` にすると 2.5〜3 倍速くなるが、できるシェーダーが遅くなりうるので使わない。
+- DXC（`dxcompiler.dll` を同梱するか、`static-dxc` で静的に組み込む）にすればさらに速くなるはずだが、同梱物が増えるので今は FXC のまま。
+
+### シェーダーのキャッシュ
+
+コンパイルしたシェーダーをディスクに残し、次の起動ではコンパイルしない。Chromium が GPU のシェーダーをディスクにキャッシュするのと同じ考え方で、Zed のようにビルド時にコンパイルしておく方法は、実行時に作るカスタムシェーダー（[14](14-shaders.md)）には使えない。
+
+- wgpu の `PipelineCache` は Vulkan にしか無く、DX12 では何もしなかった。フォークで DX12 に実装した：コンパイルした DXBC（DXC なら DXIL）を、HLSL のソース、エントリポイント、ステージ、シェーダーモデル、コンパイラ、デバッグかどうかのハッシュ（128 ビット）で持つ。`get_data` で取り出し、`create_pipeline_cache` の `data` で戻す。シェーダーはアダプタによらないので、wgpu-core のヘッダのアダプタの欄は DX12 では固定にした。上限は 64 MiB。
+- `anti-webui-wgpu` の `shader_cache.rs` が、`%LOCALAPPDATA%\AntiWebUI\shaders\<exe の名前>-<exe のパスのハッシュ>.bin` から読み、`Renderer` がパイプラインを作ったあと、増えていれば別のスレッドで書く（同じフォルダに書いてから `rename` で置き換える）。exe ごとに分けるのは、アプリどうしで上書きし合わないため。
+- wgpu のバージョンが変わればヘッダで弾かれ、空から作り直す。読めないときも空から。
+- DX12 のときだけ使う。`ANTIWEBUI_SHADER_CACHE=off` で使わない。
+- `gallery` のキャッシュは約 100 KB。
+
+### GPU を先に作る
+
+`App::run` の最初に、別のスレッドで DX12 のインスタンス、アダプタ、デバイスを作り始める（`Gpu::start_early`、`early.rs`）。その間に、メインスレッドはウィンドウを作って表示する。`ShowWindow` は約 43 ms かかり、ほとんどは最初のフォーカスでの IME（TSF）の準備で、`DefWindowProc` の `WM_ACTIVATE` の中である。
+
+- 選ぶアダプタは上の「使う GPU」と同じで、ウィンドウによらない。`Gpu::with_window` は、そのアダプタで Surface を作れるときに使い、作れなければ捨てて、いつもの手順で作る。
+- `WGPU_BACKEND` があるときは先に作らない。別のスレッドのウィンドウ（`spawn_window`）は、いつもの手順で作る。
+
+### 間接描画の検証
+
+wgpu は、間接描画の引数を検証するためのコンピュートパイプラインを、デバイスを作るときに作る（`InstanceFlags::VALIDATION_INDIRECT_CALL`）。AntiWebUI は間接描画を使わないので、このフラグを外す。`request_device` が約 53 ms から約 27 ms になった。`WGPU_VALIDATION_INDIRECT_CALL` があればそれに従う。
+
+### 計測
+
+`gallery` のリリースビルドで、プロセスを起こしてから `DWMWA_CLOAKED` が外れる（最初のフレームが出る）までの時間（同じ exe の 2 回目以降、各 4 回）：
+
+| | 最初のフレームが出るまで |
+|---|---|
+| 前 | 2.48〜2.51 秒 |
+| アダプタを絞る | 1.72〜1.74 秒 |
+| シェーダーを並列にコンパイル（`ANTIWEBUI_ADAPTERS=all`） | 1.67〜1.71 秒 |
+| アダプタを絞り、並列にコンパイル | 0.95〜0.96 秒 |
+| さらにシェーダーのキャッシュ | 0.47〜0.50 秒 |
+| さらに GPU を先に作り、間接描画の検証を外す | 0.39〜0.46 秒 |
+| md3e の `showcase`（省電力の GPU を選ぶようにした後） | 0.40〜0.43 秒（前は約 1.1 秒） |
+
+- 5 ms ごとに cloak を見る PowerShell で計ったので、数十 ms の誤差がある。
+- Zed（`--user-data-dir` で分けた、空のプロジェクト）と同じ方法で比べた。プロセスを起こしてから、ウィンドウの中身が単色でなくなるまで（画面を `BitBlt` で写して 31×31 点を見る、各 8 回）：Zed は 406〜422 ms（2 回目以降。ウィンドウは約 355 ms で出て、約 50 ms 後に描かれる）、`gallery` は 425〜451 ms。差は約 20〜40 ms。Zed は D3D11 で描き、シェーダーはビルド時にコンパイルしてある。
+- キャッシュが無い初めての起動は約 1.5 秒（GPU を先に作る前に 1 回計った。exe も新しかったので、その約 250 ms を含む）。
+- exe を初めて起動するときは、毎回約 250 ms 長い（ビルドした直後など。Defender やドライバが exe を調べる分と思われる）。
+- キャッシュと GPU を先に作る前の内訳（プロセスの中の時刻）：ウィンドウを作って表示するまで約 50 ms、アダプタを絞る約 18 ms、`request_adapter` 約 128 ms（ほぼ Radeon の `D3D12CreateDevice`）、`request_device` 約 45 ms、Surface と `Renderer` 約 25 ms、最初の提示から cloak が外れるまで約 30 ms。
+
 ## 提示
 
 - **自前のスワップチェーン（いまの既定）：** wgpu が DX12 で描くときは、`WindowRenderer` が DXGI のスワップチェーンを自分で持つ（`anti-webui-wgpu` の `dxgi.rs`）。wgpu の Surface は `Present(0, 0)` でフレームを丸ごと渡すだけで、変わった矩形を渡す口が無い。そのため DWM は、波のプログレス 1 本が動くだけでも、毎フレームウィンドウ全体を合成し直していた。
@@ -360,6 +433,12 @@ cargo run -p anti-webui --example widgets
 cargo run -p anti-webui --example multi_window
 # ダメージの出方と buffer age を見る（ANTIWEBUI_PRESENT=surface で wgpu の Surface と比べる）
 ANTIWEBUI_DEBUG_DAMAGE=1 cargo run -p anti-webui --example widgets
+# GPU を絞らずに起動して比べる（dGPU が起きて、最初のフレームが遅れる）
+ANTIWEBUI_ADAPTERS=all cargo run --release -p anti-webui-md3e --example gallery
+# シェーダーのキャッシュを使わずに起動して比べる
+ANTIWEBUI_SHADER_CACHE=off cargo run --release -p anti-webui-md3e --example gallery
 ```
+
+wgpu のフォークは `https://github.com/bea4dev/wgpu` の `adapter-filter` ブランチ。フォークを手元で変えながら試すときは、`[patch.crates-io]` の各行を一時的に `path = "../wgpu/<クレート>"` にする。フォークを push したあとは `cargo update -p wgpu-hal` などで Cargo.lock のコミットを進める。
 
 手で確かめること：125% と 150% の画面で枠線がにじまないこと、モニターをまたいだときに大きさが合うこと、ライブリサイズ中に絵がついてくること、日本語 IME（Microsoft IME）で未確定文字列がインラインに出て候補の窓が文字の下に出ること、メニューが他のアプリのクリックで閉じること。

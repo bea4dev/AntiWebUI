@@ -133,6 +133,9 @@ impl App {
         mut self,
         root: impl FnOnce() -> V,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // The GPU is made while the first window is (Windows; see `Gpu::start_early`).
+        #[cfg(windows)]
+        anti_webui_wgpu::Gpu::start_early();
         self.apply_settings();
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         {

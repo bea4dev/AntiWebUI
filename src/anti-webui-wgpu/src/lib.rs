@@ -1,5 +1,7 @@
 //! The wgpu renderer for AntiWebUI scenes.
 
+#[cfg(windows)]
+mod adapters;
 mod custom_shader;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
@@ -8,6 +10,9 @@ pub mod dmabuf;
 mod drivers;
 #[cfg(windows)]
 mod dxgi;
+#[cfg(windows)]
+mod early;
+mod shader_cache;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub use drivers::limit_vulkan_drivers;
@@ -98,6 +103,39 @@ pub struct Gpu {
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    /// Compiled shaders saved for the next launch, where the backend can keep them.
+    shader_cache: Option<std::sync::Arc<shader_cache::ShaderCache>>,
+}
+
+/// What a window's instance is made with. `filter` is the DX12 adapters to look at (Windows).
+fn instance_desc(
+    display: RawDisplayHandle,
+    backends: wgpu::Backends,
+    explicit: bool,
+    #[cfg(windows)] filter: wgpu::Dx12AdapterFilter,
+    #[cfg(not(windows))] _filter: (),
+) -> wgpu::InstanceDescriptor {
+    let mut desc =
+        wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(Display(display)));
+    if !explicit {
+        desc.backends = backends;
+    }
+    // Nothing is drawn indirectly; checking indirect draws makes compute pipelines when the device
+    // is made (about 25 ms on DX12, where FXC compiles them).
+    if std::env::var_os("WGPU_VALIDATION_INDIRECT_CALL").is_none() {
+        desc.flags
+            .remove(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
+    }
+    #[cfg(windows)]
+    {
+        desc.backend_options.dx12.adapter_filter = filter;
+        // A swapchain on a DirectComposition visual has alpha, which popups need; one on the
+        // window's handle is opaque (see `docs/design/39-platform-windows.md`).
+        if std::env::var_os("WGPU_DX12_PRESENTATION_SYSTEM").is_none() {
+            desc.backend_options.dx12.presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
+        }
+    }
+    desc
 }
 
 /// A window surface and its renderer.
@@ -144,23 +182,38 @@ impl Gpu {
         } else {
             &[wgpu::Backends::PRIMARY, wgpu::Backends::GL]
         };
+        // Only the low-power GPU: wgpu makes a device on each adapter it lists, which wakes a
+        // sleeping dGPU for up to seconds. If that one has no adapter, the next tries have all.
+        #[cfg(windows)]
+        let mut adapters = adapters::preferred();
+        // The GPU made ahead on another thread, if it is that one.
+        #[cfg(windows)]
+        if let Some(gpu) = early::take()
+            && adapters::luid_of(&gpu.adapter).is_some_and(|l| adapters.allows(l))
+        {
+            // SAFETY: forwarded to the caller.
+            let surface = unsafe {
+                gpu.instance
+                    .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                        raw_display_handle: Some(display),
+                        raw_window_handle: window,
+                    })
+            };
+            if let Ok(surface) = surface
+                && gpu.adapter.is_surface_supported(&surface)
+            {
+                let window = gpu.configure_window(surface, window, width, height);
+                return Ok((gpu, window));
+            }
+        }
         let mut last_error = None;
         let mut found = None;
         for &backends in attempts {
-            let mut desc = wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(
-                Display(display),
-            ));
-            if !explicit {
-                desc.backends = backends;
-            }
-            // A swapchain on a DirectComposition visual has alpha, which popups need; one on the
-            // window's handle is opaque (see `docs/design/39-platform-windows.md`).
             #[cfg(windows)]
-            if std::env::var_os("WGPU_DX12_PRESENTATION_SYSTEM").is_none() {
-                desc.backend_options.dx12.presentation_system =
-                    wgpu::Dx12SwapchainKind::DxgiFromVisual;
-            }
-            let instance = wgpu::Instance::new(desc);
+            let filter = std::mem::take(&mut adapters);
+            #[cfg(not(windows))]
+            let filter = ();
+            let instance = wgpu::Instance::new(instance_desc(display, backends, explicit, filter));
             // SAFETY: forwarded to the caller.
             let surface = unsafe {
                 instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
@@ -193,22 +246,42 @@ impl Gpu {
         let Some((instance, surface, adapter)) = found else {
             return Err(last_error.expect("at least one backend was tried"));
         };
+        let gpu = Gpu::open(instance, adapter)?;
+        let window = gpu.configure_window(surface, window, width, height);
+        Ok((gpu, window))
+    }
+
+    /// Makes the device on the adapter, with the cache of compiled shaders where there is one.
+    fn open(instance: wgpu::Instance, adapter: wgpu::Adapter) -> Result<Gpu, GpuError> {
+        let cache_feature = if shader_cache::ShaderCache::wanted(&adapter) {
+            wgpu::Features::PIPELINE_CACHE
+        } else {
+            wgpu::Features::empty()
+        };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("anti-webui"),
-            required_features: video_features(&adapter),
+            required_features: video_features(&adapter) | cache_feature,
             required_limits:
                 wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
             ..Default::default()
         }))
         .map_err(GpuError::Device)?;
-        let gpu = Gpu {
+        let shader_cache = shader_cache::ShaderCache::load(&device).map(std::sync::Arc::new);
+        Ok(Gpu {
             instance,
             adapter,
             device,
             queue,
-        };
-        let window = gpu.configure_window(surface, window, width, height);
-        Ok((gpu, window))
+            shader_cache,
+        })
+    }
+
+    /// Starts making the GPU on another thread, so that it is (nearly) ready when the first window
+    /// asks for it in [`Gpu::with_window`]: making the window and having it activated (IME and
+    /// all) takes about as long. Windows only; elsewhere it does nothing.
+    pub fn start_early() {
+        #[cfg(windows)]
+        early::start();
     }
 
     /// Creates a surface for another window, like a popup, with a renderer of its own.
@@ -258,6 +331,7 @@ impl Gpu {
             adapter,
             device,
             queue,
+            shader_cache: None,
         })
     }
 
@@ -335,7 +409,7 @@ impl Gpu {
         WindowRenderer {
             surface,
             config,
-            renderer: Renderer::new(&self.device, format),
+            renderer: Renderer::with_cache(&self.device, format, self.shader_cache.clone()),
             #[cfg(windows)]
             retained,
             #[cfg(windows)]

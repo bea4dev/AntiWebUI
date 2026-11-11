@@ -161,6 +161,7 @@ impl Gpu {
                 adapter,
                 device,
                 queue,
+                shader_cache: None,
             };
             let ctx = DmabufContext::new(&gpu)?;
             return Ok((gpu, ctx));

@@ -7,6 +7,7 @@ use crate::effects::{
 };
 use crate::glyph_cache::{GlyphCache, PlacedGlyph};
 use crate::path::{PathInstance, PathPass, TableRow};
+use crate::shader_cache::ShaderCache;
 use crate::video::{VideoInstance, VideoPass};
 use anti_webui_core::damage::{
     Damage, backdrop_read, diff_content, expand_for_backdrops, primitive_bounds,
@@ -548,6 +549,8 @@ pub struct Renderer {
     path_buffer: InstanceBuffer,
     /// Shaders written by users, by the address of their source.
     shaders: HashMap<usize, CompiledShader>,
+    /// Compiled shaders saved for the next launch.
+    shader_cache: Option<Arc<ShaderCache>>,
     /// What the frame being prepared needs and isn't compiled yet.
     missing_shader: Option<&'static ShaderSource>,
     /// How many of the shaders asked to be compiled ahead were seen to.
@@ -618,6 +621,16 @@ fn create_atlas(
 
 impl Renderer {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        Self::with_cache(device, format, None)
+    }
+
+    /// With a cache of compiled shaders, which it saves after compiling more.
+    pub(crate) fn with_cache(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        shader_cache: Option<Arc<ShaderCache>>,
+    ) -> Self {
+        let pipeline_cache = shader_cache.as_ref().map(|c| &c.cache);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("anti-webui shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -744,7 +757,7 @@ impl Renderer {
                 targets: &targets,
             }),
             multiview_mask: None,
-            cache: None,
+            cache: pipeline_cache,
         });
         let solid_attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
         let solid_buffers = [Some(wgpu::VertexBufferLayout {
@@ -772,7 +785,7 @@ impl Renderer {
                     targets,
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: pipeline_cache,
             })
         };
         let solid_pipeline = solid_pipeline_with("solid", &targets);
@@ -818,7 +831,7 @@ impl Renderer {
                 targets: &targets,
             }),
             multiview_mask: None,
-            cache: None,
+            cache: pipeline_cache,
         });
         let layer_attrs = wgpu::vertex_attr_array![
             0 => Float32x4, 1 => Float32x2, 2 => Float32x2, 3 => Float32x4, 4 => Float32x4,
@@ -848,7 +861,7 @@ impl Renderer {
                 targets: &targets,
             }),
             multiview_mask: None,
-            cache: None,
+            cache: pipeline_cache,
         });
 
         let picture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -946,7 +959,7 @@ impl Renderer {
                     targets,
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: pipeline_cache,
             })
         };
         let picture_pipeline = picture_pipeline_with("picture", "fs_picture", &targets);
@@ -998,6 +1011,9 @@ impl Renderer {
             &no_inputs_uniform,
         );
 
+        if let Some(c) = &shader_cache {
+            c.save_soon();
+        }
         Self {
             format,
             quad_pipeline,
@@ -1020,7 +1036,8 @@ impl Renderer {
                 blend,
                 shader.clone(),
                 device.limits().max_texture_dimension_2d,
-            ),
+            )
+            .with_shader_cache(shader_cache.clone()),
             video: VideoPass::new(globals_layout.clone(), format, blend, shader.clone()),
             globals_layout,
             atlas_layout,
@@ -1039,6 +1056,7 @@ impl Renderer {
             video_buffer: InstanceBuffer::new(device, "videos"),
             path_buffer: InstanceBuffer::new(device, "paths"),
             shaders: HashMap::new(),
+            shader_cache,
             missing_shader: None,
             preloaded: 0,
             shader_params_layout: custom_shader::params_layout(device),
@@ -1454,10 +1472,9 @@ impl Renderer {
         damage: Option<&[RectI]>,
         plans: &[LayerPlan],
     ) -> Prepared {
-        for source in preloads_from(self.preloaded) {
-            self.preloaded += 1;
-            self.compile_shader(device, source);
-        }
+        let preloads = preloads_from(self.preloaded);
+        self.preloaded += preloads.len();
+        self.compile_shaders(device, &preloads);
         let mut cleared = false;
         let mut paths_cleared = false;
         loop {
@@ -1479,7 +1496,9 @@ impl Renderer {
                             &self.globals_layout,
                             &self.atlas_layout,
                             &self.effect_uniform_layout,
+                            self.shader_cache.as_ref().map(|c| &c.cache),
                         ));
+                        self.save_shaders();
                         continue;
                     }
                     let next = self.glyphs.size_when_full(cleared, self.max_texture);
@@ -1495,6 +1514,68 @@ impl Renderer {
         }
     }
 
+    /// Compiles those not compiled yet, on as many threads as there are cores: compiling one can
+    /// take a few hundred milliseconds (FXC on DX12), and an app preloads several before its
+    /// first frame.
+    fn compile_shaders(&mut self, device: &wgpu::Device, sources: &[&'static ShaderSource]) {
+        let mut todo: Vec<&'static ShaderSource> = Vec::new();
+        for &source in sources {
+            let key = shader_key(source);
+            if !self.shaders.contains_key(&key) && !todo.iter().any(|&s| shader_key(s) == key) {
+                todo.push(source);
+            }
+        }
+        if todo.len() < 2 {
+            for source in todo {
+                self.compile_shader(device, source);
+            }
+            return;
+        }
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(todo.len());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let (format, globals, params, inputs) = (
+            self.format,
+            &self.globals_layout,
+            &self.shader_params_layout,
+            &self.inputs_layout,
+        );
+        let cache = self.shader_cache.as_ref().map(|c| &c.cache);
+        let compiled: Vec<(usize, CompiledShader)> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut out = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(&source) = todo.get(i) else {
+                                return out;
+                            };
+                            let shader = custom_shader::compile(
+                                device, source, format, globals, params, inputs, cache,
+                            );
+                            out.push((shader_key(source), shader));
+                        }
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|w| w.join().expect("compiling a shader doesn't panic"))
+                .collect()
+        });
+        self.shaders.extend(compiled);
+        self.save_shaders();
+    }
+
+    /// Saves the compiled shaders for the next launch, if anything new was compiled.
+    fn save_shaders(&self) {
+        if let Some(c) = &self.shader_cache {
+            c.save_soon();
+        }
+    }
+
     fn compile_shader(&mut self, device: &wgpu::Device, source: &'static ShaderSource) {
         let key = shader_key(source);
         if !self.shaders.contains_key(&key) {
@@ -1505,8 +1586,10 @@ impl Renderer {
                 &self.globals_layout,
                 &self.shader_params_layout,
                 &self.inputs_layout,
+                self.shader_cache.as_ref().map(|c| &c.cache),
             );
             self.shaders.insert(key, compiled);
+            self.save_shaders();
         }
     }
 
@@ -2395,7 +2478,9 @@ impl Renderer {
                     &self.globals_layout,
                     &self.atlas_layout,
                     &self.effect_uniform_layout,
+                    self.shader_cache.as_ref().map(|c| &c.cache),
                 ));
+                self.save_shaders();
             }
             if self
                 .canvases

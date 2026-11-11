@@ -193,9 +193,12 @@ pub(crate) fn compile(
     globals: &wgpu::BindGroupLayout,
     params: &wgpu::BindGroupLayout,
     inputs: &wgpu::BindGroupLayout,
+    cache: Option<&wgpu::PipelineCache>,
 ) -> CompiledShader {
     let pipeline = match validate(source) {
-        Ok(code) => create_pipeline(device, source, &code, format, globals, params, inputs),
+        Ok(code) => create_pipeline(
+            device, source, &code, format, globals, params, inputs, cache,
+        ),
         Err(e) => {
             eprintln!("[anti-webui] {e}");
             None
@@ -211,6 +214,7 @@ pub(crate) fn compile(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_pipeline(
     device: &wgpu::Device,
     source: &ShaderSource,
@@ -219,6 +223,7 @@ fn create_pipeline(
     globals: &wgpu::BindGroupLayout,
     params: &wgpu::BindGroupLayout,
     inputs: &wgpu::BindGroupLayout,
+    cache: Option<&wgpu::PipelineCache>,
 ) -> Option<wgpu::RenderPipeline> {
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -272,7 +277,7 @@ fn create_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache,
     });
     if let Some(e) = pollster::block_on(scope.pop()) {
         eprintln!("[anti-webui] shader `{}`: {e}", source.name);

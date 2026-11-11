@@ -96,3 +96,19 @@ objc2-io-surface = { version = "0.3.2", default-features = false }
 dispatch2 = { version = "0.3", default-features = false }
 windows = "0.62"
 windows-core = "0.62"
+
+# wgpu with DX12's `Dx12BackendOptions::adapter_filter`, so that a sleeping dGPU isn't woken at
+# startup, and `PipelineCache`, so that compiled shaders are kept for the next launch (see "起動" in
+# `docs/design/39-platform-windows.md`). Branch `adapter-filter` of the fork, made from v30.0.1;
+# Cargo.lock pins the commit.
+[patch.crates-io]
+naga = { git = "https://github.com/bea4dev/wgpu", branch = "adapter-filter" }
+naga-types = { git = "https://github.com/bea4dev/wgpu", branch = "adapter-filter" }
+wgpu = { git = "https://github.com/bea4dev/wgpu", branch = "adapter-filter" }
+wgpu-core = { git = "https://github.com/bea4dev/wgpu", branch = "adapter-filter" }
+wgpu-core-deps-apple = { git = "https://github.com/bea4dev/wgpu", branch = "adapter-filter" }
+wgpu-core-deps-emscripten = { git = "https://github.com/bea4dev/wgpu", branch = "adapter-filter" }
+wgpu-core-deps-windows-linux-android = { git = "https://github.com/bea4dev/wgpu", branch = "adapter-filter" }
+wgpu-hal = { git = "https://github.com/bea4dev/wgpu", branch = "adapter-filter" }
+wgpu-naga-bridge = { git = "https://github.com/bea4dev/wgpu", branch = "adapter-filter" }
+wgpu-types = { git = "https://github.com/bea4dev/wgpu", branch = "adapter-filter" }

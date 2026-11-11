@@ -53,6 +53,7 @@ impl Gpu {
             adapter,
             device,
             queue,
+            shader_cache: None,
         })
     }
 

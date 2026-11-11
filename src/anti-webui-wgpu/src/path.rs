@@ -664,6 +664,8 @@ pub struct PathPass {
     blend: Option<wgpu::BlendState>,
     max_rows: u32,
     pipeline: Option<(wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
+    /// Where compiled shaders are kept for the next launch.
+    shader_cache: Option<std::sync::Arc<crate::shader_cache::ShaderCache>>,
     entries: HashMap<Key, Entry>,
     /// How much of the store is taken.
     used: u32,
@@ -699,6 +701,7 @@ impl PathPass {
             blend,
             max_rows: max_texture,
             pipeline: None,
+            shader_cache: None,
             entries: HashMap::new(),
             used: 0,
             pending: Vec::new(),
@@ -712,6 +715,14 @@ impl PathPass {
             frame: 0,
             live: 0,
         }
+    }
+
+    pub(crate) fn with_shader_cache(
+        mut self,
+        cache: Option<std::sync::Arc<crate::shader_cache::ShaderCache>>,
+    ) -> Self {
+        self.shader_cache = cache;
+        self
     }
 
     fn ensure_pipeline(&mut self, device: &wgpu::Device) {
@@ -770,9 +781,12 @@ impl PathPass {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: self.shader_cache.as_ref().map(|c| &c.cache),
         });
         self.pipeline = Some((pipeline, layout));
+        if let Some(c) = &self.shader_cache {
+            c.save_soon();
+        }
     }
 
     /// Starts over with an empty store, after it got full. `cleared`: it already did for this frame,

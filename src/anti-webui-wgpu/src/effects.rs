@@ -758,6 +758,7 @@ pub(crate) fn create_pipelines(
     globals: &wgpu::BindGroupLayout,
     source: &wgpu::BindGroupLayout,
     uniform: &wgpu::BindGroupLayout,
+    cache: Option<&wgpu::PipelineCache>,
 ) -> EffectPipelines {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("effects"),
@@ -800,7 +801,7 @@ pub(crate) fn create_pipelines(
                 targets: &replace,
             }),
             multiview_mask: None,
-            cache: None,
+            cache,
         })
     };
     let blur = [Some(uniform), Some(source), Some(source)];
@@ -854,7 +855,7 @@ pub(crate) fn create_pipelines(
             targets: &targets,
         }),
         multiview_mask: None,
-        cache: None,
+        cache,
     });
     EffectPipelines {
         gauss,

@@ -16,7 +16,7 @@ bytemuck.workspace = true
 raw-window-handle.workspace = true
 pollster.workspace = true
 
-# Our own DXGI swapchain (see `src/dxgi.rs`).
+# Our own DXGI swapchain (see `src/dxgi.rs`), and which GPU to use (`src/adapters.rs`).
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",
@@ -24,6 +24,7 @@ windows = { workspace = true, features = [
     "Win32_Graphics_DirectComposition",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Registry",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
