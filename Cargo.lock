@@ -304,6 +304,7 @@ dependencies = [
  "raw-window-handle",
  "swash",
  "wgpu",
+ "windows",
 ]
 
 [[package]]

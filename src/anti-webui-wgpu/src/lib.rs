@@ -6,6 +6,8 @@ mod custom_shader;
 pub mod dmabuf;
 #[cfg(target_os = "linux")]
 mod drivers;
+#[cfg(windows)]
+mod dxgi;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub use drivers::limit_vulkan_drivers;
@@ -109,6 +111,9 @@ pub struct WindowRenderer {
     /// window while it is resized. `None` where the swapchain takes no copies.
     #[cfg(windows)]
     retained: Option<Option<Offscreen>>,
+    /// Our own swapchain, which tells DWM what changed; then `surface` is left unconfigured.
+    #[cfg(windows)]
+    dxgi: Option<dxgi::Swapchain>,
 }
 
 impl Gpu {
@@ -202,7 +207,7 @@ impl Gpu {
             device,
             queue,
         };
-        let window = gpu.configure_window(surface, width, height);
+        let window = gpu.configure_window(surface, window, width, height);
         Ok((gpu, window))
     }
 
@@ -226,7 +231,7 @@ impl Gpu {
                 })
         }
         .map_err(GpuError::Surface)?;
-        Ok(self.configure_window(surface, width, height))
+        Ok(self.configure_window(surface, window, width, height))
     }
 
     /// Creates a GPU context without a window, for offscreen rendering.
@@ -259,6 +264,7 @@ impl Gpu {
     fn configure_window(
         &self,
         surface: wgpu::Surface<'static>,
+        window: RawWindowHandle,
         width: u32,
         height: u32,
     ) -> WindowRenderer {
@@ -304,26 +310,69 @@ impl Gpu {
             color_space: Default::default(),
         };
         #[cfg(windows)]
-        let (config, retained) = {
+        let (config, retained, dxgi) = {
             let mut config = config;
+            let dxgi = self.own_swapchain(window, &config);
             // Made again with every new size, a swapchain waits for the GPU to finish everything
             // (25 ms on a Radeon 880M): it is given room to grow (see "提示" in
             // `docs/design/39-platform-windows.md`).
             let copies = caps.usages.contains(wgpu::TextureUsages::COPY_DST);
-            if copies {
-                config.usage |= wgpu::TextureUsages::COPY_DST;
-                config.width = swapchain_side(config.width, 0);
-                config.height = swapchain_side(config.height, 0);
+            if dxgi.is_none() {
+                if copies {
+                    config.usage |= wgpu::TextureUsages::COPY_DST;
+                    config.width = swapchain_side(config.width, 0);
+                    config.height = swapchain_side(config.height, 0);
+                }
+                surface.configure(&self.device, &config);
             }
-            (config, copies.then_some(None))
+            (config, (copies || dxgi.is_some()).then_some(None), dxgi)
         };
-        surface.configure(&self.device, &config);
+        #[cfg(not(windows))]
+        {
+            let _ = window;
+            surface.configure(&self.device, &config);
+        }
         WindowRenderer {
             surface,
             config,
             renderer: Renderer::new(&self.device, format),
             #[cfg(windows)]
             retained,
+            #[cfg(windows)]
+            dxgi,
+        }
+    }
+
+    /// Our own swapchain for the window, if wgpu draws with DX12 and it can be made: it tells DWM
+    /// what changed in each frame (see "提示" in `docs/design/39-platform-windows.md`).
+    /// `ANTIWEBUI_PRESENT=surface` uses wgpu's surface instead.
+    #[cfg(windows)]
+    fn own_swapchain(
+        &self,
+        window: RawWindowHandle,
+        config: &wgpu::SurfaceConfiguration,
+    ) -> Option<dxgi::Swapchain> {
+        if std::env::var("ANTIWEBUI_PRESENT").is_ok_and(|v| v == "surface")
+            || self.adapter.get_info().backend != wgpu::Backend::Dx12
+        {
+            return None;
+        }
+        let RawWindowHandle::Win32(handle) = window else {
+            return None;
+        };
+        let hwnd = windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut _);
+        let size = (
+            swapchain_side(config.width, 0),
+            swapchain_side(config.height, 0),
+        );
+        let premultiplied = config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
+        // SAFETY: the caller of `with_window` or `add_window` keeps the window.
+        match unsafe { dxgi::Swapchain::new(self, hwnd, size, config.format, premultiplied) } {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("[anti-webui] no DXGI swapchain of our own ({e}); using wgpu's surface");
+                None
+            }
         }
     }
 
@@ -440,6 +489,11 @@ fn swapchain_side(need: u32, have: u32) -> u32 {
 
 impl WindowRenderer {
     pub fn resize(&mut self, gpu: &Gpu, width: u32, height: u32) {
+        // Our own swapchain is fitted to each frame.
+        #[cfg(windows)]
+        if self.dxgi.is_some() {
+            return;
+        }
         let (w, h) = (width.max(1), height.max(1));
         if self.config.width != w || self.config.height != h {
             self.config.width = w;
@@ -448,7 +502,29 @@ impl WindowRenderer {
         }
     }
 
+    /// How frames get to the screen, for reports.
+    pub fn path(&self) -> &'static str {
+        #[cfg(windows)]
+        if self.dxgi.is_some() {
+            return "DXGI swapchain";
+        }
+        "wgpu surface"
+    }
+
+    /// How many frames old the buffer the last frame went to was, where that is known.
+    pub fn last_buffer_age(&self) -> Option<u64> {
+        #[cfg(windows)]
+        if let Some(d) = &self.dxgi {
+            return d.last_age();
+        }
+        None
+    }
+
     pub fn size(&self) -> (u32, u32) {
+        #[cfg(windows)]
+        if let Some(d) = &self.dxgi {
+            return d.size();
+        }
         (self.config.width, self.config.height)
     }
 
@@ -482,23 +558,35 @@ impl WindowRenderer {
         damage: &anti_webui_core::damage::Damage,
     ) -> (FrameResult, i64) {
         let (w, h) = (scene.width.max(1), scene.height.max(1));
-        let side = (
-            swapchain_side(w, self.config.width),
-            swapchain_side(h, self.config.height),
-        );
-        if side != (self.config.width, self.config.height) {
-            self.config.width = side.0;
-            self.config.height = side.1;
-            self.surface.configure(&gpu.device, &self.config);
-        }
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&gpu.device, &self.config);
+        let frame = if let Some(dxgi) = &mut self.dxgi {
+            let have = dxgi.size();
+            let side = (swapchain_side(w, have.0), swapchain_side(h, have.1));
+            if side != have
+                && let Err(e) = dxgi.resize(gpu, side)
+            {
+                eprintln!("[anti-webui] resizing the swapchain failed: {e}");
                 return (FrameResult::Skipped, 0);
             }
-            _ => return (FrameResult::Skipped, 0),
+            None
+        } else {
+            let side = (
+                swapchain_side(w, self.config.width),
+                swapchain_side(h, self.config.height),
+            );
+            if side != (self.config.width, self.config.height) {
+                self.config.width = side.0;
+                self.config.height = side.1;
+                self.surface.configure(&gpu.device, &self.config);
+            }
+            match self.surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(t)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(t) => Some(t),
+                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                    self.surface.configure(&gpu.device, &self.config);
+                    return (FrameResult::Skipped, 0);
+                }
+                _ => return (FrameResult::Skipped, 0),
+            }
         };
         let slot = self.retained.as_mut().expect("retained frames");
         let fresh = slot
@@ -525,6 +613,16 @@ impl WindowRenderer {
             );
             damage.area().min(full)
         };
+        let Some(frame) = frame else {
+            let dxgi = self.dxgi.as_mut().expect("no frame without it");
+            return match dxgi.present(gpu, encoder, kept, (w, h), damage, fresh) {
+                Ok(()) => (FrameResult::Presented, drawn),
+                Err(e) => {
+                    eprintln!("[anti-webui] presenting failed: {e}");
+                    (FrameResult::Skipped, 0)
+                }
+            };
+        };
         encoder.copy_texture_to_texture(
             kept.texture.as_image_copy(),
             frame.texture.as_image_copy(),
@@ -541,6 +639,11 @@ impl WindowRenderer {
 
     /// Renders and presents a scene.
     pub fn present(&mut self, gpu: &Gpu, scene: &Scene) -> FrameResult {
+        #[cfg(windows)]
+        if self.retained.is_some() {
+            let full = anti_webui_core::damage::Damage::full(scene.width, scene.height);
+            return self.present_retained(gpu, scene, &full).0;
+        }
         self.resize(gpu, scene.width, scene.height);
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)

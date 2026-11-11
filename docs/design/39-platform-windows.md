@@ -103,12 +103,28 @@ loop {
 
 ## 提示
 
-- **wgpu の Surface（いまの既定）：** `present/no_dmabuf.rs` の presenter は値を持たないので、`Presenter` はいつも wgpu の Surface に描く。DX12 の flip model のスワップチェーンを DirectComposition のビジュアルに付けたもの（`Dx12SwapchainKind::DxgiFromVisual`）で、`PreMultiplied` のアルファを持てる。
-  - 提示のモードは `Mailbox`（`Present(0, 0)`）。DWM が次の合成で最新の 1 枚を使う。描く間隔はこちらの垂直同期の合図で決めるので、描きすぎない。
-  - ポップアップの面も、それぞれの `HWND` に同じ方法で Surface を作る（`raw_handles`）。GPU は共有する。
+- **自前のスワップチェーン（いまの既定）：** wgpu が DX12 で描くときは、`WindowRenderer` が DXGI のスワップチェーンを自分で持つ（`anti-webui-wgpu` の `dxgi.rs`）。wgpu の Surface は `Present(0, 0)` でフレームを丸ごと渡すだけで、変わった矩形を渡す口が無い。そのため DWM は、波のプログレス 1 本が動くだけでも、毎フレームウィンドウ全体を合成し直していた。
+  - wgpu が submit するのと同じ `ID3D12CommandQueue` で `CreateSwapChainForComposition` を呼び、`FLIP_SEQUENTIAL`、3 枚、`PREMULTIPLIED` のアルファのスワップチェーンを作って、DirectComposition のビジュアルに付ける。DirectComposition のデバイスはスレッドに 1 つで、ウィンドウとポップアップで共有する。
+  - バッファは `texture_from_raw` と `create_texture_from_hal` で wgpu のテクスチャとして包む（`COPY_DST`、最初の状態は `PRESENT`）。写したあと `transition_resources` で `PRESENT` に戻してから submit する。
+  - フレームは残すテクスチャ（下記）に描き、変わったところだけをバックバッファに写す。`FLIP_SEQUENTIAL` のバッファは前に提示した中身を保つので、`GetCurrentBackBufferIndex` のバッファに最後に写したフレームから buffer age を求め、その間の変更矩形の和を写す（`DamageHistory`、Wayland と同じ）。DXGI は、変わっていない部分を前のフレームから写してはくれない（スクロール矩形を除く）。
+  - `Present1(0, 0, …)` の dirty rects に、そのフレームの変更矩形を渡す。最初のフレームと、大きさが変わったフレームは全面。描く間隔はこちらの垂直同期の合図で決めるので、描きすぎない。
+  - 大きさが変わってスワップチェーンを作り直すときは、`ResizeBuffers` ではなく新しいスワップチェーンを作り、ビジュアルの中身を差し替える。`ResizeBuffers` はバッファへの参照を全部放してからでないと呼べないので、GPU の仕事が終わるのを待つことになる（参照を放して GPU を待ってから呼ぶ形では、全画面にするときに落ちた）。古いスワップチェーンは、それまでに submit した仕事が終わるまで（`on_submitted_work_done`）持っておく。
+  - DX12 でないとき、作れなかったとき、`ANTIWEBUI_PRESENT=surface` のときは wgpu の Surface を使う。`ANTIWEBUI_DEBUG_DAMAGE=1` で、どちらを使っているか（`DXGI swapchain` / `wgpu surface`）と、フレームごとの buffer age が出る。
+  - 計測（md3e の `gallery`、リリースビルド、175%、Radeon 880M、120 Hz）。波のプログレスが動き続け、1 フレームの変更はウィンドウの 0.6%。GPU の使用率は WMI の `Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine` を 0.5 秒ごとに 10 回読んだ平均。スワップチェーンを作り直す時間は、ウィンドウの大きさを 40 px ずつ変えて計った：
+
+| | wgpu の Surface | 自前のスワップチェーン |
+|---|---|---|
+| DWM の GPU 使用率 | 4.5〜5.6% | 0〜0.6% |
+| アプリの GPU 使用率 | 3.8〜5.2% | 0〜1.0% |
+| スワップチェーンを作り直す時間 | 11〜19 ms | 8〜13 ms |
+
+  - 画面を 150 ms おきに読み、波が動いて映ることを確かめた（変わった矩形が DWM に届いている）。アプリの使用率が下がったのは、毎フレームの全面の写しが無くなったため。
+- **wgpu の Surface（代わり）：** DX12 の flip model のスワップチェーンを DirectComposition のビジュアルに付けたもの（`Dx12SwapchainKind::DxgiFromVisual`）で、`PreMultiplied` のアルファを持てる。
+  - 提示のモードは `Mailbox`（`Present(0, 0)`）。DWM が次の合成で最新の 1 枚を使う。
+  - ポップアップの面も、それぞれの `HWND` に同じ方法で作る（`raw_handles`）。GPU は共有する。どちらの方法でも同じ。
   - **DX12 を最初に試す。** wgpu の既定（`PRIMARY`）では Vulkan が選ばれることがあり（Radeon 880M で起きた）、Vulkan の Win32 のスワップチェーンは不透明なので、ポップアップの影の部分が黒くなった。Windows では DX12、`PRIMARY`、GL の順に試す。`WGPU_BACKEND` があればそれに従う。
-- **残す絵とスワップチェーンの余裕：** スワップチェーンを作り直す（`configure`）と、GPU の仕事が全部終わるのを待つ。Radeon 880M で 1 回 25 ms かかり、ライブリサイズは 1 フレーム 30〜45 ms（20〜30 fps）になっていた。
-  - フレームは、ウィンドウと同じ大きさのテクスチャ（`WindowRenderer` の `retained`）に描き、それをスワップチェーンの左上に写す（`copy_texture_to_texture`）。テクスチャは大きさが変わったら作り直すが、待ちは無い。
+- **残す絵とスワップチェーンの余裕：** wgpu の Surface のスワップチェーンを作り直す（`configure`）と、GPU の仕事が全部終わるのを待つ。Radeon 880M で 1 回 25 ms かかり、ライブリサイズは 1 フレーム 30〜45 ms（20〜30 fps）になっていた。
+  - フレームは、ウィンドウと同じ大きさのテクスチャ（`WindowRenderer` の `retained`）に描き、それをスワップチェーンの左上に写す（`copy_texture_to_texture`）。自前のスワップチェーンでは変わったところだけ、wgpu の Surface では全面を写す。テクスチャは大きさが変わったら作り直すが、待ちは無い。
   - スワップチェーンは 256 px 単位で大きめに取り、足りなくなったときと、512 px 以上余ったときだけ作り直す。余った部分は DirectComposition がウィンドウの外として切る（画面で確かめた）。
   - 残したテクスチャには前のフレームが入っているので、変わったところだけ描く（`render_damaged`）。表のスクロールで、描く画素が 100% から 40% になった。
   - スワップチェーンが写しを受けない（`COPY_DST` が無い）ときは、前のとおり全面を直に描く。
@@ -134,7 +150,6 @@ loop {
   - フレームが来ないとき（描画が失敗したなど）のため、2 秒で出す。
   - ポップアップは隠さない。透明な間は何も映らないだけで、枠が無いので目立たない。
   - 画面の画素を 5 ms ごとに読んで確かめた：隠れている間は後ろのものが映り、出たときにはもう中身（白）が映っている。
-- **今後（自前のバッファ）：** [05](05-rendering.md) の表のとおり、DXGI のスワップチェーンを自分で持ち、`IDXGISwapChain1::Present1` の dirty rects で変わったところだけを DWM に渡す。wgpu の Surface は変わった矩形を渡す口を持たないので、`create_texture_from_hal` で包む自前の presenter（`present/dxgi.rs`）にする。buffer age は flip model の `GetCurrentBackBufferIndex` から求める。
 
 ## 入力
 
@@ -246,6 +261,8 @@ Windows にもポップアップの役割は無い。X11 と同じく、自分�
 
 ポップアップの窓に wgpu の Surface を作ると、1 回約 55 ms かかる（Radeon 880M、リリースビルド）。内訳は、スワップチェーンと DirectComposition を作る `configure` が約 50 ms、`Renderer::new` が約 5 ms。GPU は空いていて、待っているのは wgpu-hal の中である。メニューを開くたびにこれがかかり、md3e のメニューは開くまで約 120 ms 止まっていた。
 
+自前のスワップチェーンでも、ポップアップの窓と面は同じように使い回す。面を前もって作る時間は、どちらの方法でも約 11 ms だった（`gallery` が何も描いていないとき、512×512）。
+
 - **閉じた窓を取っておく：** 閉じたポップアップの窓は壊さず、隠して（`SW_HIDE`）取っておく。次のポップアップはその窓を使う（`WindowData::reuse`、所有者は `GWLP_HWNDPARENT` で付け替える）。presenter の側も、閉じたポップアップの Surface を窓ごとに取っておき（`Presenter::spares`）、同じ窓の新しいポップアップにそのまま使う。取っておく数は、同時に開いていたポップアップの数まで。メインウィンドウを閉じるときに全部壊す（Surface が先）。
 - **最初のフレームまで見せない：** ポップアップの窓は、最初のフレームを提示してから（`committed`）、`SetWindowPos(HWND_TOP, SWP_SHOWWINDOW)` で見せる。使い回した窓には前のポップアップの絵が残っているので、先に見せるとそれが一瞬映る。新しい窓でも、透明な間が無くなる。`HWND_TOP` は、取っておいた窓が同じ所有者の他の窓の下にあることがあるため。
 - **前もって 1 つ作る：** 最初のメニューも待たないように、メインウィンドウの最初のフレームの後（次のフレーム、何も変わらなければ 300 ms 後）に、隠した窓を 1 つ作り、その上に 512×512 の Surface を作っておく（`Host::spare_popup_window`、`Presenter::prepare_spare`）。512 px あれば、たいていのメニューはスワップチェーンを作り直さずに済む。ウィンドウが映るのを遅らせないよう、最初のフレームでは作らない。
@@ -285,7 +302,7 @@ md3e の `menu`（301×292 px、175%）を開いてから画面に出るまで�
 | | Chromium | AntiWebUI |
 |---|---|---|
 | ウィンドウ | 自前の `HWND`（`HWNDMessageHandler`） | 自前の `HWND` |
-| 描画 | DirectComposition と DXGI のスワップチェーン、`Present1` の dirty rects | DirectComposition と DXGI のスワップチェーン（wgpu）。dirty rects は今後 |
+| 描画 | DirectComposition と DXGI のスワップチェーン、`Present1` の dirty rects | 同じ（スワップチェーンは自前、描くのは wgpu）。代わりに wgpu の Surface |
 | 垂直同期 | `D3DKMTWaitForVerticalBlankEvent` のスレッド | `IDXGIOutput::WaitForVBlank` のスレッド |
 | IME | TSF（以前は IMM32） | IMM32 |
 | ポップアップ | アクティブにならないトップレベルの窓 | 同じ |
@@ -299,7 +316,7 @@ md3e の `menu`（301×292 px、175%）を開いてから画面に出るまで�
 | W2 | IME（IMM32）、クリップボード、ポップアップ、フルスクリーン、最大化、CSD、複数ウィンドウ | 2026-11-08 に作った |
 | W3 | タッチパッド（DirectManipulation：スクロール、慣性、ピンチ） | 2026-11-08 に作った |
 | W4 | OLE の DnD、ファイルのドロップ | 今後 |
-| W5 | 自前のスワップチェーンと `Present1` の dirty rects | 今後 |
+| W5 | 自前のスワップチェーンと `Present1` の dirty rects | 2026-11-11 に作った |
 | W6 | TSF、再変換 | 今後 |
 
 ### 確かめたこと（2026-11-08、Windows 11、175% の画面）
@@ -341,7 +358,7 @@ cargo test -p anti-webui-windows
 cargo run -p anti-webui --example showcase
 cargo run -p anti-webui --example widgets
 cargo run -p anti-webui --example multi_window
-# wgpu の Surface でダメージの出方を見る
+# ダメージの出方と buffer age を見る（ANTIWEBUI_PRESENT=surface で wgpu の Surface と比べる）
 ANTIWEBUI_DEBUG_DAMAGE=1 cargo run -p anti-webui --example widgets
 ```
 

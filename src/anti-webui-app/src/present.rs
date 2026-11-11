@@ -123,8 +123,11 @@ impl Presenter {
         if debug {
             let info = gpu.adapter.get_info();
             eprintln!(
-                "[anti-webui] wgpu surface on {} ({:?}, {})",
-                info.name, info.backend, info.driver
+                "[anti-webui] {} on {} ({:?}, {})",
+                window.path(),
+                info.name,
+                info.backend,
+                info.driver
             );
         }
         Ok(Self {
@@ -151,7 +154,10 @@ impl Presenter {
     pub fn path(&self) -> &'static str {
         match &self.own {
             Some(d) => d.name(),
-            None => "wgpu surface",
+            None => match self.targets.get(&SurfaceId::Window).map(|t| &t.kind) {
+                Some(TargetKind::Surface(w)) => w.path(),
+                _ => "wgpu surface",
+            },
         }
     }
 
@@ -366,6 +372,7 @@ impl Presenter {
                             t.committed = now;
                         }
                         Ok(Some(Stats {
+                            age: window.last_buffer_age(),
                             repaint: drawn,
                             ..full_stats(&scene)
                         }))

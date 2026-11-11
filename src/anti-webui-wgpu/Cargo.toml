@@ -16,6 +16,16 @@ bytemuck.workspace = true
 raw-window-handle.workspace = true
 pollster.workspace = true
 
+# Our own DXGI swapchain (see `src/dxgi.rs`).
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_DirectComposition",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 ash.workspace = true
 libc.workspace = true
