@@ -698,7 +698,7 @@ src/anti-webui-wayland-shell/
     - `media()`：MPRIS のプレーヤーの一覧と今のプレーヤー、曲の情報、操作。`position()` は追跡されない計算で、UI は自分のタイマーで読む。
     - `notification_server()`：通知デーモンになる。`popups()` と履歴、操作、期限、`replaces_id`、おやすみモード（緊急のものは出す）。本文は `b`、`i`、`u`、`a`、`img` だけ残し、`body_text()` で文字だけも取れる。
     - `tray()`：StatusNotifierHost。watcher がいなければ自分がなる。アイコン（名前とピクセル）、ツールチップ、操作、dbusmenu のメニュー、`tray_menu`。
-    - `session()`：サスペンド、休止、電源断、再起動、ロック、ロックとスリープの合図、画面の明るさ（logind の `SetBrightness`、`actual_brightness` を inotify で追う）。
+    - `session()`：サスペンド、休止、電源断、再起動、ロック、ロックとスリープの合図、画面の明るさ（logind の `SetBrightness`、`actual_brightness` を inotify で追い、値は `brightness` から読む。`actual_brightness` はハードウェアが実際に出している値で、amdgpu などでは頼んだ値より低いか、まだ変化の途中なので、スライダーが置いた位置から戻ってしまう）。
   - 例 `shell_bar` を `--features shell-all` で作ると、電池、電源プロファイル、Wi-Fi、Bluetooth、明るさ、再生中の曲、トレイが出る。通知デーモンになれたときは、右上に通知が出る。
 - **L3 で設計から変えたところ：**
   - feature 名は Cargo の流儀に合わせ、`power-profiles` にした。

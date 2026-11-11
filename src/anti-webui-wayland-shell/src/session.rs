@@ -290,15 +290,19 @@ impl Backlight {
         self.number("max_brightness").filter(|m| *m > 0)
     }
 
-    /// How bright it is, from 0 to 1.
+    /// How bright it was asked to be, from 0 to 1. That is `brightness`, as brightnessctl, GNOME
+    /// and KDE read it: `actual_brightness` is what the hardware has got to, which on some GPUs
+    /// (amdgpu, say) is lower than what was asked for, or still on its way there, so a slider
+    /// showing it would fall back from where it was put.
     fn read(&self) -> Option<f64> {
         let now = self
-            .number("actual_brightness")
-            .or_else(|| self.number("brightness"))?;
+            .number("brightness")
+            .or_else(|| self.number("actual_brightness"))?;
         Some((now as f64 / self.max()? as f64).clamp(0.0, 1.0))
     }
 
-    /// The file the kernel tells of changes to.
+    /// The file the kernel tells of changes to: it notifies `actual_brightness` whenever the
+    /// brightness is changed, by anyone.
     fn watched(&self) -> PathBuf {
         let actual = self.dir.join("actual_brightness");
         if actual.exists() {

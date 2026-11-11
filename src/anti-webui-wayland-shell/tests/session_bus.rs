@@ -82,9 +82,12 @@ impl Session {
             .lock()
             .unwrap()
             .push(format!("brightness {subsystem} {name} {value}"));
+        // As some GPUs do, the hardware gets less than what was asked for.
+        let dir = self.backlights.join(name);
+        std::fs::write(dir.join("brightness"), format!("{value}\n")).unwrap();
         std::fs::write(
-            self.backlights.join(name).join("actual_brightness"),
-            format!("{value}\n"),
+            dir.join("actual_brightness"),
+            format!("{}\n", value * 9 / 10),
         )
         .unwrap();
     }
@@ -101,6 +104,7 @@ fn backlight(root: &std::path::Path, name: &str, kind: &str, max: u32, now: u32)
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("type"), format!("{kind}\n")).unwrap();
     std::fs::write(dir.join("max_brightness"), format!("{max}\n")).unwrap();
+    std::fs::write(dir.join("brightness"), format!("{now}\n")).unwrap();
     std::fs::write(dir.join("actual_brightness"), format!("{now}\n")).unwrap();
 }
 
@@ -208,11 +212,14 @@ fn logind_is_asked_and_heard_and_the_backlight_followed() {
     anti_webui_core::channel::pump();
     assert_eq!(*heard.borrow(), ["lock", "unlock", "sleep true"]);
 
-    // Brightness is set through logind, on the firmware's backlight.
+    // Brightness is set through logind, on the firmware's backlight, and reads as what was asked
+    // for even where the hardware gets less.
     assert_eq!(wait(s.set_brightness(0.8)), Ok(()));
     until("brighter", || s.brightness() == Some(0.8));
-    // And followed when something else changes it.
-    std::fs::write(backlights.join("acpi_video0/actual_brightness"), "250\n").unwrap();
+    // And followed when something else changes it: the kernel tells of `actual_brightness`.
+    let light = backlights.join("acpi_video0");
+    std::fs::write(light.join("brightness"), "250\n").unwrap();
+    std::fs::write(light.join("actual_brightness"), "225\n").unwrap();
     until("dimmer", || s.brightness() == Some(0.25));
 
     let log = log.lock().unwrap().clone();
