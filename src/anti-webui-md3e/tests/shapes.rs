@@ -5,6 +5,7 @@ mod common;
 
 use anti_webui::app::headless;
 use anti_webui::core::Ui;
+use anti_webui::core::event::PointerButton;
 use anti_webui::core::scene::Scene;
 use anti_webui::prelude::*;
 use anti_webui::wgpu::{Gpu, Renderer, wgpu::TextureFormat};
@@ -324,6 +325,52 @@ fn ink_on_a_box_of_its_own_shows_under_the_pointer_and_then_goes() {
     let gone = settle(&mut ui);
     assert!(shaders(&gone).is_empty());
     assert_at_rest(&mut ui);
+}
+
+/// A tile with ink of its own, 120 by 56 at the top left.
+fn ink_tile() -> Div {
+    let ink = Ink::new(|c| c.on_surface, || false);
+    let tile = div().w(120.0).h(56.0).rounded(16.0).focusable();
+    div().child(ink.paint(ink.listen(tile)))
+}
+
+#[test]
+fn a_ripple_held_down_asks_for_no_frames_until_it_is_let_go() {
+    let mut ui = start_ui(ink_tile);
+    pointer_at(&mut ui, 60.0, 28.0);
+    settle(&mut ui);
+    pointer(&mut ui, 60.0, 28.0, true);
+    assert!(ui.animating(), "it grows");
+    let held = run(&mut ui, 400);
+    assert_eq!(shaders(&held).len(), 1, "it is still drawn");
+    assert!(!ui.animating(), "but asks for no frames once it has grown");
+    pointer(&mut ui, 60.0, 28.0, false);
+    assert!(ui.animating(), "it goes once let go");
+    pointer_at(&mut ui, 600.0, 600.0);
+    let gone = settle(&mut ui);
+    assert!(shaders(&gone).is_empty());
+    assert_at_rest(&mut ui);
+}
+
+#[test]
+fn a_ripple_another_button_starts_goes_by_itself() {
+    // Only the primary button makes the tile active, which is what lets a ripple go: one another
+    // button starts, which opens a menu for one, used to stay and ask for frames for ever.
+    for button in [PointerButton::Secondary, PointerButton::Middle] {
+        let mut ui = start_ui(ink_tile);
+        pointer_at(&mut ui, 60.0, 28.0);
+        settle(&mut ui);
+        pointer_button(&mut ui, 60.0, 28.0, true, button);
+        assert!(ui.animating(), "{button:?} makes a ripple");
+        // Its release may not even come here, when what it opened takes the pointer.
+        settle(&mut ui);
+        assert!(!ui.animating(), "{button:?}: the ripple has gone");
+        pointer_button(&mut ui, 60.0, 28.0, false, button);
+        pointer_at(&mut ui, 600.0, 600.0);
+        let gone = settle(&mut ui);
+        assert!(shaders(&gone).is_empty(), "{button:?}");
+        assert_at_rest(&mut ui);
+    }
 }
 
 #[test]

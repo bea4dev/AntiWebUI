@@ -81,6 +81,12 @@ struct Ripple {
 }
 
 impl Ripple {
+    /// Whether it still changes from `now` on by itself: not once it has grown and come in, and
+    /// waits to be released.
+    fn moving(&self, now: Instant) -> bool {
+        self.released.is_some() || now.saturating_duration_since(self.started) < GROW.max(FADE_IN)
+    }
+
     /// `(x, y, how far it has grown, how strong it is)`, or `None` when it is over.
     fn at(&self, now: Instant) -> Option<[f32; 4]> {
         let elapsed = now.saturating_duration_since(self.started);
@@ -150,12 +156,19 @@ impl Ripples {
 
     fn release(&self) {
         let now = Instant::now();
+        let mut held = false;
         for r in self.list.borrow_mut().iter_mut().flatten() {
+            held |= r.released.is_none();
             r.released.get_or_insert(now);
+        }
+        // One that waited to be released asked for no frames meanwhile.
+        if held {
+            self.tick(now);
         }
     }
 
-    /// Shows how things are at `now` and, if something is still going on, comes back.
+    /// Shows how things are at `now` and, if something is still going on, comes back. A ripple
+    /// that waits to be released is not going on: it is drawn as it is until then.
     fn tick(&self, now: Instant) {
         if !self.shown.is_alive() {
             return;
@@ -163,10 +176,13 @@ impl Ripples {
         let mut shown = [[0.0; 4]; 3];
         let mut going_on = false;
         for (slot, out) in self.list.borrow_mut().iter_mut().zip(&mut shown) {
-            match slot.as_ref().and_then(|r| r.at(now)) {
-                Some(v) => {
+            match slot
+                .as_ref()
+                .and_then(|r| Some((r.at(now)?, r.moving(now))))
+            {
+                Some((v, moving)) => {
                     *out = v;
-                    going_on = true;
+                    going_on |= moving;
                 }
                 None => *slot = None,
             }
@@ -292,6 +308,7 @@ impl Ink {
             if !(this.disabled)() {
                 let center = [e.rect.width as f32 / 2.0, e.rect.height as f32 / 2.0];
                 this.ripples.press(Some(([e.local.x, e.local.y], center)));
+                this.tap_unless_primary(e.button);
             }
         })
     }
@@ -300,11 +317,20 @@ impl Ink {
     /// that is another box, like the circle around the handle of a switch.
     pub fn listen_centered(&self, node: Div) -> Div {
         let this = self.clone();
-        self.listeners(node).on_pointer_down(move |_| {
+        self.listeners(node).on_pointer_down(move |e| {
             if !(this.disabled)() {
                 this.ripples.press(None);
+                this.tap_unless_primary(e.button);
             }
         })
+    }
+
+    /// Only the primary button makes a box active, and the end of that is what releases a ripple.
+    /// One that another button starts is released at once, like a tap; it would stay otherwise.
+    fn tap_unless_primary(&self, button: Option<PointerButton>) {
+        if button != Some(PointerButton::Primary) {
+            self.ripples.release();
+        }
     }
 
     fn listeners(&self, node: Div) -> Div {

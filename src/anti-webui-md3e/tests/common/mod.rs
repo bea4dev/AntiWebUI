@@ -33,9 +33,13 @@ pub fn pointer_at(ui: &mut Ui, x: f32, y: f32) {
 }
 
 pub fn pointer(ui: &mut Ui, x: f32, y: f32, pressed: bool) {
+    pointer_button(ui, x, y, pressed, PointerButton::Primary);
+}
+
+pub fn pointer_button(ui: &mut Ui, x: f32, y: f32, pressed: bool, button: PointerButton) {
     ui.handle_event(WindowEvent::PointerButton {
         position: PointF::new(x, y),
-        button: PointerButton::Primary,
+        button,
         pressed,
         modifiers: Modifiers::default(),
         time: 0,
