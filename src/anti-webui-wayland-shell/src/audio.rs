@@ -4,6 +4,9 @@
 //!
 //! PipeWire runs a thread of its own, which tells of nodes, links and the default devices; what
 //! comes in goes to signals there. Changing something takes that thread's lock for a moment.
+//!
+//! The sound of a device of a card is kept in the route the card uses for it, as WirePlumber keeps
+//! it, and the node's own volume may say something else; so it is read from and written to that.
 
 mod ffi;
 mod pod;
@@ -12,8 +15,9 @@ use crate::ServiceError;
 use anti_webui_core::shared::{SharedSignal, shared_signal};
 use anti_webui_core::task::Task;
 use ffi::{
-    CoreEvents, CoreMethods, Lib, MetadataEvents, MetadataMethods, NodeEvents, NodeInfo,
-    NodeMethods, Object, RegistryEvents, RegistryMethods, SpaDict, SpaHook, SpaPod, methods,
+    CoreEvents, CoreMethods, DeviceEvents, DeviceInfo, DeviceMethods, Lib, MetadataEvents,
+    MetadataMethods, NodeEvents, NodeInfo, NodeMethods, Object, RegistryEvents, RegistryMethods,
+    SpaDict, SpaHook, SpaPod, methods,
 };
 use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_int, c_void};
@@ -247,6 +251,17 @@ struct Node {
     state: *mut State,
 }
 
+/// A device of cards, bound to hear of its routes. Boxed, as nodes are.
+struct Device {
+    proxy: *mut Object,
+    hook: Box<SpaHook>,
+    routes: Vec<pod::Route>,
+    /// The routes being read, and the sync that ends it.
+    incoming: Vec<pod::Route>,
+    sync: Option<c_int>,
+    state: *mut State,
+}
+
 struct Metadata {
     proxy: *mut Object,
     /// Where PipeWire keeps its listener; never read here.
@@ -256,8 +271,10 @@ struct Metadata {
 /// What PipeWire has told, kept on its thread or under its lock.
 struct State {
     lib: &'static Lib,
+    core: *mut Object,
     registry: *mut Object,
     nodes: HashMap<u32, Box<Node>>,
+    devices: HashMap<u32, Box<Device>>,
     /// Links by id: the node sound comes out of and the one it goes into.
     links: HashMap<u32, (u32, u32)>,
     metadata: Option<Metadata>,
@@ -291,7 +308,7 @@ static LIB: OnceLock<Result<Lib, String>> = OnceLock::new();
 static CORE_EVENTS: CoreEvents = CoreEvents {
     version: 0,
     info: None,
-    done: None,
+    done: Some(core_done),
     ping: None,
     error: Some(core_error),
     remove_id: None,
@@ -310,6 +327,12 @@ static NODE_EVENTS: NodeEvents = NodeEvents {
     version: 0,
     info: Some(node_info),
     param: Some(node_param),
+};
+
+static DEVICE_EVENTS: DeviceEvents = DeviceEvents {
+    version: 0,
+    info: Some(device_info),
+    param: Some(device_param),
 };
 
 static METADATA_EVENTS: MetadataEvents = MetadataEvents {
@@ -345,8 +368,10 @@ impl Pw {
             }
             let state = Box::into_raw(Box::new(State {
                 lib,
+                core,
                 registry,
                 nodes: HashMap::new(),
+                devices: HashMap::new(),
                 links: HashMap::new(),
                 metadata: None,
                 default_sink: None,
@@ -395,12 +420,24 @@ impl State {
         unsafe { &*self.shared }
     }
 
+    /// The route the sound of a node is kept in, and its device's proxy, when it has one.
+    fn route(&self, n: &Node) -> Option<(&pod::Route, *mut Object)> {
+        let device = self.devices.get(&prop(n, "device.id").parse().ok()?)?;
+        let at: i32 = prop(n, "card.profile.device").parse().ok()?;
+        let route = device.routes.iter().find(|r| r.device == at)?;
+        Some((route, device.proxy))
+    }
+
     fn set_volume(&mut self, id: u32, volume: f64) -> Result<(), ServiceError> {
         let node = self
             .nodes
             .get(&id)
             .ok_or(ServiceError::Failed("no such node".into()))?;
         let linear = volume.max(0.0).powi(3) as f32;
+        if let Some((route, device)) = self.route(node) {
+            let volumes = vec![linear; channels(node, Some(route)).max(1) as usize];
+            return set_route(device, &pod::build_route(route, Some(&volumes), None));
+        }
         let volumes = vec![linear; node.volumes.len().max(1)];
         set_props(node.proxy, &pod::build_props(Some(&volumes), None))
     }
@@ -410,6 +447,9 @@ impl State {
             .nodes
             .get(&id)
             .ok_or(ServiceError::Failed("no such node".into()))?;
+        if let Some((route, device)) = self.route(node) {
+            return set_route(device, &pod::build_route(route, None, Some(muted)));
+        }
         set_props(node.proxy, &pod::build_props(None, Some(muted)))
     }
 
@@ -429,17 +469,22 @@ impl State {
         let shared = self.shared();
         let mut nodes: Vec<&Node> = self.nodes.values().map(|n| &**n).collect();
         nodes.sort_by_key(|n| n.id);
-        let device = |n: &Node| AudioDevice {
-            id: n.id,
-            name: prop(n, "node.name"),
-            description: ["node.description", "node.nick", "node.name"]
-                .iter()
-                .map(|k| prop(n, k))
-                .find(|d| !d.is_empty())
-                .unwrap_or_default(),
-            volume: volume(n),
-            muted: n.muted,
-            channels: n.volumes.len() as u32,
+        let device = |n: &Node| {
+            let route = self.route(n).map(|(r, _)| r);
+            AudioDevice {
+                id: n.id,
+                name: prop(n, "node.name"),
+                description: ["node.description", "node.nick", "node.name"]
+                    .iter()
+                    .map(|k| prop(n, k))
+                    .find(|d| !d.is_empty())
+                    .unwrap_or_default(),
+                volume: route
+                    .and_then(|r| r.props.volumes.as_deref())
+                    .map_or_else(|| volume(&n.volumes), volume),
+                muted: route.and_then(|r| r.props.mute).unwrap_or(n.muted),
+                channels: channels(n, route),
+            }
         };
         let of = |kind| {
             nodes
@@ -464,7 +509,7 @@ impl State {
                         .unwrap_or_default(),
                     media_name: prop(n, "media.name"),
                     icon_name: prop(n, "application.icon-name"),
-                    volume: volume(n),
+                    volume: volume(&n.volumes),
                     muted: n.muted,
                     input,
                     target: self.links.values().find_map(|&(out, into)| match input {
@@ -485,11 +530,16 @@ fn prop(n: &Node, key: &str) -> String {
     n.props.get(key).cloned().unwrap_or_default()
 }
 
-fn volume(n: &Node) -> f64 {
-    if n.volumes.is_empty() {
+fn volume(volumes: &[f32]) -> f64 {
+    if volumes.is_empty() {
         return 1.0;
     }
-    cubic(n.volumes.iter().sum::<f32>() / n.volumes.len() as f32)
+    cubic(volumes.iter().sum::<f32>() / volumes.len() as f32)
+}
+
+fn channels(n: &Node, route: Option<&pod::Route>) -> u32 {
+    let route = route.and_then(|r| r.props.volumes.as_ref()).map(Vec::len);
+    route.unwrap_or(n.volumes.len()) as u32
 }
 
 fn put<T: PartialEq + Send + 'static>(signal: &SharedSignal<T>, value: T) {
@@ -521,6 +571,36 @@ fn set_props(proxy: *mut Object, pod: &[u64]) -> Result<(), ServiceError> {
         (m.set_param)(data, pod::PARAM_PROPS, 0, pod.as_ptr().cast::<SpaPod>())
     };
     result(res)
+}
+
+/// Sets the `Route` of a device.
+fn set_route(proxy: *mut Object, pod: &[u64]) -> Result<(), ServiceError> {
+    // SAFETY: a live device proxy, used under PipeWire's lock; the pod outlives the call, which
+    // copies it.
+    let res = unsafe {
+        let (m, data) = methods::<DeviceMethods>(proxy);
+        (m.set_param)(data, pod::PARAM_ROUTE, 0, pod.as_ptr().cast::<SpaPod>())
+    };
+    result(res)
+}
+
+unsafe extern "C" fn core_done(data: *mut c_void, id: u32, seq: c_int) {
+    if id != ffi::ID_CORE {
+        return;
+    }
+    // SAFETY: `data` is the state, on PipeWire's thread.
+    let state = unsafe { &mut *data.cast::<State>() };
+    let mut read = false;
+    for device in state.devices.values_mut() {
+        if device.sync == Some(seq) {
+            device.sync = None;
+            device.routes = std::mem::take(&mut device.incoming);
+            read = true;
+        }
+    }
+    if read {
+        state.publish();
+    }
 }
 
 unsafe extern "C" fn core_error(
@@ -601,6 +681,39 @@ unsafe extern "C" fn global(
         }
         state.nodes.insert(id, node);
         state.publish();
+    } else if kind == ffi::INTERFACE_DEVICE {
+        if props.get("media.class").map(String::as_str) != Some("Audio/Device") {
+            return;
+        }
+        // SAFETY: as for nodes.
+        let proxy = unsafe {
+            let (m, registry) = methods::<RegistryMethods>(state.registry);
+            (m.bind)(
+                registry,
+                id,
+                ffi::INTERFACE_DEVICE.as_ptr().cast(),
+                ffi::VERSION_DEVICE,
+                0,
+            )
+        };
+        if proxy.is_null() {
+            return;
+        }
+        let mut device = Box::new(Device {
+            proxy,
+            hook: SpaHook::new(),
+            routes: Vec::new(),
+            incoming: Vec::new(),
+            sync: None,
+            state,
+        });
+        let device_ptr: *mut Device = &mut *device;
+        // SAFETY: as for nodes. Its routes are read when it tells of its params.
+        unsafe {
+            let (m, data) = methods::<DeviceMethods>(proxy);
+            (m.add_listener)(data, &mut *device.hook, &DEVICE_EVENTS, device_ptr.cast());
+        }
+        state.devices.insert(id, device);
     } else if kind == ffi::INTERFACE_METADATA {
         if props.get("metadata.name").map(String::as_str) != Some("default")
             || state.metadata.is_some()
@@ -636,6 +749,12 @@ unsafe extern "C" fn global_remove(data: *mut c_void, id: u32) {
         unsafe {
             node.hook.remove();
             (state.lib.proxy_destroy)(node.proxy);
+        }
+    } else if let Some(mut device) = state.devices.remove(&id) {
+        // SAFETY: as for nodes.
+        unsafe {
+            device.hook.remove();
+            (state.lib.proxy_destroy)(device.proxy);
         }
     } else if state.links.remove(&id).is_none() {
         return;
@@ -691,6 +810,52 @@ unsafe extern "C" fn node_param(
     }
     // SAFETY: the state outlives its nodes.
     unsafe { &*node.state }.publish();
+}
+
+unsafe extern "C" fn device_info(data: *mut c_void, info: *const DeviceInfo) {
+    // SAFETY: `data` is a device of the state, on PipeWire's thread; `info` is PipeWire's for the
+    // length of the call.
+    let (device, info) = unsafe { (&mut *data.cast::<Device>(), &*info) };
+    if info.change_mask & ffi::DEVICE_CHANGE_MASK_PARAMS == 0 {
+        return;
+    }
+    // Its params changed, maybe its routes: all of them are read again, and taken when a sync
+    // after them comes back, so that a route no longer there goes too.
+    // SAFETY: a live device proxy and the state's core, on PipeWire's thread.
+    unsafe {
+        let (m, proxy) = methods::<DeviceMethods>(device.proxy);
+        (m.enum_params)(proxy, 0, pod::PARAM_ROUTE, 0, u32::MAX, std::ptr::null());
+        let (m, core) = methods::<CoreMethods>((*device.state).core);
+        device.incoming.clear();
+        device.sync = Some((m.sync)(core, ffi::ID_CORE, 0));
+    }
+}
+
+unsafe extern "C" fn device_param(
+    data: *mut c_void,
+    _seq: c_int,
+    id: u32,
+    _index: u32,
+    _next: u32,
+    param: *const SpaPod,
+) {
+    if id != pod::PARAM_ROUTE || param.is_null() {
+        return;
+    }
+    // SAFETY: `data` is a device of the state, on PipeWire's thread; the pod is its header and
+    // `size` bytes after it.
+    let (device, bytes) = unsafe {
+        let size = (*param).size as usize;
+        (
+            &mut *data.cast::<Device>(),
+            std::slice::from_raw_parts(param.cast::<u8>(), 8 + size),
+        )
+    };
+    // A route read twice, when its params changed again before the sync came back, is the later.
+    if let Some(route) = pod::parse_route(bytes) {
+        device.incoming.retain(|r| r.device != route.device);
+        device.incoming.push(route);
+    }
 }
 
 unsafe extern "C" fn metadata_property(

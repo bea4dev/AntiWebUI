@@ -113,6 +113,19 @@ pub struct NodeInfo {
 
 pub const NODE_CHANGE_MASK_PROPS: u64 = 1 << 3;
 
+#[repr(C)]
+pub struct DeviceInfo {
+    pub id: u32,
+    pub change_mask: u64,
+    pub props: *const SpaDict,
+    pub params: *const c_void,
+    pub n_params: u32,
+}
+
+pub const DEVICE_CHANGE_MASK_PARAMS: u64 = 1 << 1;
+/// The id of the core, as an object.
+pub const ID_CORE: u32 = 0;
+
 pub type AddListener<E> =
     unsafe extern "C" fn(*mut Object, *mut SpaHook, *const E, *mut c_void) -> c_int;
 
@@ -122,7 +135,7 @@ pub struct CoreMethods {
     pub version: u32,
     pub add_listener: AddListener<CoreEvents>,
     pub hello: *const c_void,
-    pub sync: *const c_void,
+    pub sync: unsafe extern "C" fn(*mut Object, u32, c_int) -> c_int,
     pub pong: *const c_void,
     pub error: *const c_void,
     pub get_registry: unsafe extern "C" fn(*mut Object, u32, usize) -> *mut Object,
@@ -176,6 +189,24 @@ pub struct NodeEvents {
     pub param: Option<unsafe extern "C" fn(*mut c_void, c_int, u32, u32, u32, *const SpaPod)>,
 }
 
+/// `pw_device_methods`, as far as `set_param`.
+#[repr(C)]
+pub struct DeviceMethods {
+    pub version: u32,
+    pub add_listener: AddListener<DeviceEvents>,
+    pub subscribe_params: unsafe extern "C" fn(*mut Object, *mut u32, u32) -> c_int,
+    pub enum_params:
+        unsafe extern "C" fn(*mut Object, c_int, u32, u32, u32, *const SpaPod) -> c_int,
+    pub set_param: unsafe extern "C" fn(*mut Object, u32, u32, *const SpaPod) -> c_int,
+}
+
+#[repr(C)]
+pub struct DeviceEvents {
+    pub version: u32,
+    pub info: Option<unsafe extern "C" fn(*mut c_void, *const DeviceInfo)>,
+    pub param: Option<unsafe extern "C" fn(*mut c_void, c_int, u32, u32, u32, *const SpaPod)>,
+}
+
 /// `pw_metadata_methods`, as far as `set_property`.
 #[repr(C)]
 pub struct MetadataMethods {
@@ -207,8 +238,10 @@ pub struct MetadataEvents {
 pub const VERSION_REGISTRY: u32 = 3;
 pub const VERSION_NODE: u32 = 3;
 pub const VERSION_METADATA: u32 = 3;
+pub const VERSION_DEVICE: u32 = 3;
 pub const INTERFACE_NODE: &[u8] = b"PipeWire:Interface:Node\0";
 pub const INTERFACE_METADATA: &[u8] = b"PipeWire:Interface:Metadata\0";
+pub const INTERFACE_DEVICE: &[u8] = b"PipeWire:Interface:Device\0";
 pub const INTERFACE_LINK: &[u8] = b"PipeWire:Interface:Link\0";
 
 /// The table of methods of an object and what to call them with.

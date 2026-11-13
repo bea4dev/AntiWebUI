@@ -1,8 +1,9 @@
 //! The little of SPA's pods this reads and writes: the `Props` of a node, with its volumes and
-//! whether it is muted. A pod is a size and a type, then a body padded to 8 bytes; values are in
-//! the machine's byte order.
+//! whether it is muted, and the `Route` of a device, which holds them for a node of it. A pod is a
+//! size and a type, then a body padded to 8 bytes; values are in the machine's byte order.
 
 pub const TYPE_BOOL: u32 = 2;
+pub const TYPE_INT: u32 = 4;
 pub const TYPE_FLOAT: u32 = 6;
 pub const TYPE_ARRAY: u32 = 13;
 pub const TYPE_OBJECT: u32 = 15;
@@ -14,6 +15,14 @@ pub const PARAM_PROPS: u32 = 2;
 pub const PROP_VOLUME: u32 = 0x10003;
 pub const PROP_MUTE: u32 = 0x10004;
 pub const PROP_CHANNEL_VOLUMES: u32 = 0x10008;
+/// `SPA_TYPE_OBJECT_ParamRoute`.
+pub const OBJECT_ROUTE: u32 = 0x40009;
+/// `SPA_PARAM_Route`.
+pub const PARAM_ROUTE: u32 = 13;
+pub const ROUTE_INDEX: u32 = 1;
+pub const ROUTE_DEVICE: u32 = 3;
+pub const ROUTE_PROPS: u32 = 10;
+pub const ROUTE_SAVE: u32 = 13;
 
 /// What a `Props` pod says of the sound.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -25,6 +34,15 @@ pub struct Props {
     pub mute: Option<bool>,
 }
 
+/// What a `Route` pod says: the way out or in a device of a card uses now, and its sound.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Route {
+    pub index: i32,
+    /// The device of the card it is for, which a node of it gives as `card.profile.device`.
+    pub device: i32,
+    pub props: Props,
+}
+
 fn u32_at(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_ne_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
@@ -33,33 +51,66 @@ fn pad8(n: usize) -> usize {
     (n + 7) & !7
 }
 
-/// Reads a `Props` object, given the whole pod with its header.
-pub fn parse_props(pod: &[u8]) -> Option<Props> {
+/// The properties of an object of a kind, given the whole pod with its header: each one's key
+/// and its value, a pod with its header.
+fn properties(pod: &[u8], object: u32) -> Option<Vec<(u32, &[u8])>> {
     let size = u32_at(pod, 0)? as usize;
     if u32_at(pod, 4)? != TYPE_OBJECT || pod.len() < 8 + size || size < 8 {
         return None;
     }
-    if u32_at(pod, 8)? != OBJECT_PROPS {
+    if u32_at(pod, 8)? != object {
         return None;
     }
     let end = 8 + size;
     let mut at = 16;
-    let mut props = Props::default();
+    let mut out = Vec::new();
     // Each property: a key, flags, then a pod.
     while at + 16 <= end {
         let key = u32_at(pod, at)?;
         let value_size = u32_at(pod, at + 8)? as usize;
-        let value_type = u32_at(pod, at + 12)?;
-        let body = pod.get(at + 16..at + 16 + value_size)?;
+        out.push((key, pod.get(at + 8..at + 16 + value_size)?));
+        at += 16 + pad8(value_size);
+    }
+    Some(out)
+}
+
+/// The type and the body of a pod with its header.
+fn split(value: &[u8]) -> (u32, &[u8]) {
+    (u32_at(value, 4).unwrap_or(0), &value[8..])
+}
+
+/// Reads a `Props` object, given the whole pod with its header.
+pub fn parse_props(pod: &[u8]) -> Option<Props> {
+    let mut props = Props::default();
+    for (key, value) in properties(pod, OBJECT_PROPS)? {
+        let (value_type, body) = split(value);
         match key {
             PROP_VOLUME => props.volume = float(value_type, body),
             PROP_MUTE => props.mute = boolean(value_type, body),
             PROP_CHANNEL_VOLUMES if value_type == TYPE_ARRAY => props.volumes = floats(body),
             _ => {}
         }
-        at += 16 + pad8(value_size);
     }
     Some(props)
+}
+
+/// Reads a `Route` object, given the whole pod with its header.
+pub fn parse_route(pod: &[u8]) -> Option<Route> {
+    let (mut index, mut device, mut props) = (None, None, Props::default());
+    for (key, value) in properties(pod, OBJECT_ROUTE)? {
+        let (value_type, body) = split(value);
+        match key {
+            ROUTE_INDEX => index = int(value_type, body),
+            ROUTE_DEVICE => device = int(value_type, body),
+            ROUTE_PROPS => props = parse_props(value)?,
+            _ => {}
+        }
+    }
+    Some(Route {
+        index: index?,
+        device: device?,
+        props,
+    })
 }
 
 /// The value of a pod of a type, or the current one of a choice of them.
@@ -76,6 +127,11 @@ fn unwrap_choice(kind: u32, body: &[u8]) -> Option<(u32, &[u8])> {
 fn float(kind: u32, body: &[u8]) -> Option<f32> {
     let (kind, body) = unwrap_choice(kind, body)?;
     (kind == TYPE_FLOAT).then(|| Some(f32::from_ne_bytes(body.get(..4)?.try_into().ok()?)))?
+}
+
+fn int(kind: u32, body: &[u8]) -> Option<i32> {
+    let (kind, body) = unwrap_choice(kind, body)?;
+    (kind == TYPE_INT).then(|| Some(u32_at(body, 0)? as i32))?
 }
 
 fn boolean(kind: u32, body: &[u8]) -> Option<bool> {
@@ -99,8 +155,45 @@ fn floats(body: &[u8]) -> Option<Vec<f32>> {
 
 /// A `Props` object setting what is given, in words so that it is aligned for SPA.
 pub fn build_props(volumes: Option<&[f32]>, mute: Option<bool>) -> Vec<u64> {
+    words(&props_pod(volumes, mute))
+}
+
+/// A `Route` object setting what is given of the sound of a route, kept for the next time it is
+/// used, in words so that it is aligned for SPA.
+pub fn build_route(route: &Route, volumes: Option<&[f32]>, mute: Option<bool>) -> Vec<u64> {
     let mut body: Vec<u8> = Vec::new();
-    let push = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_ne_bytes());
+    push(&mut body, OBJECT_ROUTE);
+    push(&mut body, PARAM_ROUTE);
+    for (key, value) in [(ROUTE_INDEX, route.index), (ROUTE_DEVICE, route.device)] {
+        for v in [key, 0, 4, TYPE_INT, value as u32, 0] {
+            push(&mut body, v);
+        }
+    }
+    push(&mut body, ROUTE_PROPS);
+    push(&mut body, 0);
+    body.extend_from_slice(&props_pod(volumes, mute));
+    for v in [ROUTE_SAVE, 0, 4, TYPE_BOOL, 1, 0] {
+        push(&mut body, v);
+    }
+    words(&object(body))
+}
+
+fn push(b: &mut Vec<u8>, v: u32) {
+    b.extend_from_slice(&v.to_ne_bytes());
+}
+
+/// An object pod with its header, around a body of its kind, id and properties.
+fn object(body: Vec<u8>) -> Vec<u8> {
+    let mut pod = Vec::with_capacity(8 + body.len());
+    push(&mut pod, body.len() as u32);
+    push(&mut pod, TYPE_OBJECT);
+    pod.extend_from_slice(&body);
+    pod
+}
+
+/// A `Props` pod with its header, a whole number of words long.
+fn props_pod(volumes: Option<&[f32]>, mute: Option<bool>) -> Vec<u8> {
+    let mut body: Vec<u8> = Vec::new();
     push(&mut body, OBJECT_PROPS);
     push(&mut body, PARAM_PROPS);
     if let Some(volumes) = volumes {
@@ -116,17 +209,14 @@ pub fn build_props(volumes: Option<&[f32]>, mute: Option<bool>) -> Vec<u64> {
         body.resize(pad8(body.len()), 0);
     }
     if let Some(mute) = mute {
-        push(&mut body, PROP_MUTE);
-        push(&mut body, 0);
-        push(&mut body, 4);
-        push(&mut body, TYPE_BOOL);
-        push(&mut body, mute as u32);
-        push(&mut body, 0);
+        for v in [PROP_MUTE, 0, 4, TYPE_BOOL, mute as u32, 0] {
+            push(&mut body, v);
+        }
     }
-    let mut pod = Vec::with_capacity(8 + body.len());
-    push(&mut pod, body.len() as u32);
-    push(&mut pod, TYPE_OBJECT);
-    pod.extend_from_slice(&body);
+    object(body)
+}
+
+fn words(pod: &[u8]) -> Vec<u64> {
     pod.chunks(8)
         .map(|c| {
             let mut w = [0u8; 8];
@@ -198,5 +288,23 @@ mod tests {
         assert_eq!(props.volumes, Some(vec![0.25, 0.5, 1.0]));
         // Not an object of props.
         assert_eq!(parse_props(&pod[..12]), None);
+    }
+
+    #[test]
+    fn routes_go_both_ways() {
+        let route = Route {
+            index: 4,
+            device: 1,
+            props: Props::default(),
+        };
+        let pod = bytes(&build_route(&route, Some(&[0.0, 0.25]), Some(true)));
+        assert_eq!(pod.len() % 8, 0);
+        let read = parse_route(&pod).unwrap();
+        assert_eq!((read.index, read.device), (4, 1));
+        assert_eq!(read.props.volumes, Some(vec![0.0, 0.25]));
+        assert_eq!(read.props.mute, Some(true));
+        // A route is not props, nor props a route.
+        assert_eq!(parse_props(&pod), None);
+        assert_eq!(parse_route(&bytes(&build_props(None, Some(true)))), None);
     }
 }

@@ -653,6 +653,7 @@ src/anti-webui-wayland-shell/
     - PipeWire を `libloading` で dlopen する。ビルドに C のライブラリは要らない。
     - 出力、入力、アプリごとの音、既定の機器。音量は WirePlumber と同じ三乗の目盛りで、ミュートと既定の切り替えもできる。
     - 音量は `channelVolumes` の Props の pod を手で組んで読み書きする。既定の機器は `default` メタデータの `default.configured.audio.*` に書く。
+    - カードの機器（`device.id` と `card.profile.device` を持つノード）の音量とミュートは、WirePlumber と同じく、デバイスが今使う Route の props から読み、そこへ書く（`save` 付き）。ノードの Props は Route と食い違うことがあり、たとえば Route が 0 のときにノードは 1.0 のままになる。Route はデバイスの params が変わるたびに全部読み直し、その後の core の sync が返った時点で置き換える。
     - PipeWire が再起動したときの繋ぎ直しは、まだない。
   - `apps()`（feature `apps`）：
     - .desktop を読み、ロケールの名前と表示の条件（`NoDisplay`、`OnlyShowIn` など、`TryExec`）に従う。inotify で追従する。
