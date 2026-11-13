@@ -1007,6 +1007,8 @@ impl Instance {
         if *exit || state.closed {
             return Ok(());
         }
+        // After the handler closed what was in the way.
+        state.create_released_popups();
 
         if state.redraw_at.is_some_and(|t| t <= Instant::now()) {
             state.redraw_at = None;

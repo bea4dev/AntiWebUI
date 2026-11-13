@@ -1,7 +1,8 @@
 //! Popup grabs of several windows on one connection, against a small compositor that keeps the
-//! grab rule of xdg-shell the way smithay does: a client has one grab chain, a new grabbing popup
-//! must go on its topmost grabbing popup (or on a window when there is none), and a popup can't be
-//! destroyed while popups are attached to it. It ends the connection when either rule is broken.
+//! rules of xdg-shell the way smithay does: a client has one grab chain, a new grabbing popup must
+//! go on its topmost grabbing popup (or on a window when there is none), a popup can't be destroyed
+//! while popups are attached to it, and once a popup is destroyed its surface takes no more acks or
+//! commits. It ends the connection when a rule is broken.
 
 #![cfg(target_os = "linux")]
 
@@ -11,6 +12,7 @@ use anti_webui_core::platform::{Placement, PopupId, PopupKind, PopupParams};
 use anti_webui_wayland::{
     Ctx, Handlers, Session, SurfaceId, WaylandHandler, WindowKey, WindowOptions,
 };
+use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use wayland_protocols::xdg::shell::server::{
@@ -42,6 +44,11 @@ struct Compositor {
     /// What was asked about popups, in order.
     asked: Vec<String>,
     errors: Vec<String>,
+    /// The wl_surface of each xdg_surface.
+    surfaces: HashMap<ObjectId, ObjectId>,
+    /// The xdg_surfaces and wl_surfaces whose popup was destroyed.
+    dead: Vec<ObjectId>,
+    serial: u32,
 }
 
 impl Compositor {
@@ -56,8 +63,8 @@ impl Compositor {
             .map_or(0, |p| p.n)
     }
 
-    fn fail(&mut self, popup: &xdg_popup::XdgPopup, what: String) {
-        popup.post_error(xdg_wm_base::Error::NotTheTopmostPopup as u32, what.clone());
+    fn fail(&mut self, on: &impl Resource, what: String) {
+        on.post_error(xdg_wm_base::Error::NotTheTopmostPopup as u32, what.clone());
         self.errors.push(what);
     }
 }
@@ -146,23 +153,31 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for Compositor {
 
 impl Dispatch<wl_surface::WlSurface, ()> for Compositor {
     fn request(
-        _: &mut Self,
+        state: &mut Self,
         _: &Client,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         request: wl_surface::Request,
         _: &(),
         _: &DisplayHandle,
         init: &mut DataInit<'_, Self>,
     ) {
-        if let wl_surface::Request::Frame { callback } = request {
-            init.init(callback, ());
+        match request {
+            wl_surface::Request::Frame { callback } => {
+                init.init(callback, ());
+            }
+            wl_surface::Request::Commit if state.dead.contains(&surface.id()) => {
+                let what = "a commit on the surface of a destroyed popup".to_string();
+                state.fail(surface, what);
+            }
+            wl_surface::Request::Destroy => state.dead.retain(|d| *d != surface.id()),
+            _ => {}
         }
     }
 }
 
 impl Dispatch<xdg_wm_base::XdgWmBase, ()> for Compositor {
     fn request(
-        _: &mut Self,
+        state: &mut Self,
         _: &Client,
         _: &xdg_wm_base::XdgWmBase,
         request: xdg_wm_base::Request,
@@ -171,8 +186,9 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for Compositor {
         init: &mut DataInit<'_, Self>,
     ) {
         match request {
-            xdg_wm_base::Request::GetXdgSurface { id, .. } => {
-                init.init(id, ());
+            xdg_wm_base::Request::GetXdgSurface { id, surface } => {
+                let xdg = init.init(id, ());
+                state.surfaces.insert(xdg.id(), surface.id());
             }
             xdg_wm_base::Request::CreatePositioner { id } => {
                 init.init(id, ());
@@ -203,12 +219,26 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for Compositor {
                 let on = parent.as_ref().map_or(0, |p| state.number_of_surface(p));
                 state.asked.push(format!("popup {n} on {on}"));
                 let popup = init.init(id, ());
+                popup.configure(0, 0, 50, 50);
+                state.serial += 1;
+                surface.configure(state.serial);
                 state.popups.push(ServerPopup {
                     n,
                     popup,
                     surface: surface.id(),
                     parent,
                 });
+            }
+            xdg_surface::Request::AckConfigure { .. } if state.dead.contains(&surface.id()) => {
+                let what = "an ack on the surface of a destroyed popup".to_string();
+                state.fail(surface, what);
+            }
+            xdg_surface::Request::Destroy => {
+                if state.popups.iter().any(|p| p.surface == surface.id()) {
+                    let what = "an xdg_surface destroyed before its popup".to_string();
+                    state.fail(surface, what);
+                }
+                state.dead.retain(|d| *d != surface.id());
             }
             _ => {}
         }
@@ -258,24 +288,42 @@ impl Dispatch<xdg_popup::XdgPopup, ()> for Compositor {
                 }
                 state.popups.retain(|p| p.popup.id() != popup.id());
                 state.grabs.retain(|g| *g != popup.id());
+                let wl = state.surfaces.get(&surface).cloned();
+                state.dead.extend([Some(surface), wl].into_iter().flatten());
             }
             _ => {}
         }
     }
 }
 
-/// What a window of the test is asked to do: show a popup and make it ready for popups on it.
-type Ask = PopupParams;
+/// What a window of the test is asked to do.
+enum Ask {
+    /// Show a popup and make it ready for popups on it.
+    Show(PopupParams),
+    /// Keep dismissed popups open until told otherwise, as a thread busy with something else.
+    Hold(bool),
+}
 
 struct Window {
     name: &'static str,
     asks: mpsc::Receiver<Ask>,
     events: mpsc::Sender<(&'static str, WindowEvent)>,
     mapped: bool,
+    hold: bool,
+    /// Dismissed popups it was told to keep open.
+    held: Vec<PopupId>,
 }
 
 impl WaylandHandler for Window {
-    fn event(&mut self, _: &mut Ctx<'_>, event: WindowEvent) {
+    fn event(&mut self, ctx: &mut Ctx<'_>, event: WindowEvent) {
+        // A dismissed popup closes, as the core closes it.
+        if let WindowEvent::PopupDismissed(id) = event {
+            if self.hold {
+                self.held.push(id);
+            } else {
+                ctx.close_popup(id);
+            }
+        }
         let _ = self.events.send((self.name, event));
     }
     fn frame(&mut self, _: &mut Ctx<'_>) {}
@@ -286,10 +334,22 @@ impl WaylandHandler for Window {
         if !std::mem::replace(&mut self.mapped, true) {
             ctx.committed(SurfaceId::Window);
         }
-        while let Ok(params) = self.asks.try_recv() {
-            let id = params.id;
-            ctx.show_popup(params);
-            ctx.committed(SurfaceId::Popup(id));
+        while let Ok(ask) = self.asks.try_recv() {
+            match ask {
+                Ask::Show(params) => {
+                    let id = params.id;
+                    ctx.show_popup(params);
+                    ctx.committed(SurfaceId::Popup(id));
+                }
+                Ask::Hold(hold) => {
+                    self.hold = hold;
+                    if !hold {
+                        for id in std::mem::take(&mut self.held) {
+                            ctx.close_popup(id);
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -316,8 +376,8 @@ fn run_session(mut session: Session, mut windows: Windows, ended: mpsc::Sender<S
     let _ = ended.send(error.to_string());
 }
 
-fn popup(id: u64, parent: Option<u64>, kind: PopupKind) -> PopupParams {
-    PopupParams {
+fn popup(id: u64, parent: Option<u64>, kind: PopupKind) -> Ask {
+    Ask::Show(PopupParams {
         id: PopupId(id),
         parent: parent.map(PopupId),
         kind,
@@ -329,7 +389,7 @@ fn popup(id: u64, parent: Option<u64>, kind: PopupKind) -> PopupParams {
         logical: SizeI::new(50, 50),
         geometry: RectI::new(0, 0, 50, 50),
         position: None,
-    }
+    })
 }
 
 struct World {
@@ -369,6 +429,24 @@ impl World {
             self.pump();
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// The next `n` popups dismissed, by window, in order.
+    fn dismissed(
+        &mut self,
+        events: &mpsc::Receiver<(&'static str, WindowEvent)>,
+        n: usize,
+    ) -> Vec<(&'static str, u64)> {
+        let mut dismissed = Vec::new();
+        self.until("popups to be dismissed", |_| {
+            dismissed.extend(events.try_iter().filter_map(|(name, e)| match e {
+                WindowEvent::PopupDismissed(id) => Some((name, id.0)),
+                _ => None,
+            }));
+            dismissed.len() >= n
+        });
+        dismissed.sort();
+        dismissed
     }
 
     /// What was asked about popups, up to and with `what`.
@@ -416,6 +494,8 @@ fn windows_of_one_connection_share_one_popup_grab() {
         asks,
         events: events_tx.clone(),
         mapped: false,
+        hold: false,
+        held: Vec::new(),
     };
     let (a, b, c) = (
         window("a", a_asks),
@@ -450,29 +530,30 @@ fn windows_of_one_connection_share_one_popup_grab() {
     to_a.send(popup(3, Some(1), PopupKind::Menu)).unwrap();
     assert_eq!(w.until_asked("grab 3"), ["popup 3 on 1", "grab 3"]);
 
-    // `b` opens a menu, as on a click that came to it before `a` was told its menu ended: the
-    // grab of `a` ends first, top first, and `a` is told.
+    // `b` opens a menu, as on a click that came to it before `a` was told its menu ended. `a` is
+    // asked to dismiss the grabs in the way, and `b` waits: nothing is destroyed and nothing made
+    // while `a` keeps them, as a busy thread would.
+    to_a.send(Ask::Hold(true)).unwrap();
     to_b.send(popup(1, None, PopupKind::Menu)).unwrap();
+    let dismissed = w.dismissed(&events, 2);
+    assert_eq!(dismissed, [("a", 1), ("a", 3)]);
+    let end = Instant::now() + Duration::from_millis(100);
+    w.until("a while", |_| Instant::now() >= end);
+    assert!(w.state.asked.is_empty(), "{:?}", w.state.asked);
+    // `a` closes them, top first, and then `b` makes its menu.
+    to_a.send(Ask::Hold(false)).unwrap();
+    let mut asked = w.until_asked("grab 4");
+    asked[..2].sort();
     assert_eq!(
-        w.until_asked("grab 4"),
+        asked,
         [
-            "destroy 3",
             "destroy 2",
+            "destroy 3",
             "destroy 1",
             "popup 4 on 0",
             "grab 4"
         ]
     );
-    let mut dismissed = Vec::new();
-    w.until("the menus of `a` to be dismissed", |_| {
-        dismissed.extend(events.try_iter().filter_map(|(name, e)| match e {
-            WindowEvent::PopupDismissed(id) => Some((name, id.0)),
-            _ => None,
-        }));
-        dismissed.len() >= 3
-    });
-    dismissed.sort();
-    assert_eq!(dismissed, [("a", 1), ("a", 2), ("a", 3)]);
 
     // The same from another thread.
     to_c.send(popup(1, None, PopupKind::Menu)).unwrap();
@@ -480,15 +561,15 @@ fn windows_of_one_connection_share_one_popup_grab() {
         w.until_asked("grab 5"),
         ["destroy 4", "popup 5 on 0", "grab 5"]
     );
-    let mut dismissed = Vec::new();
-    w.until("the menu of `b` to be dismissed", |_| {
-        dismissed.extend(events.try_iter().filter_map(|(name, e)| match e {
-            WindowEvent::PopupDismissed(id) => Some((name, id.0)),
-            _ => None,
-        }));
-        !dismissed.is_empty()
-    });
-    assert_eq!(dismissed, [("b", 1)]);
+    assert_eq!(w.dismissed(&events, 1), [("b", 1)]);
+
+    // A second menu of one window that isn't on the first: the first goes.
+    to_c.send(popup(2, None, PopupKind::Menu)).unwrap();
+    assert_eq!(
+        w.until_asked("grab 6"),
+        ["destroy 5", "popup 6 on 0", "grab 6"]
+    );
+    assert_eq!(w.dismissed(&events, 1), [("c", 1)]);
 
     // The connection is still there.
     w.pump();

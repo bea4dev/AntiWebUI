@@ -182,14 +182,21 @@ pub struct State {
     pub(crate) popups: HashMap<PopupId, Popup>,
     /// The xdg popups of every window on the connection, for the one grab they share.
     pub(crate) connection_popups: crate::grab::ConnectionPopups,
-    /// Where other windows say which popups of this one they ended.
+    /// Where other windows ask this one to dismiss popups whose grab is in their way.
     pub(crate) mailbox: std::sync::Arc<crate::grab::Mailbox>,
-    /// Popups whose parent has no buffer yet.
+    /// Popups whose parent has no buffer yet, or whose grab waits for another to go.
     pub(crate) waiting_popups: Vec<PopupParams>,
     pub redraw_requested: bool,
     pub redraw_at: Option<Instant>,
     pub events: Vec<WindowEvent>,
     pub(crate) present: crate::present::PresentState,
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        // Not to leave a grab in the way of the other windows, if it goes without closing them.
+        self.connection_popups.lock().destroy_all(&self.mailbox);
+    }
 }
 
 impl State {

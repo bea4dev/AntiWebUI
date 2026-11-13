@@ -183,20 +183,14 @@ impl State {
                 let grabbing = params.kind == PopupKind::Menu && self.seat.is_some();
                 let shared = self.connection_popups.clone();
                 let mut shared = shared.lock();
-                // Another window may have ended the popup it goes on.
-                if let Some(p) = params.parent
-                    && parent.is_some()
-                    && !shared.has(&self.mailbox, p)
-                {
+                // Grabs in its way end first, by their windows: it waits until they have.
+                if grabbing && !shared.may_grab(&self.mailbox, &ancestors) {
                     if let Some(vp) = viewport {
                         vp.destroy();
                     }
                     surface.destroy();
-                    self.events.push(WindowEvent::PopupDismissed(id));
+                    self.waiting_popups.push(params);
                     return;
-                }
-                if grabbing {
-                    shared.end_other_grabs(&self.mailbox, &ancestors);
                 }
                 let xdg_surface = self.wm_base.get_xdg_surface(&surface, &self.qh, tag);
                 let positioner = self.positioner(&params);
@@ -211,7 +205,7 @@ impl State {
                 if grabbing && let Some(seat) = &self.seat {
                     popup.grab(seat, self.press_serial);
                 }
-                shared.add(&self.mailbox, id, ancestors, popup.clone(), grabbing);
+                shared.add(&self.mailbox, id, popup.clone(), grabbing);
                 Role::Xdg { xdg_surface, popup }
             }
         };
@@ -362,13 +356,20 @@ impl State {
         ancestors
     }
 
-    /// Popups whose grab another window ended: they are dismissed, as when the compositor ends a
-    /// grab. Their surfaces stay until the core closes them.
+    /// Popups whose grab is in the way of another one: they are dismissed, as when the compositor
+    /// ends a grab, and the core closes them.
     pub(crate) fn take_ended_popups(&mut self) {
-        for id in self.mailbox.take() {
+        for id in self.mailbox.take_ended() {
             if self.popups.contains_key(&id) {
                 self.events.push(WindowEvent::PopupDismissed(id));
             }
+        }
+    }
+
+    /// Makes the popups that waited for a grab to go, if one went.
+    pub(crate) fn create_released_popups(&mut self) {
+        if self.mailbox.take_released() {
+            self.create_waiting_popups();
         }
     }
 
