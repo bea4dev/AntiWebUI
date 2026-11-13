@@ -19,6 +19,8 @@ const EXCLUSIVE_EDGE_VERSION: u32 = 5;
 
 pub(crate) struct LayerRole {
     pub object: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    /// What the program asked for, and what of it is sent ([`LayerSpec::checked`]).
+    asked: LayerSpec,
     pub spec: LayerSpec,
     /// The exclusive zone last asked for.
     zone: i32,
@@ -105,6 +107,12 @@ fn layer(l: Layer) -> zwlr_layer_shell_v1::Layer {
     }
 }
 
+fn warn(what: &str) {
+    if cfg!(debug_assertions) {
+        eprintln!("[anti-webui] layer: {what}");
+    }
+}
+
 fn anchor(e: Anchor) -> zwlr_layer_surface_v1::Anchor {
     zwlr_layer_surface_v1::Anchor::from_bits_truncate(e.bits() as u32)
 }
@@ -130,7 +138,8 @@ impl LayerRole {
         );
         let mut role = Self {
             object,
-            spec,
+            spec: spec.checked(warn),
+            asked: spec,
             zone: 0,
             content: size,
         };
@@ -139,7 +148,9 @@ impl LayerRole {
         let m = role.spec.margin;
         role.object.set_margin(m.top, m.right, m.bottom, m.left);
         role.send_keyboard();
-        role.send_exclusive_edge();
+        if role.spec.exclusive_edge.is_some() {
+            role.send_exclusive_edge();
+        }
         role.send_zone(size);
         role
     }
@@ -177,10 +188,9 @@ impl LayerRole {
     }
 
     fn send_exclusive_edge(&self) {
-        if let Some(edge) = self.spec.exclusive_edge
-            && self.object.version() >= EXCLUSIVE_EDGE_VERSION
-        {
-            self.object.set_exclusive_edge(anchor(edge));
+        if self.object.version() >= EXCLUSIVE_EDGE_VERSION {
+            self.object
+                .set_exclusive_edge(anchor(self.spec.exclusive_edge.unwrap_or(Anchor::NONE)));
         }
     }
 
@@ -228,14 +238,21 @@ impl State {
         let Some(role) = self.layer() else {
             return;
         };
-        role.spec.apply(&change);
+        role.asked.apply(&change);
+        let was = std::mem::replace(&mut role.spec, role.asked.checked(warn));
         match &change {
-            LayerChange::Size(..) => role.send_size(),
-            LayerChange::Geometry { anchor: edges, .. } => {
-                role.send_size();
-                role.object.set_anchor(anchor(*edges));
+            // The anchors may have put the sizes or the edge right, or no longer.
+            LayerChange::Size(..) | LayerChange::Anchor(_) | LayerChange::Geometry { .. } => {
+                if (was.width, was.height) != (role.spec.width, role.spec.height) {
+                    role.send_size();
+                }
+                if was.anchor != role.spec.anchor {
+                    role.object.set_anchor(anchor(role.spec.anchor));
+                }
+                if was.exclusive_edge != role.spec.exclusive_edge {
+                    role.send_exclusive_edge();
+                }
             }
-            LayerChange::Anchor(a) => role.object.set_anchor(anchor(*a)),
             LayerChange::Margin(m) => role.object.set_margin(m.top, m.right, m.bottom, m.left),
             LayerChange::Exclusive(_) => {}
             LayerChange::Keyboard(_) => role.send_keyboard(),

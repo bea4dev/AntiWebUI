@@ -167,6 +167,46 @@ pub struct LayerSpec {
 }
 
 impl LayerSpec {
+    /// What can be sent, with what the protocol wouldn't take put right, each said to `warn`: a
+    /// compositor ends the connection over it at the commit. What is asked stays as it is, so that
+    /// a change that makes it valid again gets it back.
+    pub fn checked(&self, mut warn: impl FnMut(&str)) -> LayerSpec {
+        let mut spec = self.clone();
+        let anchor = spec.anchor;
+        let mut axis = |size: LayerSize, spans: bool, name: &str| match size {
+            LayerSize::Fixed(n) if n <= 0 => {
+                warn(&format!("a {name} of {n} isn't a size"));
+                if spans {
+                    LayerSize::Stretch
+                } else {
+                    LayerSize::Content
+                }
+            }
+            LayerSize::Stretch if !spans => {
+                warn(&format!(
+                    "stretching the {name} needs both of its edges anchored"
+                ));
+                LayerSize::Content
+            }
+            size => size,
+        };
+        spec.width = axis(spec.width, anchor.spans_width(), "width");
+        spec.height = axis(spec.height, anchor.spans_height(), "height");
+        if let Some(edge) = spec.exclusive_edge
+            && (edge.bits().count_ones() != 1 || !anchor.contains(edge))
+        {
+            warn("the exclusive edge has to be one of the edges it is anchored to");
+            spec.exclusive_edge = None;
+        }
+        if spec.exclusive == Exclusive::Auto
+            && spec.exclusive_edge.or(anchor.exclusive_edge()).is_none()
+        {
+            warn("no one edge to keep windows away from; anchor to one, or give exclusive_edge");
+            spec.exclusive = Exclusive::None;
+        }
+        spec
+    }
+
     /// Whether one axis or both follow what is in it.
     pub fn fits_content(&self) -> (bool, bool) {
         (
@@ -282,5 +322,58 @@ mod tests {
             ..corner
         };
         assert_eq!(told.exclusive_zone(300, 100), 300);
+    }
+
+    #[test]
+    fn what_is_sent_is_put_right_and_what_is_asked_kept() {
+        let mut asked = LayerSpec {
+            anchor: Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
+            width: LayerSize::Stretch,
+            height: LayerSize::Fixed(32),
+            exclusive: Exclusive::Auto,
+            exclusive_edge: Some(Anchor::TOP),
+            ..Default::default()
+        };
+        let mut warned = 0;
+        assert_eq!(asked.checked(|_| warned += 1), asked);
+        assert_eq!(warned, 0);
+
+        // At the bottom, the top isn't an edge to keep clear any more.
+        asked.apply(&LayerChange::Anchor(
+            Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+        ));
+        let sent = asked.checked(|_| warned += 1);
+        assert_eq!(sent.exclusive_edge, None);
+        assert_eq!(sent.exclusive, Exclusive::Auto);
+        assert_eq!(warned, 1);
+
+        // Half way to the left: the width can't stretch.
+        asked.apply(&LayerChange::Anchor(
+            Anchor::LEFT | Anchor::TOP | Anchor::BOTTOM,
+        ));
+        let sent = asked.checked(|_| warned += 1);
+        assert_eq!(sent.width, LayerSize::Content);
+        assert_eq!(sent.exclusive_edge, Some(Anchor::TOP));
+        assert_eq!(warned, 2);
+        assert_eq!(asked.width, LayerSize::Stretch);
+
+        // Back on top, it stretches again.
+        asked.apply(&LayerChange::Anchor(
+            Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
+        ));
+        assert_eq!(asked.checked(|_| {}), asked);
+
+        let corner = LayerSpec {
+            anchor: Anchor::TOP | Anchor::RIGHT,
+            width: LayerSize::Fixed(0),
+            height: LayerSize::Stretch,
+            exclusive: Exclusive::Auto,
+            ..Default::default()
+        };
+        let sent = corner.checked(|_| {});
+        assert_eq!(
+            (sent.width, sent.height, sent.exclusive),
+            (LayerSize::Content, LayerSize::Content, Exclusive::None)
+        );
     }
 }

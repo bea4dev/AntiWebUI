@@ -29,6 +29,7 @@ struct Compositor {
     asked: Vec<String>,
     size: (u32, u32),
     anchor: u32,
+    edge: u32,
 }
 
 struct NoData;
@@ -159,6 +160,8 @@ impl Dispatch<wl_surface::WlSurface, ()> for Compositor {
                 // not just after the last command in a geometry change.
                 assert!(state.size.0 != 0 || state.anchor & 12 == 12);
                 assert!(state.size.1 != 0 || state.anchor & 3 == 3);
+                // The exclusive edge must be one of the anchors.
+                assert_eq!(state.anchor & state.edge, state.edge);
                 state.asked.push("commit".into());
             }
             wl_surface::Request::SetInputRegion { region } => state
@@ -220,6 +223,10 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for Compositor {
                 format!("anchor {}", state.anchor)
             }
             R::SetExclusiveZone { zone } => format!("zone {zone}"),
+            R::SetExclusiveEdge { edge } => {
+                state.edge = edge.into_result().unwrap().bits();
+                format!("edge {}", state.edge)
+            }
             R::SetMargin {
                 top,
                 right,
@@ -450,6 +457,7 @@ fn a_layer_surface_goes_by_the_protocol() {
     drop(w);
     fixed_bars_reserve_their_thickness_before_configure();
     rotating_a_bar_commits_only_the_target_geometry();
+    what_the_protocol_would_not_take_is_put_right();
 }
 
 fn fixed_bars_reserve_their_thickness_before_configure() {
@@ -587,6 +595,70 @@ fn rotating_a_bar_commits_only_the_target_geometry() {
             .unwrap();
         assert_eq!(w.until_asked("commit"), [zone, "commit"]);
     }
+    w.state.layer.as_ref().unwrap().closed();
+    w.pump();
+    w.until("the window to end", |w| w.exited.try_recv().is_ok());
+}
+
+fn what_the_protocol_would_not_take_is_put_right() {
+    let mut w = setup(WindowOptions {
+        width: 300,
+        layer: Some(LayerSpec {
+            anchor: Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
+            width: LayerSize::Stretch,
+            height: LayerSize::Fixed(32),
+            exclusive: Exclusive::Auto,
+            exclusive_edge: Some(Anchor::TOP),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    assert!(w.until_asked("commit").contains(&"edge 1".to_string()));
+    w.state.layer.as_ref().unwrap().configure(1, 2194, 32);
+    assert_eq!(w.until_asked("ack 1"), ["ack 1"]);
+
+    // The top is no longer an edge to keep clear at the bottom, and is again back on top.
+    w.asks
+        .send(Ask::Change(LayerChange::Anchor(
+            Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+        )))
+        .unwrap();
+    assert_eq!(w.until_asked("commit"), ["anchor 14", "edge 0", "commit"]);
+    let top = Anchor::TOP | Anchor::LEFT | Anchor::RIGHT;
+    w.asks.send(Ask::Change(LayerChange::Anchor(top))).unwrap();
+    assert_eq!(w.until_asked("commit"), ["anchor 13", "edge 1", "commit"]);
+
+    // Turned to the left the old way, a call at a time: the width can't stretch half way. Every
+    // commit passes the checks above.
+    w.asks
+        .send(Ask::Change(LayerChange::Anchor(
+            Anchor::LEFT | Anchor::TOP | Anchor::BOTTOM,
+        )))
+        .unwrap();
+    assert_eq!(
+        w.until_asked("commit"),
+        ["size 300 32", "anchor 7", "commit"]
+    );
+    w.asks
+        .send(Ask::Change(LayerChange::Size(
+            LayerSize::Fixed(52),
+            LayerSize::Stretch,
+        )))
+        .unwrap();
+    assert_eq!(w.until_asked("commit"), ["size 52 0", "commit"]);
+
+    // Back on top in one go, it stretches again.
+    w.asks
+        .send(Ask::Change(LayerChange::Geometry {
+            anchor: top,
+            width: LayerSize::Stretch,
+            height: LayerSize::Fixed(32),
+        }))
+        .unwrap();
+    assert_eq!(
+        w.until_asked("commit"),
+        ["size 0 32", "anchor 13", "commit"]
+    );
     w.state.layer.as_ref().unwrap().closed();
     w.pump();
     w.until("the window to end", |w| w.exited.try_recv().is_ok());

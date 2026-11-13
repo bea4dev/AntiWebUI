@@ -12,7 +12,7 @@ use crate::present::{Presented, Presenter};
 use anti_webui_core::Ui;
 use anti_webui_core::event::WindowEvent;
 use anti_webui_core::geometry::SizeI;
-use anti_webui_core::layer::{LayerChange, LayerSize, LayerSpec};
+use anti_webui_core::layer::{LayerChange, LayerSpec};
 use anti_webui_core::platform::{PlatformRequest, PopupId, SurfaceId};
 use anti_webui_core::video::VideoTiming;
 use anti_webui_core::view::IntoView;
@@ -43,6 +43,8 @@ struct Runner {
     fit: (bool, bool),
     asked: Option<SizeI>,
     logical: SizeI,
+    /// What a layer surface asks for, as its changes come; what is sent is [`LayerSpec::checked`].
+    layer: Option<LayerSpec>,
 }
 
 impl Runner {
@@ -59,6 +61,7 @@ impl Runner {
             fit: (false, false),
             asked: None,
             logical: SizeI::default(),
+            layer: None,
         }
     }
 
@@ -154,14 +157,18 @@ impl Runner {
                 PlatformRequest::SetMaximized(on) => ctx.set_maximized(on),
                 PlatformRequest::ShowWindowMenu => ctx.show_window_menu(),
                 PlatformRequest::Layer(change) => {
-                    if let LayerChange::Size(w, h)
-                    | LayerChange::Geometry {
-                        width: w,
-                        height: h,
-                        ..
-                    } = change
-                    {
-                        self.set_fit((w == LayerSize::Content, h == LayerSize::Content));
+                    if let Some(layer) = &mut self.layer {
+                        layer.apply(&change);
+                        // An anchor can make a stretched axis follow what is in it, or no longer.
+                        let fit = layer.checked(|_| {}).fits_content();
+                        if fit != self.fit
+                            || matches!(
+                                change,
+                                LayerChange::Size(..) | LayerChange::Geometry { .. }
+                            )
+                        {
+                            self.set_fit(fit);
+                        }
                     }
                     ctx.change_layer(change);
                 }
@@ -779,22 +786,24 @@ impl<P: Platform> Thread<P> {
     fn open(&mut self, request: OpenRequest) {
         let mut spec = Spec::of(&request, &self.app_id);
         let mut ui = Ui::open(request);
-        let fit = spec.layer.as_ref().map(LayerSpec::fits_content);
-        if let (Some(fit), Some(layer)) = (fit, &spec.layer)
+        let layer = spec.layer.clone();
+        let fit = layer.as_ref().map(|l| l.checked(|_| {}).fits_content());
+        if let Some(fit) = fit
             && (fit.0 || fit.1)
         {
             // What it asks for at first, before it knows how much room it has.
             let natural = ui.measure_content();
-            if layer.width == LayerSize::Content {
+            if fit.0 {
                 spec.width = natural.width;
             }
-            if layer.height == LayerSize::Content {
+            if fit.1 {
                 spec.height = natural.height;
             }
         }
         match self.add(ui, spec) {
             Ok(key) => {
                 if let (Some(fit), Some(runner)) = (fit, self.windows.find(key)) {
+                    runner.layer = layer;
                     runner.set_fit(fit);
                 }
             }

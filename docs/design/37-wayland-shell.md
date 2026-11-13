@@ -89,11 +89,14 @@ osd.close();
 - **自動の占有領域：** `Auto` は、占有する辺に垂直な軸が `LayerSize::Fixed(n)` なら、最初の commit から要求した厚さを使う。窓の初期値 640 × 480 や、前の向きの `configure` の大きさでは上書きしない。低水準の `Fixed(n)` は `set_size` と同じく最低 1 px とする。
   - `Content` と `Stretch` は従来どおり現在の面の大きさを使い、`configure` で更新する。最初の `configure` より前は初期サイズを使う。まだ測っていない新しい中身の厚さを予測するものではない。
 - **バーの向きを変える：** `LayerHandle::set_geometry(anchor, width, height)` は、貼る辺・両軸のサイズ指定・自動の占有領域を 1 回の commit で変える。たとえば左のバーへは `bar.set_geometry(Anchor::LEFT | Anchor::TOP | Anchor::BOTTOM, LayerSize::Fixed(52), LayerSize::Stretch)` とする。
-  - `Stretch` の軸は必ず向かい合う両辺に貼る。`set_anchor` と `set_size` はそれぞれ独立して commit するので、向きの切り替えには使わない。順番だけを変えても、途中で古い占有領域や不正な組み合わせを送る場合がある。
+  - `set_anchor` と `set_size` はそれぞれ独立して commit するので、向きの切り替えには使わない。途中の半端な形（伸ばせない軸を中身の大きさにした形など）が一度画面に出る。プロトコル違反は下の検査で防ぐので、接続は切れない。
   - 中身で厚さを決める場合は新しいレイアウトと `configure` を待つ。切り替え直後から決まった厚さを確保するバーには `Fixed` の軸を使う。Shoji Bar などの呼び出し側で新しいメソッドを使う変更は別途必要になる。
-- **組み立てたときの検査：** 組み立てた時点で、プロトコル上許されない組み合わせを弾く。ありのまま送ると、コンポジタがプロトコルエラーで接続ごと切ってしまうためである。
-  - 片側にしか貼っていないのに大きさが `None`：`fit_content` に置き換え、デバッグビルドでは警告を出す。
+- **送る前の検査（`LayerSpec::checked`）：** プロトコル上許されない組み合わせを、送る前に直す。ありのまま送ると、コンポジタが commit の時点でプロトコルエラーにし、接続ごと切ってしまうためである（シェルのすべての窓が消える）。組み立てたときだけでなく、`set_size` / `set_anchor` / `set_geometry` などで変えたときにもかける。
+  - 片側にしか貼っていないのに大きさが `None`：`fit_content` に置き換える。
+  - 両辺に貼っていない軸の `Stretch`、0 以下の `Fixed`：`Content`（両辺に貼っていれば 0 以下は `Stretch`）として送り、デバッグビルドでは警告を出す。
+  - `exclusive_edge` が貼った辺に含まれない：送らない（コンポジタに 0 を送って外す）。
   - `exclusive: Auto` なのに貼った辺が決まらない：`None` にして警告を出す。
+  - 変えたあとは、求められた形をそのまま覚えておき、送る形だけを直す。たとえば `set_anchor` で一時的に左右の片方を外して戻せば、`Stretch` に戻る。中身に合わせる軸（`fit_content`）も、送る形に合わせて切り替える。
 - **ポップアップ：** レイヤーから出すメニュー、select、ツールチップは、`xdg_surface.get_popup(None)` のあと `zwlr_layer_surface.get_popup` でぶら下げる。既存のウィジェットは手を入れずに動く。
 - **背景：** レイヤーの何も描かないところは透明にする。バーやドックは、貼った辺の長方形より小さな形のことが多いため。普通の窓は今までどおり白で、`WindowOptions::background` で変えられる。
 - **ウィンドウ操作：** 移動、リサイズ、最大化、最小化、窓の飾りは、レイヤーでは何もしない。`window_decorations()` は `Decorations::Server`（飾りなし扱い）を返し、`title_bar` は出ない。
@@ -621,7 +624,7 @@ src/anti-webui-wayland-shell/
   - 最初の commit の前に設定が届くこと。
   - `configure` と `ack` の順。
   - `fit_content` の `set_size`。
-  - `layer_protocol.rs`：四辺の固定厚バーが最初の commit から厚さだけを占有すること。方向切り替えの各 commit でゼロサイズの軸と貼る辺が有効で、前の長い辺を占有しないこと。厚さだけの変更、古い `configure`、明示的な占有モードも確かめる。実際のコンポジタによる窓の配置やビューポート保持までは検証しない。
+  - `layer_protocol.rs`：四辺の固定厚バーが最初の commit から厚さだけを占有すること。方向切り替えの各 commit でゼロサイズの軸と貼る辺が有効で、前の長い辺を占有しないこと。厚さだけの変更、古い `configure`、明示的な占有モードも確かめる。`set_anchor` と `set_size` を別々に呼んだ途中の commit も、送る前の検査で有効になること（`exclusive_edge` が貼った辺から外れると外し、戻せば戻すこと）も確かめる。実際のコンポジタによる窓の配置やビューポート保持までは検証しない。
   - `closed` で閉じること。
   - レイヤーの子の `get_popup`。
   - `keyboard` と `input_region`。

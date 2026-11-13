@@ -431,39 +431,14 @@ impl LayerOptions {
     fn spec(self) -> LayerSpec {
         let mut spec = self.spec;
         let anchor = spec.anchor;
-        let axis = |given: Option<LayerSize>, spans: bool, name: &str| match given {
-            Some(LayerSize::Fixed(n)) if n <= 0 => {
-                warn(&format!("a {name} of {n} isn't a size"));
-                if spans {
-                    LayerSize::Stretch
-                } else {
-                    LayerSize::Content
-                }
-            }
-            Some(LayerSize::Stretch) if !spans => {
-                warn(&format!(
-                    "stretching the {name} needs both of its edges anchored"
-                ));
-                LayerSize::Content
-            }
+        let axis = |given: Option<LayerSize>, spans: bool| match given {
             Some(size) => size,
             None if spans => LayerSize::Stretch,
             None => LayerSize::Content,
         };
-        spec.width = axis(self.width, anchor.spans_width(), "width");
-        spec.height = axis(self.height, anchor.spans_height(), "height");
-        if let Some(edge) = spec.exclusive_edge
-            && (edge.bits().count_ones() != 1 || !anchor.contains(edge))
-        {
-            warn("the exclusive edge has to be one of the edges it is anchored to");
-            spec.exclusive_edge = None;
-        }
-        if spec.exclusive == Exclusive::Auto
-            && spec.exclusive_edge.or(anchor.exclusive_edge()).is_none()
-        {
-            warn("no one edge to keep windows away from; anchor to one, or give exclusive_edge");
-            spec.exclusive = Exclusive::None;
-        }
+        spec.width = axis(self.width, anchor.spans_width());
+        spec.height = axis(self.height, anchor.spans_height());
+        let mut spec = spec.checked(warn);
         spec.output = match self.output {
             OutputChoice::Current => current_output().map(|o| o.name),
             OutputChoice::Named(name) => Some(name),
@@ -509,9 +484,10 @@ impl LayerHandle {
     }
 
     /// Change anchors and sizes together, with the automatic exclusive zone in the same commit.
-    /// Use this to rotate a bar: separate [`Self::set_anchor`] and [`Self::set_size`] calls can
-    /// commit an invalid stretch/anchor combination or reserve space using the old geometry.
-    /// A stretched axis must be anchored to both opposing edges.
+    /// Use this to rotate a bar: separate [`Self::set_anchor`] and [`Self::set_size`] calls each
+    /// commit, so the surface shows half of the change in between. What the protocol wouldn't
+    /// take is put right as it is sent, like a stretched axis without both of its edges anchored,
+    /// as when the layer was opened.
     pub fn set_geometry(&self, anchor: Anchor, width: LayerSize, height: LayerSize) {
         self.change(LayerChange::Geometry {
             anchor,
