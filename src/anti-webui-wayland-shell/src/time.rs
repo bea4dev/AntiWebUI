@@ -112,9 +112,13 @@ pub fn local_time(every: Every) -> LocalTime {
     let window = current_window().id().get();
     let found = CLOCKS.with(|c| c.borrow().get(&(window, every)).copied());
     let clock = found.unwrap_or_else(|| {
-        let (clock, _) = create_root(|| signal(LocalTime::now()));
+        let (clock, _) = create_root(|| {
+            let clock = signal(LocalTime::now());
+            // The first reader may recompute or disappear before the first tick.
+            tick(clock, every);
+            clock
+        });
         CLOCKS.with(|c| c.borrow_mut().insert((window, every), clock));
-        tick(clock, every);
         clock
     });
     clock.get()
@@ -141,6 +145,59 @@ fn tick(clock: Signal<LocalTime>, every: Every) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anti_webui_core::Ui;
+    use anti_webui_core::reactive::memo;
+    use anti_webui_core::view::div;
+    use std::time::Instant;
+
+    // Simulate an old cached reading without sleeping or changing the system clock.
+    fn stale_clock(every: Every) {
+        let window = current_window().id().get();
+        let clock = CLOCKS.with(|c| c.borrow()[&(window, every)]);
+        clock.update_untracked(|time| *time = LocalTime::at(0));
+    }
+
+    #[test]
+    fn clock_keeps_updating_after_its_first_reader_recomputes() {
+        let mut ui = Ui::new(div);
+        let ((setting, displayed), owner) = create_root(|| {
+            let setting = signal(false);
+            let displayed = memo(move || {
+                setting.get();
+                local_time(Every::Minute).unix
+            });
+            (setting, displayed)
+        });
+
+        for value in [true, false] {
+            let deadline = ui.next_deadline(Instant::now()).unwrap();
+            stale_clock(Every::Minute);
+            setting.set(value);
+            assert_eq!(displayed.get(), 0);
+
+            let before = LocalTime::now().unix;
+            ui.tick(deadline);
+            assert!((before..=LocalTime::now().unix).contains(&displayed.get()));
+        }
+        owner.dispose();
+    }
+
+    #[test]
+    fn clock_keeps_updating_after_its_first_reader_is_replaced() {
+        let mut ui = Ui::new(div);
+        let (_, first) = create_root(|| local_time(Every::Second));
+        let deadline = ui.next_deadline(Instant::now()).unwrap();
+        first.dispose();
+        stale_clock(Every::Second);
+        let (displayed, replacement) = create_root(|| memo(|| local_time(Every::Second).unix));
+        assert_eq!(displayed.get(), 0);
+
+        let before = LocalTime::now().unix;
+        ui.tick(deadline);
+        assert!((before..=LocalTime::now().unix).contains(&displayed.get()));
+        assert!(ui.next_deadline(Instant::now()).is_some());
+        replacement.dispose();
+    }
 
     #[test]
     fn formats_as_strftime() {
