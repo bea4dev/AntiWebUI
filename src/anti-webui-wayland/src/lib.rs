@@ -4,6 +4,7 @@
 
 mod decor;
 mod drag;
+mod grab;
 mod keyboard;
 mod layer;
 mod lock;
@@ -481,7 +482,10 @@ static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
 
 /// What a thread needs to open windows on the connection of another (see
 /// `docs/design/36-multi-window.md`).
-pub struct SessionShare(Connection);
+pub struct SessionShare {
+    conn: Connection,
+    popups: grab::ConnectionPopups,
+}
 
 /// A window to open others above, from any thread.
 #[derive(Clone)]
@@ -509,6 +513,8 @@ struct Instance {
 /// The windows of a thread, on a connection it may share with other threads.
 pub struct Session {
     conn: Connection,
+    /// Shared with the sessions that join this one.
+    popups: grab::ConnectionPopups,
     wl_fd: OwnedFd,
     wake_read: OwnedFd,
     wake_write: OwnedFd,
@@ -521,15 +527,18 @@ impl Session {
 
     /// Connects to the compositor.
     pub fn connect() -> Result<Self, Error> {
-        Self::on(Connection::connect_to_env().map_err(err)?)
+        Self::on(
+            Connection::connect_to_env().map_err(err)?,
+            grab::ConnectionPopups::default(),
+        )
     }
 
     /// Uses the connection of another thread's session.
     pub fn join(share: SessionShare) -> Result<Self, Error> {
-        Self::on(share.0)
+        Self::on(share.conn, share.popups)
     }
 
-    fn on(conn: Connection) -> Result<Self, Error> {
+    fn on(conn: Connection, popups: grab::ConnectionPopups) -> Result<Self, Error> {
         let (wake_read, wake_write) = rustix::pipe::pipe_with(
             rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
         )
@@ -537,6 +546,7 @@ impl Session {
         let wl_fd = conn.as_fd().try_clone_to_owned().map_err(err)?;
         Ok(Self {
             conn,
+            popups,
             wl_fd,
             wake_read,
             wake_write,
@@ -545,7 +555,10 @@ impl Session {
     }
 
     pub fn share(&self) -> SessionShare {
-        SessionShare(self.conn.clone())
+        SessionShare {
+            conn: self.conn.clone(),
+            popups: self.popups.clone(),
+        }
     }
 
     /// Something another thread can call to wake up the session, which then calls
@@ -565,7 +578,7 @@ impl Session {
     pub fn open(&mut self, options: WindowOptions) -> Result<WindowKey, Error> {
         let key = WindowKey(NEXT_KEY.fetch_add(1, Ordering::Relaxed));
         let wake = self.wake_write.try_clone().map_err(err)?;
-        let instance = open_instance(&self.conn, key, options, wake)?;
+        let instance = open_instance(&self.conn, self.popups.clone(), key, options, wake)?;
         self.instances.push(instance);
         Ok(key)
     }
@@ -725,6 +738,7 @@ impl Session {
 
 fn open_instance(
     conn: &Connection,
+    popups: grab::ConnectionPopups,
     key: WindowKey,
     options: WindowOptions,
     wake: OwnedFd,
@@ -795,6 +809,7 @@ fn open_instance(
     };
 
     let (paste_tx, paste_rx) = mpsc::channel();
+    let mailbox = grab::Mailbox::new(wake.try_clone().map_err(err)?);
     let mut state = State::new(
         qh.clone(),
         compositor,
@@ -804,6 +819,8 @@ fn open_instance(
         size,
         paste_tx,
         wake,
+        popups,
+        mailbox,
     );
     state.outputs = outputs;
     state.apply_input_region();
@@ -940,6 +957,7 @@ impl Instance {
             ..
         } = self;
         queue.dispatch_pending(state).map_err(err)?;
+        state.take_ended_popups();
 
         let now = Instant::now();
         while let Some(keycode) = state.key_repeat_due(now) {
