@@ -121,6 +121,17 @@ fn applications_are_read_searched_followed_and_launched() {
     let abs = icons.join("48x48/apps/alpha.png");
     assert_eq!(icon_path(abs.to_str().unwrap(), 16), Some(abs.clone()));
     assert_eq!(icon_path("nothing-like-this", 48), None);
+    // XPM isn't decoded, so it isn't found: what stands for a missing icon shows instead.
+    write(&icons.join("48x48/apps/old.xpm"), "xpm");
+    write(&icons.join("48x48/apps/older.xpm"), "xpm");
+    write(&icons.join("48x48/apps/older.png"), "png");
+    assert_eq!(icon_path("old", 48), None);
+    assert_eq!(
+        icon_path("older.xpm", 48),
+        Some(icons.join("48x48/apps/older.png"))
+    );
+    let xpm = icons.join("48x48/apps/old.xpm");
+    assert_eq!(icon_path(xpm.to_str().unwrap(), 48), None);
 
     // A new file is seen.
     write(&apps_dir.join("gamma.desktop"), &entry("Gamma", ""));

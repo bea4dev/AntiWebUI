@@ -839,10 +839,10 @@ impl ThemeDir {
     }
 
     /// The order to try extensions in.
-    fn extensions(&self) -> [&'static str; 3] {
+    fn extensions(&self) -> [&'static str; 2] {
         match self.kind {
-            DirKind::Scalable { .. } => ["svg", "png", "xpm"],
-            _ => ["png", "svg", "xpm"],
+            DirKind::Scalable { .. } => ["svg", "png"],
+            _ => EXTENSIONS,
         }
     }
 }
@@ -999,12 +999,20 @@ fn look_in(theme: &Theme, name: &str, size: u32) -> Option<PathBuf> {
     by_distance.into_iter().find_map(file)
 }
 
+/// What an icon is looked for as. The specification also allows XPM, but images aren't decoded
+/// from it: a path to one would show nothing, where without it what is shown in place of a missing
+/// icon is.
+const EXTENSIONS: [&str; 2] = ["png", "svg"];
+
 /// A file for an icon at about `size` pixels: a path as it is, else from the icon theme, the
-/// themes it inherits from and `hicolor`, else from `/usr/share/pixmaps`.
+/// themes it inherits from and `hicolor`, else from `/usr/share/pixmaps`. Never an XPM file.
 pub fn icon_path(name: &str, size: u32) -> Option<PathBuf> {
     if name.starts_with('/') {
         let path = PathBuf::from(name);
-        return path.is_file().then_some(path);
+        let xpm = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("xpm"));
+        return (path.is_file() && !xpm).then_some(path);
     }
     // Some files give the name with its extension.
     let name = ["png", "svg", "xpm"]
@@ -1025,7 +1033,7 @@ pub fn icon_path(name: &str, size: u32) -> Option<PathBuf> {
                 .into_iter()
                 .chain(std::iter::once(PathBuf::from("/usr/share/pixmaps")))
                 .find_map(|base| {
-                    ["png", "svg", "xpm"].iter().find_map(|ext| {
+                    EXTENSIONS.iter().find_map(|ext| {
                         let path = base.join(format!("{name}.{ext}"));
                         path.is_file().then_some(path)
                     })
