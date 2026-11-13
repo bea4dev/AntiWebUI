@@ -175,17 +175,24 @@ impl LayerSpec {
         )
     }
 
-    /// The exclusive zone to ask for, given the size the surface has.
+    /// The exclusive zone to ask for. Fixed axes use the requested size (at least one pixel),
+    /// even before configure; content and stretched axes use the supplied surface size.
     pub fn exclusive_zone(&self, width: i32, height: i32) -> i32 {
         match self.exclusive {
             Exclusive::None => 0,
             Exclusive::Ignore => -1,
             Exclusive::Fixed(n) => n.max(0),
             Exclusive::Auto => {
+                let along = |size, current| match size {
+                    LayerSize::Fixed(n) => n.max(1),
+                    LayerSize::Content | LayerSize::Stretch => current,
+                };
                 let edge = self.exclusive_edge.or(self.anchor.exclusive_edge());
                 match edge {
-                    Some(e) if e == Anchor::TOP || e == Anchor::BOTTOM => height,
-                    Some(e) if e == Anchor::LEFT || e == Anchor::RIGHT => width,
+                    Some(e) if e == Anchor::TOP || e == Anchor::BOTTOM => {
+                        along(self.height, height)
+                    }
+                    Some(e) if e == Anchor::LEFT || e == Anchor::RIGHT => along(self.width, width),
                     _ => 0,
                 }
             }
@@ -197,6 +204,12 @@ impl LayerSpec {
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayerChange {
     Size(LayerSize, LayerSize),
+    /// Change anchors and both size policies in one surface commit.
+    Geometry {
+        anchor: Anchor,
+        width: LayerSize,
+        height: LayerSize,
+    },
     Anchor(Anchor),
     Margin(Margin),
     Exclusive(Exclusive),
@@ -213,6 +226,15 @@ impl LayerSpec {
                 self.height = h;
             }
             LayerChange::Anchor(a) => self.anchor = a,
+            LayerChange::Geometry {
+                anchor,
+                width,
+                height,
+            } => {
+                self.anchor = anchor;
+                self.width = width;
+                self.height = height;
+            }
             LayerChange::Margin(m) => self.margin = m,
             LayerChange::Exclusive(e) => self.exclusive = e,
             LayerChange::Keyboard(k) => self.keyboard = k,

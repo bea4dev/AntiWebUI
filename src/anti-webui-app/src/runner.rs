@@ -154,7 +154,13 @@ impl Runner {
                 PlatformRequest::SetMaximized(on) => ctx.set_maximized(on),
                 PlatformRequest::ShowWindowMenu => ctx.show_window_menu(),
                 PlatformRequest::Layer(change) => {
-                    if let LayerChange::Size(w, h) = change {
+                    if let LayerChange::Size(w, h)
+                    | LayerChange::Geometry {
+                        width: w,
+                        height: h,
+                        ..
+                    } = change
+                    {
                         self.set_fit((w == LayerSize::Content, h == LayerSize::Content));
                     }
                     ctx.change_layer(change);

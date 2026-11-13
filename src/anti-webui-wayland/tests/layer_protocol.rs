@@ -27,6 +27,8 @@ struct Compositor {
     layer: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
     /// What was asked, in order, as text.
     asked: Vec<String>,
+    size: (u32, u32),
+    anchor: u32,
 }
 
 struct NoData;
@@ -152,7 +154,13 @@ impl Dispatch<wl_surface::WlSurface, ()> for Compositor {
             wl_surface::Request::Frame { callback } => {
                 init.init(callback, ());
             }
-            wl_surface::Request::Commit => state.asked.push("commit".into()),
+            wl_surface::Request::Commit => {
+                // Zero-sized axes must stretch between opposing anchors at every commit,
+                // not just after the last command in a geometry change.
+                assert!(state.size.0 != 0 || state.anchor & 12 == 12);
+                assert!(state.size.1 != 0 || state.anchor & 3 == 3);
+                state.asked.push("commit".into());
+            }
             wl_surface::Request::SetInputRegion { region } => state
                 .asked
                 .push(format!("input region {}", region.is_some())),
@@ -203,8 +211,14 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for Compositor {
     ) {
         use zwlr_layer_surface_v1::Request as R;
         let said = match request {
-            R::SetSize { width, height } => format!("size {width} {height}"),
-            R::SetAnchor { anchor } => format!("anchor {:?}", anchor.into_result().unwrap().bits()),
+            R::SetSize { width, height } => {
+                state.size = (width, height);
+                format!("size {width} {height}")
+            }
+            R::SetAnchor { anchor } => {
+                state.anchor = anchor.into_result().unwrap().bits();
+                format!("anchor {}", state.anchor)
+            }
             R::SetExclusiveZone { zone } => format!("zone {zone}"),
             R::SetMargin {
                 top,
@@ -302,7 +316,7 @@ impl World {
     }
 }
 
-fn setup() -> World {
+fn setup(options: WindowOptions) -> World {
     let dir = std::env::temp_dir().join(format!("anti-webui-layer-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("wayland-test");
@@ -330,29 +344,6 @@ fn setup() -> World {
             asks: ask_rx,
             events: event_tx,
         };
-        let options = WindowOptions {
-            width: 300,
-            height: 32,
-            layer: Some(LayerSpec {
-                layer: Layer::Top,
-                anchor: Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
-                width: LayerSize::Stretch,
-                height: LayerSize::Content,
-                exclusive: Exclusive::Auto,
-                margin: Margin {
-                    top: 4,
-                    ..Default::default()
-                },
-                keyboard: Keyboard::OnDemand,
-                input_region: InputRegion::Rects(vec![anti_webui_core::geometry::RectI::new(
-                    0, 0, 100, 32,
-                )]),
-                output: Some("DP-2".into()),
-                namespace: "bar".into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
         let _ = run(options, window);
         let _ = exit_tx.send(());
     });
@@ -371,7 +362,30 @@ fn setup() -> World {
 
 #[test]
 fn a_layer_surface_goes_by_the_protocol() {
-    let mut w = setup();
+    let options = WindowOptions {
+        width: 300,
+        height: 32,
+        layer: Some(LayerSpec {
+            layer: Layer::Top,
+            anchor: Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
+            width: LayerSize::Stretch,
+            height: LayerSize::Content,
+            exclusive: Exclusive::Auto,
+            margin: Margin {
+                top: 4,
+                ..Default::default()
+            },
+            keyboard: Keyboard::OnDemand,
+            input_region: InputRegion::Rects(vec![anti_webui_core::geometry::RectI::new(
+                0, 0, 100, 32,
+            )]),
+            output: Some("DP-2".into()),
+            namespace: "bar".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut w = setup(options);
     // Everything is asked for before the first commit, on the output named.
     let first = w.until_asked("commit");
     assert_eq!(
@@ -428,6 +442,151 @@ fn a_layer_surface_goes_by_the_protocol() {
     assert_eq!(w.until_asked("commit"), ["zone 0", "commit"]);
 
     // Closed by the compositor, as when its output goes: the window ends.
+    w.state.layer.as_ref().unwrap().closed();
+    w.pump();
+    w.until("the window to end", |w| w.exited.try_recv().is_ok());
+
+    // Keep scenarios in this single test: the client reads process-wide Wayland variables.
+    drop(w);
+    fixed_bars_reserve_their_thickness_before_configure();
+    rotating_a_bar_commits_only_the_target_geometry();
+}
+
+fn fixed_bars_reserve_their_thickness_before_configure() {
+    for edge in [Anchor::LEFT, Anchor::RIGHT, Anchor::TOP, Anchor::BOTTOM] {
+        let vertical = edge == Anchor::LEFT || edge == Anchor::RIGHT;
+        let mut w = setup(WindowOptions {
+            layer: Some(LayerSpec {
+                anchor: edge
+                    | if vertical {
+                        Anchor::TOP | Anchor::BOTTOM
+                    } else {
+                        Anchor::LEFT | Anchor::RIGHT
+                    },
+                width: if vertical {
+                    LayerSize::Fixed(52)
+                } else {
+                    LayerSize::Stretch
+                },
+                height: if vertical {
+                    LayerSize::Stretch
+                } else {
+                    LayerSize::Fixed(52)
+                },
+                exclusive: Exclusive::Auto,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let requests = w.until_asked("commit");
+        let zones: Vec<_> = requests.iter().filter(|r| r.starts_with("zone ")).collect();
+        assert_eq!(zones, ["zone 52"], "startup requests: {requests:?}");
+        assert_eq!(requests.last().unwrap(), "commit");
+        w.state.layer.as_ref().unwrap().closed();
+        w.pump();
+        w.until("the window to end", |w| w.exited.try_recv().is_ok());
+    }
+}
+
+fn rotating_a_bar_commits_only_the_target_geometry() {
+    let mut w = setup(WindowOptions {
+        layer: Some(LayerSpec {
+            anchor: Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
+            width: LayerSize::Stretch,
+            height: LayerSize::Fixed(52),
+            exclusive: Exclusive::Auto,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    w.until_asked("commit");
+    w.state.layer.as_ref().unwrap().configure(1, 2194, 52);
+    assert_eq!(w.until_asked("ack 1"), ["ack 1"]);
+
+    // No intermediate commit may reserve the previous orientation's long dimension.
+    for (serial, anchor, width, height, size, zone, configured) in [
+        (
+            2,
+            Anchor::LEFT | Anchor::TOP | Anchor::BOTTOM,
+            LayerSize::Fixed(52),
+            LayerSize::Stretch,
+            "size 52 0",
+            None,
+            (52, 1080),
+        ),
+        (
+            3,
+            Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+            LayerSize::Stretch,
+            LayerSize::Fixed(36),
+            "size 0 36",
+            Some("zone 36"),
+            (2194, 36),
+        ),
+        (
+            4,
+            Anchor::RIGHT | Anchor::TOP | Anchor::BOTTOM,
+            LayerSize::Fixed(44),
+            LayerSize::Stretch,
+            "size 44 0",
+            Some("zone 44"),
+            (44, 1080),
+        ),
+        (
+            5,
+            Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
+            LayerSize::Stretch,
+            LayerSize::Fixed(56),
+            "size 0 56",
+            Some("zone 56"),
+            (2194, 56),
+        ),
+    ] {
+        w.asks
+            .send(Ask::Change(LayerChange::Geometry {
+                anchor,
+                width,
+                height,
+            }))
+            .unwrap();
+        let mut expected = vec![size.to_string(), format!("anchor {}", anchor.bits())];
+        if let Some(zone) = zone {
+            expected.push(zone.into());
+        }
+        expected.push("commit".into());
+        assert_eq!(w.until_asked("commit"), expected);
+        w.state
+            .layer
+            .as_ref()
+            .unwrap()
+            .configure(serial, configured.0, configured.1);
+        let ack = format!("ack {serial}");
+        assert_eq!(w.until_asked(&ack), [ack]);
+    }
+
+    // A size-only change must also use the new thickness before the next configure.
+    w.asks
+        .send(Ask::Change(LayerChange::Size(
+            LayerSize::Stretch,
+            LayerSize::Fixed(64),
+        )))
+        .unwrap();
+    assert_eq!(w.until_asked("commit"), ["size 0 64", "zone 64", "commit"]);
+    // An older configure cannot put the old thickness back.
+    w.state.layer.as_ref().unwrap().configure(6, 2194, 56);
+    assert_eq!(w.until_asked("ack 6"), ["ack 6"]);
+
+    for (exclusive, zone) in [
+        (Exclusive::Fixed(77), "zone 77"),
+        (Exclusive::None, "zone 0"),
+        (Exclusive::Ignore, "zone -1"),
+        (Exclusive::Auto, "zone 64"),
+    ] {
+        w.asks
+            .send(Ask::Change(LayerChange::Exclusive(exclusive)))
+            .unwrap();
+        assert_eq!(w.until_asked("commit"), [zone, "commit"]);
+    }
     w.state.layer.as_ref().unwrap().closed();
     w.pump();
     w.until("the window to end", |w| w.exited.try_recv().is_ok());

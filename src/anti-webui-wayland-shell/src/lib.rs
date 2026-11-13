@@ -508,6 +508,18 @@ impl LayerHandle {
         self.0.command(Command::Layer(change));
     }
 
+    /// Change anchors and sizes together, with the automatic exclusive zone in the same commit.
+    /// Use this to rotate a bar: separate [`Self::set_anchor`] and [`Self::set_size`] calls can
+    /// commit an invalid stretch/anchor combination or reserve space using the old geometry.
+    /// A stretched axis must be anchored to both opposing edges.
+    pub fn set_geometry(&self, anchor: Anchor, width: LayerSize, height: LayerSize) {
+        self.change(LayerChange::Geometry {
+            anchor,
+            width,
+            height,
+        });
+    }
+
     pub fn set_size(&self, width: LayerSize, height: LayerSize) {
         self.change(LayerChange::Size(width, height));
     }
