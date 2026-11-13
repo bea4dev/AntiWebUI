@@ -231,6 +231,10 @@ impl State {
         role.spec.apply(&change);
         match &change {
             LayerChange::Size(..) => role.send_size(),
+            LayerChange::Geometry { anchor: edges, .. } => {
+                role.send_size();
+                role.object.set_anchor(anchor(*edges));
+            }
             LayerChange::Anchor(a) => role.object.set_anchor(anchor(*a)),
             LayerChange::Margin(m) => role.object.set_margin(m.top, m.right, m.bottom, m.left),
             LayerChange::Exclusive(_) => {}
