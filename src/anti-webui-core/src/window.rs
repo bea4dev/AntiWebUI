@@ -360,6 +360,9 @@ pub(crate) struct Info {
     next_handler: u64,
     shown: Shown,
     signals: Option<ShownSignals>,
+    /// What draws the window, once something does.
+    gpu: Option<GpuInfo>,
+    gpu_signal: Option<Signal<Option<GpuInfo>>>,
 }
 
 /// What the windows not being worked on keep.
@@ -646,6 +649,142 @@ pub(crate) fn tell_active(on: bool) {
     INFO.with(|i| i.borrow_mut().shown.active = on);
     if let Some((_, _, s)) = INFO.with(|i| i.borrow().signals) {
         s.set_if_changed(on);
+    }
+}
+
+/// What draws a window: [`gpu_info`]. See "gpu_info" in `docs/design/41-gpu-canvas.md`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct GpuInfo {
+    pub backend: GpuBackend,
+    /// The name of the GPU, as its driver says it: "AMD Radeon 880M Graphics (RADV STRIX1)".
+    pub adapter: String,
+    pub kind: GpuKind,
+    /// The driver and what it says of itself: "radv Mesa 25.2.6".
+    pub driver: String,
+    pub present: GpuPresent,
+}
+
+impl GpuInfo {
+    #[doc(hidden)]
+    pub fn new(
+        backend: GpuBackend,
+        adapter: String,
+        kind: GpuKind,
+        driver: String,
+        present: GpuPresent,
+    ) -> Self {
+        Self {
+            backend,
+            adapter,
+            kind,
+            driver,
+            present,
+        }
+    }
+}
+
+/// What a window is drawn with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GpuBackend {
+    Vulkan,
+    Metal,
+    Dx12,
+    /// OpenGL or OpenGL ES: what is left when none of the others can be had. Some effects cost
+    /// more on it, and a `gpu_canvas` gets no sRGB view.
+    Gl,
+    Other,
+}
+
+/// What kind of GPU it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GpuKind {
+    /// Part of the processor, sharing its memory.
+    Integrated,
+    Discrete,
+    Virtual,
+    /// Drawn by the processor, like llvmpipe and lavapipe: no GPU could be had.
+    Cpu,
+    Other,
+}
+
+/// How what is drawn gets to the screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum GpuPresent {
+    /// Buffers of our own handed to the Wayland or X11 compositor as dmabufs, with what changed.
+    Dmabuf {
+        /// Whether the compositor is told when the GPU is done with a buffer, rather than finding
+        /// out by itself.
+        explicit_sync: bool,
+    },
+    /// Buffers of our own on a layer of Core Animation (macOS).
+    IoSurface,
+    /// A swap chain of our own on DirectComposition (Windows), told what changed.
+    DxgiSwapchain,
+    /// wgpu's surface, what is left when none of the others can be had: all of the window is
+    /// drawn each frame.
+    Surface,
+}
+
+impl std::fmt::Display for GpuBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            GpuBackend::Vulkan => "Vulkan",
+            GpuBackend::Metal => "Metal",
+            GpuBackend::Dx12 => "DirectX 12",
+            GpuBackend::Gl => "OpenGL",
+            GpuBackend::Other => "other",
+        })
+    }
+}
+
+impl std::fmt::Display for GpuPresent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            GpuPresent::Dmabuf {
+                explicit_sync: true,
+            } => "dmabuf, explicit sync",
+            GpuPresent::Dmabuf {
+                explicit_sync: false,
+            } => "dmabuf, implicit sync",
+            GpuPresent::IoSurface => "IOSurface",
+            GpuPresent::DxgiSwapchain => "DXGI swap chain",
+            GpuPresent::Surface => "wgpu surface",
+        })
+    }
+}
+
+/// "AMD Radeon 880M Graphics (RADV STRIX1), Vulkan, dmabuf, explicit sync".
+impl std::fmt::Display for GpuInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}, {}, {}", self.adapter, self.backend, self.present)
+    }
+}
+
+/// What draws this window, or `None` before its first frame. Reading it tracks it.
+///
+/// ```ignore
+/// let fallback = gpu_info().is_some_and(|g| g.backend == GpuBackend::Gl || g.kind == GpuKind::Cpu);
+/// ```
+pub fn gpu_info() -> Option<GpuInfo> {
+    let s = INFO.with(|i| i.borrow().gpu_signal);
+    let s = s.unwrap_or_else(|| {
+        let now = INFO.with(|i| i.borrow().gpu.clone());
+        // Under a root of its own: it outlives whatever asks for it first.
+        let (s, _) = create_root(|| signal(now));
+        INFO.with(|i| i.borrow_mut().gpu_signal = Some(s));
+        s
+    });
+    s.get()
+}
+
+pub(crate) fn tell_gpu(info: GpuInfo) {
+    INFO.with(|i| i.borrow_mut().gpu = Some(info.clone()));
+    if let Some(s) = INFO.with(|i| i.borrow().gpu_signal) {
+        s.set_if_changed(Some(info));
     }
 }
 

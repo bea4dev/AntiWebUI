@@ -255,6 +255,7 @@ impl Runner {
                     // What writes frames to files draws them again, with its own renderer.
                     p.keep_picture_pixels(std::env::var_os("ANTIWEBUI_DUMP_FRAME").is_some());
                     self.ui.set_video_render_node(p.video_render_node());
+                    self.ui.set_gpu_info(p.gpu_info());
                     self.presenter = Some(p);
                 }
                 Err(e) => {

@@ -43,8 +43,7 @@ impl Gpu {
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("anti-webui"),
             required_features: video_features(&adapter),
-            required_limits:
-                wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
+            required_limits: crate::device_limits(&adapter),
             ..Default::default()
         }))
         .map_err(GpuError::Device)?;

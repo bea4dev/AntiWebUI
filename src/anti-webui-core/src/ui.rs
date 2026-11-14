@@ -535,6 +535,13 @@ impl Ui {
         with_doc(|d| d.videos.get_mut().set_timing(timing));
     }
 
+    /// What draws the window, for [`gpu_info`](crate::window::gpu_info).
+    #[doc(hidden)]
+    pub fn set_gpu_info(&mut self, info: crate::window::GpuInfo) {
+        crate::window::activate(self.window);
+        crate::window::tell_gpu(info);
+    }
+
     /// The GPU that draws, for decoders to work on. Only videos opened after this use it.
     #[doc(hidden)]
     pub fn set_video_render_node(&mut self, node: Option<std::path::PathBuf>) {

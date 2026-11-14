@@ -6,6 +6,7 @@
 
 pub mod access;
 pub mod animation;
+pub mod canvas;
 pub mod channel;
 #[doc(hidden)]
 pub mod damage;
@@ -89,10 +90,11 @@ pub mod prelude {
         text, text_area, text_editor, text_input, video, window_fullscreen, window_scale,
     };
     pub use crate::window::{
-        CloseRequest, DecorationMode, Decorations, ResizeEdge, UiThreadHandle, WindowHandle,
-        WindowId, WindowOptions, close_window, current_window, minimize_window, on_close_request,
-        open_window, quit, request_close_window, set_window_maximized, set_window_title,
-        show_window_menu, spawn_ui_thread, spawn_window, start_window_move, start_window_resize,
+        CloseRequest, DecorationMode, Decorations, GpuBackend, GpuInfo, GpuKind, GpuPresent,
+        ResizeEdge, UiThreadHandle, WindowHandle, WindowId, WindowOptions, close_window,
+        current_window, gpu_info, minimize_window, on_close_request, open_window, quit,
+        request_close_window, set_window_maximized, set_window_title, show_window_menu,
+        spawn_ui_thread, spawn_window, start_window_move, start_window_resize,
         toggle_window_maximized, window_active, window_decorations, window_maximized,
     };
     pub use anti_webui_style::*;

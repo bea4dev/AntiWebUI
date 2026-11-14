@@ -45,6 +45,7 @@ AntiWebUI は WebView に頼らず、wgpu による自前描画とネイティ�
 | 38 | [platform-macos](38-platform-macos.md) | macOS バックエンド：AppKit を直接使う、`nextEventMatchingMask` で回すループとライブリサイズ、`IOSurface` での部分描画と `CADisplayLink`、`NSTextInputClient` の IME、子の窓のポップアップ、OS との DnD、`spawn_window` の窓を別スレッドで描く、macOS のキーの決まり（`Modifiers::primary` など）、合成イベントでの端から端までのテスト |
 | 39 | [platform-windows](39-platform-windows.md) | Windows バックエンド：Win32 を直接使う、`MsgWaitForMultipleObjectsEx` で回すループとモーダルなループの中のポンプ、Per-Monitor v2 の DPI、DirectComposition の上の DX12 のスワップチェーン、`WaitForVBlank` のスレッド、IMM32 の IME、アクティブにならないポップアップ、ファイバーでの 8 MiB のスタック、合成メッセージでの端から端までのテスト |
 | 40 | [math](40-math.md) | 数式（LaTeX）：ライブラリの比較と RaTeX、core の `drawing`（em 単位のグリフ、矩形、パス）とインラインボックスのベースライン、`anti-webui-math` の `math`、文中の式の折り返し、通しの式番号と `leqno`、`\label` と `\eqref`、Markdown の `$`、`$$`、` ```math ` とエディタ、Chromium の KaTeX との比較 |
+| 41 | [gpu-canvas](41-gpu-canvas.md) | `gpu_canvas`：利用者が wgpu で描く箱、core と renderer の分担、変更矩形と描くタイミング、専用の encoder と error scope、device が変わったとき、色空間、device の limits、何が描いているかを知る `gpu_info` |
 
 ## 用語
 

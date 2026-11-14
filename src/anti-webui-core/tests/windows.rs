@@ -246,6 +246,58 @@ fn the_frame_and_the_state_of_the_window_follow_the_platform() {
 }
 
 #[test]
+fn each_window_says_what_draws_it() {
+    use anti_webui_core::window::{GpuBackend, GpuInfo, GpuKind, GpuPresent};
+    let seen: Rc<Cell<Vec<Option<GpuInfo>>>> = Rc::default();
+    let s = seen.clone();
+    let mut a = Ui::new(move || {
+        open_window(WindowOptions::new(), div);
+        effect(move || {
+            let mut v = s.take();
+            v.push(gpu_info());
+            s.set(v);
+        });
+        div()
+    });
+    show(&mut a);
+    let mut b = open_asked();
+    assert_eq!(seen.take(), vec![None], "nothing before the first frame");
+
+    let vulkan = GpuInfo::new(
+        GpuBackend::Vulkan,
+        "AMD Radeon 880M Graphics (RADV STRIX1)".into(),
+        GpuKind::Integrated,
+        "radv Mesa".into(),
+        GpuPresent::Dmabuf {
+            explicit_sync: true,
+        },
+    );
+    a.set_gpu_info(vulkan.clone());
+    assert_eq!(seen.take(), vec![Some(vulkan.clone())]);
+    a.set_gpu_info(vulkan.clone());
+    assert_eq!(seen.take(), vec![], "the same again changes nothing");
+    assert_eq!(
+        vulkan.to_string(),
+        "AMD Radeon 880M Graphics (RADV STRIX1), Vulkan, dmabuf, explicit sync"
+    );
+
+    // The other window is drawn by something else, and says so to what reads it there.
+    let gl = GpuInfo::new(
+        GpuBackend::Gl,
+        "llvmpipe".into(),
+        GpuKind::Cpu,
+        String::new(),
+        GpuPresent::Surface,
+    );
+    b.set_gpu_info(gl.clone());
+    assert_eq!(seen.take(), vec![], "not the first window's");
+    let there = anti_webui_core::window::in_window(b.window(), gpu_info);
+    assert_eq!(there, Some(gl));
+    let here = anti_webui_core::window::in_window(a.window(), gpu_info);
+    assert_eq!(here, Some(vulkan));
+}
+
+#[test]
 fn a_thread_without_a_window_closes_what_it_opened_when_it_stops() {
     use anti_webui_core::window::{has_roots, stop_root, take_threads};
     use std::sync::Arc;

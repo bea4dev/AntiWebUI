@@ -2,6 +2,7 @@
 
 #[cfg(windows)]
 mod adapters;
+pub mod canvas;
 mod custom_shader;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
@@ -36,10 +37,24 @@ use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, RawDisplayHandle, RawWindowHandle,
 };
 pub use renderer::Renderer;
-/// The wgpu crate this one is built on, for tests and tools that render offscreen. Which version it
-/// is follows this crate and is not part of what semver promises.
-#[doc(hidden)]
+/// The wgpu crate this one is built on, which a `gpu_canvas` draws with: AntiWebUI is on a fork of
+/// it, whose types aren't those of the wgpu on crates.io. Going to another major version of it is a
+/// breaking change.
 pub use wgpu;
+
+/// What the device is asked to allow: what WebGPU allows by default where the adapter can, so that
+/// what a `gpu_canvas` draws can use storage buffers and compute, and what WebGL 2 does elsewhere.
+/// Either way, textures can be as big as the adapter has them. See `docs/design/41-gpu-canvas.md`.
+pub(crate) fn device_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
+    let has = adapter.limits();
+    let base = wgpu::Limits::default();
+    let base = if base.check_limits(&has) {
+        base
+    } else {
+        wgpu::Limits::downlevel_webgl2_defaults()
+    };
+    base.using_resolution(has)
+}
 
 #[derive(Debug)]
 pub enum GpuError {
@@ -261,8 +276,7 @@ impl Gpu {
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("anti-webui"),
             required_features: video_features(&adapter) | cache_feature,
-            required_limits:
-                wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
+            required_limits: crate::device_limits(&adapter),
             ..Default::default()
         }))
         .map_err(GpuError::Device)?;

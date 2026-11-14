@@ -901,6 +901,7 @@ macro_rules! box_paint_methods {
     };
 }
 
+pub(crate) use box_paint_methods;
 pub(crate) use element_methods;
 
 /// A generic box element.

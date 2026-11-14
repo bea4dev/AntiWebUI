@@ -406,6 +406,32 @@ impl PartialEq for VideoDraw {
     }
 }
 
+/// What the program drew on the GPU, in a `gpu_canvas`. See `docs/design/41-gpu-canvas.md`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CanvasDraw {
+    /// What draws it, to the renderer.
+    pub id: u64,
+    /// One more each time what it shows changes.
+    pub version: u64,
+    /// The content box, which all of what is drawn fills.
+    pub rect: RectI,
+    /// What it is cut to, which can be rounded.
+    pub shape: Clip,
+    pub clip: Clip,
+    pub opacity: f32,
+    /// How many physical pixels make a logical one.
+    pub scale: f32,
+}
+
+impl CanvasDraw {
+    /// What it can touch.
+    pub fn area(&self) -> RectI {
+        self.rect
+            .intersect(&self.shape.rect)
+            .intersect(&self.clip.rect)
+    }
+}
+
 /// Curves in their own coordinates, shared by what draws them. Two of them are the same only if they
 /// are one and the same, which is what the renderer goes by to keep what it made of them.
 pub struct PathGeometry {
@@ -497,6 +523,7 @@ pub type ClipQuad = [(f64, f64); 4];
 pub enum Primitive {
     Image(ImageDraw),
     Video(VideoDraw),
+    Canvas(CanvasDraw),
     Path(PathDraw),
     Shadow(Shadow),
     Quad(Quad),

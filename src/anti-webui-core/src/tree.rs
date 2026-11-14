@@ -190,6 +190,8 @@ pub enum NodeKind {
     SvgText(Box<crate::svg::SvgTextData>),
     /// Glyphs, rectangles and shapes in em: `drawing`. See `docs/design/40-math.md`.
     Drawing(Box<crate::drawing::DrawingData>),
+    /// A box the program draws on the GPU: `gpu_canvas`. See `docs/design/41-gpu-canvas.md`.
+    Canvas(Box<crate::canvas::CanvasData>),
     /// Generates no box; children take part in the parent's layout.
     Fragment,
     /// The root of what is shown in a surface of its own. It stays in the tree for its lifetime,
@@ -367,6 +369,7 @@ impl Node {
             NodeKind::Image(d) => Some((d.natural, d.density)),
             NodeKind::Video(d) => Some((d.natural, 1.0)),
             NodeKind::Drawing(d) => Some((Some(d.natural(self)), 1.0)),
+            NodeKind::Canvas(d) => Some((Some(d.natural()), 1.0)),
             _ => None,
         }
     }

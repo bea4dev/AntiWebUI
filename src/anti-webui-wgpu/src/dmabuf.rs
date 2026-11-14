@@ -141,8 +141,7 @@ impl Gpu {
                 continue;
             };
             let open = open?;
-            let limits =
-                wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits());
+            let limits = crate::device_limits(&adapter);
             // SAFETY: `open` was created from this adapter with no extra features.
             let (device, queue) = unsafe {
                 adapter.create_device_from_hal(
@@ -197,7 +196,7 @@ unsafe fn open_for_dmabuf(
     if !matches {
         return None;
     }
-    let limits = wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits());
+    let limits = crate::device_limits(adapter);
     let callback: Box<wgpu::hal::vulkan::CreateDeviceCallback<'_>> = Box::new(|args| {
         for e in [
             khr::external_semaphore_fd::NAME,

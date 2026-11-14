@@ -19,6 +19,13 @@ pub use anti_webui_widgets as widgets;
 
 pub use anti_webui_app::App;
 
+/// Drawing with wgpu in a box of the UI: [`gpu_canvas`](gpu::gpu_canvas). See
+/// `docs/design/41-gpu-canvas.md`.
+pub mod gpu {
+    pub use anti_webui_wgpu::canvas::{GpuCanvas, GpuFrame, GpuInit, GpuPaint, gpu_canvas};
+    pub use anti_webui_wgpu::wgpu;
+}
+
 pub mod prelude {
     pub use anti_webui_app::App;
     #[cfg(feature = "code")]
@@ -40,5 +47,6 @@ pub mod prelude {
         PdfFieldKind, PdfFieldValue, PdfOutlineItem, PdfState, PdfTarget, PdfThumbnails, PdfTool,
         PdfView, PdfViewer, PdfZoom, pdf_thumbnails, pdf_view, pdf_viewer,
     };
+    pub use anti_webui_wgpu::canvas::{GpuCanvas, GpuPaint, gpu_canvas};
     pub use anti_webui_widgets::*;
 }

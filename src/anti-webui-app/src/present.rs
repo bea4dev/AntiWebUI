@@ -29,6 +29,7 @@ use crate::pacing::PresentTrace;
 use anti_webui_core::damage::{self, Damage};
 use anti_webui_core::platform::SurfaceId;
 use anti_webui_core::scene::Scene;
+use anti_webui_core::window::{GpuBackend, GpuInfo, GpuKind, GpuPresent};
 use anti_webui_wgpu::{FrameResult, Gpu, GpuError, WindowRenderer};
 use raw_window_handle::RawWindowHandle;
 use std::collections::HashMap;
@@ -148,6 +149,42 @@ impl Presenter {
             debug,
             trace: None,
         })
+    }
+
+    /// What draws, for `gpu_info`.
+    pub fn gpu_info(&self) -> GpuInfo {
+        use anti_webui_wgpu::wgpu;
+        let info = self.gpu.adapter.get_info();
+        let present = match &self.own {
+            #[cfg(target_os = "linux")]
+            Some(d) => GpuPresent::Dmabuf {
+                explicit_sync: d.name() == "explicit",
+            },
+            #[cfg(not(target_os = "linux"))]
+            Some(_) => GpuPresent::IoSurface,
+            None if self.path() == "DXGI swapchain" => GpuPresent::DxgiSwapchain,
+            None => GpuPresent::Surface,
+        };
+        let backend = match info.backend {
+            wgpu::Backend::Vulkan => GpuBackend::Vulkan,
+            wgpu::Backend::Metal => GpuBackend::Metal,
+            wgpu::Backend::Dx12 => GpuBackend::Dx12,
+            wgpu::Backend::Gl => GpuBackend::Gl,
+            _ => GpuBackend::Other,
+        };
+        let kind = match info.device_type {
+            wgpu::DeviceType::IntegratedGpu => GpuKind::Integrated,
+            wgpu::DeviceType::DiscreteGpu => GpuKind::Discrete,
+            wgpu::DeviceType::VirtualGpu => GpuKind::Virtual,
+            wgpu::DeviceType::Cpu => GpuKind::Cpu,
+            wgpu::DeviceType::Other => GpuKind::Other,
+        };
+        let driver = [info.driver, info.driver_info]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        GpuInfo::new(backend, info.name, kind, driver, present)
     }
 
     /// How buffers get to the compositor, for reports.

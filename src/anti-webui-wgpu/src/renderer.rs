@@ -15,7 +15,7 @@ use anti_webui_core::damage::{
 use anti_webui_core::geometry::{Affine, RectI};
 use anti_webui_core::images::Bitmap;
 use anti_webui_core::scene::{
-    Clip, ImageDraw, Layer, LayerFilter, Primitive, Quad, Scene, VideoDraw,
+    CanvasDraw, Clip, ImageDraw, Layer, LayerFilter, Primitive, Quad, Scene, VideoDraw,
 };
 use anti_webui_core::shader::{ShaderSource, preloads_from};
 use bytemuck::{Pod, Zeroable};
@@ -153,6 +153,23 @@ enum Batch {
         stream: u64,
         range: Range<u32>,
     },
+    /// Picture instances of what the `gpu_canvas` with this id drew.
+    Canvas {
+        id: u64,
+        range: Range<u32>,
+    },
+}
+
+/// What a `gpu_canvas` is drawn into. See `docs/design/41-gpu-canvas.md`.
+struct CanvasTexture {
+    view: wgpu::TextureView,
+    srgb_view: Option<wgpu::TextureView>,
+    bind: wgpu::BindGroup,
+    size: (u32, u32),
+    /// The version of the canvas it is to show, once drawn.
+    version: Option<u64>,
+    /// Whether what it holds is to be shown: drawing it didn't fail.
+    shown: bool,
 }
 
 /// What a filter made of a layer, kept until that changes.
@@ -572,6 +589,12 @@ pub struct Renderer {
     effect_uniform_bind: Option<wgpu::BindGroup>,
     /// Windows that something reads, by target.
     canvases: HashMap<u64, Canvas>,
+    /// What each `gpu_canvas` is drawn into, by its id.
+    gpu_canvases: HashMap<u64, CanvasTexture>,
+    /// The canvases to draw before this frame, with how many pixels make a logical one.
+    canvas_draws: Vec<(u64, f32)>,
+    /// Whether textures can be seen as sRGB, which OpenGL can't.
+    srgb_views: bool,
     filters_run: usize,
     max_texture: u32,
     layers: HashMap<u64, LayerCache>,
@@ -1072,6 +1095,9 @@ impl Renderer {
             effect_uniforms: None,
             effect_uniform_bind: None,
             canvases: HashMap::new(),
+            gpu_canvases: HashMap::new(),
+            canvas_draws: Vec::new(),
+            srgb_views: device.adapter_info().backend != wgpu::Backend::Gl,
             filters_run: 0,
             max_texture: device.limits().max_texture_dimension_2d,
             layers: HashMap::new(),
@@ -1105,6 +1131,12 @@ impl Renderer {
     #[doc(hidden)]
     pub fn set_video_importer(&mut self, importer: crate::dmabuf::VideoImporter) {
         self.video.set_importer(importer);
+    }
+
+    /// How many `gpu_canvas` textures are kept, for tests.
+    #[doc(hidden)]
+    pub fn canvas_textures(&self) -> usize {
+        self.gpu_canvases.len()
     }
 
     /// How much the edges of shapes take, in bytes.
@@ -1997,6 +2029,7 @@ impl Renderer {
         match prim {
             Primitive::Image(d) => self.push_picture(device, d, at, target, pictures, batches),
             Primitive::Video(d) => self.push_video(device, d, at, target, videos, batches),
+            Primitive::Canvas(d) => self.push_canvas(device, d, at, target, pictures, batches),
             Primitive::Path(d) => {
                 let clip = gpu_clip(&d.clip.scaled(k).translated(dx, dy), target);
                 let before = paths.len() as u32;
@@ -2286,6 +2319,119 @@ impl Renderer {
         }
     }
 
+    /// Adds what shows what a `gpu_canvas` drew, and has it drawn first if it isn't yet.
+    fn push_canvas(
+        &mut self,
+        device: &wgpu::Device,
+        d: &CanvasDraw,
+        at: Placement,
+        target: RectI,
+        pictures: &mut Vec<PictureInstance>,
+        batches: &mut Vec<Batch>,
+    ) {
+        let Placement { k, dx, dy } = at;
+        let rect = d.rect.scaled(k).translate(dx, dy);
+        let shape = d.shape.scaled(k).translated(dx, dy);
+        let clip = d.clip.scaled(k).translated(dx, dy);
+        let area = rect
+            .intersect(&shape.rect)
+            .intersect(&clip.rect)
+            .intersect(&target);
+        if area.is_empty() || rect.is_empty() {
+            return;
+        }
+        // As many pixels as it shows on, unless that is more than a texture can have.
+        let size = (
+            (rect.width as u32).min(self.max_texture),
+            (rect.height as u32).min(self.max_texture),
+        );
+        if self.gpu_canvases.get(&d.id).is_none_or(|c| c.size != size) {
+            let texture = self.create_canvas_texture(device, size);
+            self.gpu_canvases.insert(d.id, texture);
+        }
+        let canvas = self.gpu_canvases.get_mut(&d.id).expect("just made sure");
+        if canvas.version != Some(d.version) {
+            canvas.version = Some(d.version);
+            let scale = d.scale * k as f32 * size.0 as f32 / rect.width as f32;
+            self.canvas_draws.push((d.id, scale));
+        }
+        let (clip_rect, clip_radii) = gpu_clip(&clip, target);
+        pictures.push(PictureInstance {
+            area: rect4(area),
+            rect: rect4(rect),
+            shape: rect4(shape.rect),
+            shape_radii: shape.radii,
+            clip: clip_rect,
+            clip_radii,
+            params: [0.0, d.opacity],
+        });
+        let end = pictures.len() as u32;
+        batches.push(Batch::Canvas {
+            id: d.id,
+            range: end - 1..end,
+        });
+    }
+
+    fn create_canvas_texture(&self, device: &wgpu::Device, size: (u32, u32)) -> CanvasTexture {
+        let srgb = [crate::canvas::SRGB_FORMAT];
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gpu_canvas"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: crate::canvas::CANVAS_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: if self.srgb_views { &srgb } else { &[] },
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let srgb_view = self.srgb_views.then(|| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(crate::canvas::SRGB_FORMAT),
+                ..Default::default()
+            })
+        });
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu_canvas"),
+            layout: &self.picture_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            }],
+        });
+        CanvasTexture {
+            view,
+            srgb_view,
+            bind,
+            size,
+            version: None,
+            shown: false,
+        }
+    }
+
+    /// Has the canvases that changed draw, before anything that shows them.
+    fn draw_canvases(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        for (id, scale) in std::mem::take(&mut self.canvas_draws) {
+            let Some(canvas) = self.gpu_canvases.get_mut(&id) else {
+                continue;
+            };
+            let target = crate::canvas::Target {
+                view: &canvas.view,
+                srgb_view: canvas.srgb_view.as_ref(),
+                size: canvas.size,
+                scale,
+            };
+            canvas.shown = crate::canvas::render(id, device, queue, &target);
+        }
+    }
+
     /// Adds what shows a frame of a video, and makes sure the GPU is going to have it.
     fn push_video(
         &mut self,
@@ -2496,6 +2642,7 @@ impl Renderer {
             self.canvases.remove(&self.target);
         }
         self.pictures.retain(|_, p| p.bitmap.strong_count() > 0);
+        self.gpu_canvases.retain(|id, _| crate::canvas::alive(*id));
         self.video.begin_frame(queue);
         self.paths.begin_frame();
         self.paths.prepare_many(device, &scene.primitives);
@@ -2506,6 +2653,7 @@ impl Renderer {
             effects,
             rasters,
         } = self.prepare(device, scene, damage, &plans);
+        self.draw_canvases(device, queue);
         self.upload_pictures(queue);
         self.video.upload(device, queue);
         self.paths.upload(device, queue, &instances.path_table);
@@ -2935,6 +3083,16 @@ impl Renderer {
                     });
                     pass.set_bind_group(1, &picture.bind, &[]);
                     pass.set_bind_group(2, &self.picture_samplers[*sampler as usize], &[]);
+                    pass.set_vertex_buffer(0, self.picture_buffer.buffer.slice(..));
+                    pass.draw(0..4, range.clone());
+                }
+                Batch::Canvas { id, range } => {
+                    let Some(canvas) = self.gpu_canvases.get(id).filter(|c| c.shown) else {
+                        continue;
+                    };
+                    pass.set_pipeline(&self.picture_pipeline);
+                    pass.set_bind_group(1, &canvas.bind, &[]);
+                    pass.set_bind_group(2, &self.picture_samplers[0], &[]);
                     pass.set_vertex_buffer(0, self.picture_buffer.buffer.slice(..));
                     pass.draw(0..4, range.clone());
                 }

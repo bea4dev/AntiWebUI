@@ -6,8 +6,8 @@ use crate::geometry::{PointF, PointI, RectI, SizeI};
 use crate::layout::{child_clip, mark_outer_layers_stale};
 use crate::platform::PopupId;
 use crate::scene::{
-    BackdropDraw, ChunkKey, Clip, Glyph, GlyphRun, ImageDraw, Layer, LayerFilter, Primitive, Quad,
-    Scene, ShaderDraw, Shadow, VideoDraw,
+    BackdropDraw, CanvasDraw, ChunkKey, Clip, Glyph, GlyphRun, ImageDraw, Layer, LayerFilter,
+    Primitive, Quad, Scene, ShaderDraw, Shadow, VideoDraw,
 };
 use crate::shader::{Image, ShaderPaint};
 use crate::text::selection::{node_range, selectable_text_nodes};
@@ -244,7 +244,13 @@ pub(crate) fn paint_selected_text(
             let inner = child_clip(n, doc.scale, n.clip_shape()).rect;
             let origin = edit_text_origin(doc, id);
             let (a, b) = e.selection_range();
-            add(id, &e.layout, origin, (e.to_display(a), e.to_display(b)), inner);
+            add(
+                id,
+                &e.layout,
+                origin,
+                (e.to_display(a), e.to_display(b)),
+                inner,
+            );
         }
         crate::drag::TextOrigin::Editor(host) => {
             for &id in &doc.get(host)?.editor()?.selected_rows {
@@ -529,7 +535,7 @@ fn paints_overlapping(doc: &Document, id: NodeId) -> bool {
                     *things += u32::from(!matches!(c.stroke_paint, SvgPaint::None));
                 }
             }
-            NodeKind::Image(_) | NodeKind::Video(_) => {
+            NodeKind::Image(_) | NodeKind::Video(_) | NodeKind::Canvas(_) => {
                 *things += 1 + u32::from(!c.background.is_transparent());
                 *things += u32::from(c.background_image.is_some());
                 *things += c.shadows.len() as u32;
@@ -1270,6 +1276,10 @@ impl Painter<'_> {
             self.chunk(id, part::PICTURE);
             self.video(id, opacity);
         }
+        if let NodeKind::Canvas(_) = &node.kind {
+            self.chunk(id, part::PICTURE);
+            self.canvas(id, opacity);
+        }
         if let NodeKind::Drawing(d) = &node.kind {
             self.chunk(id, part::CONTENT);
             crate::drawing::paint(node, d, doc.scale, opacity, self.scene);
@@ -1520,6 +1530,31 @@ impl Painter<'_> {
             },
             clip: node.clip_shape(),
             opacity: snapped_opacity(opacity * c.image_opacity),
+        }));
+    }
+
+    /// What the program drew on the GPU, filling the content box.
+    fn canvas(&mut self, id: NodeId, opacity: f32) {
+        let doc = self.doc;
+        let node = &doc.nodes[id];
+        let NodeKind::Canvas(data) = &node.kind else {
+            return;
+        };
+        let content = node.content_abs();
+        if content.is_empty() {
+            return;
+        }
+        self.scene.primitives.push(Primitive::Canvas(CanvasDraw {
+            id: data.id,
+            version: data.version,
+            rect: content,
+            shape: Clip {
+                rect: content,
+                radii: content_radii(node, doc.scale),
+            },
+            clip: node.clip_shape(),
+            opacity: snapped_opacity(opacity),
+            scale: doc.scale.pxf(1.0),
         }));
     }
 

@@ -275,6 +275,7 @@ pub fn primitive_bounds(p: &Primitive) -> RectI {
         Primitive::Quad(q) => q.rect.intersect(&q.clip.rect),
         Primitive::Image(i) => i.area(),
         Primitive::Video(v) => v.area(),
+        Primitive::Canvas(c) => c.area(),
         Primitive::Path(d) => d.bounds.intersect(&d.clip.rect),
         Primitive::Shadow(s) => s.bounds().intersect(&s.clip.rect),
         Primitive::Glyphs(run) => glyph_run_bounds(run).intersect(&run.clip.rect),
