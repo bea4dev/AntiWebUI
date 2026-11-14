@@ -248,7 +248,7 @@ impl Network {
         })
     }
 
-    /// The first wired device.
+    /// The connected wired device, or the first when none is connected.
     pub fn wired(&self) -> Option<Wired> {
         self.0.wired.get()
     }
@@ -357,6 +357,23 @@ impl Model {
         self.devices.iter().filter(|(_, p)| device_type(p) == WIFI)
     }
 
+    fn wired(&self) -> Option<Wired> {
+        let mut devices = self.devices.values().filter(|p| device_type(p) == ETHERNET);
+        let first = devices.next()?;
+        let p = if get::<u32>(first, "State") == Some(ACTIVATED) {
+            first
+        } else {
+            devices
+                .find(|p| get::<u32>(p, "State") == Some(ACTIVATED))
+                .unwrap_or(first)
+        };
+        Some(Wired {
+            interface: string(p, "Interface"),
+            connected: get::<u32>(p, "State") == Some(ACTIVATED),
+            speed: get(p, "Speed").unwrap_or(0),
+        })
+    }
+
     fn access_point(&self, path: &str, active: &[String]) -> Option<AccessPoint> {
         let p = self.access_points.get(path)?;
         let ssid =
@@ -422,17 +439,7 @@ impl Model {
         let mut list: Vec<AccessPoint> = by_ssid.into_values().collect();
         list.sort_by(|a, b| b.strength.cmp(&a.strength).then(a.ssid.cmp(&b.ssid)));
         put(&s.access_points, list);
-        put(
-            &s.wired,
-            self.devices
-                .values()
-                .find(|p| device_type(p) == ETHERNET)
-                .map(|p| Wired {
-                    interface: string(p, "Interface"),
-                    connected: get::<u32>(p, "State") == Some(ACTIVATED),
-                    speed: get(p, "Speed").unwrap_or(0),
-                }),
-        );
+        put(&s.wired, self.wired());
         if let Ok(mut d) = s.wifi_device.lock() {
             *d = self.wifi_devices().next().map(|(path, _)| path.clone());
         }
@@ -586,5 +593,53 @@ async fn serve(conn: &zbus::Connection) {
         }
         model.sync(conn).await;
         model.publish();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ethernet(state: u32, interface: &str) -> Props {
+        HashMap::from([
+            (
+                "DeviceType".into(),
+                Value::from(ETHERNET).try_into().expect("device type"),
+            ),
+            (
+                "State".into(),
+                Value::from(state).try_into().expect("device state"),
+            ),
+            (
+                "Interface".into(),
+                Value::from(interface).try_into().expect("interface"),
+            ),
+        ])
+    }
+
+    #[test]
+    fn wired_selects_connected_device() {
+        let model = Model {
+            devices: BTreeMap::from([
+                (
+                    "/org/freedesktop/NetworkManager/Devices/2".into(),
+                    ethernet(20, "enp14s0"),
+                ),
+                (
+                    "/org/freedesktop/NetworkManager/Devices/3".into(),
+                    ethernet(ACTIVATED, "enp18s0"),
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            model.wired(),
+            Some(Wired {
+                interface: "enp18s0".into(),
+                connected: true,
+                speed: 0,
+            })
+        );
     }
 }
