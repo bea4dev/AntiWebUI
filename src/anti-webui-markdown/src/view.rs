@@ -9,6 +9,13 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::rc::Rc;
 
+/// A run of a paragraph's pieces, or a formula on a line of its own between them.
+enum Part<'a> {
+    Text(&'a [Piece]),
+    /// The source of a formula, and where it starts.
+    Display(&'a str, usize),
+}
+
 /// What a `:name:` in the text is: text in its place (`😄`), or a picture as tall as the letters.
 #[derive(Clone, Debug)]
 pub enum Emoji {
@@ -197,6 +204,11 @@ pub(crate) struct Ctx {
     footnote_refs: RefCell<HashMap<String, NodeRef>>,
     /// Where the blocks are kept for a split editor.
     split: RefCell<Option<Rc<Anchors>>>,
+    /// The numbers of the formulas on lines of their own, and what their labels refer to.
+    pub(crate) numbers: RefCell<Rc<crate::numbers::Numbers>>,
+    /// Where in the document the source being made into blocks starts, when it is only part of
+    /// it.
+    base: std::cell::Cell<usize>,
 }
 
 pub(crate) type EntryKey = (u64, u32, u32);
@@ -211,6 +223,12 @@ struct Entry {
 enum EntryKind {
     Block(Block),
     Footnotes(Vec<(String, Vec<Block>)>),
+}
+
+/// A block with room above it. Apart from `block`, which is called down nested lists and quotes:
+/// a builder takes much of the stack in a build without optimizations.
+fn spaced(view: View, gap: f32) -> View {
+    div().mt(gap).child(view).into_view()
 }
 
 fn px_of(l: Option<Length>) -> f32 {
@@ -250,13 +268,21 @@ impl Ctx {
             footnotes: RefCell::default(),
             footnote_refs: RefCell::default(),
             split: RefCell::default(),
+            numbers: RefCell::default(),
+            base: Default::default(),
         })
     }
 
     /// The first block of `source`, as the viewer shows it.
-    pub(crate) fn block_of(self: &Rc<Self>, source: &str) -> View {
+    /// A block alone, which starts at `at` in its document.
+    pub(crate) fn block_of(self: &Rc<Self>, source: &str, at: usize) -> View {
         match parse::parse(source).into_iter().next() {
-            Some(top) => self.block(&top.block, 0.0, 0),
+            Some(top) => {
+                self.base.set(at);
+                let view = self.block(&top.block, 0.0, 0);
+                self.base.set(0);
+                view
+            }
             None => div().into_view(),
         }
     }
@@ -294,6 +320,7 @@ impl Ctx {
         let t = &self.theme;
         match block {
             Block::Heading(level, _) => margins(&t.headings[(*level as usize).clamp(1, 6) - 1]),
+            Block::Paragraph(p) if self.only_display(p) => margins(&t.math_block),
             Block::Paragraph(_) | Block::Html(_) => margins(&t.paragraph),
             Block::Plain(_) | Block::Footnote(..) => (0.0, 0.0),
             Block::Code { lang, .. } if lang == "mermaid" => margins(&t.diagram),
@@ -455,6 +482,9 @@ impl Ctx {
                     };
                     runs.push(Run::Inline(inline(view).alt(alt.clone())));
                 }
+                Piece::Math { tex, display, .. } => {
+                    runs.extend(self.math_runs(tex, *display, size))
+                }
                 Piece::FootnoteRef(label) => {
                     let n = self.footnotes.borrow().get(label).copied();
                     let shown = n.map_or_else(|| format!("[^{label}]"), |n| n.to_string());
@@ -472,6 +502,150 @@ impl Ctx {
             }
         }
         rich_text(runs).into_view()
+    }
+
+    /// A formula among words, in parts a line can break between. One meant for a line of its own
+    /// (in a heading or a cell) is at full size there.
+    fn math_runs(self: &Rc<Self>, tex: &str, display: bool, size: f32) -> Vec<Run> {
+        #[cfg(feature = "math")]
+        {
+            let _ = size;
+            let source = if display {
+                format!("\\displaystyle {tex}")
+            } else {
+                tex.to_owned()
+            };
+            self.math(source).style(&self.theme.math).runs()
+        }
+        #[cfg(not(feature = "math"))]
+        {
+            let written = if display {
+                format!("$${tex}$$")
+            } else {
+                format!("${tex}$")
+            };
+            vec![Run::Span(span(written).shared_style(self.span_style(
+                mark::CODE,
+                false,
+                size,
+            )))]
+        }
+    }
+
+    /// A formula whose references show the numbers of the document's formulas, in the link's
+    /// color, and go to them.
+    #[cfg(feature = "math")]
+    pub(crate) fn math(self: &Rc<Self>, tex: String) -> anti_webui_math::Math {
+        let (numbers, ctx) = (self.numbers.borrow().clone(), self.clone());
+        anti_webui_math::math(tex)
+            .reference_color(self.theme.link.color.unwrap_or(anti_webui_math::LINK_COLOR))
+            .references(move |label| numbers.number(label))
+            .on_reference(move |label| ctx.follow(&format!("#{label}")))
+    }
+
+    /// The pieces of a paragraph, split where a formula is on a line of its own: lines of text, and
+    /// formulas between them. `None` when there is no such formula.
+    fn display_parts<'a>(&self, pieces: &'a Inlines) -> Option<Vec<Part<'a>>> {
+        if !cfg!(feature = "math")
+            || !pieces
+                .iter()
+                .any(|p| matches!(p, Piece::Math { display: true, .. }))
+        {
+            return None;
+        }
+        let mut parts = Vec::new();
+        let mut start = 0;
+        let blank = |run: &[Piece]| {
+            run.iter()
+                .all(|p| matches!(p, Piece::Text(t, _) if t.trim().is_empty()))
+        };
+        for (i, p) in pieces.iter().enumerate() {
+            if let Piece::Math {
+                tex,
+                display: true,
+                at,
+            } = p
+            {
+                if !blank(&pieces[start..i]) {
+                    parts.push(Part::Text(&pieces[start..i]));
+                }
+                parts.push(Part::Display(tex, *at));
+                start = i + 1;
+            }
+        }
+        if !blank(&pieces[start..]) {
+            parts.push(Part::Text(&pieces[start..]));
+        }
+        Some(parts)
+    }
+
+    /// A paragraph: its text, or its text and the formulas on lines of their own in it.
+    fn flow(self: &Rc<Self>, pieces: &Inlines, size: f32) -> View {
+        let Some(parts) = self.display_parts(pieces) else {
+            return self.inlines(pieces, size);
+        };
+        let mut views = Vec::new();
+        for part in parts {
+            views.push(match part {
+                // A line of its own starts and ends where its words do.
+                Part::Text(run) => {
+                    let mut run = run.to_vec();
+                    if let Some(Piece::Text(t, _)) = run.first_mut() {
+                        *t = t.trim_start().to_owned();
+                    }
+                    if let Some(Piece::Text(t, _)) = run.last_mut() {
+                        *t = t.trim_end().to_owned();
+                    }
+                    self.inlines(&run, size)
+                }
+                Part::Display(tex, at) => self.display_math(tex, at),
+            });
+        }
+        match views.len() {
+            1 => views.pop().unwrap(),
+            _ => div().children(views).into_view(),
+        }
+    }
+
+    /// A formula on a line of its own, numbered from where the document is, and found by its
+    /// labels.
+    fn display_math(self: &Rc<Self>, tex: &str, at: usize) -> View {
+        #[cfg(feature = "math")]
+        {
+            let at = at + self.base.get();
+            let numbers = self.numbers.borrow().clone();
+            let mut m = self
+                .math(tex.to_owned())
+                .display()
+                .first_number(numbers.first_at(at))
+                .style(&self.theme.math_block);
+            if self.theme.math_leqno {
+                m = m.leqno();
+            }
+            let labels = numbers.labels_at(at);
+            if labels.is_empty() {
+                return m.into_view();
+            }
+            let r = node_ref();
+            let mut anchors = self.anchors.borrow_mut();
+            for label in labels {
+                anchors.entry(label.to_owned()).or_insert(r);
+            }
+            div().node_ref(r).child(m).into_view()
+        }
+        #[cfg(not(feature = "math"))]
+        {
+            let _ = (tex, at);
+            div().into_view()
+        }
+    }
+
+    /// Whether a paragraph is only a formula on a line of its own, which has the margins of one.
+    fn only_display(&self, pieces: &Inlines) -> bool {
+        matches!(
+            self.display_parts(pieces).as_deref(),
+            Some([Part::Display(..)])
+        )
     }
 
     /// Blocks one under the other, with the larger of the margins of two neighbors between them.
@@ -497,13 +671,14 @@ impl Ctx {
         let t = &self.theme;
         let base = t.base_size();
         match block {
+            Block::Paragraph(p) if self.only_display(p) => spaced(self.flow(p, base), gap),
             Block::Paragraph(p) => div()
                 .style(&t.paragraph)
                 .mt(gap)
                 .mb(0.0)
-                .child(self.inlines(p, base))
+                .child(self.flow(p, base))
                 .into_view(),
-            Block::Plain(p) => div().mt(gap).child(self.inlines(p, base)).into_view(),
+            Block::Plain(p) => div().mt(gap).child(self.flow(p, base)).into_view(),
             Block::Heading(level, p) => {
                 let style = &t.headings[(*level as usize).clamp(1, 6) - 1];
                 let r = node_ref();
@@ -869,6 +1044,11 @@ impl Ctx {
     fn entries(self: &Rc<Self>, source: &str) -> Vec<Rc<Entry>> {
         let tops = parse::parse(source);
         self.number_footnotes(&tops);
+        let numbers = Rc::new(crate::numbers::Numbers::of(
+            &self.numbers.borrow(),
+            &crate::numbers::of_blocks(&tops),
+        ));
+        *self.numbers.borrow_mut() = numbers.clone();
         let mut out = Vec::new();
         let mut seen: HashMap<u64, u32> = HashMap::new();
         let mut prev: Option<f32> = None;
@@ -894,7 +1074,9 @@ impl Ctx {
             let (top_margin, bottom) = self.margins_of(&top.block);
             let gap = prev.map_or(0.0, |p| p.max(top_margin));
             prev = Some(bottom);
-            let hash = hash_of(&source[top.range.clone()]);
+            // Made again when the numbers it shows change, though it doesn't.
+            let hash = hash_of(&source[top.range.clone()])
+                ^ numbers.hash_of(top.range.clone(), &source[top.range.clone()]);
             let n = seen.entry(hash).or_insert(0);
             *n += 1;
             let key = (hash, *n, gap.to_bits());

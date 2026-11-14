@@ -11,13 +11,17 @@ anti-webui-core.workspace = true
 pulldown-cmark = { workspace = true }
 log.workspace = true
 anti-webui-code = { workspace = true, optional = true }
+anti-webui-math = { workspace = true, optional = true }
 # Pinned: it is an alpha, and its API changes between releases.
 merman = { version = "=0.10.0-alpha.1", default-features = false, features = ["svg", "all-diagrams", "layout-cytoscape"], optional = true }
 
 [features]
-default = ["mermaid", "code"]
+default = ["mermaid", "code", "math"]
 ## Code blocks colored by tree-sitter grammars, and the split editor, whose source side is a
 ## `code_editor`.
 code = ["dep:anti-webui-code"]
+## Formulas in LaTeX (`$…$`, `$$…$$` and ` ```math `), on `anti-webui-math`, which adds about
+## 2.8 MB. See `docs/design/40-math.md`.
+math = ["dep:anti-webui-math"]
 ## Mermaid diagrams, on `merman`, which follows mermaid.js closely and adds about 25 MB.
 mermaid = ["dep:merman", "anti-webui-core/svg"]

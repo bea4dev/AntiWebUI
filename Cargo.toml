@@ -17,6 +17,7 @@ members = [
     "src/anti-webui-pdf",
     "src/anti-webui-markdown",
     "src/anti-webui-code",
+    "src/anti-webui-math",
     "src/anti-webui-wayland",
     "src/anti-webui-x11",
     "src/anti-webui-wayland-shell",
@@ -45,6 +46,7 @@ anti-webui-video = { path = "src/anti-webui-video", version = "0.1.0" }
 anti-webui-pdf = { path = "src/anti-webui-pdf", version = "0.1.0" }
 anti-webui-markdown = { path = "src/anti-webui-markdown", version = "0.1.0" }
 anti-webui-code = { path = "src/anti-webui-code", version = "0.1.0" }
+anti-webui-math = { path = "src/anti-webui-math", version = "0.1.0" }
 anti-webui-wayland = { path = "src/anti-webui-wayland", version = "0.1.0" }
 anti-webui-x11 = { path = "src/anti-webui-x11", version = "0.1.0" }
 anti-webui-macos = { path = "src/anti-webui-macos", version = "0.1.0" }

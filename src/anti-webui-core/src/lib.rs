@@ -10,6 +10,7 @@ pub mod channel;
 #[doc(hidden)]
 pub mod damage;
 pub mod drag;
+pub mod drawing;
 pub mod event;
 pub mod geometry;
 pub mod images;
@@ -55,6 +56,7 @@ pub mod prelude {
     pub use crate::drag::{
         DragData, DraggedText, DropEvent, ExternalDrag, GrabEvent, GrabPhase, dragged, start_drag,
     };
+    pub use crate::drawing::{Drawing, DrawingBox, drawing};
     pub use crate::event::{
         ClipboardKind, DragAction, DragActions, DragResult, Key, KeyboardEvent, Modifiers,
         NamedKey, PinchEvent, PinchPhase, PointerButton, PointerEvent, ScrollEvent, ScrollPhase,

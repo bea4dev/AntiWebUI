@@ -17,6 +17,7 @@ video = ["anti-webui-app/video"]
 pdf = ["dep:anti-webui-pdf"]
 pdf-js = ["pdf", "anti-webui-pdf/js"]
 markdown = ["dep:anti-webui-markdown"]
+math = ["dep:anti-webui-math"]
 code = ["dep:anti-webui-code"]
 wayland-shell = ["wayland", "dep:anti-webui-wayland-shell"]
 shell-hyprland = ["wayland-shell", "anti-webui-wayland-shell/hyprland"]
@@ -45,4 +46,5 @@ anti-webui-macros.workspace = true
 anti-webui-pdf = { workspace = true, optional = true }
 anti-webui-markdown = { workspace = true, optional = true }
 anti-webui-code = { workspace = true, optional = true }
+anti-webui-math = { workspace = true, optional = true }
 anti-webui-wayland-shell = { workspace = true, optional = true }

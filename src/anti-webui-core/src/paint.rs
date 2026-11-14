@@ -544,6 +544,10 @@ fn paints_overlapping(doc: &Document, id: NodeId) -> bool {
                 *things += u32::from(node.fill.is_some()) + u32::from(node.overlay.is_some());
                 *things += u32::from(c.backdrop_blur > 0.0);
                 *things += u32::from(c.outline_width > 0.0);
+                // What a drawing is made of can lie over each other, as a line through a glyph.
+                if let NodeKind::Drawing(d) = &node.kind {
+                    *things += d.drawing.items.len().min(2) as u32;
+                }
                 if c.overflow_x == Overflow::Scroll || c.overflow_y == Overflow::Scroll {
                     *things += 2;
                 }
@@ -1265,6 +1269,10 @@ impl Painter<'_> {
         if let NodeKind::Video(_) = &node.kind {
             self.chunk(id, part::PICTURE);
             self.video(id, opacity);
+        }
+        if let NodeKind::Drawing(d) = &node.kind {
+            self.chunk(id, part::CONTENT);
+            crate::drawing::paint(node, d, doc.scale, opacity, self.scene);
         }
 
         if node.scroll_root {

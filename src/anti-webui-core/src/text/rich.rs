@@ -265,6 +265,7 @@ impl IntoView for RichText {
                         alt: i.alt,
                         align: i.align,
                         size: SizeI::default(),
+                        baseline: None,
                     });
                 }
             }
@@ -326,6 +327,9 @@ pub struct BoxData {
     pub align: VerticalAlign,
     /// What it measured, in physical pixels.
     pub size: SizeI,
+    /// Its baseline below its top, when it has one of its own (a formula); otherwise its bottom
+    /// is.
+    pub baseline: Option<i32>,
 }
 
 /// What a text has when its parts look different.

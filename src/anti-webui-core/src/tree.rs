@@ -188,6 +188,8 @@ pub enum NodeKind {
     SvgShape(Box<crate::svg::ShapeData>),
     /// What puts a text at a point in an `svg`.
     SvgText(Box<crate::svg::SvgTextData>),
+    /// Glyphs, rectangles and shapes in em: `drawing`. See `docs/design/40-math.md`.
+    Drawing(Box<crate::drawing::DrawingData>),
     /// Generates no box; children take part in the parent's layout.
     Fragment,
     /// The root of what is shown in a surface of its own. It stays in the tree for its lifetime,
@@ -364,6 +366,7 @@ impl Node {
         match &self.kind {
             NodeKind::Image(d) => Some((d.natural, d.density)),
             NodeKind::Video(d) => Some((d.natural, 1.0)),
+            NodeKind::Drawing(d) => Some((Some(d.natural(self)), 1.0)),
             _ => None,
         }
     }

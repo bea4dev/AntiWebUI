@@ -402,6 +402,62 @@ pub fn with_text<R>(f: impl FnOnce(&mut TextSystem) -> R) -> R {
     TEXT.with(|t| f(&mut t.borrow_mut()))
 }
 
+/// A string on one line in the program's fonts, as the glyphs that draw it: for drawing it
+/// somewhere else, as a formula draws what its own fonts lack (see `docs/design/40-math.md`).
+#[derive(Clone, Debug)]
+pub struct ShapedText {
+    pub runs: Vec<ShapedRun>,
+    /// The advance of all of it, in logical pixels.
+    pub width: f32,
+}
+
+/// Glyphs of one font, in logical pixels: `x` from the start of the text, `y` down from the
+/// baseline.
+#[derive(Clone, Debug)]
+pub struct ShapedRun {
+    pub font: crate::scene::FontData,
+    pub size: f32,
+    pub glyphs: Vec<crate::scene::Glyph>,
+}
+
+/// Shapes `text` on one line with what of `style` has to do with text, falling back to other
+/// fonts as the text of a page does.
+pub fn shape_glyphs(text: &str, style: &anti_webui_style::Style) -> ShapedText {
+    let mut computed = ComputedStyle::default();
+    style.apply_to(&mut computed);
+    let shape = ShapeStyle::from_computed(&computed, Scale::ONE);
+    with_text(|ts| {
+        let mut layout = TextLayout::default();
+        layout.shape(ts, text, 1, &shape);
+        layout.break_lines(None);
+        let mut runs = Vec::new();
+        let mut width = 0.0f32;
+        for line in layout.layout.lines() {
+            width = width.max(line.metrics().advance);
+            for item in line.items() {
+                let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                    continue;
+                };
+                let baseline = glyph_run.baseline();
+                let run = glyph_run.run();
+                runs.push(ShapedRun {
+                    font: run.font().clone(),
+                    size: run.font_size(),
+                    glyphs: glyph_run
+                        .positioned_glyphs()
+                        .map(|g| crate::scene::Glyph {
+                            id: g.id,
+                            x: g.x,
+                            y: g.y - baseline,
+                        })
+                        .collect(),
+                });
+            }
+        }
+        ShapedText { runs, width }
+    })
+}
+
 /// Every property that affects shaping or line breaking, already in physical units.
 #[derive(Clone, Debug, PartialEq)]
 #[doc(hidden)]
@@ -549,7 +605,7 @@ struct ShapeKey {
 #[derive(Clone, Debug, PartialEq)]
 struct RichKey {
     spans: Vec<(ShapeStyle, parley::VerticalAlign, (i32, i32))>,
-    boxes: Vec<(SizeI, parley::VerticalAlign)>,
+    boxes: Vec<(SizeI, Option<i32>, parley::VerticalAlign)>,
 }
 
 impl RichKey {
@@ -563,7 +619,7 @@ impl RichKey {
             boxes: rich
                 .boxes
                 .iter()
-                .map(|b| (b.size, b.align.parley(scale)))
+                .map(|b| (b.size, b.baseline, b.align.parley(scale)))
                 .collect(),
         }
     }
@@ -756,19 +812,23 @@ impl TextLayout {
             }
             // The boxes go in the order of the text, a span's padding around what is in it.
             let mut boxes: Vec<parley::InlineBox> = Vec::new();
-            let mut put = |id: u64, index: usize, size: SizeI, align: parley::VerticalAlign| {
+            let mut put = |id: u64,
+                           index: usize,
+                           size: SizeI,
+                           baseline: Option<i32>,
+                           align: parley::VerticalAlign| {
                 boxes.push(parley::InlineBox {
                     id,
                     kind: parley::InlineBoxKind::InFlow,
                     index,
                     width: size.width as f32,
                     height: size.height as f32,
-                    baseline: None,
+                    baseline: baseline.map(|b| b as f32),
                     vertical_align: align,
                 });
             };
             for (i, b) in rich.boxes.iter().enumerate() {
-                put(i as u64, b.at, b.size, b.align.parley(scale));
+                put(i as u64, b.at, b.size, b.baseline, b.align.parley(scale));
             }
             for (i, (s, r)) in rich.spans.iter().zip(&rich.resolved).enumerate() {
                 if r.pad.0 > 0 {
@@ -776,6 +836,7 @@ impl TextLayout {
                         pad_id(i, false),
                         s.range.start,
                         SizeI::new(r.pad.0, 0),
+                        None,
                         parley::VerticalAlign::BASELINE,
                     );
                 }
@@ -784,6 +845,7 @@ impl TextLayout {
                         pad_id(i, true),
                         s.range.end,
                         SizeI::new(r.pad.1, 0),
+                        None,
                         parley::VerticalAlign::BASELINE,
                     );
                 }

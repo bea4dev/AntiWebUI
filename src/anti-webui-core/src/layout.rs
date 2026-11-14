@@ -1808,12 +1808,13 @@ impl Engine<'_> {
             .unwrap_or_default();
         // What is among the words takes the size it would like, as an `inline-block` does.
         let base = (avail_w, None);
-        let sizes: Vec<SizeI> = boxes
+        let sizes: Vec<(SizeI, Option<i32>)> = boxes
             .iter()
             .map(|&c| {
                 let s = self.compute(c, (None, None), avail_w, base, false);
                 let m = self.margins_of(c, avail_w);
-                SizeI::new(s.width + m.left + m.right, s.height + m.top + m.bottom)
+                let size = SizeI::new(s.width + m.left + m.right, s.height + m.top + m.bottom);
+                (size, self.baseline_of(c).map(|b| b + m.top))
             })
             .collect();
         let node = &mut self.doc.nodes[id];
@@ -1821,8 +1822,9 @@ impl Engine<'_> {
             unreachable!()
         };
         if let Some(rich) = &mut data.rich {
-            for (b, size) in rich.boxes.iter_mut().zip(sizes) {
+            for (b, (size, baseline)) in rich.boxes.iter_mut().zip(sizes) {
                 b.size = size;
+                b.baseline = baseline;
             }
         }
         data.layout.shape_rich(
@@ -1838,8 +1840,8 @@ impl Engine<'_> {
             None => {
                 data.layout.break_lines(None);
                 // parley lays out empty text as a space, for the height of its line. Like an
-                // empty text node in a browser, it takes no width.
-                let max = if data.text.is_empty() {
+                // empty text node in a browser, it takes no width, unless there are boxes in it.
+                let max = if data.text.is_empty() && boxes.is_empty() {
                     0
                 } else {
                     data.layout.size().width
@@ -1925,6 +1927,16 @@ impl Engine<'_> {
             _ => widest.ceil() as i32,
         });
         SizeI::new(width, (lines as f32 * average.line).ceil() as i32)
+    }
+
+    /// The baseline of a box below its border edge, if it has one of its own: a drawing's.
+    fn baseline_of(&self, id: NodeId) -> Option<i32> {
+        let node = &self.doc.nodes[id];
+        let NodeKind::Drawing(d) = &node.kind else {
+            return None;
+        };
+        let r = &node.resolved;
+        Some(r.border.top + r.padding.top + d.baseline(node, self.scale))
     }
 
     fn margins_of(&self, id: NodeId, base_w: Option<i32>) -> Edges<i32> {

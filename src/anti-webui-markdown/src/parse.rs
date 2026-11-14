@@ -32,6 +32,13 @@ pub(crate) enum Piece {
         link: Option<Rc<str>>,
     },
     FootnoteRef(String),
+    /// A formula in LaTeX: `$…$`, or `$$…$$` (and ` ```math `) for one on a line of its own.
+    Math {
+        tex: String,
+        display: bool,
+        /// Where it starts in the source, which is what its numbers are found by.
+        at: usize,
+    },
 }
 
 pub(crate) type Inlines = Vec<Piece>;
@@ -92,7 +99,12 @@ pub(crate) struct Top {
 }
 
 pub(crate) fn options() -> Options {
-    Options::ENABLE_TABLES
+    let math = if cfg!(feature = "math") {
+        Options::ENABLE_MATH
+    } else {
+        Options::empty()
+    };
+    math | Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
@@ -117,7 +129,8 @@ enum Frame {
         url: String,
         alt: String,
     },
-    Code(String, String),
+    /// The language, the text, and where it starts.
+    Code(String, String, usize),
     Html(String),
 }
 
@@ -164,7 +177,7 @@ impl Builder {
             alt.push_str(text);
             return;
         }
-        if let Some(Frame::Code(_, code) | Frame::Html(code)) = self.stack.last_mut() {
+        if let Some(Frame::Code(_, code, _) | Frame::Html(code)) = self.stack.last_mut() {
             code.push_str(text);
             return;
         }
@@ -176,6 +189,21 @@ impl Builder {
         match inlines.last_mut() {
             Some(Piece::Text(t, m)) if *m == marks => t.push_str(text),
             _ => inlines.push(Piece::Text(text.to_owned(), marks)),
+        }
+    }
+
+    fn math(&mut self, tex: &str, display: bool, at: usize) {
+        // In the alt of an image, a formula is its source.
+        if let Some(Frame::Image { alt, .. }) = self.stack.last_mut() {
+            alt.push_str(tex);
+            return;
+        }
+        if let Some(inlines) = self.inlines() {
+            inlines.push(Piece::Math {
+                tex: tex.to_owned(),
+                display,
+                at,
+            });
         }
     }
 
@@ -221,7 +249,7 @@ impl Builder {
                     }
                     CodeBlockKind::Indented => String::new(),
                 };
-                self.stack.push(Frame::Code(lang, String::new()));
+                self.stack.push(Frame::Code(lang, String::new(), at));
             }
             Tag::HtmlBlock => self.stack.push(Frame::Html(String::new())),
             Tag::List(start) => self.stack.push(Frame::List(start, Vec::new())),
@@ -312,11 +340,22 @@ impl Builder {
                 }
             }
             TagEnd::CodeBlock => {
-                if let Some(Frame::Code(lang, mut text)) = self.stack.pop() {
+                if let Some(Frame::Code(lang, mut text, at)) = self.stack.pop() {
                     if text.ends_with('\n') {
                         text.pop();
                     }
-                    self.block(Block::Code { lang, text }, end);
+                    // A formula on a line of its own, as GitHub shows one.
+                    if cfg!(feature = "math") && lang == "math" {
+                        let tex = text;
+                        let math = Piece::Math {
+                            tex,
+                            display: true,
+                            at,
+                        };
+                        self.block(Block::Paragraph(vec![math]), end);
+                    } else {
+                        self.block(Block::Code { lang, text }, end);
+                    }
                 }
             }
             TagEnd::HtmlBlock => {
@@ -396,7 +435,8 @@ pub(crate) fn parse(source: &str) -> Vec<Top> {
             Event::End(tag) => b.end(tag, range.end),
             Event::Text(t) => b.text(&t, 0),
             Event::Code(t) => b.text(&t, mark::CODE),
-            Event::InlineMath(t) | Event::DisplayMath(t) => b.text(&t, mark::CODE),
+            Event::InlineMath(t) => b.math(&t, false, range.start),
+            Event::DisplayMath(t) => b.math(&t, true, range.start),
             Event::Html(t) => {
                 if b.stack.is_empty() {
                     b.start = range.start;
@@ -504,6 +544,7 @@ pub(crate) fn plain(inlines: &Inlines) -> String {
         match p {
             Piece::Text(t, _) => out.push_str(t),
             Piece::Image { alt, .. } => out.push_str(alt),
+            Piece::Math { tex, .. } => out.push_str(tex),
             Piece::FootnoteRef(_) => {}
         }
     }
@@ -562,6 +603,43 @@ mod tests {
             ]
         );
         assert_eq!(doc[2].block, Block::Rule);
+    }
+
+    #[cfg(feature = "math")]
+    #[test]
+    fn formulas_among_words_and_on_lines_of_their_own() {
+        let doc = parse("Energy $E = mc^2$ here.\n\n$$\n\\frac{a}{b}\n$$\n\n![a $x$](p.png)\n");
+        let Block::Paragraph(p) = &doc[0].block else {
+            panic!()
+        };
+        assert_eq!(
+            p,
+            &vec![
+                text("Energy ", 0),
+                Piece::Math {
+                    tex: "E = mc^2".into(),
+                    display: false,
+                    at: 7
+                },
+                text(" here.", 0),
+            ]
+        );
+        let Block::Paragraph(p) = &doc[1].block else {
+            panic!()
+        };
+        assert_eq!(
+            p,
+            &vec![Piece::Math {
+                tex: "\n\\frac{a}{b}\n".into(),
+                display: true,
+                at: 25
+            }]
+        );
+        // In the alt of a picture, a formula is its source.
+        let Block::Paragraph(p) = &doc[2].block else {
+            panic!()
+        };
+        assert!(matches!(&p[0], Piece::Image { alt, .. } if alt == "a x"));
     }
 
     #[test]

@@ -1446,6 +1446,7 @@ fn build_row(
                     alt: String::new(),
                     align: VerticalAlign::Baseline,
                     size: Default::default(),
+                    baseline: None,
                 })
                 .collect();
             let link = link_of(host, line, &d, preedit.map(|p| p.1));

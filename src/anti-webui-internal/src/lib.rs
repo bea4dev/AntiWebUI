@@ -7,6 +7,8 @@ pub use anti_webui_code as code;
 pub use anti_webui_core as core;
 #[cfg(feature = "markdown")]
 pub use anti_webui_markdown as markdown;
+#[cfg(feature = "math")]
+pub use anti_webui_math as math;
 #[cfg(feature = "pdf")]
 pub use anti_webui_pdf as pdf;
 pub use anti_webui_style as style;
@@ -30,6 +32,8 @@ pub mod prelude {
         Emoji, MarkdownEditor, MarkdownSplitEditor, MarkdownTheme, MarkdownView, markdown_editor,
         markdown_split_editor, markdown_view,
     };
+    #[cfg(feature = "math")]
+    pub use anti_webui_math::{Math, MathError, math};
     #[cfg(feature = "pdf")]
     pub use anti_webui_pdf::{
         PdfAnnotationId, PdfAnnotationKind, PdfEditing, PdfError, PdfField, PdfFieldChange,

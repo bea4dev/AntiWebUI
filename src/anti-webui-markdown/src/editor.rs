@@ -8,7 +8,8 @@ use crate::theme::MarkdownTheme;
 use crate::view::{Ctx, Highlight, OnLink, Pictures};
 use anti_webui_core::event::KeyboardEvent;
 use anti_webui_core::prelude::*;
-use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, CowStr, Event, Parser, Tag, TagEnd};
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -89,6 +90,8 @@ struct Tops {
     /// The definitions of its footnotes, empty, to put after each block that is looked at alone,
     /// so that what refers to them is known as a reference.
     footnotes: String,
+    /// The numbers of its formulas on lines of their own.
+    numbers: Rc<crate::numbers::Numbers>,
 }
 
 fn hash_of(s: &str) -> u64 {
@@ -250,7 +253,8 @@ impl Decorator {
         let mut next = HashMap::with_capacity(old.len());
         let mut seen: HashMap<u64, u32> = HashMap::new();
         for &(ref b, hash) in tops.blocks.iter() {
-            let hash = hash ^ footnotes;
+            // Made again when the numbers it shows change, though it doesn't.
+            let hash = hash ^ footnotes ^ tops.numbers.hash_of(b.clone(), &text[b.clone()]);
             let first = cx.line_of(b.start);
             let last = cx.line_of(b.end.saturating_sub(1).max(b.start));
             if first < line {
@@ -300,7 +304,52 @@ impl Decorator {
             let mut footnotes = String::new();
             let mut depth = 0usize;
             let mut start = 0;
+            // The formulas on lines of their own, with where each starts, as the viewer reads them.
+            let mut formulas: Vec<(usize, Cow<str>)> = Vec::new();
+            let mut math_block: Option<(usize, Cow<str>)> = None;
+            // What the parser gives is mostly part of the text: it is not copied.
+            fn text_of<'a>(t: &CowStr<'a>) -> Cow<'a, str> {
+                match t {
+                    CowStr::Borrowed(s) => Cow::Borrowed(*s),
+                    other => Cow::Owned(other.to_string()),
+                }
+            }
             for (event, range) in Parser::new_ext(text, options()).into_offset_iter() {
+                match &event {
+                    Event::DisplayMath(t) => formulas.push((range.start, text_of(t))),
+                    Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
+                        if cfg!(feature = "math")
+                            && info.split_whitespace().next() == Some("math") =>
+                    {
+                        math_block = Some((range.start, Cow::Borrowed("")));
+                    }
+                    Event::Text(t) => {
+                        if let Some((_, tex)) = &mut math_block {
+                            if tex.is_empty() {
+                                *tex = text_of(t);
+                            } else {
+                                tex.to_mut().push_str(t);
+                            }
+                        }
+                    }
+                    Event::End(TagEnd::CodeBlock) => {
+                        if let Some((at, tex)) = math_block.take() {
+                            let tex = match tex {
+                                Cow::Borrowed(s) => {
+                                    Cow::Borrowed(s.strip_suffix('\n').unwrap_or(s))
+                                }
+                                Cow::Owned(mut s) => {
+                                    if s.ends_with('\n') {
+                                        s.pop();
+                                    }
+                                    Cow::Owned(s)
+                                }
+                            };
+                            formulas.push((at, tex));
+                        }
+                    }
+                    _ => {}
+                }
                 let done = match event {
                     Event::Start(tag) => {
                         if depth == 0 {
@@ -331,10 +380,20 @@ impl Decorator {
                     out.push((r, hash_of(&text[a..b.max(a)])));
                 }
             }
+            let formulas: Vec<(usize, &str)> = formulas
+                .iter()
+                .map(|(at, tex)| (*at, tex.as_ref()))
+                .collect();
+            let numbers = Rc::new(crate::numbers::Numbers::of(
+                &self.tops.borrow().numbers,
+                &formulas,
+            ));
+            *self.ctx.numbers.borrow_mut() = numbers.clone();
             *self.tops.borrow_mut() = Tops {
                 version: Some(version),
                 blocks: out,
                 footnotes,
+                numbers,
             };
         }
         self.tops.borrow()
@@ -540,8 +599,10 @@ impl Decorator {
                             let fenced = matches!(kind_of, CodeBlockKind::Fenced(_));
                             let ls: Vec<usize> = lines_in(&range).collect();
                             let inside = touches(range.start, range.end);
-                            if top_level && lang == "mermaid" && !(holds && inside) {
-                                whole = Some(self.whole(src, uid, 1));
+                            let drawn =
+                                lang == "mermaid" || (lang == "math" && cfg!(feature = "math"));
+                            if top_level && drawn && !(holds && inside) {
+                                whole = Some(self.whole(src, uid, 1, start));
                             }
                             let (first, last) = (ls[0], *ls.last().unwrap());
                             let closed = fenced && last > first && {
@@ -586,7 +647,7 @@ impl Decorator {
                         }
                         Tag::Table(_) => {
                             if top_level && !(holds && touches(range.start, range.end)) {
-                                whole = Some(self.whole(src, uid, 2));
+                                whole = Some(self.whole(src, uid, 2, start));
                             }
                             for l in lines_in(&range) {
                                 lines[l].kind |= kind::MONO;
@@ -723,6 +784,61 @@ impl Decorator {
                         hide(&mut lines, range.end - k..range.end, show);
                     }
                 }
+                #[cfg(feature = "math")]
+                Event::InlineMath(ref tex) | Event::DisplayMath(ref tex) => {
+                    let display = matches!(event, Event::DisplayMath(_));
+                    let k = src[range.clone()]
+                        .bytes()
+                        .take_while(|&b| b == b'$')
+                        .count();
+                    let inside = touches(range.start, range.end);
+                    let l = line_of(range.start);
+                    // A paragraph that is only a formula on a line of its own shows as the
+                    // viewer shows it, until the selection is all in it.
+                    let alone = display
+                        && stack.len() == 1
+                        && matches!(stack[0].tag, TagEnd::Paragraph)
+                        && src.trim() == src[range.clone()].trim();
+                    if alone {
+                        if !(holds && inside) {
+                            whole = Some(self.whole(src, uid, 3, start));
+                        }
+                    } else if inside || line_of(range.end - 1) != l || range.len() < 2 * k {
+                        mark(&mut lines, range.start + k..range.end - k, bit::CODE);
+                        mark(&mut lines, range.start..range.start + k, bit::SYNTAX);
+                        mark(&mut lines, range.end - k..range.end, bit::SYNTAX);
+                    } else {
+                        // Among the words, at full size if it is meant for a line of its own.
+                        let source = if display {
+                            format!("\\displaystyle {tex}")
+                        } else {
+                            tex.to_string()
+                        };
+                        // In parts a line can break between, each over some of the source. Where
+                        // `\\` ends a line, a box as wide as the line, and no higher, makes the
+                        // next part start a line of its own, as a line break in the text would.
+                        let pieces = self
+                            .ctx
+                            .math(source.clone())
+                            .style(&self.theme.math)
+                            .pieces();
+                        let (a, b) = (range.start - starts[l], range.end - starts[l]);
+                        let n = pieces.len().min(b - a).max(1);
+                        for (i, piece) in pieces.into_iter().enumerate().take(n) {
+                            let key = hash_of(&format!("math {uid} {a} {i} {source}"));
+                            let w = match piece {
+                                anti_webui_math::MathPiece::Part(part) => {
+                                    Widget::new(key, move || part.clone().into_view())
+                                }
+                                anti_webui_math::MathPiece::LineBreak => {
+                                    Widget::new(key, || div().w_full().h(0.0).into_view())
+                                }
+                            };
+                            let end = if i + 1 == n { b } else { a + i + 1 };
+                            lines[l].replace.push((a + i..end, Some(w)));
+                        }
+                    }
+                }
                 Event::InlineHtml(_) | Event::Html(_) => mark(&mut lines, range, bit::SYNTAX),
                 Event::FootnoteReference(_) if range.len() > 3 => {
                     // `[^1]` shows as a raised `1`.
@@ -801,14 +917,15 @@ impl Decorator {
     }
 
     /// A block shown as the viewer shows it.
-    fn whole(&self, src: &str, uid: u64, what: u64) -> Row {
+    fn whole(&self, src: &str, uid: u64, what: u64, start: &Rc<Cell<usize>>) -> Row {
         let ctx = self.ctx.clone();
         let src = src.to_owned();
+        let start = start.clone();
         let key = hash_of(&format!("whole {what} {uid}"));
         Row::Block {
             lines: 1,
             style: Some(Rc::new(Style::default().py(4.0))),
-            widget: Widget::new(key, move || ctx.block_of(&src)),
+            widget: Widget::new(key, move || ctx.block_of(&src, start.get())),
         }
     }
 

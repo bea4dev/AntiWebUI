@@ -41,6 +41,13 @@ pub struct MarkdownTheme {
     pub image: Style,
     /// The box of a diagram.
     pub diagram: Style,
+    /// A formula among words (`$…$`). Its size is 1.21 times the text's, as KaTeX's is.
+    pub math: Style,
+    /// The box of a formula on a line of its own (`$$…$$`, ` ```math `).
+    pub math_block: Style,
+    /// The numbers of equations at the left end of their lines rather than the right, as KaTeX's
+    /// `leqno`.
+    pub math_leqno: bool,
     pub footnotes: Style,
     /// The text of a task that is done (`- [x]`). Empty by default, as on GitHub, where only the
     /// box is ticked; `Style::default().strikethrough().text_color(muted)` looks like Obsidian.
@@ -134,6 +141,10 @@ impl Default for MarkdownTheme {
             rule: Style::default().h(size * 0.25).bg(BORDER).mt(24.0).mb(24.0),
             image: Style::default(),
             diagram: Style::default().mb(16.0),
+            math: Style::default(),
+            // KaTeX's `.katex-display` has 1 em above and below.
+            math_block: Style::default().mt(size).mb(size),
+            math_leqno: false,
             footnotes: Style::default()
                 .text_size(12.0)
                 .text_color(MUTED)

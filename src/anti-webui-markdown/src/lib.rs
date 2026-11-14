@@ -10,6 +10,7 @@
 mod editor;
 #[cfg(feature = "mermaid")]
 mod mermaid;
+mod numbers;
 mod parse;
 #[cfg(feature = "code")]
 mod split;

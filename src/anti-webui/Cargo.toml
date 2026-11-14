@@ -26,10 +26,12 @@ video = ["anti-webui-internal/video"]
 pdf = ["anti-webui-internal/pdf"]
 ## The JavaScript of PDF forms, on QuickJS, which adds about 1 MB.
 pdf-js = ["pdf", "anti-webui-internal/pdf-js"]
-## A Markdown viewer and editors (live preview, and source beside preview) with Mermaid diagrams
-## and code blocks colored by tree-sitter. See `docs/design/28-markdown.md` and
+## A Markdown viewer and editors (live preview, and source beside preview) with Mermaid diagrams,
+## formulas, and code blocks colored by tree-sitter. See `docs/design/28-markdown.md` and
 ## `docs/design/32-markdown-split.md`.
 markdown = ["anti-webui-internal/markdown"]
+## Formulas in LaTeX, laid out as KaTeX does, which adds about 2.8 MB. See `docs/design/40-math.md`.
+math = ["anti-webui-internal/math"]
 ## A code editor with tree-sitter highlighting for 14 languages. See `docs/design/31-code-editor.md`.
 code = ["anti-webui-internal/code"]
 ## Desktop shells on Wayland: bars, wallpapers and launchers as layer surfaces, as

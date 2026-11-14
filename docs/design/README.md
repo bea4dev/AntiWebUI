@@ -44,6 +44,7 @@ AntiWebUI は WebView に頼らず、wgpu による自前描画とネイティ�
 | 37 | [wayland-shell](37-wayland-shell.md) | Wayland のシェル（`anti-webui-wayland-shell`）：レイヤーサーフェス、ディスプレイごとのスレッド（`for_each_output`）、`Task`、汎用ワークスペースと Hyprland・niri・sway の IPC、NetworkManager などの D-Bus の機能、PipeWire、通知、トレイ、画面ロック。X11 は対象外 |
 | 38 | [platform-macos](38-platform-macos.md) | macOS バックエンド：AppKit を直接使う、`nextEventMatchingMask` で回すループとライブリサイズ、`IOSurface` での部分描画と `CADisplayLink`、`NSTextInputClient` の IME、子の窓のポップアップ、OS との DnD、`spawn_window` の窓を別スレッドで描く、macOS のキーの決まり（`Modifiers::primary` など）、合成イベントでの端から端までのテスト |
 | 39 | [platform-windows](39-platform-windows.md) | Windows バックエンド：Win32 を直接使う、`MsgWaitForMultipleObjectsEx` で回すループとモーダルなループの中のポンプ、Per-Monitor v2 の DPI、DirectComposition の上の DX12 のスワップチェーン、`WaitForVBlank` のスレッド、IMM32 の IME、アクティブにならないポップアップ、ファイバーでの 8 MiB のスタック、合成メッセージでの端から端までのテスト |
+| 40 | [math](40-math.md) | 数式（LaTeX）：ライブラリの比較と RaTeX、core の `drawing`（em 単位のグリフ、矩形、パス）とインラインボックスのベースライン、`anti-webui-math` の `math`、文中の式の折り返し、通しの式番号と `leqno`、`\label` と `\eqref`、Markdown の `$`、`$$`、` ```math ` とエディタ、Chromium の KaTeX との比較 |
 
 ## 用語
 
