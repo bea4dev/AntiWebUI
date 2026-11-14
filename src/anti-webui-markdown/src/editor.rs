@@ -1093,6 +1093,7 @@ pub struct MarkdownEditor {
     source: Signal<String>,
     theme: MarkdownTheme,
     on_link: OnLink,
+    on_key_down: Option<Rc<dyn Fn(&KeyboardEvent)>>,
     image: Pictures,
     highlight: Option<Rc<Highlight>>,
     #[cfg(feature = "code")]
@@ -1105,6 +1106,7 @@ pub fn markdown_editor(source: Signal<String>) -> MarkdownEditor {
         source,
         theme: MarkdownTheme::default(),
         on_link: None,
+        on_key_down: None,
         image: None,
         highlight: None,
         #[cfg(feature = "code")]
@@ -1122,6 +1124,12 @@ impl MarkdownEditor {
     /// Called with the target of a link clicked with Ctrl held.
     pub fn on_link(mut self, f: impl Fn(&str) + 'static) -> Self {
         self.on_link = Some(Rc::new(f));
+        self
+    }
+
+    /// Called before the Markdown editor handles a key. Preventing default skips its built-in handling.
+    pub fn on_key_down(mut self, f: impl Fn(&KeyboardEvent) + 'static) -> Self {
+        self.on_key_down = Some(Rc::new(f));
         self
     }
 
@@ -1273,6 +1281,7 @@ impl IntoView for MarkdownEditor {
     fn into_view(self) -> View {
         let editor = editor_ref();
         let on_link = self.on_link.clone();
+        let on_key_down = self.on_key_down;
         #[cfg(feature = "code")]
         let (highlight, ready) = crate::view::code_colors(self.highlight, self.code_theme);
         #[cfg(not(feature = "code"))]
@@ -1301,7 +1310,15 @@ impl IntoView for MarkdownEditor {
             .style(&self.theme.root)
             .style(&self.style)
             .decorate(move |cx| deco.rows(cx))
-            .on_key_down(move |e| list_keys(editor, e));
+            .on_key_down(move |e| {
+                if let Some(f) = &on_key_down {
+                    f(e);
+                    if e.is_default_prevented() {
+                        return;
+                    }
+                }
+                list_keys(editor, e);
+            });
         if let Some(open) = on_link {
             e = e.on_click(move |p| {
                 if !p.modifiers.primary() {
