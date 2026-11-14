@@ -18,6 +18,9 @@ A lightweight framework for building UIs in **Rust with its own wgpu renderer**,
  - Markdown editor (`cargo run --example markdown_editor --features=markdown -- filepath --split`)
 ![](./image/markdown.png)
 
+ - Latex support (included in Markdown)
+![](./image/latex.png)
+
 ## Example
 
 ```rust
