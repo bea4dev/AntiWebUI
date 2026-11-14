@@ -33,6 +33,7 @@ mod clipboard;
 mod conn;
 #[cfg(feature = "dbus")]
 mod dbus;
+mod gamma;
 #[cfg(feature = "hyprland")]
 pub mod hyprland;
 mod idle;
@@ -82,6 +83,7 @@ pub use battery::{Battery, BatteryDevice, BatteryKind, BatteryState, battery};
 pub use bluetooth::{Bluetooth, BluetoothAdapter, BluetoothDevice, bluetooth};
 pub use capture::{Capture, CaptureOptions, CaptureSource, CaptureTarget, capture, thumbnail};
 pub use clipboard::{Clipboard, clipboard};
+pub use gamma::{Gamma, gamma};
 pub use idle::{Idle, idle};
 pub use lock::{LockState, SessionLock, lock_session, lock_state, spawn_lock_session};
 #[cfg(feature = "media")]
@@ -128,10 +130,10 @@ use std::sync::Mutex;
 pub mod prelude {
     pub use crate::{
         Anchor, Capture, CaptureOptions, CaptureSource, CaptureTarget, Clipboard, Every, Exclusive,
-        Idle, InputRegion, Keyboard, Layer, LayerHandle, LayerOptions, LayerSize, LocalTime,
-        Margin, Output, OutputTransform, ServiceError, Shell, ShellError, Toplevel, Toplevels,
-        Workspace, WorkspaceAction, WorkspaceSource, Workspaces, capture, clipboard,
-        current_output, for_each_output, idle, local_time, open_layer, outputs,
+        Gamma, Idle, InputRegion, Keyboard, Layer, LayerHandle, LayerOptions, LayerSize,
+        LocalTime, Margin, Output, OutputTransform, ServiceError, Shell, ShellError, Toplevel,
+        Toplevels, Workspace, WorkspaceAction, WorkspaceSource, Workspaces, capture, clipboard,
+        current_output, for_each_output, gamma, idle, local_time, open_layer, outputs,
         spawn_for_each_output, spawn_layer, thumbnail, toplevels, workspaces,
     };
     #[cfg(feature = "apps")]
