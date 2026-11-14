@@ -20,6 +20,7 @@ pub struct MarkdownSplitEditor {
     theme: MarkdownTheme,
     code_theme: CodeTheme,
     on_link: OnLink,
+    on_key_down: Option<Rc<dyn Fn(&KeyboardEvent)>>,
     image: Pictures,
     emoji: Emojis,
     editor_ref: Option<EditorRef>,
@@ -35,6 +36,7 @@ pub fn markdown_split_editor(source: Signal<String>) -> MarkdownSplitEditor {
         theme: MarkdownTheme::default(),
         code_theme: CodeTheme::light(),
         on_link: None,
+        on_key_down: None,
         image: None,
         emoji: None,
         editor_ref: None,
@@ -60,6 +62,12 @@ impl MarkdownSplitEditor {
     /// Called with the target of a link clicked on the right.
     pub fn on_link(mut self, f: impl Fn(&str) + 'static) -> Self {
         self.on_link = Some(Rc::new(f));
+        self
+    }
+
+    /// Called before the split editor handles a key. Preventing default skips its built-in handling.
+    pub fn on_key_down(mut self, f: impl Fn(&KeyboardEvent) + 'static) -> Self {
+        self.on_key_down = Some(Rc::new(f));
         self
     }
 
@@ -247,6 +255,7 @@ impl Places {
 impl IntoView for MarkdownSplitEditor {
     fn into_view(self) -> View {
         let source = self.source;
+        let on_key_down = self.on_key_down;
         let editor = self.editor_ref.unwrap_or_else(editor_ref);
         let preview = node_ref();
         let page = node_ref();
@@ -327,9 +336,19 @@ impl IntoView for MarkdownSplitEditor {
                             // edit.
                             show();
                             let show = show.clone();
-                            request_frame(move |_| show());
+                            request_frame(move |_| {
+                                if mark.is_alive() {
+                                    show();
+                                }
+                            });
                         })
                         .on_key_down(move |e| {
+                            if let Some(f) = &on_key_down {
+                                f(e);
+                                if e.is_default_prevented() {
+                                    return;
+                                }
+                            }
                             l3();
                             list_keys(editor, e);
                         })
