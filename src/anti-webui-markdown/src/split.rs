@@ -336,7 +336,11 @@ impl IntoView for MarkdownSplitEditor {
                             // edit.
                             show();
                             let show = show.clone();
-                            request_frame(move |_| show());
+                            request_frame(move |_| {
+                                if mark.is_alive() {
+                                    show();
+                                }
+                            });
                         })
                         .on_key_down(move |e| {
                             if let Some(f) = &on_key_down {
